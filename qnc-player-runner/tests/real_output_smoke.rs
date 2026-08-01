@@ -145,6 +145,19 @@ fn runner_emits_realtime_diagnostics_with_real_file() {
 }
 
 #[test]
+fn runner_emits_cue_latency_diagnostics_with_real_file() {
+    require_runner_tools();
+    let fixture = RealRunnerFixture::create_av();
+    let output_dir = fixture.dir.join("cue-latency-out");
+    let stdout = run_runner_cue_latency_diagnostics(&fixture, &output_dir);
+
+    assert!(stdout_contains_event(&stdout, "FramePresented", Some(10)));
+    assert!(stdout_contains_event(&stdout, "FramePresented", Some(11)));
+    assert!(stdout_contains_cue_latency_diagnostics(&stdout, &[10, 11]));
+    assert!(stdout_contains_final_state(&stdout, false));
+}
+
+#[test]
 fn runner_uses_explicit_probe_source_runtime_when_requested() {
     require_runner_tools();
     let fixture = RealRunnerFixture::create_av();
@@ -644,6 +657,42 @@ fn run_runner_realtime_diagnostics(fixture: &RealRunnerFixture, output_dir: &Pat
     String::from_utf8_lossy(&output.stdout).into_owned()
 }
 
+fn run_runner_cue_latency_diagnostics(fixture: &RealRunnerFixture, output_dir: &Path) -> String {
+    let output = Command::new(env!("CARGO_BIN_EXE_qnc-player-runner"))
+        .args([
+            "--path",
+            fixture.path.to_str().unwrap(),
+            "--duration-frames",
+            "50",
+            "--timebase",
+            "25/1",
+            "--out-frame",
+            "49",
+            "--output-dir",
+            output_dir.to_str().unwrap(),
+            "--video-format",
+            "160x90",
+            "--audio-format",
+            "48000x1",
+            "--cue-latency-diagnostics",
+            "--cue-latency-frame",
+            "10",
+            "--cue-latency-repeat",
+            "2",
+            "--cue-latency-step",
+            "1",
+        ])
+        .output()
+        .expect("runner should execute");
+    assert!(
+        output.status.success(),
+        "runner failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
 fn spawn_runner_jsonl(fixture: &RealRunnerFixture, output_dir: &Path) -> Child {
     spawn_runner_jsonl_with_extra_source(fixture, output_dir, None)
 }
@@ -766,6 +815,44 @@ fn stdout_contains_realtime_diagnostics(stdout: &str, seek_frame: u64) -> bool {
                 .is_some_and(|records| records.iter().all(segment_has_one_av_output_per_tick))
             && diagnostics["totals"]["playback_dropped_frame_count"] == 0
             && diagnostics["totals"]["playback_av_sync_warning_count"] == 0
+            && diagnostics["totals"]["playback_error_count"] == 0
+    })
+}
+
+fn stdout_contains_cue_latency_diagnostics(stdout: &str, expected_frames: &[u64]) -> bool {
+    stdout.lines().any(|line| {
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            return false;
+        };
+        let diagnostics = &value["diagnostics"];
+        if value["stage"] != "cue_latency_diagnostics" {
+            return false;
+        }
+        let Some(frames) = diagnostics["frames"].as_array() else {
+            return false;
+        };
+        if frames.len() != expected_frames.len()
+            || frames
+                .iter()
+                .zip(expected_frames)
+                .any(|(actual, expected)| actual.as_u64() != Some(*expected))
+        {
+            return false;
+        }
+        diagnostics["records"].as_array().is_some_and(|records| {
+            records.len() == expected_frames.len()
+                && records
+                    .iter()
+                    .zip(expected_frames)
+                    .all(|(record, expected)| {
+                        record["command_name"] == "CueFrame"
+                            && record["frame"] == *expected
+                            && record["first_presented_frame"] == *expected
+                            && record["accepted"] == true
+                            && record["rejected"] == false
+                            && record["elapsed_ns"].as_u64().is_some_and(|value| value > 0)
+                    })
+        }) && diagnostics["totals"]["av_sync_warning_count"] == 0
             && diagnostics["totals"]["playback_error_count"] == 0
     })
 }

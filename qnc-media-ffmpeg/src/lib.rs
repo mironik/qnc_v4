@@ -3,7 +3,7 @@ use std::env;
 use std::io::{ErrorKind, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdout, Command, Stdio};
-use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, sync_channel};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, TryRecvError, sync_channel};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -464,7 +464,34 @@ impl FfmpegVideoSession {
             decoded_frames,
             request.cache_config.max_cache_frames,
             request.cache_config.max_cache_bytes,
+        )?;
+        self.cache_ready_streamed_frames(
+            end_frame,
+            request.cache_config.max_cache_frames,
+            request.cache_config.max_cache_bytes,
         )
+    }
+
+    fn cache_ready_streamed_frames(
+        &mut self,
+        end_frame: u64,
+        max_cache_frames: usize,
+        max_cache_bytes: usize,
+    ) -> Result<(), BroadcastEngineError> {
+        let Some(stream) = self.stream.as_mut() else {
+            return Ok(());
+        };
+        let decoded_frames = match stream.read_ready_frames_until(end_frame) {
+            Ok(decoded_frames) => decoded_frames,
+            Err(_error) => {
+                self.stream = None;
+                return Ok(());
+            }
+        };
+        if decoded_frames.is_empty() {
+            return Ok(());
+        }
+        self.cache_decoded_frames(decoded_frames, max_cache_frames, max_cache_bytes)
     }
 
     fn frame_byte_len(&self) -> Result<usize, BroadcastEngineError> {
@@ -626,6 +653,50 @@ impl FfmpegVideoStream {
             .with_frame(frame)),
         }
     }
+
+    fn read_ready_frames_until(
+        &mut self,
+        end_frame: u64,
+    ) -> Result<Vec<FfmpegVideoPayload>, BroadcastEngineError> {
+        let mut frames = Vec::new();
+        while self.next_frame <= end_frame {
+            let frame = self.next_frame;
+            let Some(bytes) = self.try_read_next_frame(frame)? else {
+                break;
+            };
+            frames.push(FfmpegVideoPayload { frame, bytes });
+            self.next_frame = self.next_frame.saturating_add(1);
+        }
+        Ok(frames)
+    }
+
+    fn try_read_next_frame(&mut self, frame: u64) -> Result<Option<Vec<u8>>, BroadcastEngineError> {
+        match self.reader.try_read_next() {
+            Ok(bytes) => Ok(bytes),
+            Err(FfmpegPipeReadFailure::Read(err)) => {
+                let message = if let Some(child) = self.child.as_mut() {
+                    ffmpeg_stream_read_error_message(
+                        child,
+                        &err,
+                        "ffmpeg video stream ended before requested frame",
+                    )
+                } else {
+                    "ffmpeg video stream ended before requested frame; ffmpeg child is already closed"
+                        .to_string()
+                };
+                Err(
+                    BroadcastEngineError::new(BroadcastEngineErrorKind::VideoDecode, message)
+                        .with_frame(frame),
+                )
+            }
+            Err(FfmpegPipeReadFailure::Timeout) => Ok(None),
+            Err(FfmpegPipeReadFailure::Disconnected(message)) => Err(BroadcastEngineError::new(
+                BroadcastEngineErrorKind::VideoDecode,
+                message,
+            )
+            .with_frame(frame)),
+        }
+    }
 }
 
 impl Drop for FfmpegVideoStream {
@@ -712,6 +783,20 @@ impl FfmpegContinuousPipeReader {
             Ok(Err(err)) => Err(FfmpegPipeReadFailure::Read(err)),
             Err(RecvTimeoutError::Timeout) => Err(FfmpegPipeReadFailure::Timeout),
             Err(RecvTimeoutError::Disconnected) => Err(FfmpegPipeReadFailure::Disconnected(
+                "ffmpeg pipe reader stopped before returning payload".to_string(),
+            )),
+        }
+    }
+
+    fn try_read_next(&mut self) -> Result<Option<Vec<u8>>, FfmpegPipeReadFailure> {
+        let payload_rx = self.payload_rx.as_ref().ok_or_else(|| {
+            FfmpegPipeReadFailure::Disconnected("ffmpeg pipe reader is closed".to_string())
+        })?;
+        match payload_rx.try_recv() {
+            Ok(Ok(bytes)) => Ok(Some(bytes)),
+            Ok(Err(err)) => Err(FfmpegPipeReadFailure::Read(err)),
+            Err(TryRecvError::Empty) => Ok(None),
+            Err(TryRecvError::Disconnected) => Err(FfmpegPipeReadFailure::Disconnected(
                 "ffmpeg pipe reader stopped before returning payload".to_string(),
             )),
         }
@@ -933,6 +1018,22 @@ impl FfmpegVideoDecode {
             .map_err(|error| error.with_source_id(request.source_id.clone()))
     }
 
+    fn cache_ready_streamed_payload(
+        &mut self,
+        request: &EngineFrameRequest,
+    ) -> Result<(), BroadcastEngineError> {
+        let max_cache_frames = self.options.video_cache_frames;
+        let max_cache_bytes = self.options.video_cache_bytes;
+        let end_frame = {
+            let session = self.video_session(&request.source_id)?;
+            let start_frame = session.decode_frame_for_request(request.frame);
+            session.prefetch_end_frame(start_frame, self.options.video_prefetch_frames)
+        };
+        self.video_session_mut(&request.source_id)?
+            .cache_ready_streamed_frames(end_frame, max_cache_frames, max_cache_bytes)
+            .map_err(|error| error.with_source_id(request.source_id.clone()))
+    }
+
     fn video_session(&self, source_id: &str) -> Result<&FfmpegVideoSession, BroadcastEngineError> {
         self.sessions.get(source_id).ok_or_else(|| {
             BroadcastEngineError::new(
@@ -977,6 +1078,7 @@ impl VideoDecodeAdapter for FfmpegVideoDecode {
         &mut self,
         request: EngineFrameRequest,
     ) -> Result<DecodedVideoFrame<Self::VideoFrame>, BroadcastEngineError> {
+        self.cache_ready_streamed_payload(&request)?;
         if let Some(payload) = self.cached_payload(&request.source_id, request.frame) {
             return Ok(decoded_video_frame(request, payload));
         }
@@ -1058,6 +1160,22 @@ impl FfmpegAudioOutput {
                 end_frame,
                 cache_config,
             )
+            .map_err(|error| error.with_source_id(request.source_id.clone()))
+    }
+
+    fn cache_ready_streamed_packet(
+        &mut self,
+        request: &EngineFrameRequest,
+    ) -> Result<(), BroadcastEngineError> {
+        let max_cache_frames = self.options.audio_cache_frames;
+        let max_cache_bytes = self.options.audio_cache_bytes;
+        let end_frame = {
+            let session = self.audio_session(&request.source_id)?;
+            let start_frame = session.decode_frame_for_request(request.frame);
+            session.prefetch_end_frame(start_frame, self.options.audio_prefetch_frames)
+        };
+        self.audio_session_mut(&request.source_id)?
+            .cache_ready_streamed_packets(end_frame, max_cache_frames, max_cache_bytes)
             .map_err(|error| error.with_source_id(request.source_id.clone()))
     }
 
@@ -1223,7 +1341,37 @@ impl FfmpegAudioSession {
             read_result.packets,
             cache_config.max_cache_frames,
             cache_config.max_cache_bytes,
+        )?;
+        self.cache_ready_streamed_packets(
+            end_frame,
+            cache_config.max_cache_frames,
+            cache_config.max_cache_bytes,
         )
+    }
+
+    fn cache_ready_streamed_packets(
+        &mut self,
+        end_frame: u64,
+        max_cache_frames: usize,
+        max_cache_bytes: usize,
+    ) -> Result<(), BroadcastEngineError> {
+        let Some(stream) = self.stream.as_mut() else {
+            return Ok(());
+        };
+        let read_result = match stream.read_ready_packets_until(end_frame) {
+            Ok(read_result) => read_result,
+            Err(_error) => {
+                self.stream = None;
+                return Ok(());
+            }
+        };
+        if read_result.stream_ended {
+            self.stream = None;
+        }
+        if read_result.packets.is_empty() {
+            return Ok(());
+        }
+        self.cache_decoded_packets(read_result.packets, max_cache_frames, max_cache_bytes)
     }
 
     fn cache_decoded_packets(
@@ -1323,6 +1471,22 @@ impl FfmpegAudioPipeReader {
             Ok(Err(error)) => Err(FfmpegAudioPipeReadFailure::Read(error)),
             Err(RecvTimeoutError::Timeout) => Err(FfmpegAudioPipeReadFailure::Timeout),
             Err(RecvTimeoutError::Disconnected) => Err(FfmpegAudioPipeReadFailure::Disconnected(
+                "ffmpeg audio pipe reader stopped before returning payload".to_string(),
+            )),
+        }
+    }
+
+    fn try_read_next(&mut self) -> Result<Option<FfmpegAudioPayload>, FfmpegAudioPipeReadFailure> {
+        let payload_rx = self.payload_rx.as_ref().ok_or_else(|| {
+            FfmpegAudioPipeReadFailure::Disconnected(
+                "ffmpeg audio pipe reader is closed".to_string(),
+            )
+        })?;
+        match payload_rx.try_recv() {
+            Ok(Ok(packet)) => Ok(Some(packet)),
+            Ok(Err(error)) => Err(FfmpegAudioPipeReadFailure::Read(error)),
+            Err(TryRecvError::Empty) => Ok(None),
+            Err(TryRecvError::Disconnected) => Err(FfmpegAudioPipeReadFailure::Disconnected(
                 "ffmpeg audio pipe reader stopped before returning payload".to_string(),
             )),
         }
@@ -1459,6 +1623,26 @@ impl FfmpegAudioStream {
         })
     }
 
+    fn read_ready_packets_until(
+        &mut self,
+        end_frame: u64,
+    ) -> Result<FfmpegAudioReadResult, BroadcastEngineError> {
+        let mut packets = Vec::new();
+        while self.next_frame <= end_frame {
+            match self.try_read_next_packet()? {
+                Some(packet) => {
+                    self.next_frame = packet.frame.saturating_add(1);
+                    packets.push(packet);
+                }
+                None => break,
+            }
+        }
+        Ok(FfmpegAudioReadResult {
+            packets,
+            stream_ended: false,
+        })
+    }
+
     fn read_next_packet(&mut self) -> Result<FfmpegAudioPayload, BroadcastEngineError> {
         match self.reader.read_next(self.read_timeout) {
             Ok(packet) => Ok(packet),
@@ -1480,6 +1664,18 @@ impl FfmpegAudioStream {
                         .with_frame(frame),
                 )
             }
+            Err(FfmpegAudioPipeReadFailure::Disconnected(message)) => Err(
+                BroadcastEngineError::new(BroadcastEngineErrorKind::AudioOutput, message)
+                    .with_frame(self.next_frame),
+            ),
+        }
+    }
+
+    fn try_read_next_packet(&mut self) -> Result<Option<FfmpegAudioPayload>, BroadcastEngineError> {
+        match self.reader.try_read_next() {
+            Ok(packet) => Ok(packet),
+            Err(FfmpegAudioPipeReadFailure::Read(error)) => Err(error),
+            Err(FfmpegAudioPipeReadFailure::Timeout) => Ok(None),
             Err(FfmpegAudioPipeReadFailure::Disconnected(message)) => Err(
                 BroadcastEngineError::new(BroadcastEngineErrorKind::AudioOutput, message)
                     .with_frame(self.next_frame),
@@ -1704,6 +1900,7 @@ impl AudioOutputAdapter for FfmpegAudioOutput {
         &mut self,
         request: EngineFrameRequest,
     ) -> Result<AudioFramePacket<Self::AudioPacket>, BroadcastEngineError> {
+        self.cache_ready_streamed_packet(&request)?;
         if let Some(payload) = self.cached_packet(&request.source_id, request.frame) {
             let audio_format = self.audio_session(&request.source_id)?.audio_format.clone();
             return Ok(audio_packet(request, audio_format, payload));
@@ -2534,6 +2731,18 @@ mod tests {
     }
 
     #[test]
+    fn video_session_ready_stream_cache_without_stream_is_noop() {
+        let mut session = video_session(2, 1, 20);
+
+        session
+            .cache_ready_streamed_frames(12, 8, usize::MAX)
+            .unwrap();
+
+        assert!(session.cached_frame(12).is_none());
+        assert_eq!(session.cache_byte_len(), 0);
+    }
+
+    #[test]
     fn video_session_labels_boundary_payload_with_requested_frame() {
         let mut session = video_session(2, 1, 20);
 
@@ -2678,6 +2887,18 @@ mod tests {
         assert_eq!(session.payload_for_request(11).unwrap().bytes, vec![11; 4]);
         assert_eq!(session.payload_for_request(12).unwrap().bytes, vec![12; 4]);
         assert_eq!(session.cache_byte_len(), 8);
+    }
+
+    #[test]
+    fn audio_session_ready_stream_cache_without_stream_is_noop() {
+        let mut session = audio_session(20);
+
+        session
+            .cache_ready_streamed_packets(12, 8, usize::MAX)
+            .unwrap();
+
+        assert!(session.payload_for_request(12).is_none());
+        assert_eq!(session.cache_byte_len(), 0);
     }
 
     #[test]

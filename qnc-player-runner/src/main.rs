@@ -233,6 +233,15 @@ fn run() -> Result<(), String> {
         return Err("playback setup failed".to_string());
     }
 
+    if args.cue_latency_diagnostics {
+        run_cue_latency_diagnostics(&mut runtime, monitor.as_ref(), &diagnostic_source, &args)?;
+        emit_final_state(&runtime, false)?;
+        if let Some(monitor) = &monitor {
+            emit_monitor_state(monitor)?;
+        }
+        return Ok(());
+    }
+
     if args.realtime_diagnostics {
         let frame_interval = frame_interval_ticks(playback_timebase, args.rate_num, args.rate_den)?;
         let reached_boundary = run_realtime_diagnostics(
@@ -451,6 +460,13 @@ struct RealtimeDiagnostics {
     playback_error_count: u64,
 }
 
+#[derive(Debug)]
+struct CueLatencyTotals {
+    dropped_frame_count: u64,
+    av_sync_warning_count: u64,
+    playback_error_count: u64,
+}
+
 #[derive(Clone, Copy, Debug)]
 enum DiagnosticEventBucket {
     Command,
@@ -517,6 +533,148 @@ impl RealtimeDiagnostics {
             }
         }
     }
+}
+
+fn run_cue_latency_diagnostics(
+    runtime: &mut RunnerRuntime,
+    monitor: Option<&RunnerMonitor>,
+    source: &SourceRuntime,
+    args: &RunnerArgs,
+) -> Result<(), String> {
+    let start_frame = diagnostic_cue_frame(source, args.cue_latency_frame)?;
+    let frames = cue_latency_frame_sequence(
+        source,
+        start_frame,
+        args.cue_latency_repeat,
+        args.cue_latency_step,
+    )?;
+    let mut records = Vec::with_capacity(frames.len());
+    let mut latencies_ns = Vec::with_capacity(frames.len());
+    let mut totals = CueLatencyTotals {
+        dropped_frame_count: 0,
+        av_sync_warning_count: 0,
+        playback_error_count: 0,
+    };
+
+    for (index, frame) in frames.iter().copied().enumerate() {
+        let command_id = format!("cue-latency-{index:04}");
+        let started_at = Instant::now();
+        runtime.dispatch_at(
+            PlayerRuntimeCommand::new(
+                command_id.clone(),
+                BroadcastPlayerProtocolCommand::CueFrame {
+                    frame,
+                    present_frame: true,
+                },
+            ),
+            0,
+        );
+        let events = drain_runtime_events(runtime, monitor)?;
+        let elapsed_ns = duration_ns(started_at.elapsed());
+        let accepted = event_contains_command_accepted(&events, &command_id);
+        let rejected = event_contains_command_rejected(&events, &command_id);
+        let first_presented_frame = first_presented_frame(&events);
+        let audio_level_event_count = event_count_audio_level(&events);
+        let av_sync_warning_count = event_count_av_sync_warning(&events);
+        let dropped_frame_count = event_count_dropped_frame(&events);
+        let playback_error_count = event_count_playback_error(&events);
+        let failed = has_failure_event(&events);
+
+        totals.dropped_frame_count = totals
+            .dropped_frame_count
+            .saturating_add(dropped_frame_count as u64);
+        totals.av_sync_warning_count = totals
+            .av_sync_warning_count
+            .saturating_add(av_sync_warning_count as u64);
+        totals.playback_error_count = totals
+            .playback_error_count
+            .saturating_add(playback_error_count as u64);
+        latencies_ns.push(elapsed_ns);
+
+        records.push(json!({
+            "index": index,
+            "command_id": command_id,
+            "command_name": "CueFrame",
+            "frame": frame,
+            "elapsed_ns": elapsed_ns,
+            "accepted": accepted,
+            "rejected": rejected,
+            "first_presented_frame": first_presented_frame,
+            "audio_level_event_count": audio_level_event_count,
+            "av_sync_warning_count": av_sync_warning_count,
+            "dropped_frame_count": dropped_frame_count,
+            "playback_error_count": playback_error_count,
+        }));
+
+        emit_events("cue_latency", Some(index as u64), events)?;
+        if failed || rejected {
+            return Err(format!("cue latency command failed at frame {frame}"));
+        }
+        if first_presented_frame.is_none() {
+            return Err(format!(
+                "cue latency command did not present requested frame {frame}"
+            ));
+        }
+    }
+
+    emit_cue_latency_diagnostics(source, args, &frames, &latencies_ns, records, totals)
+}
+
+fn emit_cue_latency_diagnostics(
+    source: &SourceRuntime,
+    args: &RunnerArgs,
+    frames: &[u64],
+    latencies_ns: &[u64],
+    records: Vec<Value>,
+    totals: CueLatencyTotals,
+) -> Result<(), String> {
+    let min_latency_ns = latencies_ns.iter().copied().min().unwrap_or(0);
+    let max_latency_ns = latencies_ns.iter().copied().max().unwrap_or(0);
+    let total_latency_ns = latencies_ns.iter().fold(0_u128, |total, latency| {
+        total.saturating_add(*latency as u128)
+    });
+    let avg_latency_ns = if latencies_ns.is_empty() {
+        0
+    } else {
+        saturating_u128_to_u64(total_latency_ns / latencies_ns.len() as u128)
+    };
+    let record = json!({
+        "stage": "cue_latency_diagnostics",
+        "diagnostics": {
+            "source_id": &source.source_id,
+            "timebase": source.timebase,
+            "duration_frames": source.duration_frames,
+            "audio_device": args.audio_device,
+            "hardware_decode": format!("{:?}", args.hardware_decode),
+            "video_prefetch_frames": args.video_prefetch_frames,
+            "video_cache_frames": args.video_cache_frames,
+            "video_cache_bytes": args.video_cache_bytes,
+            "audio_prefetch_frames": args.audio_prefetch_frames,
+            "audio_cache_frames": args.audio_cache_frames,
+            "audio_cache_bytes": args.audio_cache_bytes,
+            "ffmpeg_read_timeout_ms": args.ffmpeg_read_timeout_ms,
+            "start_frame": frames.first().copied(),
+            "repeat": args.cue_latency_repeat,
+            "step": args.cue_latency_step,
+            "frames": frames,
+            "records": records,
+            "summary": {
+                "min_elapsed_ns": min_latency_ns,
+                "avg_elapsed_ns": avg_latency_ns,
+                "max_elapsed_ns": max_latency_ns,
+            },
+            "totals": {
+                "dropped_frame_count": totals.dropped_frame_count,
+                "av_sync_warning_count": totals.av_sync_warning_count,
+                "playback_error_count": totals.playback_error_count,
+            }
+        }
+    });
+    println!(
+        "{}",
+        serde_json::to_string(&record).map_err(|err| err.to_string())?
+    );
+    Ok(())
 }
 
 fn run_realtime_diagnostics(
@@ -816,6 +974,48 @@ fn diagnostic_seek_frame(
     Ok(seek_frame.min(max_seek_frame))
 }
 
+fn diagnostic_cue_frame(
+    source: &SourceRuntime,
+    requested_cue_frame: Option<u64>,
+) -> Result<u64, String> {
+    if source.duration_frames == 0 {
+        return Err("cue latency diagnostics require at least one source frame".to_string());
+    }
+    let cue_frame = requested_cue_frame.unwrap_or(source.duration_frames / 2);
+    if cue_frame >= source.duration_frames {
+        return Err(format!(
+            "--cue-latency-frame {cue_frame} is outside source duration {}",
+            source.duration_frames
+        ));
+    }
+    Ok(cue_frame)
+}
+
+fn cue_latency_frame_sequence(
+    source: &SourceRuntime,
+    start_frame: u64,
+    repeat: u64,
+    step: u64,
+) -> Result<Vec<u64>, String> {
+    let mut frames = Vec::with_capacity(repeat as usize);
+    for index in 0..repeat {
+        let offset = index
+            .checked_mul(step)
+            .ok_or_else(|| "--cue-latency-repeat/step overflowed frame range".to_string())?;
+        let frame = start_frame
+            .checked_add(offset)
+            .ok_or_else(|| "--cue-latency-repeat/step overflowed frame range".to_string())?;
+        if frame >= source.duration_frames {
+            return Err(format!(
+                "--cue-latency-frame sequence reaches frame {frame}, outside source duration {}",
+                source.duration_frames
+            ));
+        }
+        frames.push(frame);
+    }
+    Ok(frames)
+}
+
 fn diagnostic_seek_range(
     source: &SourceRuntime,
     seek_frame: u64,
@@ -923,6 +1123,19 @@ fn event_count_dropped_frame(events: &[BroadcastPlayerProtocolEvent]) -> usize {
         .count()
 }
 
+fn event_count_playback_error(events: &[BroadcastPlayerProtocolEvent]) -> usize {
+    events
+        .iter()
+        .filter(|event| {
+            matches!(
+                event,
+                BroadcastPlayerProtocolEvent::PlaybackError { .. }
+                    | BroadcastPlayerProtocolEvent::SourceFailed { .. }
+            )
+        })
+        .count()
+}
+
 #[derive(Debug)]
 struct JsonlInput {
     tick: ClockTick,
@@ -996,6 +1209,10 @@ struct RunnerArgs {
     realtime_diagnostics: bool,
     diagnostic_frames: u64,
     diagnostic_seek_frame: Option<u64>,
+    cue_latency_diagnostics: bool,
+    cue_latency_frame: Option<u64>,
+    cue_latency_repeat: u64,
+    cue_latency_step: u64,
     require_boundary: bool,
     list_hwaccels: bool,
     emit_monitor_state: bool,
@@ -1036,6 +1253,10 @@ impl RunnerArgs {
         let mut realtime_diagnostics = false;
         let mut diagnostic_frames = 250;
         let mut diagnostic_seek_frame = None;
+        let mut cue_latency_diagnostics = false;
+        let mut cue_latency_frame = None;
+        let mut cue_latency_repeat = 1;
+        let mut cue_latency_step = 1;
         let mut require_boundary = false;
         let mut list_hwaccels = false;
         let mut emit_monitor_state = false;
@@ -1086,6 +1307,7 @@ impl RunnerArgs {
                 "--probe-source-runtime" => probe_source_runtime = true,
                 "--realtime" => realtime = true,
                 "--realtime-diagnostics" => realtime_diagnostics = true,
+                "--cue-latency-diagnostics" => cue_latency_diagnostics = true,
                 "--require-boundary" => require_boundary = true,
                 "--list-hwaccels" => list_hwaccels = true,
                 "--emit-monitor-state" => emit_monitor_state = true,
@@ -1100,6 +1322,24 @@ impl RunnerArgs {
                         &next_value(&mut args, "--diagnostic-seek-frame")?,
                         "--diagnostic-seek-frame",
                     )?)
+                }
+                "--cue-latency-frame" => {
+                    cue_latency_frame = Some(parse_u64(
+                        &next_value(&mut args, "--cue-latency-frame")?,
+                        "--cue-latency-frame",
+                    )?)
+                }
+                "--cue-latency-repeat" => {
+                    cue_latency_repeat = parse_u64(
+                        &next_value(&mut args, "--cue-latency-repeat")?,
+                        "--cue-latency-repeat",
+                    )?
+                }
+                "--cue-latency-step" => {
+                    cue_latency_step = parse_u64(
+                        &next_value(&mut args, "--cue-latency-step")?,
+                        "--cue-latency-step",
+                    )?
                 }
                 "--register-source" => registered_sources.push(parse_source_registration(
                     &next_value(&mut args, "--register-source")?,
@@ -1219,6 +1459,10 @@ impl RunnerArgs {
                 realtime_diagnostics,
                 diagnostic_frames,
                 diagnostic_seek_frame,
+                cue_latency_diagnostics,
+                cue_latency_frame,
+                cue_latency_repeat,
+                cue_latency_step,
                 require_boundary,
                 list_hwaccels,
                 emit_monitor_state,
@@ -1266,9 +1510,23 @@ impl RunnerArgs {
         if diagnostic_frames == 0 {
             return Err("--diagnostic-frames must be greater than zero".to_string());
         }
+        if cue_latency_repeat == 0 {
+            return Err("--cue-latency-repeat must be greater than zero".to_string());
+        }
         if stdin_jsonl && realtime_diagnostics {
             return Err(
                 "--stdin-jsonl and --realtime-diagnostics cannot be used together".to_string(),
+            );
+        }
+        if stdin_jsonl && cue_latency_diagnostics {
+            return Err(
+                "--stdin-jsonl and --cue-latency-diagnostics cannot be used together".to_string(),
+            );
+        }
+        if realtime_diagnostics && cue_latency_diagnostics {
+            return Err(
+                "--realtime-diagnostics and --cue-latency-diagnostics cannot be used together"
+                    .to_string(),
             );
         }
         Ok(Self {
@@ -1304,6 +1562,10 @@ impl RunnerArgs {
             realtime_diagnostics,
             diagnostic_frames,
             diagnostic_seek_frame,
+            cue_latency_diagnostics,
+            cue_latency_frame,
+            cue_latency_repeat,
+            cue_latency_step,
             require_boundary,
             list_hwaccels,
             emit_monitor_state,
@@ -1730,6 +1992,10 @@ Options:
   --realtime-diagnostics     Run measured Play/Stop/seek/Play realtime diagnostics.
   --diagnostic-frames <n>    Realtime diagnostic tick count per play segment. Default: 250.
   --diagnostic-seek-frame <n> Frame used by diagnostic seek SetPlaybackRequest. Default: source midpoint.
+  --cue-latency-diagnostics  Run measured CueFrame diagnostics without UI.
+  --cue-latency-frame <n>    First frame used by CueFrame diagnostics. Default: source midpoint.
+  --cue-latency-repeat <n>   Number of CueFrame commands to measure. Default: 1.
+  --cue-latency-step <n>     Frame step between measured CueFrame commands. Default: 1; use 0 for same-frame cache hit.
   --require-boundary         Exit with failure if playback does not reach the execution boundary.
   --emit-monitor-state       Emit final monitor projection state after playback.
   --video-format <w>x<h>     Declares a video track, Rec709 progressive.
@@ -1961,6 +2227,105 @@ mod tests {
         assert_eq!(args.diagnostic_seek_frame, Some(40));
 
         let _ = std::fs::remove_file(temp_path);
+    }
+
+    #[test]
+    fn runner_args_accept_cue_latency_diagnostics_flags() {
+        let temp_path = std::env::temp_dir().join("qnc-runner-cue-latency-source.tmp");
+        std::fs::write(&temp_path, b"fixture").unwrap();
+
+        let args = RunnerArgs::parse([
+            "--path".to_string(),
+            temp_path.to_string_lossy().into_owned(),
+            "--duration-frames".to_string(),
+            "100".to_string(),
+            "--timebase".to_string(),
+            "25/1".to_string(),
+            "--video-format".to_string(),
+            "160x90".to_string(),
+            "--cue-latency-diagnostics".to_string(),
+            "--cue-latency-frame".to_string(),
+            "40".to_string(),
+            "--cue-latency-repeat".to_string(),
+            "3".to_string(),
+            "--cue-latency-step".to_string(),
+            "2".to_string(),
+        ])
+        .unwrap();
+
+        assert!(args.cue_latency_diagnostics);
+        assert_eq!(args.cue_latency_frame, Some(40));
+        assert_eq!(args.cue_latency_repeat, 3);
+        assert_eq!(args.cue_latency_step, 2);
+
+        let _ = std::fs::remove_file(temp_path);
+    }
+
+    #[test]
+    fn runner_args_reject_jsonl_with_cue_latency_diagnostics() {
+        let temp_path = std::env::temp_dir().join("qnc-runner-jsonl-cue-latency-source.tmp");
+        std::fs::write(&temp_path, b"fixture").unwrap();
+
+        let err = RunnerArgs::parse([
+            "--path".to_string(),
+            temp_path.to_string_lossy().into_owned(),
+            "--duration-frames".to_string(),
+            "100".to_string(),
+            "--timebase".to_string(),
+            "25/1".to_string(),
+            "--video-format".to_string(),
+            "160x90".to_string(),
+            "--stdin-jsonl".to_string(),
+            "--cue-latency-diagnostics".to_string(),
+        ])
+        .unwrap_err();
+
+        assert!(err.contains("--stdin-jsonl and --cue-latency-diagnostics"));
+
+        let _ = std::fs::remove_file(temp_path);
+    }
+
+    #[test]
+    fn runner_args_reject_realtime_with_cue_latency_diagnostics() {
+        let temp_path = std::env::temp_dir().join("qnc-runner-realtime-cue-latency-source.tmp");
+        std::fs::write(&temp_path, b"fixture").unwrap();
+
+        let err = RunnerArgs::parse([
+            "--path".to_string(),
+            temp_path.to_string_lossy().into_owned(),
+            "--duration-frames".to_string(),
+            "100".to_string(),
+            "--timebase".to_string(),
+            "25/1".to_string(),
+            "--video-format".to_string(),
+            "160x90".to_string(),
+            "--realtime-diagnostics".to_string(),
+            "--cue-latency-diagnostics".to_string(),
+        ])
+        .unwrap_err();
+
+        assert!(err.contains("--realtime-diagnostics and --cue-latency-diagnostics"));
+
+        let _ = std::fs::remove_file(temp_path);
+    }
+
+    #[test]
+    fn cue_latency_frame_sequence_is_frame_based() {
+        let source = SourceRuntime::new("src", 10, Timebase::new(25, 1).unwrap()).unwrap();
+
+        assert_eq!(
+            cue_latency_frame_sequence(&source, 3, 3, 2).unwrap(),
+            vec![3, 5, 7]
+        );
+        assert_eq!(
+            cue_latency_frame_sequence(&source, 3, 3, 0).unwrap(),
+            vec![3, 3, 3]
+        );
+        assert!(
+            cue_latency_frame_sequence(&source, 8, 3, 1)
+                .unwrap_err()
+                .contains("outside source duration")
+        );
     }
 
     #[test]
