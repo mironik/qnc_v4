@@ -12,26 +12,26 @@ use std::time::{Duration, Instant};
 
 use eframe::egui::{self, ColorImage};
 use qnc_media_ffmpeg::{
-    FfmpegAudioDecodeOptions, FfmpegAudioOutput, FfmpegDecodeOptions, FfmpegHardwareDecode,
-    FfmpegSourceOpen, FfmpegSourceRegistry, FfmpegToolchain, FfmpegVideoDecode,
-    FfmpegVideoPayload, probe_source_runtime_with_toolchain,
+    probe_source_runtime_with_toolchain, FfmpegAudioDecodeOptions, FfmpegAudioOutput,
+    FfmpegDecodeOptions, FfmpegHardwareDecode, FfmpegSourceOpen, FfmpegSourceRegistry,
+    FfmpegToolchain, FfmpegVideoDecode, FfmpegVideoPayload,
 };
 use qnc_player_core::{
-    AudioFormat, BroadcastEngineError, BroadcastEvent,
+    map_broadcast_player_protocol_event, AudioFormat, BroadcastEngineError, BroadcastEvent,
     BroadcastPlayerProtocolEvent, ClockTick, ColorSpace, DecodedVideoFrame, FieldMode,
-    FrameNumber as CoreFrameNumber, FramePresenter, FrameRange as CoreFrameRange,
-    SourceRuntime, Timebase as CoreTimebase, TransportEngine, TransportStatus, VideoFormat,
-    map_broadcast_player_protocol_event,
+    FrameNumber as CoreFrameNumber, FramePresenter, FrameRange as CoreFrameRange, SourceRuntime,
+    Timebase as CoreTimebase, TransportEngine, TransportStatus, VideoFormat,
 };
+use qnc_player_monitor::MonitorPixelLayout;
 use qnc_player_monitor_bridge::{
     MonitorBridgeError, MonitorEventBridge, MonitorFrameMapper, MonitorFramePresenter,
     SharedPlayerMonitor,
 };
-use qnc_player_monitor::MonitorPixelLayout;
 use qnc_player_output::{
     AudioOutputWithSink, AudioPacketTelemetry, AvSyncAudioPacketSink, AvSyncFramePresenter,
     AvSyncTelemetry, FfmpegAudioSink, FfmpegFramePresenter, OutputFrameTelemetry,
 };
+use serde_json::Value;
 
 use crate::player_contract::{BroadcastHostSourceRef, BroadcastSourceKind, FrameNumber};
 
@@ -40,11 +40,9 @@ type PlayerAudioOutput = AudioOutputWithSink<
     AudioPacketTelemetry<AvSyncAudioPacketSink<FfmpegAudioSink>>,
 >;
 
-type PlayerVideoPresenter =
-    AvSyncFramePresenter<OutputFrameTelemetry<FfmpegFramePresenter>>;
+type PlayerVideoPresenter = AvSyncFramePresenter<OutputFrameTelemetry<FfmpegFramePresenter>>;
 
-type PlayerMonitorPresenter =
-    MonitorFramePresenter<PlayerVideoPresenter, PlayerMonitorFrameMapper>;
+type PlayerMonitorPresenter = MonitorFramePresenter<PlayerVideoPresenter, PlayerMonitorFrameMapper>;
 
 type PlayerTransport =
     TransportEngine<FfmpegSourceOpen, FfmpegVideoDecode, PlayerAudioOutput, PlayerFramePresenter>;
@@ -179,10 +177,36 @@ struct PlayerRuntimeSession {
     last_frame_revision: u64,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct PlayerDecodePolicy {
+    recommended_backend: Option<String>,
+}
+
+impl PlayerDecodePolicy {
+    fn from_runtime(runtime: &Value) -> Self {
+        runtime
+            .get("hardware_profile")
+            .map(Self::from_hardware_profile)
+            .unwrap_or_default()
+    }
+
+    fn from_hardware_profile(profile: &Value) -> Self {
+        let recommended_backend = profile
+            .get("media_decode")
+            .and_then(|media| media.get("recommended_backend"))
+            .and_then(Value::as_str)
+            .and_then(normalize_decode_backend);
+        Self {
+            recommended_backend,
+        }
+    }
+}
+
 pub struct PlayerRemote {
     runtime: Option<PlayerRuntimeSession>,
     last_request: Option<BroadcastPlayerOpenRequest>,
     identity: Option<LoadedSourceIdentity>,
+    decode_policy: PlayerDecodePolicy,
     source_frame: FrameNumber,
     source_sec: f64,
     playing: bool,
@@ -214,6 +238,7 @@ impl PlayerRemote {
             runtime: None,
             last_request: None,
             identity: None,
+            decode_policy: PlayerDecodePolicy::default(),
             source_frame: FrameNumber(0),
             source_sec: 0.0,
             playing: false,
@@ -235,8 +260,14 @@ impl PlayerRemote {
             active: self.active,
             has_source: self.runtime.is_some(),
             source_kind: self.identity.as_ref().map(|identity| identity.source_kind),
-            project_id: self.identity.as_ref().map(|identity| identity.project_id.clone()),
-            clip_id: self.identity.as_ref().map(|identity| identity.clip_id.clone()),
+            project_id: self
+                .identity
+                .as_ref()
+                .map(|identity| identity.project_id.clone()),
+            clip_id: self
+                .identity
+                .as_ref()
+                .map(|identity| identity.clip_id.clone()),
             virtual_shot_id: self
                 .identity
                 .as_ref()
@@ -272,6 +303,10 @@ impl PlayerRemote {
                 && prev.source_ref.virtual_shot_id == request.source_ref.virtual_shot_id
                 && prev.media_input == request.media_input
         })
+    }
+
+    pub fn configure_runtime_profile(&mut self, runtime: &Value) {
+        self.decode_policy = PlayerDecodePolicy::from_runtime(runtime);
     }
 
     pub fn set_display_sec(&mut self, source_sec: f64) {
@@ -369,9 +404,10 @@ impl PlayerRemote {
         self.active = false;
         self.status = "Open".into();
 
-        match build_runtime_session(&request) {
+        match build_runtime_session(&request, &self.decode_policy) {
             Ok(mut session) => {
-                let start_frame = frame_at_seconds(request.start_source_sec, session.source.timebase);
+                let start_frame =
+                    frame_at_seconds(request.start_source_sec, session.source.timebase);
                 let start_frame = clamp_core_frame(start_frame, session.range);
                 match session
                     .transport
@@ -528,9 +564,7 @@ impl PlayerRemote {
 
         for event in protocol_events {
             match event {
-                BroadcastPlayerProtocolEvent::CarrierPositionChanged {
-                    frame, status, ..
-                } => {
+                BroadcastPlayerProtocolEvent::CarrierPositionChanged { frame, status, .. } => {
                     self.set_display_core_frame(frame);
                     self.playing = status == TransportStatus::Playing;
                     self.active = true;
@@ -647,6 +681,7 @@ impl PlayerRemote {
 
 fn build_runtime_session(
     request: &BroadcastPlayerOpenRequest,
+    decode_policy: &PlayerDecodePolicy,
 ) -> Result<PlayerRuntimeSession, String> {
     let media_path = PathBuf::from(request.media_input.trim());
     if media_path.as_os_str().is_empty() {
@@ -668,13 +703,15 @@ fn build_runtime_session(
     if !request.has_audio {
         source.audio_format = None;
     } else if source.audio_format.is_none() {
-        source.audio_format =
-            Some(AudioFormat::new(48_000, request.audio_channels.max(1) as u16)?);
+        source.audio_format = Some(AudioFormat::new(
+            48_000,
+            request.audio_channels.max(1) as u16,
+        )?);
     }
 
     let range = range_from_request(request, &source)?;
     let registry = FfmpegSourceRegistry::new(BTreeMap::from([(source_id, media_path)]));
-    let (hardware_decode, hardware_warning) = hardware_decode_from_env();
+    let (hardware_decode, hardware_warning) = hardware_decode_from_policy(decode_policy);
     let video_decode = FfmpegVideoDecode::with_options(
         registry.clone(),
         FfmpegDecodeOptions::software()
@@ -771,28 +808,49 @@ fn build_audio_sink() -> (FfmpegAudioSink, Option<String>) {
     }
 }
 
-fn hardware_decode_from_env() -> (FfmpegHardwareDecode, Option<String>) {
-    let Some(value) = env::var("QNC_PLAYER_HWACCEL")
+fn hardware_decode_from_policy(
+    policy: &PlayerDecodePolicy,
+) -> (FfmpegHardwareDecode, Option<String>) {
+    if let Some(value) = env::var("QNC_PLAYER_HWACCEL")
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
-    else {
+    {
+        return hardware_decode_from_backend_label(&value, "QNC_PLAYER_HWACCEL");
+    }
+
+    let Some(value) = policy.recommended_backend.as_deref() else {
         return (FfmpegHardwareDecode::Software, None);
     };
+    hardware_decode_from_backend_label(value, "hardware_profile.media_decode")
+}
 
-    if value.eq_ignore_ascii_case("none") || value.eq_ignore_ascii_case("software") {
+fn hardware_decode_from_backend_label(
+    value: &str,
+    source: &str,
+) -> (FfmpegHardwareDecode, Option<String>) {
+    if normalize_decode_backend(value).is_none() {
         return (FfmpegHardwareDecode::Software, None);
     }
+    let value = value.trim();
     if value.eq_ignore_ascii_case("auto") {
         return (FfmpegHardwareDecode::Auto, None);
     }
-    match FfmpegHardwareDecode::backend(&value) {
+    match FfmpegHardwareDecode::backend(value) {
         Ok(backend) => (backend, None),
         Err(error) => (
             FfmpegHardwareDecode::Software,
-            Some(format!("Hardware decode disabled: {error}")),
+            Some(format!("Hardware decode disabled from {source}: {error}")),
         ),
     }
+}
+
+fn normalize_decode_backend(raw: &str) -> Option<String> {
+    let value = raw.trim().to_ascii_lowercase();
+    if value.is_empty() || matches!(value.as_str(), "none" | "software" | "off" | "sw") {
+        return None;
+    }
+    Some(value)
 }
 
 fn fallback_source_runtime(
@@ -800,8 +858,8 @@ fn fallback_source_runtime(
     source_id: String,
 ) -> Result<qnc_media_ffmpeg::FfmpegProbeReport, String> {
     let timebase = core_timebase_from_fps(request.source_fps)?;
-    let duration_frames = frame_at_seconds(request.source_ref.duration_sec.max(1.0), timebase)
-        .max(1);
+    let duration_frames =
+        frame_at_seconds(request.source_ref.duration_sec.max(1.0), timebase).max(1);
     let mut source = SourceRuntime::new(source_id, duration_frames, timebase)?;
     source = source.with_video_format(
         VideoFormat::new(1920, 1080, FieldMode::Progressive, ColorSpace::Rec709)
@@ -830,7 +888,8 @@ fn range_from_request(
         .out_seconds
         .filter(|value| *value > in_sec)
         .unwrap_or_else(|| request.source_ref.duration_sec.max(in_sec + 0.04));
-    let start = frame_at_seconds(in_sec, source.timebase).min(source.duration_frames.saturating_sub(1));
+    let start =
+        frame_at_seconds(in_sec, source.timebase).min(source.duration_frames.saturating_sub(1));
     let mut end = frame_at_seconds(out_sec, source.timebase).min(source.duration_frames);
     if end <= start {
         end = start.saturating_add(1).min(source.duration_frames);
@@ -888,8 +947,8 @@ fn core_timebase_from_fps(fps: f64) -> Result<CoreTimebase, String> {
 }
 
 fn frame_at_seconds(seconds: f64, timebase: CoreTimebase) -> CoreFrameNumber {
-    let frames = seconds.max(0.0) * f64::from(timebase.frame_rate_num)
-        / f64::from(timebase.frame_rate_den);
+    let frames =
+        seconds.max(0.0) * f64::from(timebase.frame_rate_num) / f64::from(timebase.frame_rate_den);
     frames.round().max(0.0) as CoreFrameNumber
 }
 
@@ -945,5 +1004,35 @@ mod tests {
             core_timebase_from_fps(59.94).unwrap(),
             CoreTimebase::new(60_000, 1_001).unwrap()
         );
+    }
+
+    #[test]
+    fn decode_policy_reads_runtime_hardware_profile_backend() {
+        let runtime = serde_json::json!({
+            "hardware_profile": {
+                "media_decode": {
+                    "recommended_backend": "d3d11va"
+                }
+            }
+        });
+
+        let policy = PlayerDecodePolicy::from_runtime(&runtime);
+
+        assert_eq!(policy.recommended_backend.as_deref(), Some("d3d11va"));
+    }
+
+    #[test]
+    fn decode_policy_treats_software_profile_as_no_hardware_backend() {
+        let runtime = serde_json::json!({
+            "hardware_profile": {
+                "media_decode": {
+                    "recommended_backend": "software"
+                }
+            }
+        });
+
+        let policy = PlayerDecodePolicy::from_runtime(&runtime);
+
+        assert_eq!(policy.recommended_backend, None);
     }
 }

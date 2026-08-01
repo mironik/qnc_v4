@@ -150,6 +150,7 @@ impl QncApp {
                         .get("plugins_loaded_count")
                         .and_then(|v| v.as_u64())
                         .unwrap_or(0);
+                    self.player.configure_runtime_profile(&rt);
                     self.runtime_summary = format!("port={port}  plugins={plugins}");
                 } else {
                     self.runtime_summary.clear();

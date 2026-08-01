@@ -16,6 +16,7 @@ use std::sync::mpsc::{self, Receiver, Sender, SyncSender, TryRecvError, TrySendE
 use std::sync::{Arc, Mutex};
 
 use eframe::egui::{self, ColorImage, TextureHandle, TextureOptions};
+use serde_json::Value;
 
 use crate::player_contract::{BroadcastSourceKind, FrameNumber};
 use crate::player_remote::PlayerRemote;
@@ -234,6 +235,10 @@ impl QncBroadcastPlayer {
         self.remote.matches_source(request)
     }
 
+    pub fn configure_runtime_profile(&mut self, runtime: &Value) {
+        self.remote.configure_runtime_profile(runtime);
+    }
+
     /// Shell tick: TX inbox → pump → texture + fan-out on RX subscribers.
     pub fn pump(&mut self, ctx: &egui::Context) {
         loop {
@@ -306,11 +311,8 @@ impl QncBroadcastPlayer {
         if let Some(texture) = self.texture.as_mut() {
             texture.set(image, TextureOptions::LINEAR);
         } else {
-            self.texture = Some(ctx.load_texture(
-                "qnc_broadcast_player_frame",
-                image,
-                TextureOptions::LINEAR,
-            ));
+            self.texture =
+                Some(ctx.load_texture("qnc_broadcast_player_frame", image, TextureOptions::LINEAR));
         }
         ctx.request_repaint();
     }
