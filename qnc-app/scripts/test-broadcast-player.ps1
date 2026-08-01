@@ -1,13 +1,9 @@
-# QNC native app — broadcast player test suite (policy + contracts)
+# QNC active broadcast player test suite.
 #
-# Measures: carrier/nosilja, A/V lockstep, contiguous PCM, soft EOS, mono buses,
-#            source rack A1 media + A2 silence.
-# Does NOT measure: live FFmpeg continuous pipes, rodio OutputStream, EngineCommand loop.
-#
-# Usage (from QNC repo root or anywhere):
-#   pwsh -File qnc-app\scripts\test-broadcast-player.ps1
-#   pwsh -File qnc-app\scripts\test-broadcast-player.ps1 -Quick
-#   pwsh -File qnc-app\scripts\test-broadcast-player.ps1 -Full
+# This script targets the modular player stack only:
+# qnc-broadcast-player, qnc-media-ffmpeg, qnc-player-output,
+# qnc-player-monitor, qnc-player-monitor-bridge, qnc-player-runtime,
+# and qnc-player-runner unless -Quick is used.
 
 param(
     [switch]$Quick,
@@ -15,69 +11,62 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-$AppDir = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
-if (-not (Test-Path (Join-Path $AppDir "Cargo.toml"))) {
-    Write-Error "Expected qnc-app at $AppDir"
-}
 
-function Invoke-QncAppTests {
-    param([string[]]$Filters)
-    Write-Host ("cargo test --bin qnc-app -- " + ($Filters -join " ")) -ForegroundColor DarkGray
-    & cargo test --bin qnc-app -- @Filters
+$AppDir = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
+$Root = Split-Path -Parent $AppDir
+
+function Invoke-Cargo {
+    param(
+        [string]$Label,
+        [string[]]$CargoArgs
+    )
+    Write-Host "--- $Label ---" -ForegroundColor Yellow
+    Write-Host ("cargo " + ($CargoArgs -join " ")) -ForegroundColor DarkGray
+    & cargo @CargoArgs
     if ($null -ne $LASTEXITCODE -and $LASTEXITCODE -ne 0) {
         exit $LASTEXITCODE
     }
 }
 
-Push-Location $AppDir
+Push-Location $Root
 try {
-    Write-Host "=== broadcast player tests (qnc-app) ===" -ForegroundColor Cyan
-    Write-Host "cwd: $AppDir"
+    Write-Host "=== QNC active broadcast player tests ===" -ForegroundColor Cyan
+    Write-Host "cwd: $Root"
     Write-Host ""
 
-    Write-Host "--- [1/3] Quality + lifecycle policy ---" -ForegroundColor Yellow
-    Invoke-QncAppTests -Filters @(
-        "broadcast_quality",
-        "thin_preroll",
-        "eof_before",
-        "soft_eos",
-        "contiguous_emit",
-        "play_start",
-        "decode_frontier",
-        "ffmpeg_bus_pipe",
-        "carrier_decode_exhausted"
-    )
-
-    if ($Quick) {
+    if ($Full) {
+        Invoke-Cargo -Label "Workspace" -CargoArgs @("test", "--workspace", "--no-fail-fast")
         Write-Host ""
-        Write-Host "Quick mode: skip rack contracts + full broadcast module." -ForegroundColor DarkGray
-        Write-Host "PASS (quick)" -ForegroundColor Green
+        Write-Host "PASS - workspace green." -ForegroundColor Green
         exit 0
     }
 
-    Write-Host ""
-    Write-Host "--- [2/3] Source rack contracts (A1 media + A2 silence) ---" -ForegroundColor Yellow
-    Invoke-QncAppTests -Filters @(
-        "source_program_rack",
-        "render_plan_routes_source_rack",
-        "resolved_plan_maps_virtual_shot"
+    $packages = @(
+        "qnc-broadcast-player",
+        "qnc-media-ffmpeg",
+        "qnc-player-output",
+        "qnc-player-monitor",
+        "qnc-player-monitor-bridge",
+        "qnc-player-runtime"
     )
 
-    if ($Full) {
-        Write-Host ""
-        Write-Host "--- [3/3] Full qnc-app bin suite ---" -ForegroundColor Yellow
-        & cargo test --bin qnc-app
-        if ($null -ne $LASTEXITCODE -and $LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-    } else {
-        Write-Host ""
-        Write-Host "--- [3/3] All broadcast::* unit tests ---" -ForegroundColor Yellow
-        Invoke-QncAppTests -Filters @("broadcast::")
+    if (-not $Quick) {
+        $packages += "qnc-player-runner"
     }
 
+    $cargoArgs = @("test", "--no-fail-fast")
+    foreach ($package in $packages) {
+        $cargoArgs += @("-p", $package)
+    }
+    Invoke-Cargo -Label "Active player crates" -CargoArgs $cargoArgs
+
     Write-Host ""
-    Write-Host "PASS — policy + contracts green." -ForegroundColor Green
-    Write-Host "LIVE — pwsh -File qnc-app\scripts\test-broadcast-player-live.ps1" -ForegroundColor Cyan
-    Write-Host "GAP — EngineCommand::Play + rodio device still separate from unit/live decode tests." -ForegroundColor DarkYellow
+    if ($Quick) {
+        Write-Host "PASS - active player core crates green." -ForegroundColor Green
+    } else {
+        Write-Host "PASS - active player stack green." -ForegroundColor Green
+    }
+    Write-Host "LIVE - pwsh -File qnc-app\scripts\test-broadcast-player-live.ps1" -ForegroundColor Cyan
 } finally {
     Pop-Location
 }

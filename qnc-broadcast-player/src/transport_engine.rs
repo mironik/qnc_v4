@@ -694,6 +694,32 @@ mod tests {
     }
 
     #[test]
+    fn delayed_tick_still_presents_boundary_frame_before_boundary_event() {
+        let mut engine = fake_engine();
+        engine.load_source(&source_runtime(), None).unwrap();
+        engine
+            .sync_range_runtime(Some(FrameRange::new(10, 20).unwrap()), 18, true)
+            .unwrap();
+        engine.play(0).unwrap();
+
+        let events = engine.tick(160_000_000).unwrap();
+
+        let frame_presented_index = event_index(&events, |event| {
+            matches!(event, BroadcastEvent::FramePresented { frame: 20 })
+        });
+        let boundary_index = event_index(&events, |event| {
+            matches!(event, BroadcastEvent::PlaybackBoundaryReached { frame: 20 })
+        });
+        assert!(frame_presented_index < boundary_index);
+        assert_eq!(engine.state().carrier_frame, 20);
+        assert_eq!(engine.state().status, TransportStatus::Paused);
+        assert!(events.iter().all(|event| !matches!(
+            event,
+            BroadcastEvent::FramePresented { frame } if *frame > 20
+        )));
+    }
+
+    #[test]
     fn load_source_open_failure_keeps_active_engine_state() {
         let mut engine = rejecting_open_engine();
         engine.load_source(&source_runtime(), Some(1)).unwrap();

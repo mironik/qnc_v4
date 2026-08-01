@@ -30,16 +30,11 @@ pub trait PlayerClient {
     fn missing_source_message(&self) -> String;
     fn missing_path_message(&self) -> String;
 
-    fn set_native_preview_active(&mut self, active: bool);
+    fn set_player_preview_active(&mut self, active: bool);
     fn apply_playback_command_state(&mut self, playing: bool, status: impl Into<String>);
-    fn apply_native_player_frame(&mut self, image: ColorImage, source_sec: f64, playing: bool);
-    fn apply_native_player_state(
-        &mut self,
-        source_sec: f64,
-        playing: bool,
-        status: impl Into<String>,
-    );
-    fn apply_native_player_error(&mut self, status: impl Into<String>);
+    fn apply_player_frame(&mut self, image: ColorImage, source_sec: f64, playing: bool);
+    fn apply_player_state(&mut self, source_sec: f64, playing: bool, status: impl Into<String>);
+    fn apply_player_error(&mut self, status: impl Into<String>);
 }
 
 fn open_request(
@@ -83,7 +78,7 @@ pub fn handle_playback_commands(
                         let _ = tx.open(request);
                         let _ = tx.seek_sec(sec, true, coalesce);
                     }
-                    Err(err) => client.apply_native_player_error(err),
+                    Err(err) => client.apply_player_error(err),
                 }
             }
             PlaybackCommand::TogglePlay => {
@@ -96,7 +91,7 @@ pub fn handle_playback_commands(
                     }
                     Err(err) => {
                         crate::player_log::log_error("bridge", &err);
-                        client.apply_native_player_error(err);
+                        client.apply_player_error(err);
                     }
                 }
             }
@@ -117,23 +112,23 @@ pub fn poll_player_remote(
                 source_sec,
                 playing,
                 ..
-            } => client.apply_native_player_frame(image, source_sec, playing),
+            } => client.apply_player_frame(image, source_sec, playing),
             PlayerEvent::State {
                 source_sec,
                 playing,
                 status,
                 ..
-            } => client.apply_native_player_state(source_sec, playing, status),
+            } => client.apply_player_state(source_sec, playing, status),
             PlayerEvent::Error(err) => {
                 crate::player_log::log_error("bridge-rx", &err);
-                client.apply_native_player_error(err);
+                client.apply_player_error(err);
             }
             PlayerEvent::Stopped => {
-                client.set_native_preview_active(false);
+                client.set_player_preview_active(false);
                 client.apply_playback_command_state(false, "Stopped");
             }
         }
     }
     let snap = player.snapshot();
-    client.set_native_preview_active(snap.active || snap.playing);
+    client.set_player_preview_active(snap.active || snap.playing);
 }

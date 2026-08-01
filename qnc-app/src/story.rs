@@ -83,7 +83,7 @@ pub struct StoryScreen {
     layer: String,
     status: String,
     texture: Option<TextureHandle>,
-    pending_native_image: Option<ColorImage>,
+    pending_player_image: Option<ColorImage>,
     /// True while broadcast PlayerRemote owns the monitor.
     broadcast_preview_active: bool,
     thumb_textures: HashMap<String, TextureHandle>,
@@ -162,7 +162,7 @@ impl StoryScreen {
             layer: String::new(),
             status: role.idle_status().into(),
             texture: None,
-            pending_native_image: None,
+            pending_player_image: None,
             broadcast_preview_active: false,
             thumb_textures: HashMap::new(),
             thumbs_queued: Vec::new(),
@@ -693,29 +693,29 @@ impl StoryScreen {
         )
     }
 
-    pub fn set_native_preview_active(&mut self, active: bool) {
-        <Self as crate::player_bridge::PlayerClient>::set_native_preview_active(self, active)
+    pub fn set_player_preview_active(&mut self, active: bool) {
+        <Self as crate::player_bridge::PlayerClient>::set_player_preview_active(self, active)
     }
 
-    pub fn apply_native_player_frame(&mut self, image: ColorImage, source_sec: f64, playing: bool) {
-        <Self as crate::player_bridge::PlayerClient>::apply_native_player_frame(
+    pub fn apply_player_frame(&mut self, image: ColorImage, source_sec: f64, playing: bool) {
+        <Self as crate::player_bridge::PlayerClient>::apply_player_frame(
             self, image, source_sec, playing,
         )
     }
 
-    pub fn apply_native_player_state(
+    pub fn apply_player_state(
         &mut self,
         source_sec: f64,
         playing: bool,
         status: impl Into<String>,
     ) {
-        <Self as crate::player_bridge::PlayerClient>::apply_native_player_state(
+        <Self as crate::player_bridge::PlayerClient>::apply_player_state(
             self, source_sec, playing, status,
         )
     }
 
-    pub fn apply_native_player_error(&mut self, status: impl Into<String>) {
-        <Self as crate::player_bridge::PlayerClient>::apply_native_player_error(self, status)
+    pub fn apply_player_error(&mut self, status: impl Into<String>) {
+        <Self as crate::player_bridge::PlayerClient>::apply_player_error(self, status)
     }
 
     pub fn apply_playback_command_state(&mut self, playing: bool, status: impl Into<String>) {
@@ -727,7 +727,7 @@ impl StoryScreen {
     pub fn prepare_frame(&mut self, host: &HostClient, ctx: &egui::Context) {
         self.repaint_ctx = Some(ctx.clone());
         self.poll_async_media(host, ctx);
-        if let Some(img) = self.pending_native_image.take() {
+        if let Some(img) = self.pending_player_image.take() {
             let tex =
                 ctx.load_texture("story_broadcast_preview_frame", img, TextureOptions::LINEAR);
             self.texture = Some(tex);
@@ -1616,7 +1616,7 @@ impl crate::player_bridge::PlayerClient for StoryScreen {
         "Proxy path nije spreman — pričekaj proxy ili odaberi clip ponovo".into()
     }
 
-    fn set_native_preview_active(&mut self, active: bool) {
+    fn set_player_preview_active(&mut self, active: bool) {
         self.broadcast_preview_active = active;
     }
 
@@ -1625,7 +1625,7 @@ impl crate::player_bridge::PlayerClient for StoryScreen {
         self.status = status.into();
     }
 
-    fn apply_native_player_frame(&mut self, image: ColorImage, source_sec: f64, playing: bool) {
+    fn apply_player_frame(&mut self, image: ColorImage, source_sec: f64, playing: bool) {
         let snapped = if self.view_mode == ViewMode::Wrap {
             self.snap_sec(source_sec.max(0.0))
         } else {
@@ -1639,7 +1639,7 @@ impl crate::player_bridge::PlayerClient for StoryScreen {
             .playhead_ui_target
             .map(|t| (snapped - t).abs() <= eps)
             .unwrap_or(false);
-        self.pending_native_image = Some(image);
+        self.pending_player_image = Some(image);
         self.broadcast_preview_active = true;
         self.playing = playing;
         if locked && !near_ui && !playing {
@@ -1654,12 +1654,7 @@ impl crate::player_bridge::PlayerClient for StoryScreen {
         self.status = "Broadcast player".into();
     }
 
-    fn apply_native_player_state(
-        &mut self,
-        source_sec: f64,
-        playing: bool,
-        status: impl Into<String>,
-    ) {
+    fn apply_player_state(&mut self, source_sec: f64, playing: bool, status: impl Into<String>) {
         let snapped = if self.view_mode == ViewMode::Wrap {
             self.snap_sec(source_sec.max(0.0))
         } else {
@@ -1689,7 +1684,7 @@ impl crate::player_bridge::PlayerClient for StoryScreen {
         self.virtual_sec = snapped;
     }
 
-    fn apply_native_player_error(&mut self, status: impl Into<String>) {
+    fn apply_player_error(&mut self, status: impl Into<String>) {
         self.broadcast_preview_active = false;
         self.playing = false;
         self.status = status.into();

@@ -5,9 +5,9 @@ use std::time::{Duration, Instant};
 use eframe::egui::{self, ColorImage, TextureHandle, TextureOptions};
 
 use crate::api::HostClient;
-use crate::player_contract::BroadcastHostSourceRef;
 use crate::ingest::IngestScreen;
 use crate::player_bridge::{PlaybackCommand, PlayerClient};
+use crate::player_contract::BroadcastHostSourceRef;
 
 pub use crate::player_bridge::PlaybackCommand as IngestPlaybackCommand;
 
@@ -48,34 +48,34 @@ impl IngestScreen {
         PlayerClient::playback_source_range_sec(self)
     }
 
-    pub fn set_native_preview_active(&mut self, active: bool) {
-        PlayerClient::set_native_preview_active(self, active)
+    pub fn set_player_preview_active(&mut self, active: bool) {
+        PlayerClient::set_player_preview_active(self, active)
     }
 
     pub fn apply_playback_command_state(&mut self, playing: bool, status: impl Into<String>) {
         PlayerClient::apply_playback_command_state(self, playing, status)
     }
 
-    pub fn apply_native_player_error(&mut self, status: impl Into<String>) {
-        PlayerClient::apply_native_player_error(self, status)
+    pub fn apply_player_error(&mut self, status: impl Into<String>) {
+        PlayerClient::apply_player_error(self, status)
     }
 
-    pub fn apply_native_player_frame(&mut self, image: ColorImage, source_sec: f64, playing: bool) {
-        PlayerClient::apply_native_player_frame(self, image, source_sec, playing)
+    pub fn apply_player_frame(&mut self, image: ColorImage, source_sec: f64, playing: bool) {
+        PlayerClient::apply_player_frame(self, image, source_sec, playing)
     }
 
-    pub fn apply_native_player_state(
+    pub fn apply_player_state(
         &mut self,
         source_sec: f64,
         playing: bool,
         status: impl Into<String>,
     ) {
-        PlayerClient::apply_native_player_state(self, source_sec, playing, status)
+        PlayerClient::apply_player_state(self, source_sec, playing, status)
     }
 
     pub fn prepare_player_frame(&mut self, ctx: &egui::Context) {
-        if let Some(img) = self.pending_native_image.take() {
-            let tex = ctx.load_texture("ingest_native_preview", img, TextureOptions::LINEAR);
+        if let Some(img) = self.pending_player_image.take() {
+            let tex = ctx.load_texture("ingest_player_preview", img, TextureOptions::LINEAR);
             self.player_texture = Some(tex);
         }
     }
@@ -100,8 +100,8 @@ impl IngestScreen {
         self.selected_play_path.clear();
         self.selected_source_ref = None;
         self.player_texture = None;
-        self.pending_native_image = None;
-        self.native_preview_active = false;
+        self.pending_player_image = None;
+        self.player_preview_active = false;
         self.playing = false;
         self.virtual_sec = 0.0;
         self.pending_playback_commands.clear();
@@ -120,9 +120,9 @@ impl IngestScreen {
         self.preview_clip_id = clip_id.to_string();
         self.virtual_sec = 0.0;
         self.playing = false;
-        self.native_preview_active = false;
+        self.player_preview_active = false;
         self.player_texture = None;
-        self.pending_native_image = None;
+        self.pending_player_image = None;
 
         let (fps, has_audio, channels, duration) = self
             .state
@@ -333,8 +333,8 @@ impl PlayerClient for IngestScreen {
         "Nema play path na sourceu (kartica / folder) — odaberi klip s medijem".into()
     }
 
-    fn set_native_preview_active(&mut self, active: bool) {
-        self.native_preview_active = active;
+    fn set_player_preview_active(&mut self, active: bool) {
+        self.player_preview_active = active;
     }
 
     fn apply_playback_command_state(&mut self, playing: bool, status: impl Into<String>) {
@@ -342,13 +342,13 @@ impl PlayerClient for IngestScreen {
         self.player_status = status.into();
     }
 
-    fn apply_native_player_error(&mut self, status: impl Into<String>) {
-        self.native_preview_active = false;
+    fn apply_player_error(&mut self, status: impl Into<String>) {
+        self.player_preview_active = false;
         self.playing = false;
         self.player_status = status.into();
     }
 
-    fn apply_native_player_frame(&mut self, image: ColorImage, source_sec: f64, playing: bool) {
+    fn apply_player_frame(&mut self, image: ColorImage, source_sec: f64, playing: bool) {
         let snapped = self.snap_source_sec(source_sec.max(0.0));
         let eps = self.frame_eps_sec();
         let locked = self
@@ -358,8 +358,8 @@ impl PlayerClient for IngestScreen {
             .playhead_ui_target
             .map(|t| (snapped - t).abs() <= eps)
             .unwrap_or(false);
-        self.pending_native_image = Some(image);
-        self.native_preview_active = true;
+        self.pending_player_image = Some(image);
+        self.player_preview_active = true;
         self.playing = playing;
         if locked && !near_ui && !playing {
             return;
@@ -369,15 +369,10 @@ impl PlayerClient for IngestScreen {
             self.playhead_ui_target = None;
             self.virtual_sec = snapped;
         }
-        self.player_status = "Native player".into();
+        self.player_status = "Broadcast player".into();
     }
 
-    fn apply_native_player_state(
-        &mut self,
-        source_sec: f64,
-        playing: bool,
-        status: impl Into<String>,
-    ) {
+    fn apply_player_state(&mut self, source_sec: f64, playing: bool, status: impl Into<String>) {
         let snapped = self.snap_source_sec(source_sec.max(0.0));
         let eps = self.frame_eps_sec();
         let locked = self

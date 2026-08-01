@@ -45,7 +45,7 @@ pub struct IngestScreen {
     dir_entries: Vec<FsEntry>,
     dir_error: Option<String>,
     dir_browser: DirBrowserKind,
-    // —— Native player (PlayerRemote via app) ——
+    // Broadcast player projection (PlayerRemote via app).
     pub(crate) selected_play_path: String,
     pub(crate) selected_source_ref: Option<BroadcastHostSourceRef>,
     pub(crate) selected_source_fps: f64,
@@ -55,8 +55,8 @@ pub struct IngestScreen {
     pub(crate) playing: bool,
     pub(crate) player_status: String,
     pub(crate) player_texture: Option<TextureHandle>,
-    pub(crate) pending_native_image: Option<ColorImage>,
-    pub(crate) native_preview_active: bool,
+    pub(crate) pending_player_image: Option<ColorImage>,
+    pub(crate) player_preview_active: bool,
     pub(crate) pending_playback_commands: Vec<IngestPlaybackCommand>,
     pub(crate) playhead_ui_lock_until: Option<Instant>,
     pub(crate) playhead_ui_target: Option<f64>,
@@ -114,8 +114,8 @@ impl Default for IngestScreen {
             playing: false,
             player_status: String::new(),
             player_texture: None,
-            pending_native_image: None,
-            native_preview_active: false,
+            pending_player_image: None,
+            player_preview_active: false,
             pending_playback_commands: Vec::new(),
             playhead_ui_lock_until: None,
             playhead_ui_target: None,
@@ -262,7 +262,7 @@ impl IngestScreen {
         if ui.input(|i| i.key_pressed(egui::Key::Space)) && !self.preview_clip_id.is_empty() {
             self.queue_toggle_play();
         }
-        if self.playing || self.native_preview_active {
+        if self.playing || self.player_preview_active {
             ctx.request_repaint();
         }
         if self.state.as_ref().is_some_and(|st| {

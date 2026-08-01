@@ -1,6 +1,6 @@
 # QNC — upute za agenta (obavezno)
 
-Workspace: `C:\Users\miron\Projects\QNC` (native track).
+Workspace: `C:\Users\miron\Projects\qnc_v4` (native track).
 
 ## Produkt
 
@@ -14,9 +14,13 @@ Workspace: `C:\Users\miron\Projects\QNC` (native track).
 - Vraćati `app/` ili `plugins/` na root
 - Servirati HTML/JS iz hosta kao produkt UI
 - Editirati `qnc-app/src/qnc_timeline.rs` bez izričitog odobrenja (vidi `.cursor/rules/qnc-timeline-freeze.mdc`)
-- Editirati **broadcast player** bez izričitog „odmrznuti broadcast player”:
-  `qnc-app/src/broadcast/**`, `player_remote.rs`, `player_bridge.rs`, `qnc_broadcast_player.rs`,
+- Editirati **broadcast player** bez izricitog "odmrznuti broadcast player":
+  `qnc-broadcast-player/**`, `qnc-media-ffmpeg/**`, `qnc-player-output/**`,
+  `qnc-player-monitor/**`, `qnc-player-monitor-bridge/**`, `qnc-player-runtime/**`,
+  `qnc-player-runner/**`, `player_remote.rs`, `player_bridge.rs`, `qnc_broadcast_player.rs`,
   `qnc-app/scripts/test-broadcast-player*.ps1` (vidi `.cursor/rules/qnc-broadcast-player-freeze.mdc`)
+- `archive/orphan-broadcast-2026-08-01/**` je arhiva starog app broadcast/native player koda.
+  Smije se citati za port mapu, ali ne smije se vracati u aktivni `qnc-app/src`.
 - Python runtime / FastAPI / pytest
 
 ## Arhitektura

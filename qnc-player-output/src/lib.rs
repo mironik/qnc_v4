@@ -306,17 +306,11 @@ impl AudioPacketSink<Vec<u8>> for RodioAudioDeviceSink {
             .with_source_id(packet.source_id.clone())
             .with_frame(packet.start_frame)
         })?;
-        let channel_count = NonZero::new(audio_format.channel_count).ok_or_else(|| {
-            audio_output_error("audio packet channel count must be greater than zero")
-        })?;
         let sample_rate = NonZero::new(audio_format.sample_rate_hz).ok_or_else(|| {
             audio_output_error("audio packet sample rate must be greater than zero")
         })?;
-        let samples = pcm_s16le_samples(&packet.payload)?
-            .into_iter()
-            .map(sample_to_output_sample)
-            .collect::<Vec<_>>();
-        if !samples
+        let decoded_samples = pcm_s16le_samples(&packet.payload)?;
+        if !decoded_samples
             .len()
             .is_multiple_of(usize::from(audio_format.channel_count))
         {
@@ -327,6 +321,11 @@ impl AudioPacketSink<Vec<u8>> for RodioAudioDeviceSink {
             .with_source_id(packet.source_id.clone())
             .with_frame(packet.start_frame));
         }
+        let samples =
+            stereo_dual_mono_monitor_samples(&decoded_samples, audio_format.channel_count)?;
+        let channel_count = NonZero::new(MONITOR_STEREO_CHANNELS).ok_or_else(|| {
+            audio_output_error("monitor audio channel count must be greater than zero")
+        })?;
 
         self.clear_retired_players();
         let player = self
@@ -589,6 +588,9 @@ fn audio_output_error(message: impl Into<String>) -> BroadcastEngineError {
     BroadcastEngineError::new(BroadcastEngineErrorKind::AudioOutput, message)
 }
 
+#[cfg(feature = "audio-device")]
+const MONITOR_STEREO_CHANNELS: u16 = 2;
+
 #[cfg(any(test, feature = "audio-device"))]
 fn pcm_s16le_samples(payload: &[u8]) -> Result<Vec<i16>, BroadcastEngineError> {
     if !payload.len().is_multiple_of(2) {
@@ -603,9 +605,47 @@ fn pcm_s16le_samples(payload: &[u8]) -> Result<Vec<i16>, BroadcastEngineError> {
         .collect())
 }
 
-#[cfg(feature = "audio-device")]
-fn sample_to_output_sample(sample: i16) -> rodio::Sample {
-    rodio::Sample::from(sample) / rodio::Sample::from(i16::MAX)
+#[cfg(any(test, feature = "audio-device"))]
+fn stereo_dual_mono_monitor_samples(
+    samples: &[i16],
+    source_channels: u16,
+) -> Result<Vec<f32>, BroadcastEngineError> {
+    if source_channels == 0 {
+        return Err(audio_output_error(
+            "audio packet channel count must be greater than zero",
+        ));
+    }
+    let source_channels = usize::from(source_channels);
+    if !samples.len().is_multiple_of(source_channels) {
+        return Err(audio_output_error(
+            "audio packet sample count must align to channel count",
+        ));
+    }
+
+    let mut monitor = Vec::with_capacity(samples.len() / source_channels * 2);
+    for frame_samples in samples.chunks_exact(source_channels) {
+        let mut left = 0.0_f32;
+        let mut right = 0.0_f32;
+        for (index, sample) in frame_samples.iter().enumerate() {
+            if index % 2 == 0 {
+                left += sample_to_unit(*sample);
+            } else {
+                right += sample_to_unit(*sample);
+            }
+        }
+        monitor.push(left.clamp(-1.0, 1.0));
+        monitor.push(right.clamp(-1.0, 1.0));
+    }
+    Ok(monitor)
+}
+
+#[cfg(any(test, feature = "audio-device"))]
+fn sample_to_unit(sample: i16) -> f32 {
+    if sample == i16::MIN {
+        -1.0
+    } else {
+        f32::from(sample) / f32::from(i16::MAX)
+    }
 }
 
 #[cfg(test)]
@@ -658,6 +698,21 @@ mod tests {
         let err = pcm_s16le_samples(&[0]).unwrap_err();
 
         assert_eq!(err.kind, BroadcastEngineErrorKind::AudioOutput);
+    }
+
+    #[test]
+    fn stereo_dual_mono_monitor_keeps_single_channel_on_left() {
+        let samples = stereo_dual_mono_monitor_samples(&[i16::MAX, 0], 1).unwrap();
+
+        assert_eq!(samples, vec![1.0, 0.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn stereo_dual_mono_monitor_routes_odd_buses_left_even_buses_right() {
+        let samples = stereo_dual_mono_monitor_samples(&[1000, 2000, 3000, 4000], 4).unwrap();
+
+        assert_close(samples[0], 4000.0 / f32::from(i16::MAX));
+        assert_close(samples[1], 6000.0 / f32::from(i16::MAX));
     }
 
     #[test]
@@ -794,5 +849,12 @@ mod tests {
             audio_format: None,
             payload: vec![1, 2],
         }
+    }
+
+    fn assert_close(left: f32, right: f32) {
+        assert!(
+            (left - right).abs() <= 0.000_001,
+            "left={left} right={right}"
+        );
     }
 }
