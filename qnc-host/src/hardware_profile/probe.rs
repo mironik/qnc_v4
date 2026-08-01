@@ -140,6 +140,7 @@ fn probe_media_decode(ffmpeg_ok: bool) -> MediaDecodeProfile {
         verified: false,
         selection_reason,
         warnings,
+        ..MediaDecodeProfile::default()
     }
 }
 

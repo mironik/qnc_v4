@@ -13,7 +13,7 @@ use tracing::{info, warn};
 
 use crate::shell_store;
 
-pub const SCHEMA_VERSION: u32 = 2;
+pub const SCHEMA_VERSION: u32 = 3;
 const SETTING_KEY: &str = "hardware.profile";
 const LEGACY_JSON_FILE: &str = "hardware_profile.json";
 const LEGACY_PROJECT_STORE_KEY: &str = "hardware.profile";
@@ -66,11 +66,34 @@ pub struct MediaDecodeProfile {
     pub recommended_backend: String,
     #[serde(default)]
     pub forced_backend: Option<String>,
+    #[serde(default = "default_video_prefetch_frames")]
+    pub video_prefetch_frames: u16,
+    #[serde(default = "default_video_cache_frames")]
+    pub video_cache_frames: usize,
+    #[serde(default = "default_audio_prefetch_frames")]
+    pub audio_prefetch_frames: u16,
+    #[serde(default = "default_audio_cache_frames")]
+    pub audio_cache_frames: usize,
+    #[serde(default)]
+    pub video_prefetch_rules: Vec<MediaDecodePrefetchRule>,
     pub probe_method: String,
     pub verified: bool,
     pub selection_reason: String,
     #[serde(default)]
     pub warnings: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MediaDecodePrefetchRule {
+    #[serde(default)]
+    pub container_contains: Option<String>,
+    #[serde(default)]
+    pub codec: Option<String>,
+    #[serde(default)]
+    pub pixel_format_contains: Option<String>,
+    #[serde(default)]
+    pub profile_contains: Option<String>,
+    pub min_prefetch_frames: u16,
 }
 
 impl Default for MediaDecodeProfile {
@@ -79,12 +102,33 @@ impl Default for MediaDecodeProfile {
             available_backends: Vec::new(),
             recommended_backend: "software".into(),
             forced_backend: None,
+            video_prefetch_frames: default_video_prefetch_frames(),
+            video_cache_frames: default_video_cache_frames(),
+            audio_prefetch_frames: default_audio_prefetch_frames(),
+            audio_cache_frames: default_audio_cache_frames(),
+            video_prefetch_rules: Vec::new(),
             probe_method: "not_probed".into(),
             verified: false,
             selection_reason: "software fallback".into(),
             warnings: Vec::new(),
         }
     }
+}
+
+fn default_video_prefetch_frames() -> u16 {
+    8
+}
+
+fn default_video_cache_frames() -> usize {
+    32
+}
+
+fn default_audio_prefetch_frames() -> u16 {
+    8
+}
+
+fn default_audio_cache_frames() -> usize {
+    96
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -291,6 +335,17 @@ mod tests {
                 available_backends: vec!["d3d11va".into()],
                 recommended_backend: "d3d11va".into(),
                 forced_backend: None,
+                video_prefetch_frames: 8,
+                video_cache_frames: 32,
+                audio_prefetch_frames: 8,
+                audio_cache_frames: 96,
+                video_prefetch_rules: vec![MediaDecodePrefetchRule {
+                    container_contains: Some("container_a".into()),
+                    codec: Some("codec_a".into()),
+                    pixel_format_contains: Some("pixel_format_a".into()),
+                    profile_contains: None,
+                    min_prefetch_frames: 8,
+                }],
                 probe_method: "ffmpeg -hwaccels".into(),
                 verified: false,
                 selection_reason: "platform priority".into(),
@@ -311,6 +366,8 @@ mod tests {
         let back: HardwareProfile = serde_json::from_str(&raw).unwrap();
         assert_eq!(back.proxy_encoder, "nvenc");
         assert_eq!(back.media_decode.recommended_backend, "d3d11va");
+        assert_eq!(back.media_decode.video_prefetch_frames, 8);
+        assert_eq!(back.media_decode.video_prefetch_rules.len(), 1);
         assert!(back.audio_output.available);
     }
 }

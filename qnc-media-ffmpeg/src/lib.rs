@@ -291,6 +291,7 @@ impl FfmpegVideoDecode {
 pub struct FfmpegDecodeOptions {
     pub toolchain: FfmpegToolchain,
     pub hardware_decode: FfmpegHardwareDecode,
+    pub decode_policy: FfmpegDecodePolicy,
     pub video_prefetch_frames: u16,
     pub video_cache_frames: usize,
     pub video_cache_bytes: usize,
@@ -308,6 +309,7 @@ impl FfmpegDecodeOptions {
         Self {
             toolchain: FfmpegToolchain::default(),
             hardware_decode: FfmpegHardwareDecode::Software,
+            decode_policy: FfmpegDecodePolicy::default(),
             video_prefetch_frames: DEFAULT_VIDEO_PREFETCH_FRAMES,
             video_cache_frames: DEFAULT_VIDEO_CACHE_FRAMES,
             video_cache_bytes: DEFAULT_VIDEO_CACHE_BYTES,
@@ -322,6 +324,11 @@ impl FfmpegDecodeOptions {
 
     pub fn with_hardware_decode(mut self, hardware_decode: FfmpegHardwareDecode) -> Self {
         self.hardware_decode = hardware_decode;
+        self
+    }
+
+    pub fn with_decode_policy(mut self, decode_policy: FfmpegDecodePolicy) -> Self {
+        self.decode_policy = decode_policy;
         self
     }
 
@@ -344,18 +351,167 @@ impl FfmpegDecodeOptions {
         self.read_timeout = read_timeout.max(Duration::from_millis(1));
         self
     }
+
+    fn effective_video_prefetch_frames(&self, profile: &FfmpegVideoDecodeProfile) -> u16 {
+        self.decode_policy
+            .effective_video_prefetch_frames(self.video_prefetch_frames, profile)
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct FfmpegDecodePolicy {
+    video_prefetch_rules: Vec<FfmpegVideoPrefetchRule>,
+}
+
+impl FfmpegDecodePolicy {
+    pub fn fixed() -> Self {
+        Self::default()
+    }
+
+    pub fn with_video_prefetch_rule(mut self, rule: FfmpegVideoPrefetchRule) -> Self {
+        self.video_prefetch_rules.push(rule);
+        self
+    }
+
+    pub fn video_prefetch_rules(&self) -> &[FfmpegVideoPrefetchRule] {
+        &self.video_prefetch_rules
+    }
+
+    fn effective_video_prefetch_frames(
+        &self,
+        requested_prefetch_frames: u16,
+        profile: &FfmpegVideoDecodeProfile,
+    ) -> u16 {
+        self.video_prefetch_rules
+            .iter()
+            .filter(|rule| rule.matches(profile))
+            .fold(requested_prefetch_frames.max(1), |prefetch_frames, rule| {
+                prefetch_frames.max(rule.min_prefetch_frames)
+            })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FfmpegVideoPrefetchRule {
+    pub container_contains: Option<String>,
+    pub codec: Option<String>,
+    pub pixel_format_contains: Option<String>,
+    pub profile_contains: Option<String>,
+    pub min_prefetch_frames: u16,
+}
+
+impl FfmpegVideoPrefetchRule {
+    pub fn new(min_prefetch_frames: u16) -> Self {
+        Self {
+            container_contains: None,
+            codec: None,
+            pixel_format_contains: None,
+            profile_contains: None,
+            min_prefetch_frames: min_prefetch_frames.max(1),
+        }
+    }
+
+    pub fn when_container_contains(mut self, value: impl AsRef<str>) -> Self {
+        self.container_contains = normalized_rule_value(value);
+        self
+    }
+
+    pub fn when_codec(mut self, value: impl AsRef<str>) -> Self {
+        self.codec = normalized_rule_value(value);
+        self
+    }
+
+    pub fn when_pixel_format_contains(mut self, value: impl AsRef<str>) -> Self {
+        self.pixel_format_contains = normalized_rule_value(value);
+        self
+    }
+
+    pub fn when_profile_contains(mut self, value: impl AsRef<str>) -> Self {
+        self.profile_contains = normalized_rule_value(value);
+        self
+    }
+
+    fn matches(&self, profile: &FfmpegVideoDecodeProfile) -> bool {
+        rule_contains_matches(&self.container_contains, profile.container.as_deref())
+            && rule_exact_matches(&self.codec, profile.codec.as_deref())
+            && rule_contains_matches(&self.pixel_format_contains, profile.pixel_format.as_deref())
+            && rule_contains_matches(&self.profile_contains, profile.profile.as_deref())
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct FfmpegVideoDecodeProfile {
+    pub container: Option<String>,
+    pub codec: Option<String>,
+    pub pixel_format: Option<String>,
+    pub profile: Option<String>,
+}
+
+impl FfmpegVideoDecodeProfile {
+    fn from_path(path: &Path) -> Self {
+        Self {
+            container: path
+                .extension()
+                .and_then(|value| value.to_str())
+                .map(normalized_label),
+            ..Self::default()
+        }
+    }
+
+    fn from_probe_values(path: &Path, values: &BTreeMap<String, String>) -> Self {
+        let mut profile = Self::from_path(path);
+        if let Some(container) = values
+            .get("format_name")
+            .map(|value| normalized_label(value))
+        {
+            profile.container = Some(container);
+        }
+        profile.codec = values
+            .get("codec_name")
+            .map(|value| normalized_label(value));
+        profile.pixel_format = values.get("pix_fmt").map(|value| normalized_label(value));
+        profile.profile = values.get("profile").map(|value| normalized_label(value));
+        profile
+    }
+}
+
+fn normalized_label(value: impl AsRef<str>) -> String {
+    value.as_ref().trim().to_ascii_lowercase()
+}
+
+fn normalized_rule_value(value: impl AsRef<str>) -> Option<String> {
+    let value = normalized_label(value);
+    if value.is_empty() { None } else { Some(value) }
+}
+
+fn rule_contains_matches(rule_value: &Option<String>, profile_value: Option<&str>) -> bool {
+    match rule_value.as_deref() {
+        Some(rule_value) => profile_value.is_some_and(|value| value.contains(rule_value)),
+        None => true,
+    }
+}
+
+fn rule_exact_matches(rule_value: &Option<String>, profile_value: Option<&str>) -> bool {
+    match rule_value.as_deref() {
+        Some(rule_value) => profile_value == Some(rule_value),
+        None => true,
+    }
 }
 
 #[derive(Debug)]
 struct FfmpegVideoSession {
     video_format: VideoFormat,
     duration_frames: u64,
+    decode_profile: FfmpegVideoDecodeProfile,
     cache: BTreeMap<u64, FfmpegVideoPayload>,
     stream: Option<FfmpegVideoStream>,
 }
 
 impl FfmpegVideoSession {
-    fn new(source: &EngineSourceHandle) -> Result<Self, BroadcastEngineError> {
+    fn new(
+        source: &EngineSourceHandle,
+        decode_profile: FfmpegVideoDecodeProfile,
+    ) -> Result<Self, BroadcastEngineError> {
         let video_format = source.video_format.clone().ok_or_else(|| {
             BroadcastEngineError::new(
                 BroadcastEngineErrorKind::Contract,
@@ -366,6 +522,7 @@ impl FfmpegVideoSession {
         Ok(Self {
             video_format,
             duration_frames: source.duration_frames,
+            decode_profile,
             cache: BTreeMap::new(),
             stream: None,
         })
@@ -987,7 +1144,10 @@ impl FfmpegVideoDecode {
     ) -> Result<(u64, u64), BroadcastEngineError> {
         let session = self.video_session(&request.source_id)?;
         let start_frame = session.decode_frame_for_request(request.frame);
-        let end_frame = session.prefetch_end_frame(start_frame, self.options.video_prefetch_frames);
+        let prefetch_frames = self
+            .options
+            .effective_video_prefetch_frames(&session.decode_profile);
+        let end_frame = session.prefetch_end_frame(start_frame, prefetch_frames);
         Ok((start_frame, end_frame))
     }
 
@@ -1027,7 +1187,10 @@ impl FfmpegVideoDecode {
         let end_frame = {
             let session = self.video_session(&request.source_id)?;
             let start_frame = session.decode_frame_for_request(request.frame);
-            session.prefetch_end_frame(start_frame, self.options.video_prefetch_frames)
+            let prefetch_frames = self
+                .options
+                .effective_video_prefetch_frames(&session.decode_profile);
+            session.prefetch_end_frame(start_frame, prefetch_frames)
         };
         self.video_session_mut(&request.source_id)?
             .cache_ready_streamed_frames(end_frame, max_cache_frames, max_cache_bytes)
@@ -1068,9 +1231,13 @@ impl VideoDecodeAdapter for FfmpegVideoDecode {
         if source.video_format.is_none() {
             return Ok(Vec::new());
         }
-        self.registry.source_path(&source.source_id)?;
-        self.sessions
-            .insert(source.source_id.clone(), FfmpegVideoSession::new(source)?);
+        let path = self.registry.source_path(&source.source_id)?.to_path_buf();
+        let decode_profile =
+            probe_video_decode_profile(&path, &source.source_id, &self.options.toolchain);
+        self.sessions.insert(
+            source.source_id.clone(),
+            FfmpegVideoSession::new(source, decode_profile)?,
+        );
         Ok(Vec::new())
     }
 
@@ -2000,6 +2167,24 @@ struct FfmpegAudioProbe {
     duration_samples: u64,
 }
 
+fn probe_video_decode_profile(
+    path: &Path,
+    source_id: &str,
+    toolchain: &FfmpegToolchain,
+) -> FfmpegVideoDecodeProfile {
+    match probe_key_values(
+        path,
+        toolchain,
+        "v:0",
+        "stream=codec_name,pix_fmt,profile:format=format_name",
+        BroadcastEngineErrorKind::VideoDecode,
+        source_id,
+    ) {
+        Ok(Some(values)) => FfmpegVideoDecodeProfile::from_probe_values(path, &values),
+        Ok(None) | Err(_) => FfmpegVideoDecodeProfile::from_path(path),
+    }
+}
+
 fn probe_video_runtime(
     path: &Path,
     source_id: &str,
@@ -2607,6 +2792,73 @@ mod tests {
     }
 
     #[test]
+    fn decode_policy_applies_matching_prefetch_rule() {
+        let mut values = BTreeMap::new();
+        values.insert("format_name".to_string(), "container_a".to_string());
+        values.insert("codec_name".to_string(), "codec_a".to_string());
+        values.insert("pix_fmt".to_string(), "pixel_format_a".to_string());
+        values.insert("profile".to_string(), "profile_a".to_string());
+        let profile = FfmpegVideoDecodeProfile::from_probe_values(Path::new("clip.ext"), &values);
+        let policy = FfmpegDecodePolicy::fixed().with_video_prefetch_rule(
+            FfmpegVideoPrefetchRule::new(8)
+                .when_container_contains("container_a")
+                .when_codec("codec_a")
+                .when_pixel_format_contains("pixel_format_a"),
+        );
+        let options = FfmpegDecodeOptions::software()
+            .with_decode_policy(policy)
+            .with_video_prefetch_frames(1);
+
+        assert_eq!(options.effective_video_prefetch_frames(&profile), 8);
+    }
+
+    #[test]
+    fn decode_policy_ignores_non_matching_prefetch_rule() {
+        let profile = FfmpegVideoDecodeProfile {
+            container: Some("container_b".to_string()),
+            codec: Some("codec_a".to_string()),
+            pixel_format: Some("pixel_format_b".to_string()),
+            profile: Some("profile_b".to_string()),
+        };
+        let policy = FfmpegDecodePolicy::fixed().with_video_prefetch_rule(
+            FfmpegVideoPrefetchRule::new(8)
+                .when_container_contains("container_a")
+                .when_codec("codec_a")
+                .when_pixel_format_contains("pixel_format_a"),
+        );
+        let options = FfmpegDecodeOptions::software()
+            .with_decode_policy(policy)
+            .with_video_prefetch_frames(2);
+
+        assert_eq!(options.effective_video_prefetch_frames(&profile), 2);
+    }
+
+    #[test]
+    fn empty_decode_policy_keeps_requested_prefetch() {
+        let profile = FfmpegVideoDecodeProfile {
+            container: Some("container_a".to_string()),
+            codec: Some("codec_a".to_string()),
+            pixel_format: Some("pixel_format_a".to_string()),
+            profile: Some("profile_a".to_string()),
+        };
+        let options = FfmpegDecodeOptions::software()
+            .with_decode_policy(FfmpegDecodePolicy::fixed())
+            .with_video_prefetch_frames(2);
+
+        assert_eq!(options.effective_video_prefetch_frames(&profile), 2);
+    }
+
+    #[test]
+    fn decode_profile_falls_back_to_path_container() {
+        let profile = FfmpegVideoDecodeProfile::from_path(Path::new("clip.EXT"));
+
+        assert_eq!(profile.container.as_deref(), Some("ext"));
+        assert_eq!(profile.codec, None);
+        assert_eq!(profile.pixel_format, None);
+        assert_eq!(profile.profile, None);
+    }
+
+    #[test]
     fn hardware_decode_auto_builds_ffmpeg_input_args() {
         let options =
             FfmpegDecodeOptions::software().with_hardware_decode(FfmpegHardwareDecode::Auto);
@@ -3045,7 +3297,7 @@ mod tests {
             ),
             audio_format: None,
         };
-        FfmpegVideoSession::new(&source).unwrap()
+        FfmpegVideoSession::new(&source, FfmpegVideoDecodeProfile::default()).unwrap()
     }
 
     fn assert_contiguous_audio_sample_spans(timebase: Timebase, sample_rate_hz: u32, frames: u64) {

@@ -6,15 +6,15 @@
 //! runtime owns frame position and transport state.
 
 use std::collections::BTreeMap;
-use std::env;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use eframe::egui::{self, ColorImage};
 use qnc_media_ffmpeg::{
     probe_source_runtime_with_toolchain, FfmpegAudioDecodeOptions, FfmpegAudioOutput,
-    FfmpegDecodeOptions, FfmpegHardwareDecode, FfmpegSourceOpen, FfmpegSourceRegistry,
-    FfmpegToolchain, FfmpegVideoDecode, FfmpegVideoPayload,
+    FfmpegDecodeOptions, FfmpegDecodePolicy as AdapterDecodePolicy, FfmpegHardwareDecode,
+    FfmpegSourceOpen, FfmpegSourceRegistry, FfmpegToolchain, FfmpegVideoDecode, FfmpegVideoPayload,
+    FfmpegVideoPrefetchRule,
 };
 use qnc_player_core::{
     AudioFormat, BroadcastEngineError, BroadcastEvent, BroadcastPlaybackRequest,
@@ -184,6 +184,11 @@ struct PlayerRuntimeSession {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct PlayerDecodePolicy {
     recommended_backend: Option<String>,
+    video_prefetch_frames: Option<u16>,
+    video_cache_frames: Option<usize>,
+    audio_prefetch_frames: Option<u16>,
+    audio_cache_frames: Option<usize>,
+    video_prefetch_rules: Vec<FfmpegVideoPrefetchRule>,
 }
 
 impl PlayerDecodePolicy {
@@ -195,14 +200,46 @@ impl PlayerDecodePolicy {
     }
 
     fn from_hardware_profile(profile: &Value) -> Self {
-        let recommended_backend = profile
-            .get("media_decode")
+        let media_decode = profile.get("media_decode");
+        let recommended_backend = media_decode
             .and_then(|media| media.get("recommended_backend"))
             .and_then(Value::as_str)
             .and_then(normalize_decode_backend);
+        let video_prefetch_frames =
+            media_decode.and_then(|media| positive_u16_field(media, "video_prefetch_frames"));
+        let video_cache_frames =
+            media_decode.and_then(|media| positive_usize_field(media, "video_cache_frames"));
+        let audio_prefetch_frames =
+            media_decode.and_then(|media| positive_u16_field(media, "audio_prefetch_frames"));
+        let audio_cache_frames =
+            media_decode.and_then(|media| positive_usize_field(media, "audio_cache_frames"));
+        let video_prefetch_rules = media_decode
+            .and_then(|media| media.get("video_prefetch_rules"))
+            .and_then(Value::as_array)
+            .map(|rules| {
+                rules
+                    .iter()
+                    .filter_map(video_prefetch_rule_from_json)
+                    .collect()
+            })
+            .unwrap_or_default();
         Self {
             recommended_backend,
+            video_prefetch_frames,
+            video_cache_frames,
+            audio_prefetch_frames,
+            audio_cache_frames,
+            video_prefetch_rules,
         }
+    }
+
+    fn adapter_decode_policy(&self) -> AdapterDecodePolicy {
+        self.video_prefetch_rules
+            .iter()
+            .cloned()
+            .fold(AdapterDecodePolicy::fixed(), |policy, rule| {
+                policy.with_video_prefetch_rule(rule)
+            })
     }
 }
 
@@ -225,10 +262,6 @@ pub struct PlayerRemote {
 
 const STILL_SEEK_DEBOUNCE: Duration = Duration::from_millis(80);
 const MAX_CATCHUP_FRAMES: usize = 4;
-const VIDEO_PREFETCH_FRAMES: u16 = 8;
-const VIDEO_CACHE_FRAMES: usize = 32;
-const AUDIO_PREFETCH_FRAMES: u16 = 8;
-const AUDIO_CACHE_FRAMES: usize = 96;
 
 impl Default for PlayerRemote {
     fn default() -> Self {
@@ -742,18 +775,11 @@ fn build_runtime_session(
     let (hardware_decode, hardware_warning) = hardware_decode_from_policy(decode_policy);
     let video_decode = FfmpegVideoDecode::with_options(
         registry.clone(),
-        FfmpegDecodeOptions::software()
-            .with_toolchain(toolchain.clone())
-            .with_hardware_decode(hardware_decode)
-            .with_video_prefetch_frames(VIDEO_PREFETCH_FRAMES)
-            .with_video_cache_frames(VIDEO_CACHE_FRAMES),
+        video_decode_options(toolchain.clone(), hardware_decode, decode_policy),
     );
     let audio_output = FfmpegAudioOutput::with_options(
         registry.clone(),
-        FfmpegAudioDecodeOptions::default()
-            .with_toolchain(toolchain)
-            .with_audio_prefetch_frames(AUDIO_PREFETCH_FRAMES)
-            .with_audio_cache_frames(AUDIO_CACHE_FRAMES),
+        audio_decode_options(toolchain, decode_policy),
     );
     let av_sync = AvSyncTelemetry::default();
     let (audio_sink, audio_device_warning) = build_audio_sink();
@@ -821,17 +847,41 @@ fn build_audio_sink() -> (FfmpegAudioSink, Option<String>) {
     }
 }
 
+fn video_decode_options(
+    toolchain: FfmpegToolchain,
+    hardware_decode: FfmpegHardwareDecode,
+    policy: &PlayerDecodePolicy,
+) -> FfmpegDecodeOptions {
+    let mut options = FfmpegDecodeOptions::software()
+        .with_toolchain(toolchain)
+        .with_hardware_decode(hardware_decode)
+        .with_decode_policy(policy.adapter_decode_policy());
+    if let Some(prefetch_frames) = policy.video_prefetch_frames {
+        options = options.with_video_prefetch_frames(prefetch_frames);
+    }
+    if let Some(cache_frames) = policy.video_cache_frames {
+        options = options.with_video_cache_frames(cache_frames);
+    }
+    options
+}
+
+fn audio_decode_options(
+    toolchain: FfmpegToolchain,
+    policy: &PlayerDecodePolicy,
+) -> FfmpegAudioDecodeOptions {
+    let mut options = FfmpegAudioDecodeOptions::default().with_toolchain(toolchain);
+    if let Some(prefetch_frames) = policy.audio_prefetch_frames {
+        options = options.with_audio_prefetch_frames(prefetch_frames);
+    }
+    if let Some(cache_frames) = policy.audio_cache_frames {
+        options = options.with_audio_cache_frames(cache_frames);
+    }
+    options
+}
+
 fn hardware_decode_from_policy(
     policy: &PlayerDecodePolicy,
 ) -> (FfmpegHardwareDecode, Option<String>) {
-    if let Some(value) = env::var("QNC_PLAYER_HWACCEL")
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-    {
-        return hardware_decode_from_backend_label(&value, "QNC_PLAYER_HWACCEL");
-    }
-
     let Some(value) = policy.recommended_backend.as_deref() else {
         return (FfmpegHardwareDecode::Software, None);
     };
@@ -864,6 +914,48 @@ fn normalize_decode_backend(raw: &str) -> Option<String> {
         return None;
     }
     Some(value)
+}
+
+fn positive_u16_field(value: &Value, key: &str) -> Option<u16> {
+    value
+        .get(key)
+        .and_then(Value::as_u64)
+        .and_then(|value| u16::try_from(value).ok())
+        .filter(|value| *value > 0)
+}
+
+fn positive_usize_field(value: &Value, key: &str) -> Option<usize> {
+    value
+        .get(key)
+        .and_then(Value::as_u64)
+        .and_then(|value| usize::try_from(value).ok())
+        .filter(|value| *value > 0)
+}
+
+fn non_empty_string_field(value: &Value, key: &str) -> Option<String> {
+    value
+        .get(key)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn video_prefetch_rule_from_json(value: &Value) -> Option<FfmpegVideoPrefetchRule> {
+    let mut rule = FfmpegVideoPrefetchRule::new(positive_u16_field(value, "min_prefetch_frames")?);
+    if let Some(container) = non_empty_string_field(value, "container_contains") {
+        rule = rule.when_container_contains(container);
+    }
+    if let Some(codec) = non_empty_string_field(value, "codec") {
+        rule = rule.when_codec(codec);
+    }
+    if let Some(pixel_format) = non_empty_string_field(value, "pixel_format_contains") {
+        rule = rule.when_pixel_format_contains(pixel_format);
+    }
+    if let Some(profile) = non_empty_string_field(value, "profile_contains") {
+        rule = rule.when_profile_contains(profile);
+    }
+    Some(rule)
 }
 
 fn fallback_source_runtime(
@@ -1046,7 +1138,19 @@ mod tests {
         let runtime = serde_json::json!({
             "hardware_profile": {
                 "media_decode": {
-                    "recommended_backend": "d3d11va"
+                    "recommended_backend": "d3d11va",
+                    "video_prefetch_frames": 6,
+                    "video_cache_frames": 40,
+                    "audio_prefetch_frames": 5,
+                    "audio_cache_frames": 80,
+                    "video_prefetch_rules": [
+                        {
+                            "container_contains": "container_a",
+                            "codec": "codec_a",
+                            "pixel_format_contains": "pixel_format_a",
+                            "min_prefetch_frames": 8
+                        }
+                    ]
                 }
             }
         });
@@ -1054,6 +1158,44 @@ mod tests {
         let policy = PlayerDecodePolicy::from_runtime(&runtime);
 
         assert_eq!(policy.recommended_backend.as_deref(), Some("d3d11va"));
+        assert_eq!(policy.video_prefetch_frames, Some(6));
+        assert_eq!(policy.video_cache_frames, Some(40));
+        assert_eq!(policy.audio_prefetch_frames, Some(5));
+        assert_eq!(policy.audio_cache_frames, Some(80));
+        assert_eq!(policy.video_prefetch_rules.len(), 1);
+    }
+
+    #[test]
+    fn decode_policy_builds_adapter_options_from_runtime_profile() {
+        let runtime = serde_json::json!({
+            "hardware_profile": {
+                "media_decode": {
+                    "video_prefetch_frames": 6,
+                    "video_cache_frames": 40,
+                    "audio_prefetch_frames": 5,
+                    "audio_cache_frames": 80,
+                    "video_prefetch_rules": [
+                        {
+                            "codec": "codec_a",
+                            "profile_contains": "profile_a",
+                            "min_prefetch_frames": 8
+                        }
+                    ]
+                }
+            }
+        });
+        let policy = PlayerDecodePolicy::from_runtime(&runtime);
+        let toolchain = FfmpegToolchain::new("ffmpeg", "ffprobe").unwrap();
+
+        let video_options =
+            video_decode_options(toolchain.clone(), FfmpegHardwareDecode::Software, &policy);
+        let audio_options = audio_decode_options(toolchain, &policy);
+
+        assert_eq!(video_options.video_prefetch_frames, 6);
+        assert_eq!(video_options.video_cache_frames, 40);
+        assert_eq!(video_options.decode_policy.video_prefetch_rules().len(), 1);
+        assert_eq!(audio_options.audio_prefetch_frames, 5);
+        assert_eq!(audio_options.audio_cache_frames, 80);
     }
 
     #[test]
@@ -1069,5 +1211,7 @@ mod tests {
         let policy = PlayerDecodePolicy::from_runtime(&runtime);
 
         assert_eq!(policy.recommended_backend, None);
+        assert_eq!(policy.video_prefetch_frames, None);
+        assert!(policy.video_prefetch_rules.is_empty());
     }
 }
