@@ -1,0 +1,27 @@
+# qnc_v4 broadcast player freeze
+
+Broadcast player code is frozen by default.
+
+Do not edit these paths unless the user explicitly says "odmrznuti broadcast player":
+
+- `qnc-broadcast-player/**`
+- `qnc-media-ffmpeg/**`
+- `qnc-player-output/**`
+- `qnc-player-monitor/**`
+- `qnc-player-monitor-bridge/**`
+- `qnc-player-runtime/**`
+- `qnc-player-runner/**`
+- `qnc-app/src/player_remote.rs`
+- `qnc-app/src/player_bridge.rs`
+- `qnc-app/src/qnc_broadcast_player.rs`
+- `qnc-app/scripts/test-broadcast-player*.ps1`
+
+The archived old player code under `archive/orphan-broadcast-2026-08-01/**`
+is read-only reference material. Do not copy it back into active source.
+
+Allowed without unfreeze:
+
+- read-only audit
+- running tests
+- documentation that does not change code behavior
+

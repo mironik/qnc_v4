@@ -7,7 +7,8 @@ Workspace: `C:\Users\miron\Projects\qnc_v4` (native track).
 - **`qnc-app`** = native egui UI (jedini UI)
 - **`qnc-host`** = Rust API + SQLite (bez web static serve)
 - **`seed/`** = host seed JSON (templates, keyboard, tab manifeste)
-- **`web-arhive/`** = legacy web — **samo čitanje / referenca**, ne razvijati
+- Legacy web UI is not part of `qnc_v4`. Do not recreate `web-arhive/`,
+  root `app/`, or root `plugins/` as product UI.
 
 ## Zabranjeno
 
@@ -26,13 +27,13 @@ Workspace: `C:\Users\miron\Projects\qnc_v4` (native track).
 ## Arhitektura
 
 ```
-QNC/
+qnc_v4/
   qnc-app/       native UI
   qnc-host/      API
   qnc-client/    client crate
   seed/          host-owned JSON
   data/          runtime SQLite
-  web-arhive/    legacy web archive
+  archive/       read-only historical reference
 ```
 
 ## Pokretanje

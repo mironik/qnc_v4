@@ -1,7 +1,10 @@
 # QNC — usklađeni plan native migracije
 
 **Status:** prijedlog · **bez koda** · 2026-07-17  
-**Workspace (kanonski za ovaj track):** `C:\Users\miron\Projects\QNC`  
+**Legacy note:** ovaj dokument je stariji migracijski plan i nije kanonska
+istina za trenutno `qnc_v4` stanje. Kanonski runtime/player opis je u
+`docs/qnc-playback-engine.md` i root `README.md`.
+**Original workspace:** `C:\Users\miron\Projects\QNC`
 **Ulazi:** [qnc-native-rust-app-plan.md](qnc-native-rust-app-plan.md), [qnc-client-server.md](qnc-client-server.md), [qnc-playback-engine.md](qnc-playback-engine.md), [architecture-db-first.md](architecture-db-first.md)
 
 Ovaj doc **zatvara napetosti** između native UI plana, deployment profila i playback ownershipa.  
@@ -19,7 +22,7 @@ Jedan Rust desktop klijent `qnc-app` (Win / Linux / macOS) + postojeći `qnc-hos
 
 | Lokacija | Uloga |
 |----------|--------|
-| `C:\Users\miron\Projects\QNC` | **Kanonski** native migracijski track |
+| `C:\Users\miron\Projects\QNC` | Originalni native migracijski track u vrijeme pisanja |
 | `quick_news_cutter` | Stariji / paralelni tree — ne miješati commitove bez dogovora |
 | `app/`, `plugins/` u QNC | Legacy web — samo referenca toka/API dok traje migracija |
 | `qnc-av-player-wasm`, `docs/qnc-elements.md`, custom HTML tagovi | **ODBAČENO** — ne produkt, ne lab track, ne fallback |
@@ -233,7 +236,7 @@ Playback rute moraju biti na **živom** Story (ili neutralnom `/api/playback`) m
 | D5 | online_test / auth / agent = nakon local+LAN MVP |
 | D6 | Legacy web parallel samo dok native ne pokrije parity; zatim sunset |
 | D8 | WASM + web custom elements = **odbaceno** (ne koristiti) |
-| D7 | Write target native tracka = `Projects\QNC` |
+| D7 | Originalni write target native tracka = `Projects\QNC`; za trenutno stanje koristi `qnc_v4` README |
 
 ---
 

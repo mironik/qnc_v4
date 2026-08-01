@@ -2,7 +2,11 @@
 
 Status: prijedlog plana, bez implementacijskog koda.
 
-Workspace: `C:\Users\miron\Projects\QNC`
+Legacy note: ovaj dokument je stariji migracijski plan i nije kanonska istina
+za trenutno `qnc_v4` stanje. Kanonski runtime/player opis je u
+`docs/qnc-playback-engine.md` i root `README.md`.
+
+Original workspace at the time of writing: `C:\Users\miron\Projects\QNC`
 
 **Usklađena verzija (playback ownership + client-server):**  
 → [qnc-native-migration-plan.md](qnc-native-migration-plan.md) — koristi taj doc kao kanonski redoslijed kad krene implementacija.
@@ -54,7 +58,7 @@ Ključna pravila koja treba zadržati:
 ## Ciljna arhitektura
 
 ```text
-QNC/
+qnc_v4/
   qnc-host/          Rust API, SQLite, workers, ingest, proxy, waveform, story data
   qnc-app/           novi native Rust desktop klijent
     src/

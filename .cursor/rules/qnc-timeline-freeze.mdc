@@ -1,0 +1,17 @@
+# qnc_v4 timeline freeze
+
+`qnc-app/src/qnc_timeline.rs` is frozen by default.
+
+Do not edit it unless the user explicitly says "odmrznuti qnc-timeline" or
+otherwise gives direct permission to change timeline code.
+
+The timeline is a passive UI projection/control surface. It must not become the
+owner of playback truth, media decode, source timing, filmstrip generation,
+project state, workflow state, or form-specific logic.
+
+Allowed without unfreeze:
+
+- read-only audit
+- running tests
+- documentation that does not change code behavior
+

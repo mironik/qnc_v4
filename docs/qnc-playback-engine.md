@@ -1,11 +1,12 @@
 # QNC Playback Engine
 
-Status: v0.4.4, aktivni modularni broadcast player.
+Status: v0.4.5, aktivni modularni broadcast player.
 
 ## Aktivni Put
 
 ```text
 qnc-app/src/player_remote.rs
+  -> qnc-player-runtime
   -> qnc-broadcast-player
   -> qnc-media-ffmpeg
   -> qnc-player-output

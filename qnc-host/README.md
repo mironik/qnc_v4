@@ -2,7 +2,7 @@
 
 Multiplatform **API** server — Shell API v1, bez Pythona, **bez web UI**.
 
-Native UI = `qnc-app`. Legacy web = `web-arhive/` (nije mountan).
+Native UI = `qnc-app`. Legacy web UI is not part of this `qnc_v4` tree.
 
 ## Zahtjevi
 
@@ -11,7 +11,7 @@ Native UI = `qnc-app`. Legacy web = `web-arhive/` (nije mountan).
 ## Pokretanje
 
 ```powershell
-cd C:\Users\miron\Projects\QNC
+cd C:\Users\miron\Projects\qnc_v4
 .\run_host.ps1
 ```
 
