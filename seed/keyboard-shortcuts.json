@@ -1,0 +1,2640 @@
+{
+  "version": 1,
+  "active_preset": "default",
+  "actions": {
+    "play_pause": {
+      "label": "Play / Pauza"
+    },
+    "step_back_frame": {
+      "label": "Korak unazad (kadar)"
+    },
+    "step_forward_frame": {
+      "label": "Korak naprijed (kadar)"
+    },
+    "step_prev_part": {
+      "label": "Prethodni blok"
+    },
+    "step_next_part": {
+      "label": "Sljedeći blok"
+    },
+    "mark_in": {
+      "label": "Mark IN"
+    },
+    "mark_out": {
+      "label": "Mark OUT"
+    },
+    "save_virtual_shot": {
+      "label": "Spremi virtualni kadar"
+    },
+    "add_marker": {
+      "label": "Dodaj marker"
+    },
+    "add_marker_continue": {
+      "label": "Dodaj marker (nastavak)"
+    },
+    "step_prev_marker_slot": {
+      "label": "Prethodni odsječak (M–M)"
+    },
+    "step_next_marker_slot": {
+      "label": "Sljedeći odsječak (M–M)"
+    },
+    "quick_overwrite_cover": {
+      "label": "Quick B pokrivanje"
+    },
+    "overwrite_cover": {
+      "label": "Pokrivalice"
+    },
+    "delete_part": {
+      "label": "Obriši story segment"
+    },
+    "close_player": {
+      "label": "Zatvori plejer"
+    },
+    "add_off_segment": {
+      "label": "Voice over"
+    },
+    "add_ton_segment": {
+      "label": "Talking Head"
+    },
+    "record_toggle": {
+      "label": "Snimi / zaustavi OFF audio"
+    },
+    "delete_segment": {
+      "label": "Obriši OFF segment"
+    },
+    "save_off": {
+      "label": "Spremi OFF priču"
+    },
+    "step_prev_segment": {
+      "label": "Prethodni OFF segment"
+    },
+    "step_next_segment": {
+      "label": "Sljedeći OFF segment"
+    },
+    "translate_transcript": {
+      "label": "Prevedi transkript (IN–OUT ako je označen)"
+    },
+    "select_mark_in": {
+      "label": "Selektiraj IN marker"
+    },
+    "select_mark_out": {
+      "label": "Selektiraj OUT marker"
+    },
+    "select_marker": {
+      "label": "Selektiraj M marker"
+    },
+    "focus_next": {
+      "label": "Fokus naprijed"
+    },
+    "focus_prev": {
+      "label": "Fokus natrag"
+    },
+    "clear_focus": {
+      "label": "Makni fokus (playhead)"
+    },
+    "delete_marker": {
+      "label": "Obriši M marker"
+    },
+    "mark_in_fit_duration": {
+      "label": "Mark IN + OUT iz trajanja slota"
+    },
+    "focus_empty_slot": {
+      "label": "Fokus prvi prazni M–M slot (kopiraj trajanje)"
+    },
+    "undo_last": {
+      "label": "Poništi zadnju Story mutaciju"
+    },
+    "toggle_cheatsheet": {
+      "label": "Prikaži / sakrij tipkovnički pregled"
+    },
+    "toggle_source_wrap": {
+      "label": "Prebaci Source ↔ Wrap pregled"
+    }
+  },
+  "presets": {
+    "default": {
+      "name": "QNC",
+      "description": "QNC: I/O mark, T Talking Head, V Voice over",
+      "storyboard": {
+        "play_pause": [
+          {
+            "code": "Space"
+          },
+          {
+            "key": " "
+          }
+        ],
+        "step_back_frame": [
+          {
+            "key": "ArrowLeft"
+          }
+        ],
+        "step_forward_frame": [
+          {
+            "key": "ArrowRight"
+          }
+        ],
+        "step_prev_part": [
+          {
+            "key": "ArrowUp"
+          }
+        ],
+        "step_next_part": [
+          {
+            "key": "ArrowDown"
+          }
+        ],
+        "mark_in": [
+          {
+            "code": "KeyI",
+            "shift": false
+          }
+        ],
+        "mark_out": [
+          {
+            "code": "KeyO",
+            "shift": false
+          }
+        ],
+        "add_marker": [
+          {
+            "key": "m"
+          },
+          {
+            "key": "M"
+          }
+        ],
+        "overwrite_cover": [
+          {
+            "code": "KeyB",
+            "shift": true,
+            "ctrl": false
+          }
+        ],
+        "delete_part": [
+          {
+            "key": "Delete"
+          },
+          {
+            "key": "Backspace"
+          }
+        ],
+        "close_player": [
+          {
+            "key": "Escape"
+          }
+        ],
+        "add_ton_segment": [
+          {
+            "code": "KeyT",
+            "shift": true,
+            "ctrl": false
+          }
+        ],
+        "add_off_segment": [
+          {
+            "code": "KeyV",
+            "shift": true,
+            "ctrl": false
+          }
+        ],
+        "select_mark_in": [
+          {
+            "code": "KeyI",
+            "ctrl": true,
+            "shift": false
+          }
+        ],
+        "select_mark_out": [
+          {
+            "code": "KeyO",
+            "ctrl": true,
+            "shift": false
+          }
+        ],
+        "select_marker": [
+          {
+            "code": "KeyM",
+            "ctrl": true,
+            "shift": false
+          }
+        ],
+        "focus_next": [
+          {
+            "key": "Tab",
+            "shift": false
+          }
+        ],
+        "focus_prev": [
+          {
+            "key": "Tab",
+            "shift": true
+          }
+        ],
+        "clear_focus": [
+          {
+            "key": "Escape"
+          }
+        ],
+        "add_marker_continue": [
+          {
+            "code": "KeyM",
+            "shift": true,
+            "ctrl": false
+          }
+        ],
+        "delete_marker": [
+          {
+            "key": "Delete"
+          },
+          {
+            "key": "Backspace"
+          },
+          {
+            "key": "Delete",
+            "ctrl": true
+          },
+          {
+            "key": "Backspace",
+            "ctrl": true
+          }
+        ],
+        "mark_in_fit_duration": [
+          {
+            "code": "KeyI",
+            "shift": true,
+            "ctrl": false
+          }
+        ],
+        "focus_empty_slot": [
+          {
+            "code": "KeyS",
+            "shift": true,
+            "ctrl": false
+          }
+        ],
+        "step_prev_marker_slot": [
+          {
+            "key": "["
+          },
+          {
+            "code": "BracketLeft"
+          }
+        ],
+        "step_next_marker_slot": [
+          {
+            "key": "]"
+          },
+          {
+            "code": "BracketRight"
+          }
+        ],
+        "undo_last": [
+          {
+            "code": "KeyZ",
+            "ctrl": true,
+            "shift": false
+          }
+        ],
+        "toggle_cheatsheet": [
+          {
+            "key": "F1"
+          },
+          {
+            "code": "Slash",
+            "shift": true
+          }
+        ],
+        "toggle_source_wrap": [
+          {
+            "code": "KeyW",
+            "shift": true,
+            "ctrl": false
+          }
+        ]
+      },
+      "timeline_modal": {
+        "close_player": [
+          {
+            "key": "Escape"
+          }
+        ],
+        "play_pause": [
+          {
+            "code": "Space"
+          },
+          {
+            "key": " "
+          }
+        ],
+        "mark_in": [
+          {
+            "code": "KeyI",
+            "shift": false
+          }
+        ],
+        "mark_out": [
+          {
+            "code": "KeyO",
+            "shift": false
+          }
+        ],
+        "save_virtual_shot": [
+          {
+            "key": "Enter"
+          }
+        ],
+        "step_back_frame": [
+          {
+            "key": "ArrowLeft"
+          }
+        ],
+        "step_forward_frame": [
+          {
+            "key": "ArrowRight"
+          }
+        ],
+        "add_marker": [
+          {
+            "key": "m"
+          },
+          {
+            "key": "M"
+          }
+        ],
+        "overwrite_cover": [
+          {
+            "code": "KeyB",
+            "shift": true,
+            "ctrl": false
+          }
+        ],
+        "delete_marker": [
+          {
+            "key": "Delete"
+          },
+          {
+            "key": "Backspace"
+          },
+          {
+            "key": "Delete",
+            "ctrl": true
+          },
+          {
+            "key": "Backspace",
+            "ctrl": true
+          }
+        ],
+        "clear_focus": [
+          {
+            "key": "Escape"
+          }
+        ],
+        "mark_in_fit_duration": [
+          {
+            "code": "KeyI",
+            "shift": true,
+            "ctrl": false
+          }
+        ],
+        "focus_empty_slot": [
+          {
+            "code": "KeyS",
+            "shift": true,
+            "ctrl": false
+          }
+        ],
+        "step_prev_marker_slot": [
+          {
+            "key": "["
+          },
+          {
+            "code": "BracketLeft"
+          }
+        ],
+        "step_next_marker_slot": [
+          {
+            "key": "]"
+          },
+          {
+            "code": "BracketRight"
+          }
+        ],
+        "undo_last": [
+          {
+            "code": "KeyZ",
+            "ctrl": true,
+            "shift": false
+          }
+        ],
+        "toggle_cheatsheet": [
+          {
+            "key": "F1"
+          },
+          {
+            "code": "Slash",
+            "shift": true
+          }
+        ],
+        "toggle_source_wrap": [
+          {
+            "code": "KeyW",
+            "shift": true,
+            "ctrl": false
+          }
+        ]
+      },
+      "off": {
+        "play_pause": [
+          {
+            "code": "Space"
+          },
+          {
+            "key": " "
+          }
+        ],
+        "mark_in": [
+          {
+            "code": "KeyI",
+            "shift": false
+          }
+        ],
+        "mark_out": [
+          {
+            "code": "KeyO",
+            "shift": false
+          }
+        ],
+        "save_virtual_shot": [
+          {
+            "key": "Enter"
+          }
+        ],
+        "step_back_frame": [
+          {
+            "key": "ArrowLeft"
+          }
+        ],
+        "step_forward_frame": [
+          {
+            "key": "ArrowRight"
+          }
+        ],
+        "record_toggle": [
+          {
+            "key": "r"
+          },
+          {
+            "key": "R"
+          }
+        ],
+        "delete_segment": [
+          {
+            "key": "Delete"
+          },
+          {
+            "key": "Backspace"
+          }
+        ],
+        "save_off": [
+          {
+            "code": "KeyS",
+            "ctrl": true
+          }
+        ],
+        "step_prev_segment": [
+          {
+            "key": "ArrowUp"
+          }
+        ],
+        "step_next_segment": [
+          {
+            "key": "ArrowDown"
+          }
+        ],
+        "add_ton_segment": [
+          {
+            "code": "KeyT",
+            "shift": true,
+            "ctrl": false
+          }
+        ],
+        "add_off_segment": [
+          {
+            "code": "KeyV",
+            "shift": true,
+            "ctrl": false
+          }
+        ]
+      }
+    },
+    "edius": {
+      "name": "Grass Valley EDIUS",
+      "description": "EDIUS raspored: V marker, ] overwrite, Space play",
+      "storyboard": {
+        "play_pause": [
+          {
+            "code": "Space"
+          },
+          {
+            "key": " "
+          }
+        ],
+        "step_back_frame": [
+          {
+            "key": "ArrowLeft"
+          }
+        ],
+        "step_forward_frame": [
+          {
+            "key": "ArrowRight"
+          }
+        ],
+        "step_prev_part": [
+          {
+            "key": "ArrowUp"
+          }
+        ],
+        "step_next_part": [
+          {
+            "key": "ArrowDown"
+          }
+        ],
+        "mark_in": [
+          {
+            "code": "KeyI",
+            "shift": false
+          }
+        ],
+        "mark_out": [
+          {
+            "code": "KeyO",
+            "shift": false
+          }
+        ],
+        "add_marker": [
+          {
+            "key": "v"
+          },
+          {
+            "key": "V"
+          }
+        ],
+        "add_marker_continue": [
+          {
+            "code": "KeyM",
+            "shift": true,
+            "ctrl": false
+          }
+        ],
+        "overwrite_cover": [
+          {
+            "code": "KeyB",
+            "shift": true,
+            "ctrl": false
+          }
+        ],
+        "delete_part": [
+          {
+            "key": "Delete"
+          },
+          {
+            "key": "Backspace"
+          }
+        ],
+        "close_player": [
+          {
+            "key": "Escape"
+          }
+        ],
+        "add_ton_segment": [
+          {
+            "code": "KeyT",
+            "shift": true,
+            "ctrl": false
+          }
+        ],
+        "add_off_segment": [
+          {
+            "code": "KeyV",
+            "shift": true,
+            "ctrl": false
+          }
+        ],
+        "select_mark_in": [
+          {
+            "code": "KeyI",
+            "ctrl": true,
+            "shift": false
+          }
+        ],
+        "select_mark_out": [
+          {
+            "code": "KeyO",
+            "ctrl": true,
+            "shift": false
+          }
+        ],
+        "select_marker": [
+          {
+            "code": "KeyM",
+            "ctrl": true,
+            "shift": false
+          }
+        ],
+        "focus_next": [
+          {
+            "key": "Tab",
+            "shift": false
+          }
+        ],
+        "focus_prev": [
+          {
+            "key": "Tab",
+            "shift": true
+          }
+        ],
+        "clear_focus": [
+          {
+            "key": "Escape"
+          }
+        ],
+        "delete_marker": [
+          {
+            "key": "Delete"
+          },
+          {
+            "key": "Backspace"
+          },
+          {
+            "key": "Delete",
+            "ctrl": true
+          },
+          {
+            "key": "Backspace",
+            "ctrl": true
+          }
+        ],
+        "mark_in_fit_duration": [
+          {
+            "code": "KeyI",
+            "shift": true,
+            "ctrl": false
+          }
+        ],
+        "focus_empty_slot": [
+          {
+            "code": "KeyS",
+            "shift": true,
+            "ctrl": false
+          }
+        ],
+        "step_prev_marker_slot": [
+          {
+            "key": "["
+          },
+          {
+            "code": "BracketLeft"
+          }
+        ],
+        "step_next_marker_slot": [
+          {
+            "key": "]"
+          },
+          {
+            "code": "BracketRight"
+          }
+        ],
+        "undo_last": [
+          {
+            "code": "KeyZ",
+            "ctrl": true,
+            "shift": false
+          }
+        ],
+        "toggle_cheatsheet": [
+          {
+            "key": "F1"
+          },
+          {
+            "code": "Slash",
+            "shift": true
+          }
+        ],
+        "toggle_source_wrap": [
+          {
+            "code": "KeyW",
+            "shift": true,
+            "ctrl": false
+          }
+        ]
+      },
+      "timeline_modal": {
+        "close_player": [
+          {
+            "key": "Escape"
+          }
+        ],
+        "play_pause": [
+          {
+            "code": "Space"
+          },
+          {
+            "key": " "
+          }
+        ],
+        "mark_in": [
+          {
+            "code": "KeyI",
+            "shift": false
+          }
+        ],
+        "mark_out": [
+          {
+            "code": "KeyO",
+            "shift": false
+          }
+        ],
+        "save_virtual_shot": [
+          {
+            "key": "Enter"
+          }
+        ],
+        "step_back_frame": [
+          {
+            "key": "ArrowLeft"
+          }
+        ],
+        "step_forward_frame": [
+          {
+            "key": "ArrowRight"
+          }
+        ],
+        "step_prev_part": [
+          {
+            "key": "ArrowUp"
+          }
+        ],
+        "step_next_part": [
+          {
+            "key": "ArrowDown"
+          }
+        ],
+        "add_marker": [
+          {
+            "key": "v"
+          },
+          {
+            "key": "V"
+          }
+        ],
+        "add_marker_continue": [
+          {
+            "code": "KeyM",
+            "shift": true,
+            "ctrl": false
+          }
+        ],
+        "overwrite_cover": [
+          {
+            "code": "KeyB",
+            "shift": true,
+            "ctrl": false
+          }
+        ],
+        "delete_marker": [
+          {
+            "key": "Delete"
+          },
+          {
+            "key": "Backspace"
+          },
+          {
+            "key": "Delete",
+            "ctrl": true
+          },
+          {
+            "key": "Backspace",
+            "ctrl": true
+          }
+        ],
+        "clear_focus": [
+          {
+            "key": "Escape"
+          }
+        ],
+        "mark_in_fit_duration": [
+          {
+            "code": "KeyI",
+            "shift": true,
+            "ctrl": false
+          }
+        ],
+        "focus_empty_slot": [
+          {
+            "code": "KeyS",
+            "shift": true,
+            "ctrl": false
+          }
+        ],
+        "step_prev_marker_slot": [
+          {
+            "key": "["
+          },
+          {
+            "code": "BracketLeft"
+          }
+        ],
+        "step_next_marker_slot": [
+          {
+            "key": "]"
+          },
+          {
+            "code": "BracketRight"
+          }
+        ],
+        "undo_last": [
+          {
+            "code": "KeyZ",
+            "ctrl": true,
+            "shift": false
+          }
+        ],
+        "toggle_cheatsheet": [
+          {
+            "key": "F1"
+          },
+          {
+            "code": "Slash",
+            "shift": true
+          }
+        ],
+        "toggle_source_wrap": [
+          {
+            "code": "KeyW",
+            "shift": true,
+            "ctrl": false
+          }
+        ]
+      },
+      "off": {
+        "play_pause": [
+          {
+            "code": "Space"
+          },
+          {
+            "key": " "
+          }
+        ],
+        "mark_in": [
+          {
+            "code": "KeyI",
+            "shift": false
+          }
+        ],
+        "mark_out": [
+          {
+            "code": "KeyO",
+            "shift": false
+          }
+        ],
+        "save_virtual_shot": [
+          {
+            "key": "Enter"
+          }
+        ],
+        "step_back_frame": [
+          {
+            "key": "ArrowLeft"
+          }
+        ],
+        "step_forward_frame": [
+          {
+            "key": "ArrowRight"
+          }
+        ],
+        "record_toggle": [
+          {
+            "key": "r"
+          },
+          {
+            "key": "R"
+          }
+        ],
+        "delete_segment": [
+          {
+            "key": "Delete"
+          },
+          {
+            "key": "Backspace"
+          }
+        ],
+        "save_off": [
+          {
+            "code": "KeyS",
+            "ctrl": true
+          }
+        ],
+        "step_prev_segment": [
+          {
+            "key": "ArrowUp"
+          }
+        ],
+        "step_next_segment": [
+          {
+            "key": "ArrowDown"
+          }
+        ],
+        "add_ton_segment": [
+          {
+            "code": "KeyT",
+            "shift": true,
+            "ctrl": false
+          }
+        ],
+        "add_off_segment": [
+          {
+            "code": "KeyV",
+            "shift": true,
+            "ctrl": false
+          }
+        ]
+      }
+    },
+    "resolve": {
+      "name": "DaVinci Resolve",
+      "description": "M marker, I/O in-out, F10 overwrite, Space play",
+      "storyboard": {
+        "play_pause": [
+          {
+            "code": "Space"
+          },
+          {
+            "key": " "
+          }
+        ],
+        "step_back_frame": [
+          {
+            "key": "ArrowLeft"
+          }
+        ],
+        "step_forward_frame": [
+          {
+            "key": "ArrowRight"
+          }
+        ],
+        "step_prev_part": [
+          {
+            "key": "ArrowUp"
+          }
+        ],
+        "step_next_part": [
+          {
+            "key": "ArrowDown"
+          }
+        ],
+        "mark_in": [
+          {
+            "code": "KeyI",
+            "shift": false
+          }
+        ],
+        "mark_out": [
+          {
+            "code": "KeyO",
+            "shift": false
+          }
+        ],
+        "add_marker": [
+          {
+            "key": "m"
+          },
+          {
+            "key": "M"
+          }
+        ],
+        "overwrite_cover": [
+          {
+            "code": "KeyB",
+            "shift": true,
+            "ctrl": false
+          }
+        ],
+        "delete_part": [
+          {
+            "key": "Delete"
+          },
+          {
+            "key": "Backspace"
+          }
+        ],
+        "close_player": [
+          {
+            "key": "Escape"
+          }
+        ],
+        "add_ton_segment": [
+          {
+            "code": "KeyT",
+            "shift": true,
+            "ctrl": false
+          }
+        ],
+        "add_off_segment": [
+          {
+            "code": "KeyV",
+            "shift": true,
+            "ctrl": false
+          }
+        ],
+        "select_mark_in": [
+          {
+            "code": "KeyI",
+            "ctrl": true,
+            "shift": false
+          }
+        ],
+        "select_mark_out": [
+          {
+            "code": "KeyO",
+            "ctrl": true,
+            "shift": false
+          }
+        ],
+        "select_marker": [
+          {
+            "code": "KeyM",
+            "ctrl": true,
+            "shift": false
+          }
+        ],
+        "focus_next": [
+          {
+            "key": "Tab",
+            "shift": false
+          }
+        ],
+        "focus_prev": [
+          {
+            "key": "Tab",
+            "shift": true
+          }
+        ],
+        "clear_focus": [
+          {
+            "key": "Escape"
+          }
+        ],
+        "add_marker_continue": [
+          {
+            "code": "KeyM",
+            "shift": true,
+            "ctrl": false
+          }
+        ],
+        "delete_marker": [
+          {
+            "key": "Delete"
+          },
+          {
+            "key": "Backspace"
+          },
+          {
+            "key": "Delete",
+            "ctrl": true
+          },
+          {
+            "key": "Backspace",
+            "ctrl": true
+          }
+        ],
+        "mark_in_fit_duration": [
+          {
+            "code": "KeyI",
+            "shift": true,
+            "ctrl": false
+          }
+        ],
+        "focus_empty_slot": [
+          {
+            "code": "KeyS",
+            "shift": true,
+            "ctrl": false
+          }
+        ],
+        "step_prev_marker_slot": [
+          {
+            "key": "["
+          },
+          {
+            "code": "BracketLeft"
+          }
+        ],
+        "step_next_marker_slot": [
+          {
+            "key": "]"
+          },
+          {
+            "code": "BracketRight"
+          }
+        ],
+        "undo_last": [
+          {
+            "code": "KeyZ",
+            "ctrl": true,
+            "shift": false
+          }
+        ],
+        "toggle_cheatsheet": [
+          {
+            "key": "F1"
+          },
+          {
+            "code": "Slash",
+            "shift": true
+          }
+        ],
+        "toggle_source_wrap": [
+          {
+            "code": "KeyW",
+            "shift": true,
+            "ctrl": false
+          }
+        ]
+      },
+      "timeline_modal": {
+        "close_player": [
+          {
+            "key": "Escape"
+          }
+        ],
+        "play_pause": [
+          {
+            "code": "Space"
+          },
+          {
+            "key": " "
+          }
+        ],
+        "mark_in": [
+          {
+            "code": "KeyI",
+            "shift": false
+          }
+        ],
+        "mark_out": [
+          {
+            "code": "KeyO",
+            "shift": false
+          }
+        ],
+        "save_virtual_shot": [
+          {
+            "key": "Enter"
+          }
+        ],
+        "step_back_frame": [
+          {
+            "key": "ArrowLeft"
+          }
+        ],
+        "step_forward_frame": [
+          {
+            "key": "ArrowRight"
+          }
+        ],
+        "add_marker": [
+          {
+            "key": "m"
+          },
+          {
+            "key": "M"
+          }
+        ],
+        "overwrite_cover": [
+          {
+            "code": "KeyB",
+            "shift": true,
+            "ctrl": false
+          }
+        ],
+        "delete_marker": [
+          {
+            "key": "Delete"
+          },
+          {
+            "key": "Backspace"
+          },
+          {
+            "key": "Delete",
+            "ctrl": true
+          },
+          {
+            "key": "Backspace",
+            "ctrl": true
+          }
+        ],
+        "clear_focus": [
+          {
+            "key": "Escape"
+          }
+        ],
+        "mark_in_fit_duration": [
+          {
+            "code": "KeyI",
+            "shift": true,
+            "ctrl": false
+          }
+        ],
+        "focus_empty_slot": [
+          {
+            "code": "KeyS",
+            "shift": true,
+            "ctrl": false
+          }
+        ],
+        "step_prev_marker_slot": [
+          {
+            "key": "["
+          },
+          {
+            "code": "BracketLeft"
+          }
+        ],
+        "step_next_marker_slot": [
+          {
+            "key": "]"
+          },
+          {
+            "code": "BracketRight"
+          }
+        ],
+        "undo_last": [
+          {
+            "code": "KeyZ",
+            "ctrl": true,
+            "shift": false
+          }
+        ],
+        "toggle_cheatsheet": [
+          {
+            "key": "F1"
+          },
+          {
+            "code": "Slash",
+            "shift": true
+          }
+        ],
+        "toggle_source_wrap": [
+          {
+            "code": "KeyW",
+            "shift": true,
+            "ctrl": false
+          }
+        ]
+      },
+      "off": {
+        "play_pause": [
+          {
+            "code": "Space"
+          },
+          {
+            "key": " "
+          }
+        ],
+        "mark_in": [
+          {
+            "code": "KeyI",
+            "shift": false
+          }
+        ],
+        "mark_out": [
+          {
+            "code": "KeyO",
+            "shift": false
+          }
+        ],
+        "save_virtual_shot": [
+          {
+            "key": "Enter"
+          }
+        ],
+        "step_back_frame": [
+          {
+            "key": "ArrowLeft"
+          }
+        ],
+        "step_forward_frame": [
+          {
+            "key": "ArrowRight"
+          }
+        ],
+        "record_toggle": [
+          {
+            "key": "r"
+          },
+          {
+            "key": "R"
+          }
+        ],
+        "delete_segment": [
+          {
+            "key": "Delete"
+          },
+          {
+            "key": "Backspace"
+          }
+        ],
+        "save_off": [
+          {
+            "code": "KeyS",
+            "ctrl": true
+          }
+        ],
+        "step_prev_segment": [
+          {
+            "key": "ArrowUp"
+          }
+        ],
+        "step_next_segment": [
+          {
+            "key": "ArrowDown"
+          }
+        ],
+        "add_ton_segment": [
+          {
+            "code": "KeyT",
+            "shift": true,
+            "ctrl": false
+          }
+        ],
+        "add_off_segment": [
+          {
+            "code": "KeyV",
+            "shift": true,
+            "ctrl": false
+          }
+        ]
+      }
+    },
+    "premiere": {
+      "name": "Adobe Premiere Pro",
+      "description": "Premiere raspored: M marker, . overwrite, Space play",
+      "storyboard": {
+        "play_pause": [
+          {
+            "code": "Space"
+          },
+          {
+            "key": " "
+          }
+        ],
+        "step_back_frame": [
+          {
+            "key": "ArrowLeft"
+          }
+        ],
+        "step_forward_frame": [
+          {
+            "key": "ArrowRight"
+          }
+        ],
+        "step_prev_part": [
+          {
+            "key": "ArrowUp"
+          }
+        ],
+        "step_next_part": [
+          {
+            "key": "ArrowDown"
+          }
+        ],
+        "mark_in": [
+          {
+            "code": "KeyI",
+            "shift": false
+          }
+        ],
+        "mark_out": [
+          {
+            "code": "KeyO",
+            "shift": false
+          }
+        ],
+        "add_marker": [
+          {
+            "key": "m"
+          },
+          {
+            "key": "M"
+          }
+        ],
+        "overwrite_cover": [
+          {
+            "code": "KeyB",
+            "shift": true,
+            "ctrl": false
+          }
+        ],
+        "delete_part": [
+          {
+            "key": "Delete"
+          },
+          {
+            "key": "Backspace"
+          }
+        ],
+        "close_player": [
+          {
+            "key": "Escape"
+          }
+        ],
+        "add_ton_segment": [
+          {
+            "code": "KeyT",
+            "shift": true,
+            "ctrl": false
+          }
+        ],
+        "add_off_segment": [
+          {
+            "code": "KeyV",
+            "shift": true,
+            "ctrl": false
+          }
+        ],
+        "select_mark_in": [
+          {
+            "code": "KeyI",
+            "ctrl": true,
+            "shift": false
+          }
+        ],
+        "select_mark_out": [
+          {
+            "code": "KeyO",
+            "ctrl": true,
+            "shift": false
+          }
+        ],
+        "select_marker": [
+          {
+            "code": "KeyM",
+            "ctrl": true,
+            "shift": false
+          }
+        ],
+        "focus_next": [
+          {
+            "key": "Tab",
+            "shift": false
+          }
+        ],
+        "focus_prev": [
+          {
+            "key": "Tab",
+            "shift": true
+          }
+        ],
+        "clear_focus": [
+          {
+            "key": "Escape"
+          }
+        ],
+        "add_marker_continue": [
+          {
+            "code": "KeyM",
+            "shift": true,
+            "ctrl": false
+          }
+        ],
+        "delete_marker": [
+          {
+            "key": "Delete"
+          },
+          {
+            "key": "Backspace"
+          },
+          {
+            "key": "Delete",
+            "ctrl": true
+          },
+          {
+            "key": "Backspace",
+            "ctrl": true
+          }
+        ],
+        "mark_in_fit_duration": [
+          {
+            "code": "KeyI",
+            "shift": true,
+            "ctrl": false
+          }
+        ],
+        "focus_empty_slot": [
+          {
+            "code": "KeyS",
+            "shift": true,
+            "ctrl": false
+          }
+        ],
+        "step_prev_marker_slot": [
+          {
+            "key": "["
+          },
+          {
+            "code": "BracketLeft"
+          }
+        ],
+        "step_next_marker_slot": [
+          {
+            "key": "]"
+          },
+          {
+            "code": "BracketRight"
+          }
+        ],
+        "undo_last": [
+          {
+            "code": "KeyZ",
+            "ctrl": true,
+            "shift": false
+          }
+        ],
+        "toggle_cheatsheet": [
+          {
+            "key": "F1"
+          },
+          {
+            "code": "Slash",
+            "shift": true
+          }
+        ],
+        "toggle_source_wrap": [
+          {
+            "code": "KeyW",
+            "shift": true,
+            "ctrl": false
+          }
+        ]
+      },
+      "timeline_modal": {
+        "close_player": [
+          {
+            "key": "Escape"
+          }
+        ],
+        "play_pause": [
+          {
+            "code": "Space"
+          },
+          {
+            "key": " "
+          }
+        ],
+        "mark_in": [
+          {
+            "code": "KeyI",
+            "shift": false
+          }
+        ],
+        "mark_out": [
+          {
+            "code": "KeyO",
+            "shift": false
+          }
+        ],
+        "save_virtual_shot": [
+          {
+            "key": "Enter"
+          }
+        ],
+        "step_back_frame": [
+          {
+            "key": "ArrowLeft"
+          }
+        ],
+        "step_forward_frame": [
+          {
+            "key": "ArrowRight"
+          }
+        ],
+        "add_marker": [
+          {
+            "key": "m"
+          },
+          {
+            "key": "M"
+          }
+        ],
+        "overwrite_cover": [
+          {
+            "code": "KeyB",
+            "shift": true,
+            "ctrl": false
+          }
+        ],
+        "delete_marker": [
+          {
+            "key": "Delete"
+          },
+          {
+            "key": "Backspace"
+          },
+          {
+            "key": "Delete",
+            "ctrl": true
+          },
+          {
+            "key": "Backspace",
+            "ctrl": true
+          }
+        ],
+        "clear_focus": [
+          {
+            "key": "Escape"
+          }
+        ],
+        "mark_in_fit_duration": [
+          {
+            "code": "KeyI",
+            "shift": true,
+            "ctrl": false
+          }
+        ],
+        "focus_empty_slot": [
+          {
+            "code": "KeyS",
+            "shift": true,
+            "ctrl": false
+          }
+        ],
+        "step_prev_marker_slot": [
+          {
+            "key": "["
+          },
+          {
+            "code": "BracketLeft"
+          }
+        ],
+        "step_next_marker_slot": [
+          {
+            "key": "]"
+          },
+          {
+            "code": "BracketRight"
+          }
+        ],
+        "undo_last": [
+          {
+            "code": "KeyZ",
+            "ctrl": true,
+            "shift": false
+          }
+        ],
+        "toggle_cheatsheet": [
+          {
+            "key": "F1"
+          },
+          {
+            "code": "Slash",
+            "shift": true
+          }
+        ],
+        "toggle_source_wrap": [
+          {
+            "code": "KeyW",
+            "shift": true,
+            "ctrl": false
+          }
+        ]
+      },
+      "off": {
+        "play_pause": [
+          {
+            "code": "Space"
+          },
+          {
+            "key": " "
+          }
+        ],
+        "mark_in": [
+          {
+            "code": "KeyI",
+            "shift": false
+          }
+        ],
+        "mark_out": [
+          {
+            "code": "KeyO",
+            "shift": false
+          }
+        ],
+        "save_virtual_shot": [
+          {
+            "key": "Enter"
+          }
+        ],
+        "step_back_frame": [
+          {
+            "key": "ArrowLeft"
+          }
+        ],
+        "step_forward_frame": [
+          {
+            "key": "ArrowRight"
+          }
+        ],
+        "record_toggle": [
+          {
+            "key": "r"
+          },
+          {
+            "key": "R"
+          }
+        ],
+        "delete_segment": [
+          {
+            "key": "Delete"
+          },
+          {
+            "key": "Backspace"
+          }
+        ],
+        "save_off": [
+          {
+            "code": "KeyS",
+            "ctrl": true
+          }
+        ],
+        "step_prev_segment": [
+          {
+            "key": "ArrowUp"
+          }
+        ],
+        "step_next_segment": [
+          {
+            "key": "ArrowDown"
+          }
+        ],
+        "add_ton_segment": [
+          {
+            "code": "KeyT",
+            "shift": true,
+            "ctrl": false
+          }
+        ],
+        "add_off_segment": [
+          {
+            "code": "KeyV",
+            "shift": true,
+            "ctrl": false
+          }
+        ]
+      }
+    },
+    "finalcut": {
+      "name": "Final Cut Pro 11",
+      "description": "Final Cut raspored: M marker, D overwrite, Space play",
+      "storyboard": {
+        "play_pause": [
+          {
+            "code": "Space"
+          },
+          {
+            "key": " "
+          }
+        ],
+        "step_back_frame": [
+          {
+            "key": "ArrowLeft"
+          }
+        ],
+        "step_forward_frame": [
+          {
+            "key": "ArrowRight"
+          }
+        ],
+        "step_prev_part": [
+          {
+            "key": "ArrowUp"
+          }
+        ],
+        "step_next_part": [
+          {
+            "key": "ArrowDown"
+          }
+        ],
+        "mark_in": [
+          {
+            "code": "KeyI",
+            "shift": false
+          }
+        ],
+        "mark_out": [
+          {
+            "code": "KeyO",
+            "shift": false
+          }
+        ],
+        "add_marker": [
+          {
+            "key": "m"
+          },
+          {
+            "key": "M"
+          }
+        ],
+        "add_marker_continue": [
+          {
+            "code": "KeyM",
+            "shift": true,
+            "ctrl": false
+          }
+        ],
+        "overwrite_cover": [
+          {
+            "code": "KeyB",
+            "shift": true,
+            "ctrl": false
+          }
+        ],
+        "delete_part": [
+          {
+            "key": "Delete"
+          },
+          {
+            "key": "Backspace"
+          }
+        ],
+        "close_player": [
+          {
+            "key": "Escape"
+          }
+        ],
+        "add_ton_segment": [
+          {
+            "code": "KeyT",
+            "shift": true,
+            "ctrl": false
+          }
+        ],
+        "add_off_segment": [
+          {
+            "code": "KeyV",
+            "shift": true,
+            "ctrl": false
+          }
+        ],
+        "select_mark_in": [
+          {
+            "code": "KeyI",
+            "ctrl": true,
+            "shift": false
+          }
+        ],
+        "select_mark_out": [
+          {
+            "code": "KeyO",
+            "ctrl": true,
+            "shift": false
+          }
+        ],
+        "select_marker": [
+          {
+            "code": "KeyM",
+            "ctrl": true,
+            "shift": false
+          }
+        ],
+        "focus_next": [
+          {
+            "key": "Tab",
+            "shift": false
+          }
+        ],
+        "focus_prev": [
+          {
+            "key": "Tab",
+            "shift": true
+          }
+        ],
+        "clear_focus": [
+          {
+            "key": "Escape"
+          }
+        ],
+        "delete_marker": [
+          {
+            "key": "Delete"
+          },
+          {
+            "key": "Backspace"
+          },
+          {
+            "key": "Delete",
+            "ctrl": true
+          },
+          {
+            "key": "Backspace",
+            "ctrl": true
+          }
+        ],
+        "mark_in_fit_duration": [
+          {
+            "code": "KeyI",
+            "shift": true,
+            "ctrl": false
+          }
+        ],
+        "focus_empty_slot": [
+          {
+            "code": "KeyS",
+            "shift": true,
+            "ctrl": false
+          }
+        ],
+        "step_prev_marker_slot": [
+          {
+            "key": "["
+          },
+          {
+            "code": "BracketLeft"
+          }
+        ],
+        "step_next_marker_slot": [
+          {
+            "key": "]"
+          },
+          {
+            "code": "BracketRight"
+          }
+        ],
+        "undo_last": [
+          {
+            "code": "KeyZ",
+            "ctrl": true,
+            "shift": false
+          }
+        ],
+        "toggle_cheatsheet": [
+          {
+            "key": "F1"
+          },
+          {
+            "code": "Slash",
+            "shift": true
+          }
+        ],
+        "toggle_source_wrap": [
+          {
+            "code": "KeyW",
+            "shift": true,
+            "ctrl": false
+          }
+        ]
+      },
+      "timeline_modal": {
+        "close_player": [
+          {
+            "key": "Escape"
+          }
+        ],
+        "play_pause": [
+          {
+            "code": "Space"
+          },
+          {
+            "key": " "
+          }
+        ],
+        "mark_in": [
+          {
+            "code": "KeyI",
+            "shift": false
+          }
+        ],
+        "mark_out": [
+          {
+            "code": "KeyO",
+            "shift": false
+          }
+        ],
+        "save_virtual_shot": [
+          {
+            "key": "Enter"
+          }
+        ],
+        "step_back_frame": [
+          {
+            "key": "ArrowLeft"
+          }
+        ],
+        "step_forward_frame": [
+          {
+            "key": "ArrowRight"
+          }
+        ],
+        "step_prev_part": [
+          {
+            "key": "ArrowUp"
+          }
+        ],
+        "step_next_part": [
+          {
+            "key": "ArrowDown"
+          }
+        ],
+        "add_marker": [
+          {
+            "key": "m"
+          },
+          {
+            "key": "M"
+          }
+        ],
+        "add_marker_continue": [
+          {
+            "code": "KeyM",
+            "shift": true,
+            "ctrl": false
+          }
+        ],
+        "overwrite_cover": [
+          {
+            "code": "KeyB",
+            "shift": true,
+            "ctrl": false
+          }
+        ],
+        "delete_marker": [
+          {
+            "key": "Delete"
+          },
+          {
+            "key": "Backspace"
+          },
+          {
+            "key": "Delete",
+            "ctrl": true
+          },
+          {
+            "key": "Backspace",
+            "ctrl": true
+          }
+        ],
+        "clear_focus": [
+          {
+            "key": "Escape"
+          }
+        ],
+        "mark_in_fit_duration": [
+          {
+            "code": "KeyI",
+            "shift": true,
+            "ctrl": false
+          }
+        ],
+        "focus_empty_slot": [
+          {
+            "code": "KeyS",
+            "shift": true,
+            "ctrl": false
+          }
+        ],
+        "step_prev_marker_slot": [
+          {
+            "key": "["
+          },
+          {
+            "code": "BracketLeft"
+          }
+        ],
+        "step_next_marker_slot": [
+          {
+            "key": "]"
+          },
+          {
+            "code": "BracketRight"
+          }
+        ],
+        "undo_last": [
+          {
+            "code": "KeyZ",
+            "ctrl": true,
+            "shift": false
+          }
+        ],
+        "toggle_cheatsheet": [
+          {
+            "key": "F1"
+          },
+          {
+            "code": "Slash",
+            "shift": true
+          }
+        ],
+        "toggle_source_wrap": [
+          {
+            "code": "KeyW",
+            "shift": true,
+            "ctrl": false
+          }
+        ]
+      },
+      "off": {
+        "play_pause": [
+          {
+            "code": "Space"
+          },
+          {
+            "key": " "
+          }
+        ],
+        "mark_in": [
+          {
+            "code": "KeyI",
+            "shift": false
+          }
+        ],
+        "mark_out": [
+          {
+            "code": "KeyO",
+            "shift": false
+          }
+        ],
+        "save_virtual_shot": [
+          {
+            "key": "Enter"
+          }
+        ],
+        "step_back_frame": [
+          {
+            "key": "ArrowLeft"
+          }
+        ],
+        "step_forward_frame": [
+          {
+            "key": "ArrowRight"
+          }
+        ],
+        "record_toggle": [
+          {
+            "key": "r"
+          },
+          {
+            "key": "R"
+          }
+        ],
+        "delete_segment": [
+          {
+            "key": "Delete"
+          },
+          {
+            "key": "Backspace"
+          }
+        ],
+        "save_off": [
+          {
+            "code": "KeyS",
+            "ctrl": true
+          }
+        ],
+        "step_prev_segment": [
+          {
+            "key": "ArrowUp"
+          }
+        ],
+        "step_next_segment": [
+          {
+            "key": "ArrowDown"
+          }
+        ],
+        "add_ton_segment": [
+          {
+            "code": "KeyT",
+            "shift": true,
+            "ctrl": false
+          }
+        ],
+        "add_off_segment": [
+          {
+            "code": "KeyV",
+            "shift": true,
+            "ctrl": false
+          }
+        ]
+      }
+    },
+    "avid": {
+      "name": "Avid Media Composer",
+      "description": "Avid raspored: ' marker, B overwrite, Space play",
+      "storyboard": {
+        "play_pause": [
+          {
+            "code": "Space"
+          },
+          {
+            "key": " "
+          }
+        ],
+        "step_back_frame": [
+          {
+            "key": "ArrowLeft"
+          }
+        ],
+        "step_forward_frame": [
+          {
+            "key": "ArrowRight"
+          }
+        ],
+        "step_prev_part": [
+          {
+            "key": "ArrowUp"
+          }
+        ],
+        "step_next_part": [
+          {
+            "key": "ArrowDown"
+          }
+        ],
+        "mark_in": [
+          {
+            "code": "KeyI",
+            "shift": false
+          }
+        ],
+        "mark_out": [
+          {
+            "code": "KeyO",
+            "shift": false
+          }
+        ],
+        "add_marker": [
+          {
+            "key": "'"
+          }
+        ],
+        "add_marker_continue": [
+          {
+            "code": "KeyM",
+            "shift": true,
+            "ctrl": false
+          }
+        ],
+        "overwrite_cover": [
+          {
+            "code": "KeyB",
+            "shift": true,
+            "ctrl": false
+          }
+        ],
+        "delete_part": [
+          {
+            "key": "Delete"
+          },
+          {
+            "key": "Backspace"
+          }
+        ],
+        "close_player": [
+          {
+            "key": "Escape"
+          }
+        ],
+        "add_ton_segment": [
+          {
+            "code": "KeyT",
+            "shift": true,
+            "ctrl": false
+          }
+        ],
+        "add_off_segment": [
+          {
+            "code": "KeyV",
+            "shift": true,
+            "ctrl": false
+          }
+        ],
+        "select_mark_in": [
+          {
+            "code": "KeyI",
+            "ctrl": true,
+            "shift": false
+          }
+        ],
+        "select_mark_out": [
+          {
+            "code": "KeyO",
+            "ctrl": true,
+            "shift": false
+          }
+        ],
+        "select_marker": [
+          {
+            "code": "KeyM",
+            "ctrl": true,
+            "shift": false
+          }
+        ],
+        "focus_next": [
+          {
+            "key": "Tab",
+            "shift": false
+          }
+        ],
+        "focus_prev": [
+          {
+            "key": "Tab",
+            "shift": true
+          }
+        ],
+        "clear_focus": [
+          {
+            "key": "Escape"
+          }
+        ],
+        "delete_marker": [
+          {
+            "key": "Delete"
+          },
+          {
+            "key": "Backspace"
+          },
+          {
+            "key": "Delete",
+            "ctrl": true
+          },
+          {
+            "key": "Backspace",
+            "ctrl": true
+          }
+        ],
+        "mark_in_fit_duration": [
+          {
+            "code": "KeyI",
+            "shift": true,
+            "ctrl": false
+          }
+        ],
+        "focus_empty_slot": [
+          {
+            "code": "KeyS",
+            "shift": true,
+            "ctrl": false
+          }
+        ],
+        "step_prev_marker_slot": [
+          {
+            "key": "["
+          },
+          {
+            "code": "BracketLeft"
+          }
+        ],
+        "step_next_marker_slot": [
+          {
+            "key": "]"
+          },
+          {
+            "code": "BracketRight"
+          }
+        ],
+        "undo_last": [
+          {
+            "code": "KeyZ",
+            "ctrl": true,
+            "shift": false
+          }
+        ],
+        "toggle_cheatsheet": [
+          {
+            "key": "F1"
+          },
+          {
+            "code": "Slash",
+            "shift": true
+          }
+        ],
+        "toggle_source_wrap": [
+          {
+            "code": "KeyW",
+            "shift": true,
+            "ctrl": false
+          }
+        ]
+      },
+      "timeline_modal": {
+        "close_player": [
+          {
+            "key": "Escape"
+          }
+        ],
+        "play_pause": [
+          {
+            "code": "Space"
+          },
+          {
+            "key": " "
+          }
+        ],
+        "mark_in": [
+          {
+            "code": "KeyI",
+            "shift": false
+          }
+        ],
+        "mark_out": [
+          {
+            "code": "KeyO",
+            "shift": false
+          }
+        ],
+        "save_virtual_shot": [
+          {
+            "key": "Enter"
+          }
+        ],
+        "step_back_frame": [
+          {
+            "key": "ArrowLeft"
+          }
+        ],
+        "step_forward_frame": [
+          {
+            "key": "ArrowRight"
+          }
+        ],
+        "add_marker": [
+          {
+            "key": "'"
+          }
+        ],
+        "overwrite_cover": [
+          {
+            "code": "KeyB",
+            "shift": true,
+            "ctrl": false
+          }
+        ],
+        "delete_marker": [
+          {
+            "key": "Delete"
+          },
+          {
+            "key": "Backspace"
+          },
+          {
+            "key": "Delete",
+            "ctrl": true
+          },
+          {
+            "key": "Backspace",
+            "ctrl": true
+          }
+        ],
+        "clear_focus": [
+          {
+            "key": "Escape"
+          }
+        ],
+        "mark_in_fit_duration": [
+          {
+            "code": "KeyI",
+            "shift": true,
+            "ctrl": false
+          }
+        ],
+        "focus_empty_slot": [
+          {
+            "code": "KeyS",
+            "shift": true,
+            "ctrl": false
+          }
+        ],
+        "step_prev_marker_slot": [
+          {
+            "key": "["
+          },
+          {
+            "code": "BracketLeft"
+          }
+        ],
+        "step_next_marker_slot": [
+          {
+            "key": "]"
+          },
+          {
+            "code": "BracketRight"
+          }
+        ],
+        "undo_last": [
+          {
+            "code": "KeyZ",
+            "ctrl": true,
+            "shift": false
+          }
+        ],
+        "toggle_cheatsheet": [
+          {
+            "key": "F1"
+          },
+          {
+            "code": "Slash",
+            "shift": true
+          }
+        ],
+        "toggle_source_wrap": [
+          {
+            "code": "KeyW",
+            "shift": true,
+            "ctrl": false
+          }
+        ]
+      },
+      "off": {
+        "play_pause": [
+          {
+            "code": "Space"
+          },
+          {
+            "key": " "
+          }
+        ],
+        "mark_in": [
+          {
+            "code": "KeyI",
+            "shift": false
+          }
+        ],
+        "mark_out": [
+          {
+            "code": "KeyO",
+            "shift": false
+          }
+        ],
+        "save_virtual_shot": [
+          {
+            "key": "Enter"
+          }
+        ],
+        "step_back_frame": [
+          {
+            "key": "ArrowLeft"
+          }
+        ],
+        "step_forward_frame": [
+          {
+            "key": "ArrowRight"
+          }
+        ],
+        "record_toggle": [
+          {
+            "key": "r"
+          },
+          {
+            "key": "R"
+          }
+        ],
+        "delete_segment": [
+          {
+            "key": "Delete"
+          },
+          {
+            "key": "Backspace"
+          }
+        ],
+        "save_off": [
+          {
+            "code": "KeyS",
+            "ctrl": true
+          }
+        ],
+        "step_prev_segment": [
+          {
+            "key": "ArrowUp"
+          }
+        ],
+        "step_next_segment": [
+          {
+            "key": "ArrowDown"
+          }
+        ],
+        "add_ton_segment": [
+          {
+            "code": "KeyT",
+            "shift": true,
+            "ctrl": false
+          }
+        ],
+        "add_off_segment": [
+          {
+            "code": "KeyV",
+            "shift": true,
+            "ctrl": false
+          }
+        ]
+      }
+    }
+  }
+}

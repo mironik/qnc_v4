@@ -1,0 +1,192 @@
+{
+  "plugin_id": "story",
+  "tab_id": "storyboard",
+  "label": "Story",
+  "priority": 200,
+  "position": "normal",
+  "asset_version": 142,
+  "panel_id": "panel-storyboard",
+  "api_namespace": "/api/story",
+  "storage": "story",
+  "enabled": true,
+  "system": true,
+  "removable": false,
+  "description": "Story form — native qnc-app owns UI; playback via broadcast player.",
+  "sdk_version": 1,
+  "state": {
+    "snapshots": [
+      {
+        "key": "story.state",
+        "method": "GET",
+        "path": "/api/story/state",
+        "query": [
+          "project_id"
+        ]
+      }
+    ],
+    "invalidates_on": [
+      "project:changed"
+    ]
+  },
+  "consumes": {
+    "shell_events": [
+      "project:changed",
+      "keyboard-shortcuts:changed"
+    ]
+  },
+  "backend": {
+    "implementation": "rust",
+    "host_module": "qnc-host/src/story",
+    "store": {
+      "scope": "project",
+      "persistence": "project_db"
+    },
+    "actions": [
+      {
+        "action": "story.part.create",
+        "method": "POST",
+        "path": "/api/story/part/create",
+        "writes": [
+          "story.state"
+        ]
+      },
+      {
+        "action": "story.part.update",
+        "method": "POST",
+        "path": "/api/story/part/update",
+        "writes": [
+          "story.state"
+        ]
+      },
+      {
+        "action": "story.part.delete",
+        "method": "POST",
+        "path": "/api/story/part/delete",
+        "writes": [
+          "story.state"
+        ]
+      },
+      {
+        "action": "story.part.reorder",
+        "method": "POST",
+        "path": "/api/story/part/reorder",
+        "writes": [
+          "story.state"
+        ]
+      },
+      {
+        "action": "story.part.select",
+        "method": "POST",
+        "path": "/api/story/part/select",
+        "writes": [
+          "story.state"
+        ]
+      },
+      {
+        "action": "story.part.mark_in",
+        "method": "POST",
+        "path": "/api/story/part/mark_in",
+        "writes": [
+          "story.state"
+        ]
+      },
+      {
+        "action": "story.part.mark_out",
+        "method": "POST",
+        "path": "/api/story/part/mark_out",
+        "writes": [
+          "story.state"
+        ]
+      },
+      {
+        "action": "story.shot.select",
+        "method": "POST",
+        "path": "/api/story/shot/select",
+        "writes": [
+          "story.state"
+        ]
+      },
+      {
+        "action": "story.marker.create",
+        "method": "POST",
+        "path": "/api/story/marker/create",
+        "writes": [
+          "story.state"
+        ]
+      },
+      {
+        "action": "story.marker.delete",
+        "method": "POST",
+        "path": "/api/story/marker/delete",
+        "writes": [
+          "story.state"
+        ]
+      },
+      {
+        "action": "story.marker.move",
+        "method": "POST",
+        "path": "/api/story/marker/move",
+        "writes": [
+          "story.state"
+        ]
+      },
+      {
+        "action": "story.marker.update",
+        "method": "POST",
+        "path": "/api/story/marker/update",
+        "writes": [
+          "story.state"
+        ]
+      },
+      {
+        "action": "story.marker_slot.select",
+        "method": "POST",
+        "path": "/api/story/marker_slot/select",
+        "writes": [
+          "story.state"
+        ]
+      },
+      {
+        "action": "story.cover.create",
+        "method": "POST",
+        "path": "/api/story/cover/create",
+        "writes": [
+          "story.state"
+        ]
+      },
+      {
+        "action": "story.cover.update",
+        "method": "POST",
+        "path": "/api/story/cover/update",
+        "writes": [
+          "story.state"
+        ]
+      },
+      {
+        "action": "story.cover.delete",
+        "method": "POST",
+        "path": "/api/story/cover/delete",
+        "writes": [
+          "story.state"
+        ]
+      },
+      {
+        "action": "story.cover.select",
+        "method": "POST",
+        "path": "/api/story/cover/select",
+        "writes": [
+          "story.state"
+        ]
+      },
+      {
+        "action": "story.commit",
+        "method": "POST",
+        "path": "/api/story/commit",
+        "writes": [
+          "story.state"
+        ]
+      }
+    ],
+    "jobs": []
+  }
+}

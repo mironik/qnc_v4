@@ -1,0 +1,17 @@
+[package]
+name = "qnc-player-runner"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[features]
+default = []
+audio-device = ["qnc-player-output/audio-device"]
+
+[dependencies]
+qnc-broadcast-player = { path = "../qnc-broadcast-player" }
+qnc-media-ffmpeg = { path = "../qnc-media-ffmpeg" }
+qnc-player-monitor-bridge = { path = "../qnc-player-monitor-bridge" }
+qnc-player-output = { path = "../qnc-player-output" }
+qnc-player-runtime = { path = "../qnc-player-runtime" }
+serde_json = "1"

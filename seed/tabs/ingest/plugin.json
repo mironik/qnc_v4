@@ -1,0 +1,83 @@
+{
+  "plugin_id": "ingest",
+  "tab_id": "ingest",
+  "label": "Ingest",
+  "priority": 100,
+  "position": "normal",
+  "asset_version": 40,
+  "panel_id": "panel-ingest",
+  "api_namespace": "/api/ingest",
+  "storage": "ingest",
+  "enabled": true,
+  "system": true,
+  "removable": false,
+  "description": "Ingest tab — Rust host API; native qnc-app owns UI.",
+  "sdk_version": 1,
+  "state": {
+    "snapshots": [
+      {
+        "key": "ingest.state",
+        "method": "GET",
+        "path": "/api/ingest/state",
+        "query": ["project_id"]
+      }
+    ],
+    "invalidates_on": ["project:changed"]
+  },
+  "consumes": {
+    "shell_events": ["project:changed"]
+  },
+  "backend": {
+    "implementation": "rust",
+    "host_module": "qnc-host/src/ingest",
+    "store": {
+      "scope": "project",
+      "path": "ingest"
+    },
+    "actions": [
+      {
+        "action": "ingest.discover",
+        "method": "POST",
+        "path": "/api/ingest/discover",
+        "writes": ["ingest.clips"]
+      },
+      {
+        "action": "ingest.import",
+        "method": "POST",
+        "path": "/api/ingest/import",
+        "writes": ["ingest.import"]
+      },
+      {
+        "action": "source.change",
+        "method": "POST",
+        "path": "/api/ingest/source",
+        "writes": ["ingest.source"]
+      },
+      {
+        "action": "clip.toggle",
+        "method": "POST",
+        "path": "/api/ingest/selection/toggle",
+        "writes": ["ingest.selection"]
+      },
+      {
+        "action": "ingest.select-all",
+        "method": "POST",
+        "path": "/api/ingest/selection/select-all",
+        "writes": ["ingest.selection"]
+      },
+      {
+        "action": "ingest.browse",
+        "method": "POST",
+        "path": "/api/ingest/browse",
+        "writes": ["ingest.browse_path"]
+      },
+      {
+        "action": "ingest.archive-original",
+        "method": "POST",
+        "path": "/api/ingest/options",
+        "writes": ["ingest.options"]
+      }
+    ],
+    "jobs": []
+  }
+}

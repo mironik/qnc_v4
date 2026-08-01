@@ -1,0 +1,65 @@
+# Rust build artifacts (OVO JE GLAVNI PROBLEM)
+/target
+**/target/
+debug/
+release/
+
+# Compiled binaries
+*.exe
+*.dll
+*.so
+*.dylib
+*.pdb
+
+# Local AI runtimes and model weights
+/tools/whisper/
+/models/*.bin
+
+# Node.js (ako koristiš)
+node_modules/
+npm-debug.log
+yarn-error.log
+
+# IDE i editori
+.vscode/
+.idea/
+.cursor/
+*.swp
+*.swo
+*~
+
+# OS datoteke
+.DS_Store
+Thumbs.db
+
+# Logovi
+*.log
+build-check.log
+.run/
+
+# Cache direktoriji
+__pycache__/
+.pytest_cache/
+
+# Runtime SQLite (developer machine only)
+data/*.db
+data/*.db-*
+data/*.db.*
+data/backups/
+data/hardware_profile.json
+data/_proxy_bench/
+
+# Alternate cargo target dir (local check builds)
+**/target-check/
+
+# Local DB dumps / scratch
+_dbdump/
+
+# Broadcast player backups (local restore points)
+qnc-app/_backup_broadcast_*/
+
+# Migration leftovers
+*.migrated
+
+# QNC-timeline backups (local restore points)
+qnc-app/_backup_qnc_timeline_*/

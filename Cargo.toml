@@ -1,0 +1,14 @@
+[workspace]
+resolver = "2"
+members = [
+    "qnc-host",
+    "qnc-client",
+    "qnc-app",
+    "qnc-broadcast-player",
+    "qnc-media-ffmpeg",
+    "qnc-player-runtime",
+    "qnc-player-output",
+    "qnc-player-monitor",
+    "qnc-player-monitor-bridge",
+    "qnc-player-runner",
+]

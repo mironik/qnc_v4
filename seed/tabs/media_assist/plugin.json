@@ -1,0 +1,40 @@
+{
+  "plugin_id": "media_assist",
+  "tab_id": "media_assist",
+  "label": "Media Assist",
+  "priority": 210,
+  "position": "normal",
+  "asset_version": 1,
+  "panel_id": "panel-media-assist",
+  "api_namespace": "/api/story",
+  "storage": "story",
+  "enabled": true,
+  "system": true,
+  "removable": true,
+  "description": "Media Assist — Story form for AI/ASR/virtual prep (optional after Ingest). Native qnc-app owns UI; shares /api/story.",
+  "sdk_version": 1,
+  "state": {
+    "snapshots": [
+      {
+        "key": "story.state",
+        "method": "GET",
+        "path": "/api/story/state",
+        "query": ["project_id"]
+      }
+    ],
+    "invalidates_on": ["project:changed"]
+  },
+  "consumes": {
+    "shell_events": ["project:changed", "keyboard-shortcuts:changed"]
+  },
+  "backend": {
+    "implementation": "rust",
+    "host_module": "qnc-host/src/story",
+    "store": {
+      "scope": "project",
+      "persistence": "project_db"
+    },
+    "actions": [],
+    "jobs": []
+  }
+}

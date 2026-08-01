@@ -1,0 +1,90 @@
+{
+  "plugin_id": "project",
+  "tab_id": "project",
+  "label": "Project",
+  "priority": -1000,
+  "position": "first",
+  "asset_version": 57,
+  "panel_id": "panel-project",
+  "keep_alive": true,
+  "api_namespace": "/api/projects",
+  "storage": "project",
+  "enabled": true,
+  "system": true,
+  "removable": false,
+  "description": "Project tab — list, templates, workspace; native qnc-app owns UI.",
+  "sdk_version": 1,
+  "state": {
+    "snapshots": [
+      {
+        "key": "project.index",
+        "method": "GET",
+        "path": "/api/projects"
+      },
+      {
+        "key": "project.templates",
+        "method": "GET",
+        "path": "/api/project-templates"
+      },
+      {
+        "key": "project.modules",
+        "method": "GET",
+        "path": "/api/modules",
+        "pick": "modules"
+      },
+      {
+        "key": "project.ui",
+        "method": "GET",
+        "path": "/api/projects/ui-state",
+        "pick": "ui_state"
+      }
+    ]
+  },
+  "backend": {
+    "implementation": "rust",
+    "host_module": "qnc-host/src/project",
+    "store": {
+      "scope": "project",
+      "path": "project"
+    },
+    "actions": [
+      {
+        "action": "project.ui.patch",
+        "method": "POST",
+        "path": "/api/projects/ui-state",
+        "writes": ["project.ui"]
+      },
+      {
+        "action": "project.create",
+        "method": "POST",
+        "path": "/api/projects/from-template",
+        "writes": ["project.index", "project.ui"]
+      },
+      {
+        "action": "project.open",
+        "method": "POST",
+        "path": "/api/projects/open",
+        "writes": ["project.index"]
+      },
+      {
+        "action": "project.delete",
+        "method": "POST",
+        "path": "/api/projects/delete",
+        "writes": ["project.index", "project.ui"]
+      },
+      {
+        "action": "template.save-custom",
+        "method": "POST",
+        "path": "/api/project-templates",
+        "writes": ["project.templates", "project.ui"]
+      },
+      {
+        "action": "template.delete",
+        "method": "POST",
+        "path": "/api/project-templates/delete",
+        "writes": ["project.templates", "project.ui"]
+      }
+    ],
+    "jobs": []
+  }
+}

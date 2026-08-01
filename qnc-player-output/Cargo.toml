@@ -1,0 +1,14 @@
+[package]
+name = "qnc-player-output"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[features]
+default = []
+audio-device = ["dep:rodio"]
+
+[dependencies]
+qnc-broadcast-player = { path = "../qnc-broadcast-player" }
+qnc-media-ffmpeg = { path = "../qnc-media-ffmpeg" }
+rodio = { version = "0.22.2", default-features = false, features = ["playback"], optional = true }

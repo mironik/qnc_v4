@@ -1,0 +1,26 @@
+[package]
+name = "qnc-host"
+version = "0.4.0"
+edition = "2021"
+description = "QNC multiplatform shell host (Shell API v1)"
+
+[[bin]]
+name = "qnc-host"
+path = "src/main.rs"
+
+[dependencies]
+axum = "0.8"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "fs", "sync"] }
+tokio-stream = "0.1"
+tower-http = { version = "0.6", features = ["fs", "set-header", "trace"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rusqlite = { version = "0.32", features = ["bundled"] }
+uuid = { version = "1", features = ["v4"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+hostname = "0.4"
+cpal = "0.15"
+
+[target.'cfg(not(windows))'.dependencies]
+rfd = "0.15"

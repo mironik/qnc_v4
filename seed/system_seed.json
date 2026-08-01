@@ -1,0 +1,317 @@
+{
+  "source_templates": [
+    {
+      "source_template_id": "src_card_fx6_private",
+      "name": "Card reader incoming",
+      "description": "Kartica se čita/kopira u lokalni QNC incoming folder na serveru.",
+      "source_kind": "card_reader",
+      "config": {
+        "source_id": "local_incoming",
+        "incoming_folder": "incoming/card",
+        "proxy_policy": "generate_if_missing"
+      }
+    },
+    {
+      "source_template_id": "src_camera_ftp",
+      "name": "Kamera / FTP incoming",
+      "description": "Kamera salje proxy i original u lokalni incoming folder.",
+      "source_kind": "ftp",
+      "config": {
+        "source_id": "camera_ftp",
+        "incoming_folder": "incoming/ftp",
+        "proxy_policy": "generate_if_missing",
+        "expects": ["proxy", "original"]
+      }
+    },
+    {
+      "source_template_id": "src_local_incoming",
+      "name": "Lokalni incoming folder",
+      "description": "Materijal je već kopiran na server u incoming folder.",
+      "source_kind": "local",
+      "config": {
+        "source_id": "local_incoming",
+        "incoming_folder": "incoming",
+        "proxy_policy": "generate_if_missing"
+      }
+    },
+    {
+      "source_template_id": "src_house_nas",
+      "name": "Kućni NAS / ingest",
+      "description": "XDCAM 50 422 MXF na NAS-u — samo referenca, bez kopiranja u projekt.",
+      "source_kind": "house_ingest",
+      "config": {
+        "source_id": "house_nas",
+        "incoming_folder": "",
+        "proxy_policy": "use_house_media",
+        "expects": ["xdcam_mxf"]
+      }
+    }
+  ],
+  "project_templates": [
+    {
+      "template_id": "tpl_ingest_field",
+      "name": "Teren — Sony XAVC",
+      "description": "Terenski ingest: Sony proxy (S03) ako postoji, inače original u projekt/proxy.",
+      "source_template_ids": [
+        "src_card_fx6_private",
+        "src_camera_ftp",
+        "src_local_incoming"
+      ],
+      "settings": {
+        "workflow": "field_ingest",
+        "input": {
+          "mode": "auto"
+        },
+        "video": {
+          "format": "HD 1080p50",
+          "width": 1920,
+          "height": 1080,
+          "fps": 50,
+          "field_order": "progressive",
+          "color_space": "rec709",
+          "timeline_codec": "proxy_h264"
+        },
+        "storage": {
+          "projects_root": "",
+          "ingest_profile": "field",
+          "proxy_policy": "generate_if_missing",
+          "original_policy": "link_when_available"
+        },
+        "export": {
+          "directory": "",
+          "default_mode": "original",
+          "preset": "h264_1080p50",
+          "format": "HD 1080p50",
+          "fps": 50,
+          "width": 1920,
+          "height": 1080,
+          "field_order": "progressive",
+          "color_space": "rec709",
+          "container": "mp4",
+          "video_codec": "h264",
+          "audio_sample_rate": 48000,
+          "audio_channels": 2,
+          "custom_presets": [],
+          "xml_enabled": true
+        },
+        "audio": {
+          "sample_rate": 48000,
+          "channels": 2,
+          "transcribe_channel": "CH1",
+          "atmosphere_channel": "CH2"
+        },
+        "ai": {
+          "enabled": false,
+          "coverage_suggestions": false
+        },
+        "keyboard_shortcuts": {
+          "active_preset": "default"
+        },
+        "workspace": {
+          "tabs": ["project", "ingest", "media_assist", "storyboard"],
+          "tab_labels": {
+            "ingest": "Ingest",
+            "media_assist": "Media Assist",
+            "storyboard": "Story"
+          }
+        }
+      }
+    },
+    {
+      "template_id": "tpl_ingest_house",
+      "name": "TV kuća — XDCAM 50",
+      "description": "Kućni mezzanine (XDCAM HD 422 50 Mb/s) — referenca na NAS, bez re-transcodea.",
+      "source_template_ids": ["src_house_nas", "src_local_incoming"],
+      "settings": {
+        "workflow": "house_ingest",
+        "input": {
+          "mode": "auto"
+        },
+        "video": {
+          "format": "HD 1080i50",
+          "width": 1920,
+          "height": 1080,
+          "fps": 25,
+          "field_order": "upper_first",
+          "color_space": "rec709",
+          "timeline_codec": "xdcam_hd_422"
+        },
+        "storage": {
+          "projects_root": "",
+          "ingest_profile": "house",
+          "proxy_policy": "use_house_media",
+          "original_policy": "link_when_available"
+        },
+        "export": {
+          "directory": "",
+          "default_mode": "xdcam",
+          "preset": "xdcam_hd422_50i",
+          "format": "HD 1080i50",
+          "fps": 25,
+          "width": 1920,
+          "height": 1080,
+          "field_order": "upper_first",
+          "color_space": "rec709",
+          "container": "mxf_op1a",
+          "video_codec": "mpeg2_422_50mbit",
+          "audio_sample_rate": 48000,
+          "audio_channels": 2,
+          "custom_presets": [],
+          "xml_enabled": true
+        },
+        "audio": {
+          "sample_rate": 48000,
+          "channels": 2,
+          "transcribe_channel": "CH1",
+          "atmosphere_channel": "CH2"
+        },
+        "ai": {
+          "enabled": false,
+          "coverage_suggestions": true
+        },
+        "keyboard_shortcuts": {
+          "active_preset": "resolve"
+        },
+        "workspace": {
+          "tabs": ["project", "ingest", "media_assist", "storyboard"],
+          "tab_labels": {
+            "ingest": "Ingest",
+            "media_assist": "Media Assist",
+            "storyboard": "Story"
+          }
+        }
+      }
+    },
+    {
+      "template_id": "tpl_breaking_news",
+      "name": "Breaking news",
+      "description": "Najbrzi start: proxy ingest.",
+      "source_template_ids": ["src_card_fx6_private", "src_camera_ftp"],
+      "settings": {
+        "workflow": "news_fast",
+        "input": {
+          "mode": "auto"
+        },
+        "video": {
+          "format": "HD 1080p50",
+          "width": 1920,
+          "height": 1080,
+          "fps": 50,
+          "field_order": "progressive",
+          "color_space": "rec709",
+          "timeline_codec": "proxy_h264"
+        },
+        "storage": {
+          "projects_root": "",
+          "ingest_profile": "field",
+          "proxy_policy": "copy_to_project",
+          "original_policy": "link_when_available"
+        },
+        "export": {
+          "directory": "",
+          "default_mode": "original",
+          "preset": "h264_1080p50",
+          "format": "HD 1080p50",
+          "fps": 50,
+          "width": 1920,
+          "height": 1080,
+          "field_order": "progressive",
+          "color_space": "rec709",
+          "container": "mp4",
+          "video_codec": "h264",
+          "audio_sample_rate": 48000,
+          "audio_channels": 2,
+          "custom_presets": [],
+          "xml_enabled": true
+        },
+        "audio": {
+          "sample_rate": 48000,
+          "channels": 2,
+          "transcribe_channel": "CH1",
+          "atmosphere_channel": "CH2"
+        },
+        "ai": {
+          "enabled": false,
+          "coverage_suggestions": true
+        },
+        "keyboard_shortcuts": {
+          "active_preset": "default"
+        },
+        "workspace": {
+          "tabs": ["project", "ingest", "media_assist", "storyboard"],
+          "tab_labels": {
+            "ingest": "Ingest",
+            "media_assist": "Media Assist",
+            "storyboard": "Story"
+          }
+        }
+      }
+    },
+    {
+      "template_id": "tpl_news_package",
+      "name": "News package",
+      "description": "Uravnotezen workflow: ingest.",
+      "source_template_ids": ["src_card_fx6_private", "src_local_incoming"],
+      "settings": {
+        "workflow": "news_package",
+        "input": {
+          "mode": "auto"
+        },
+        "video": {
+          "format": "HD 1080i50",
+          "width": 1920,
+          "height": 1080,
+          "fps": 25,
+          "field_order": "upper_first",
+          "color_space": "rec709",
+          "timeline_codec": "xdcam_hd_422"
+        },
+        "storage": {
+          "projects_root": "",
+          "ingest_profile": "field",
+          "proxy_policy": "copy_to_project",
+          "original_policy": "link_when_available"
+        },
+        "export": {
+          "directory": "",
+          "default_mode": "xml_master",
+          "preset": "xdcam_hd422_50i",
+          "format": "HD 1080i50",
+          "fps": 25,
+          "width": 1920,
+          "height": 1080,
+          "field_order": "upper_first",
+          "color_space": "rec709",
+          "container": "mxf_op1a",
+          "video_codec": "mpeg2_422_50mbit",
+          "audio_sample_rate": 48000,
+          "audio_channels": 2,
+          "custom_presets": [],
+          "xml_enabled": true
+        },
+        "audio": {
+          "sample_rate": 48000,
+          "channels": 2,
+          "transcribe_channel": "CH1",
+          "atmosphere_channel": "CH2"
+        },
+        "ai": {
+          "enabled": false,
+          "coverage_suggestions": true
+        },
+        "keyboard_shortcuts": {
+          "active_preset": "resolve"
+        },
+        "workspace": {
+          "tabs": ["project", "ingest", "media_assist", "storyboard"],
+          "tab_labels": {
+            "ingest": "Ingest",
+            "media_assist": "Media Assist",
+            "storyboard": "Story"
+          }
+        }
+      }
+    }
+  ]
+}
+

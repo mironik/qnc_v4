@@ -1,0 +1,8 @@
+[package]
+name = "qnc-media-ffmpeg"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+qnc-broadcast-player = { path = "../qnc-broadcast-player" }

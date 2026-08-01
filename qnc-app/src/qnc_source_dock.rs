@@ -1,0 +1,248 @@
+//! Universal source dock — Story/Ingest chrome around standalone `QncTimeline`.
+
+use eframe::egui::{self, RichText};
+
+use crate::qnc_filmstrip_background::FilmFrame;
+use crate::qnc_theme::{self, MUTED, TEXT};
+use crate::qnc_timeline::{ExpandedAudio, LayerFlags, QncTimeline, TimelineFocusPaint};
+
+pub struct SourceDockInput<'a> {
+    pub clip_label: &'a str,
+    pub source_in: f64,
+    pub source_out: f64,
+    pub clip_duration: f64,
+    pub playhead_sec: f64,
+    pub focus: TimelineFocusPaint,
+    pub a1_peaks: &'a [f32],
+    pub a2_peaks: &'a [f32],
+    pub frames: &'a [FilmFrame],
+    pub tc: &'a dyn Fn(f64) -> String,
+    /// Clip name + IN/OUT row above the timeline (Story + Ingest — full-width chrome).
+    pub show_header: bool,
+    /// Story edit buttons (virtual / parts).
+    pub show_story_actions: bool,
+    /// Ingest import / selection actions in the same full-width header as Story.
+    pub show_ingest_actions: bool,
+    pub archive_original: bool,
+    pub ai_mining: bool,
+    pub import_enabled: bool,
+    /// e.g. "8 uvezeno · 10/81" — shown in ingest header (right side).
+    pub ingest_status: &'a str,
+    /// Which A1/A2 lane is expanded (web kodak toggle).
+    pub expanded_audio: ExpandedAudio,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum SourceDockAction {
+    None,
+    Seek(f64),
+    /// Toggle expand for A1 or A2 (same lane collapses).
+    ToggleAudioExpand(ExpandedAudio),
+    SaveVirtualShot,
+    CreatePart(&'static str),
+    ImportSelected,
+    SelectAll,
+    ClearSelection,
+    Reload,
+    SetArchive(bool),
+    SetAiMining(bool),
+}
+
+/// Horizontal inset shared by workspace columns and the bottom timeline dock.
+pub const SHELL_MARGIN_X: i8 = 8;
+
+/// Owner layer mask for source dock (presets later — not a second timeline type).
+fn source_layers() -> LayerFlags {
+    LayerFlags {
+        carrier: true,
+        audio_a1: true,
+        audio_a2: true,
+        audio_a3: false,
+        audio_a4: false,
+        base_video: false,
+        covers: false,
+        markers: false,
+        marker_slots: false,
+        in_out: true,
+        playhead: true,
+    }
+}
+
+/// Exact dock height so timeline fits fully; upper CentralPanel flex-shrinks.
+pub fn dock_height(expanded_audio: ExpandedAudio, show_header: bool) -> f32 {
+    let track = QncTimeline {
+        layers: source_layers(),
+        duration_sec: 1.0,
+        playhead_sec: 0.0,
+        source_in: 0.0,
+        source_out: 1.0,
+        video_background: None,
+        focus: TimelineFocusPaint::Playhead,
+        expanded_audio,
+        a1_peaks: &[],
+        a2_peaks: &[],
+        a3_peaks: &[],
+        a4_peaks: &[],
+        covers: &[],
+        marker_slots: &[],
+        markers: &[],
+        base_video_blank: false,
+    }
+    .content_height()
+        + 2.0; // Frame stroke outside content
+    if show_header {
+        track + qnc_theme::CHROME_ROW_H
+    } else {
+        track
+    }
+}
+
+pub fn show(ui: &mut egui::Ui, input: SourceDockInput<'_>) -> SourceDockAction {
+    let mut action = SourceDockAction::None;
+    let mut archive = input.archive_original;
+    let mut ai_mining = input.ai_mining;
+    let tl_colors = qnc_theme::current(ui).timeline();
+
+    egui::Frame::NONE
+        .fill(tl_colors.bg)
+        .inner_margin(egui::Margin {
+            left: SHELL_MARGIN_X,
+            right: SHELL_MARGIN_X,
+            top: 0,
+            bottom: 0,
+        })
+        .show(ui, |ui| {
+            ui.spacing_mut().item_spacing.y = 0.0;
+            if input.show_header {
+                qnc_theme::chrome_row(ui, true, |ui| {
+                    ui.label(
+                        RichText::new(input.clip_label)
+                            .color(TEXT)
+                            .strong()
+                            .size(qnc_theme::FONT_UI),
+                    );
+                    ui.add_space(10.0);
+                    timecode_label(
+                        ui,
+                        "IN",
+                        (input.tc)(input.source_in),
+                        input.focus == TimelineFocusPaint::In,
+                    );
+                    timecode_label(
+                        ui,
+                        "OUT",
+                        (input.tc)(input.source_out),
+                        input.focus == TimelineFocusPaint::Out,
+                    );
+                    timecode_label(
+                        ui,
+                        "Trajanje",
+                        (input.tc)((input.source_out - input.source_in).max(0.0)),
+                        false,
+                    );
+                    if input.show_story_actions {
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if qnc_theme::action_btn(ui, "Pokrivalice").clicked() {
+                                action = SourceDockAction::CreatePart("tonovi");
+                            }
+                            if qnc_theme::action_btn(ui, "Voice over").clicked() {
+                                action = SourceDockAction::CreatePart("offovi");
+                            }
+                            if qnc_theme::action_btn(ui, "Talking Head").clicked() {
+                                action = SourceDockAction::CreatePart("offovi");
+                            }
+                            if qnc_theme::action_btn(ui, "Spremi virtualni kadar").clicked() {
+                                action = SourceDockAction::SaveVirtualShot;
+                            }
+                        });
+                    } else if input.show_ingest_actions {
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.spacing_mut().item_spacing.x = 8.0;
+                            if !input.ingest_status.is_empty() {
+                                ui.label(
+                                    RichText::new(input.ingest_status)
+                                        .size(qnc_theme::FONT_UI)
+                                        .color(MUTED),
+                                );
+                            }
+                            if qnc_theme::action_btn(ui, "Osvježi").clicked() {
+                                action = SourceDockAction::Reload;
+                            }
+                            let uvezi = ui.add_enabled_ui(input.import_enabled, |ui| {
+                                qnc_theme::primary_btn(ui, "Uvezi")
+                            });
+                            if uvezi.inner.clicked() {
+                                action = SourceDockAction::ImportSelected;
+                            }
+                            if qnc_theme::action_btn(ui, "Odaberi sve").clicked() {
+                                action = SourceDockAction::SelectAll;
+                            }
+                            if qnc_theme::action_btn(ui, "Očisti").clicked() {
+                                action = SourceDockAction::ClearSelection;
+                            }
+                            if ui
+                                .checkbox(
+                                    &mut archive,
+                                    RichText::new("Kopiraj original").size(qnc_theme::FONT_UI),
+                                )
+                                .changed()
+                            {
+                                action = SourceDockAction::SetArchive(archive);
+                            }
+                            if ui
+                                .checkbox(
+                                    &mut ai_mining,
+                                    RichText::new("AI mining").size(qnc_theme::FONT_UI),
+                                )
+                                .changed()
+                            {
+                                action = SourceDockAction::SetAiMining(ai_mining);
+                            }
+                        });
+                    }
+                });
+            }
+
+            let filmstrip_background = |ui: &mut egui::Ui, rect: egui::Rect| {
+                crate::qnc_filmstrip_background::paint(ui, rect, input.frames);
+            };
+            let video_background = if input.frames.is_empty() {
+                None
+            } else {
+                Some(&filmstrip_background as &dyn Fn(&mut egui::Ui, egui::Rect))
+            };
+
+            let interact = QncTimeline {
+                layers: source_layers(),
+                duration_sec: input.clip_duration,
+                playhead_sec: input.playhead_sec,
+                source_in: input.source_in,
+                source_out: input.source_out,
+                video_background,
+                focus: input.focus,
+                expanded_audio: input.expanded_audio,
+                a1_peaks: input.a1_peaks,
+                a2_peaks: input.a2_peaks,
+                a3_peaks: &[],
+                a4_peaks: &[],
+                covers: &[],
+                marker_slots: &[],
+                markers: &[],
+                base_video_blank: false,
+            }
+            .show(ui);
+            if matches!(action, SourceDockAction::None) {
+                if let Some(lane) = interact.expand_click {
+                    action = SourceDockAction::ToggleAudioExpand(lane);
+                } else if let Some(sec) = interact.seek_sec {
+                    action = SourceDockAction::Seek(sec);
+                }
+            }
+        });
+
+    action
+}
+
+fn timecode_label(ui: &mut egui::Ui, label: &str, value: String, focused: bool) {
+    qnc_theme::timecode_label(ui, label, &value, focused);
+}

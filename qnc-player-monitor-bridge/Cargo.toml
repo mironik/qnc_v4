@@ -1,0 +1,9 @@
+[package]
+name = "qnc-player-monitor-bridge"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+qnc-broadcast-player = { path = "../qnc-broadcast-player" }
+qnc-player-monitor = { path = "../qnc-player-monitor" }

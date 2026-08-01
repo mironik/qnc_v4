@@ -1,0 +1,138 @@
+//! Timeline focus: same ←/→ command; focus chooses the target.
+
+use crate::api::TimelineModel;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FocusTarget {
+    Playhead,
+    In,
+    Out,
+    Marker { id: String },
+    Slot { id: String },
+}
+
+impl FocusTarget {
+    pub fn label(&self) -> String {
+        match self {
+            FocusTarget::Playhead => "playhead".into(),
+            FocusTarget::In => "IN".into(),
+            FocusTarget::Out => "OUT".into(),
+            FocusTarget::Marker { id } => format!("M:{id}"),
+            FocusTarget::Slot { id } => format!("slot:{id}"),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct TimelineFocus {
+    pub target: FocusTarget,
+}
+
+impl Default for TimelineFocus {
+    fn default() -> Self {
+        Self {
+            target: FocusTarget::Playhead,
+        }
+    }
+}
+
+impl TimelineFocus {
+    pub fn clear(&mut self) {
+        self.target = FocusTarget::Playhead;
+    }
+
+    pub fn is_playhead(&self) -> bool {
+        matches!(self.target, FocusTarget::Playhead)
+    }
+
+    pub fn select_in(&mut self) {
+        self.target = FocusTarget::In;
+    }
+
+    pub fn select_out(&mut self) {
+        self.target = FocusTarget::Out;
+    }
+
+    pub fn select_marker(&mut self, id: impl Into<String>) {
+        self.target = FocusTarget::Marker { id: id.into() };
+    }
+
+    pub fn select_slot(&mut self, id: impl Into<String>) {
+        self.target = FocusTarget::Slot { id: id.into() };
+    }
+
+    pub fn focus_next(&mut self, chain: &[FocusTarget]) {
+        if chain.is_empty() {
+            self.clear();
+            return;
+        }
+        let idx = chain.iter().position(|t| t == &self.target);
+        let next = match idx {
+            Some(i) => (i + 1) % chain.len(),
+            None => 0,
+        };
+        self.target = chain[next].clone();
+    }
+
+    pub fn focus_prev(&mut self, chain: &[FocusTarget]) {
+        if chain.is_empty() {
+            self.clear();
+            return;
+        }
+        let idx = chain.iter().position(|t| t == &self.target);
+        let prev = match idx {
+            Some(0) | None => chain.len() - 1,
+            Some(i) => i - 1,
+        };
+        self.target = chain[prev].clone();
+    }
+}
+
+/// 1 frame in seconds — broadcast unit for seek/nudge.
+pub fn frame_sec(fps: f64) -> f64 {
+    let fps = if fps.is_finite() && fps > 1.0 {
+        fps
+    } else {
+        25.0
+    };
+    1.0 / fps
+}
+
+pub fn fps_from_timeline(model: Option<&TimelineModel>) -> f64 {
+    model
+        .map(|m| m.timeline_fps)
+        .filter(|f| f.is_finite() && *f > 1.0)
+        .unwrap_or(25.0)
+}
+
+/// Build Tab cycle: playhead → IN → OUT → markers → slots.
+pub fn focus_chain(
+    has_in: bool,
+    has_out: bool,
+    marker_ids: impl IntoIterator<Item = String>,
+    slot_ids: impl IntoIterator<Item = String>,
+) -> Vec<FocusTarget> {
+    let mut chain = vec![FocusTarget::Playhead];
+    if has_in {
+        chain.push(FocusTarget::In);
+    }
+    if has_out {
+        chain.push(FocusTarget::Out);
+    }
+    for id in marker_ids {
+        if !id.is_empty() {
+            chain.push(FocusTarget::Marker { id });
+        }
+    }
+    for id in slot_ids {
+        if !id.is_empty() {
+            chain.push(FocusTarget::Slot { id });
+        }
+    }
+    chain
+}
+
+/// Always include IN/OUT in chain for source editing (even before first mark).
+pub fn source_focus_chain(marker_ids: impl IntoIterator<Item = String>) -> Vec<FocusTarget> {
+    focus_chain(true, true, marker_ids, std::iter::empty())
+}
