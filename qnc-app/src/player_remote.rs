@@ -17,10 +17,11 @@ use qnc_media_ffmpeg::{
     FfmpegToolchain, FfmpegVideoDecode, FfmpegVideoPayload,
 };
 use qnc_player_core::{
-    map_broadcast_player_protocol_event, AudioFormat, BroadcastEngineError, BroadcastEvent,
-    BroadcastPlayerProtocolEvent, ClockTick, ColorSpace, DecodedVideoFrame, FieldMode,
-    FrameNumber as CoreFrameNumber, FramePresenter, FrameRange as CoreFrameRange, SourceRuntime,
-    Timebase as CoreTimebase, TransportEngine, TransportStatus, VideoFormat,
+    AudioFormat, BroadcastEngineError, BroadcastEvent, BroadcastPlaybackRequest,
+    BroadcastPlayerProtocolCommand, BroadcastPlayerProtocolEvent, ClockTick, ColorSpace,
+    DecodedVideoFrame, FieldMode, FrameNumber as CoreFrameNumber, FramePresenter,
+    FrameRange as CoreFrameRange, SourceRuntime, Timebase as CoreTimebase, TransportEngine,
+    TransportStatus, VideoFormat,
 };
 use qnc_player_monitor::MonitorPixelLayout;
 use qnc_player_monitor_bridge::{
@@ -31,6 +32,7 @@ use qnc_player_output::{
     AudioOutputWithSink, AudioPacketTelemetry, AvSyncAudioPacketSink, AvSyncFramePresenter,
     AvSyncTelemetry, FfmpegAudioSink, FfmpegFramePresenter, OutputFrameTelemetry,
 };
+use qnc_player_runtime::{BroadcastPlayerRuntime, PlayerRuntimeCommand};
 use serde_json::Value;
 
 use crate::player_contract::{BroadcastHostSourceRef, BroadcastSourceKind, FrameNumber};
@@ -46,6 +48,8 @@ type PlayerMonitorPresenter = MonitorFramePresenter<PlayerVideoPresenter, Player
 
 type PlayerTransport =
     TransportEngine<FfmpegSourceOpen, FfmpegVideoDecode, PlayerAudioOutput, PlayerFramePresenter>;
+
+type PlayerRuntime = BroadcastPlayerRuntime<PlayerTransport>;
 
 /// UI open payload - media identity for the modular player runtime.
 #[derive(Debug, Clone)]
@@ -168,7 +172,7 @@ impl MonitorFrameMapper<FfmpegVideoPayload> for PlayerMonitorFrameMapper {
 }
 
 struct PlayerRuntimeSession {
-    transport: PlayerTransport,
+    runtime: PlayerRuntime,
     monitor: SharedPlayerMonitor,
     event_bridge: MonitorEventBridge,
     source: SourceRuntime,
@@ -350,35 +354,29 @@ impl PlayerRemote {
         }
 
         let now = self.now_tick();
-        let events = match self.runtime.as_mut() {
-            Some(runtime) if self.playing => runtime.transport.tick(now),
-            _ => Ok(Vec::new()),
-        };
-        match events {
-            Ok(events) => out.extend(self.apply_core_events(events)),
-            Err(error) => out.extend(self.apply_core_error(error)),
+        if let Some(runtime) = self.runtime.as_mut() {
+            if self.playing {
+                runtime.runtime.tick(now);
+            }
         }
+        out.extend(self.drain_runtime_events());
 
         if self.playing {
             ctx.request_repaint();
         }
+
         out
     }
 
     pub fn stop(&mut self) {
         self.pending_still = None;
-        if let Some(runtime) = self.runtime.as_mut() {
-            let events = runtime.transport.stop();
-            match events {
-                Ok(events) => {
-                    let applied = self.apply_core_events(events);
-                    self.pending_events.extend(applied);
-                }
-                Err(error) => {
-                    let applied = self.apply_core_error(error);
-                    self.pending_events.extend(applied);
-                }
-            }
+        if self.runtime.is_some() {
+            let events = self.dispatch_runtime_command(
+                "app-stop",
+                BroadcastPlayerProtocolCommand::Stop,
+                self.now_tick(),
+            );
+            self.pending_events.extend(events);
         }
         self.runtime = None;
         self.identity = None;
@@ -405,26 +403,51 @@ impl PlayerRemote {
         self.status = "Open".into();
 
         match build_runtime_session(&request, &self.decode_policy) {
-            Ok(mut session) => {
+            Ok(session) => {
                 let start_frame =
                     frame_at_seconds(request.start_source_sec, session.source.timebase);
                 let start_frame = clamp_core_frame(start_frame, session.range);
-                match session
-                    .transport
-                    .sync_range_runtime(Some(session.range), start_frame, true)
-                {
-                    Ok(events) => {
+                let startup_warnings = session.startup_warnings.clone();
+                let playback_request = playback_request_from_source(
+                    format!("app-open-{}", session.source.source_id),
+                    session.source.clone(),
+                    session.range,
+                    start_frame,
+                );
+                match playback_request {
+                    Ok(playback_request) => {
                         self.runtime = Some(session);
                         self.identity = Some(identity_from_request(&request));
                         self.last_request = Some(request);
                         self.active = true;
                         self.set_display_core_frame(start_frame);
-                        self.queue_core_events(events);
+                        let mut events = self.dispatch_runtime_command(
+                            "app-set-playback-request",
+                            BroadcastPlayerProtocolCommand::SetPlaybackRequest {
+                                request: Box::new(playback_request),
+                            },
+                            self.now_tick(),
+                        );
+                        events.extend(
+                            self.apply_protocol_events(
+                                startup_warnings
+                                    .into_iter()
+                                    .map(|message| BroadcastPlayerProtocolEvent::DecodeWarning {
+                                        message,
+                                    })
+                                    .collect(),
+                            ),
+                        );
+                        self.pending_events.extend(events);
                     }
-                    Err(error) => {
-                        self.runtime = Some(session);
-                        self.last_request = Some(request);
-                        self.queue_core_error(error);
+                    Err(err) => {
+                        self.runtime = None;
+                        self.identity = None;
+                        self.last_request = None;
+                        self.playing = false;
+                        self.active = false;
+                        self.status = err.clone();
+                        self.pending_error = Some(err);
                     }
                 }
             }
@@ -452,31 +475,29 @@ impl PlayerRemote {
             self.open(request, ctx);
         }
         let now = self.now_tick();
-        match self.runtime.as_mut() {
-            Some(runtime) => match runtime.transport.play(now) {
-                Ok(events) => {
-                    self.playing = true;
-                    self.active = true;
-                    self.status = "Playing".into();
-                    self.queue_core_events(events);
-                    ctx.request_repaint();
-                }
-                Err(error) => self.queue_core_error(error),
-            },
-            None => {
-                self.status = "Source nije otvoren".into();
-                self.pending_error = Some(self.status.clone());
-            }
+        if self.runtime.is_some() {
+            let events = self.dispatch_runtime_command(
+                "app-play",
+                BroadcastPlayerProtocolCommand::Play,
+                now,
+            );
+            self.pending_events.extend(events);
+            ctx.request_repaint();
+        } else {
+            self.status = "Source nije otvoren".into();
+            self.pending_error = Some(self.status.clone());
         }
     }
 
     fn pause(&mut self) {
         self.pending_still = None;
-        if let Some(runtime) = self.runtime.as_mut() {
-            match runtime.transport.pause() {
-                Ok(events) => self.queue_core_events(events),
-                Err(error) => self.queue_core_error(error),
-            }
+        if self.runtime.is_some() {
+            let events = self.dispatch_runtime_command(
+                "app-pause",
+                BroadcastPlayerProtocolCommand::Pause,
+                self.now_tick(),
+            );
+            self.pending_events.extend(events);
         }
         self.playing = false;
         self.status = "Paused".into();
@@ -520,43 +541,56 @@ impl PlayerRemote {
             return;
         }
         self.last_still_frame = Some(frame);
-        let Some(runtime) = self.runtime.as_mut() else {
+        if self.runtime.is_none() {
             self.status = "Nema source za seek".into();
             self.pending_error = Some(self.status.clone());
             return;
         };
-        match runtime
-            .transport
-            .sync_range_runtime(Some(runtime.range), frame, true)
-        {
-            Ok(events) => {
-                self.playing = false;
-                self.active = true;
-                self.status = "Ready".into();
-                self.set_display_core_frame(frame);
-                self.queue_core_events(events);
-                ctx.request_repaint();
-            }
-            Err(error) => self.queue_core_error(error),
+
+        let events = self.dispatch_runtime_command(
+            "app-cue-frame",
+            BroadcastPlayerProtocolCommand::CueFrame {
+                frame,
+                present_frame: true,
+            },
+            self.now_tick(),
+        );
+        self.playing = false;
+        self.active = true;
+        self.status = "Ready".into();
+        self.set_display_core_frame(frame);
+        self.pending_events.extend(events);
+        ctx.request_repaint();
+    }
+
+    fn dispatch_runtime_command(
+        &mut self,
+        command_id: impl Into<String>,
+        command: BroadcastPlayerProtocolCommand,
+        now_tick: ClockTick,
+    ) -> Vec<PlayerEvent> {
+        if let Some(runtime) = self.runtime.as_mut() {
+            runtime
+                .runtime
+                .dispatch_at(PlayerRuntimeCommand::new(command_id, command), now_tick);
         }
+        self.drain_runtime_events()
     }
 
-    fn queue_core_events(&mut self, events: Vec<BroadcastEvent>) {
-        let applied = self.apply_core_events(events);
-        self.pending_events.extend(applied);
+    fn drain_runtime_events(&mut self) -> Vec<PlayerEvent> {
+        let protocol_events = self
+            .runtime
+            .as_mut()
+            .map(|runtime| runtime.runtime.drain_events())
+            .unwrap_or_default();
+        self.apply_protocol_events(protocol_events)
     }
 
-    fn queue_core_error(&mut self, error: BroadcastEngineError) {
-        let applied = self.apply_core_error(error);
-        self.pending_events.extend(applied);
-    }
-
-    fn apply_core_events(&mut self, events: Vec<BroadcastEvent>) -> Vec<PlayerEvent> {
+    fn apply_protocol_events(
+        &mut self,
+        protocol_events: Vec<BroadcastPlayerProtocolEvent>,
+    ) -> Vec<PlayerEvent> {
         let mut out = Vec::new();
-        let protocol_events = events
-            .iter()
-            .filter_map(|event| map_broadcast_player_protocol_event(event).ok())
-            .collect::<Vec<_>>();
 
         if let Some(runtime) = self.runtime.as_mut() {
             let _ = runtime.event_bridge.apply_events(&protocol_events);
@@ -605,12 +639,6 @@ impl PlayerRemote {
 
         out.extend(self.take_monitor_frame_event());
         out
-    }
-
-    fn apply_core_error(&mut self, error: BroadcastEngineError) -> Vec<PlayerEvent> {
-        self.playing = false;
-        self.status = error.to_string();
-        vec![PlayerEvent::Error(self.status.clone())]
     }
 
     fn take_monitor_frame_event(&mut self) -> Vec<PlayerEvent> {
@@ -748,8 +776,8 @@ fn build_runtime_session(
     )
     .with_max_catchup_frames(MAX_CATCHUP_FRAMES);
 
-    let mut session = PlayerRuntimeSession {
-        transport,
+    let session = PlayerRuntimeSession {
+        runtime: BroadcastPlayerRuntime::new(transport),
         monitor,
         event_bridge,
         source: source.clone(),
@@ -758,21 +786,6 @@ fn build_runtime_session(
         last_frame_revision: 0,
     };
 
-    let mut events = session
-        .transport
-        .set_active_source(&source, None)
-        .map_err(|error| error.to_string())?;
-    for warning in session.startup_warnings.clone() {
-        events.push(BroadcastEvent::DecodeWarning { message: warning });
-    }
-    let protocol_events = events
-        .iter()
-        .filter_map(|event| map_broadcast_player_protocol_event(event).ok())
-        .collect::<Vec<_>>();
-    session
-        .event_bridge
-        .apply_events(&protocol_events)
-        .map_err(|error| error.to_string())?;
     Ok(session)
 }
 
@@ -897,6 +910,17 @@ fn range_from_request(
     CoreFrameRange::new(start, end)
 }
 
+fn playback_request_from_source(
+    request_id: impl Into<String>,
+    source: SourceRuntime,
+    range: CoreFrameRange,
+    initial_frame: CoreFrameNumber,
+) -> Result<BroadcastPlaybackRequest, String> {
+    BroadcastPlaybackRequest::new(request_id, source)?
+        .with_range(range)?
+        .with_initial_frame(initial_frame)
+}
+
 fn identity_from_request(request: &BroadcastPlayerOpenRequest) -> LoadedSourceIdentity {
     LoadedSourceIdentity {
         project_id: request.source_ref.project_id.clone(),
@@ -1004,6 +1028,17 @@ mod tests {
             core_timebase_from_fps(59.94).unwrap(),
             CoreTimebase::new(60_000, 1_001).unwrap()
         );
+    }
+
+    #[test]
+    fn app_adapter_builds_runtime_playback_request_with_initial_frame() {
+        let source = SourceRuntime::new("src", 100, CoreTimebase::new(25, 1).unwrap()).unwrap();
+        let range = CoreFrameRange::new(10, 20).unwrap();
+
+        let request = playback_request_from_source("request-1", source, range, 14).unwrap();
+
+        assert_eq!(request.execution_range, range);
+        assert_eq!(request.initial_frame, 14);
     }
 
     #[test]

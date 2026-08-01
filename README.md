@@ -1,4 +1,4 @@
-# QNC — native (v0.4.4)
+# QNC — native (v0.4.5)
 
 Aktivna radna kopija: **`qnc-app` + `qnc-host`**. Web UI je u `web-arhive/` (nije produkt).
 
@@ -39,6 +39,12 @@ LAN: `QNC_BIND_HOST=0.0.0.0` zahtijeva `QNC_TRUSTED_LAN=1`. Internet bez auth/pr
 | `project`, `ingest`, `story` | produkt API |
 | `media_pool` (Rust) | shared helperi za Ingest/Story |
 | design-tools HTTP | API only (nema web UI) |
+
+## v0.4.5 — runtime protocol path
+
+- `qnc-app` player remote now goes through `qnc-player-runtime`, the same runtime/protocol path used by `qnc-player-runner`.
+- `BroadcastPlaybackRequest` carries `initial_frame`, so opening a bounded source can cue the requested frame without app-side transport calls.
+- `CueFrame` is a neutral protocol command for frame-position cueing and still-frame presentation.
 
 ## v0.4.4 — broadcast player truth
 

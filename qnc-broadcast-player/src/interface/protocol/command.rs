@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 use super::BroadcastPlaybackRequest;
-use crate::model::SourceRuntime;
+use crate::model::{FrameNumber, SourceRuntime};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum BroadcastPlayerProtocolCommand {
@@ -18,6 +18,10 @@ pub enum BroadcastPlayerProtocolCommand {
     SetPlaybackRequest {
         request: Box<BroadcastPlaybackRequest>,
     },
+    CueFrame {
+        frame: FrameNumber,
+        present_frame: bool,
+    },
 
     Play,
     Pause,
@@ -32,6 +36,7 @@ impl BroadcastPlayerProtocolCommand {
             BroadcastPlayerProtocolCommand::SetActiveSource { .. } => "SetActiveSource",
             BroadcastPlayerProtocolCommand::UnloadSource => "UnloadSource",
             BroadcastPlayerProtocolCommand::SetPlaybackRequest { .. } => "SetPlaybackRequest",
+            BroadcastPlayerProtocolCommand::CueFrame { .. } => "CueFrame",
             BroadcastPlayerProtocolCommand::Play => "Play",
             BroadcastPlayerProtocolCommand::Pause => "Pause",
             BroadcastPlayerProtocolCommand::Stop => "Stop",
@@ -48,6 +53,7 @@ impl BroadcastPlayerProtocolCommand {
                 reject_blank("source_id", source_id)
             }
             BroadcastPlayerProtocolCommand::SetPlaybackRequest { request } => request.validate(),
+            BroadcastPlayerProtocolCommand::CueFrame { .. } => Ok(()),
             BroadcastPlayerProtocolCommand::UnloadSource
             | BroadcastPlayerProtocolCommand::Play
             | BroadcastPlayerProtocolCommand::Pause

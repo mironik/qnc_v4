@@ -31,7 +31,8 @@ pub fn broadcast_player_contract() -> Value {
                 "PreloadSource",
                 "SetActiveSource",
                 "UnloadSource",
-                "SetPlaybackRequest"
+                "SetPlaybackRequest",
+                "CueFrame"
             ],
             "transport": [
                 "Play",
@@ -45,6 +46,7 @@ pub fn broadcast_player_contract() -> Value {
             "source_runtime_snapshot",
             "start_frame",
             "end_frame",
+            "initial_frame",
             "execution_range",
             "rate",
             "audio_monitor_state"
@@ -106,6 +108,7 @@ pub fn broadcast_player_contract() -> Value {
             "bounded_playback_uses_execution_boundary",
             "followup_after_execution_boundary_is_external_resolution",
             "protocol_accepts_only_av_executor_commands",
+            "cue_frame_is_transport_position_only",
             "goto_and_edit_navigation_are_external_control_commands",
             "protocol_maps_boundary_without_edit_semantics",
             "execution_range_is_request_boundary",
@@ -155,6 +158,7 @@ pub fn assert_broadcast_player_contract(contract: &Value) -> Result<(), String> 
         "SetActiveSource",
         "UnloadSource",
         "SetPlaybackRequest",
+        "CueFrame",
         "Play",
         "Pause",
         "Stop",
@@ -359,6 +363,7 @@ mod tests {
                 "SetActiveSource",
                 "UnloadSource",
                 "SetPlaybackRequest",
+                "CueFrame",
                 "Play",
                 "Pause",
                 "Stop",

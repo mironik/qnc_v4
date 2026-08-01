@@ -106,7 +106,7 @@ where
                     .set_active_source(&request.source_runtime, None)?;
                 events.extend(self.transport.sync_range_runtime(
                     Some(request.execution_range),
-                    request.execution_range.start_frame,
+                    request.initial_frame,
                     true,
                 )?);
                 events.extend(
@@ -117,6 +117,14 @@ where
                     audio_runtime: request.audio_runtime.clone(),
                 });
                 Ok(events)
+            }
+            BroadcastPlayerProtocolCommand::CueFrame {
+                frame,
+                present_frame,
+            } => {
+                let active_range = self.transport.state().active_range;
+                self.transport
+                    .sync_range_runtime(active_range, *frame, *present_frame)
             }
             BroadcastPlayerProtocolCommand::Play => self.transport.play(now_tick),
             BroadcastPlayerProtocolCommand::Pause => self.transport.pause(),
@@ -271,6 +279,53 @@ mod tests {
                 .source_id,
             "src-b"
         );
+    }
+
+    #[test]
+    fn runtime_cues_frame_from_protocol_command() {
+        let mut runtime = fake_runtime();
+        let request =
+            qnc_broadcast_player::BroadcastPlaybackRequest::new("request-1", source_runtime("src"))
+                .unwrap()
+                .with_range(FrameRange::new(10, 15).unwrap())
+                .unwrap();
+        runtime.dispatch_at(
+            PlayerRuntimeCommand::new(
+                "cmd-request",
+                BroadcastPlayerProtocolCommand::SetPlaybackRequest {
+                    request: Box::new(request),
+                },
+            ),
+            0,
+        );
+        let _ = runtime.drain_events();
+
+        runtime.dispatch_at(
+            PlayerRuntimeCommand::new(
+                "cmd-cue",
+                BroadcastPlayerProtocolCommand::CueFrame {
+                    frame: 13,
+                    present_frame: true,
+                },
+            ),
+            0,
+        );
+
+        let events = runtime.drain_events();
+        assert!(events.iter().any(|event| matches!(
+            event,
+            BroadcastPlayerProtocolEvent::CommandAccepted { command_name, .. }
+                if command_name == "CueFrame"
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            BroadcastPlayerProtocolEvent::CarrierPositionChanged { frame: 13, .. }
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            BroadcastPlayerProtocolEvent::FramePresented { frame: 13 }
+        )));
+        assert_eq!(runtime.transport().state().carrier_frame, 13);
     }
 
     #[test]

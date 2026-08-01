@@ -1,12 +1,13 @@
 use serde::{Deserialize, Serialize};
 
-use crate::model::{AudioRuntime, FrameRange, SourceRuntime};
+use crate::model::{AudioRuntime, FrameNumber, FrameRange, SourceRuntime};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BroadcastPlaybackRequest {
     pub request_id: String,
     pub source_runtime: SourceRuntime,
     pub execution_range: FrameRange,
+    pub initial_frame: FrameNumber,
     pub rate_num: i32,
     pub rate_den: u32,
     pub audio_runtime: AudioRuntime,
@@ -21,6 +22,7 @@ impl BroadcastPlaybackRequest {
         let request = Self {
             request_id: request_id.into(),
             source_runtime,
+            initial_frame: execution_range.start_frame,
             execution_range,
             rate_num: 1,
             rate_den: 1,
@@ -32,6 +34,13 @@ impl BroadcastPlaybackRequest {
 
     pub fn with_range(mut self, execution_range: FrameRange) -> Result<Self, String> {
         self.execution_range = execution_range;
+        self.initial_frame = execution_range.start_frame;
+        self.validate()?;
+        Ok(self)
+    }
+
+    pub fn with_initial_frame(mut self, initial_frame: FrameNumber) -> Result<Self, String> {
+        self.initial_frame = initial_frame;
         self.validate()?;
         Ok(self)
     }
@@ -66,6 +75,14 @@ impl BroadcastPlaybackRequest {
             return Err(format!(
                 "execution range end {} is outside source duration {}",
                 self.execution_range.end_frame, self.source_runtime.duration_frames
+            ));
+        }
+        if !self.execution_range.contains_position(self.initial_frame) {
+            return Err(format!(
+                "initial frame {} is outside execution range {}..{}",
+                self.initial_frame,
+                self.execution_range.start_frame,
+                self.execution_range.end_frame
             ));
         }
         Ok(())

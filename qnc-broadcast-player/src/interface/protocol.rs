@@ -27,6 +27,10 @@ mod tests {
                     .unwrap(),
                 ),
             },
+            BroadcastPlayerProtocolCommand::CueFrame {
+                frame: 12,
+                present_frame: true,
+            },
             BroadcastPlayerProtocolCommand::Play,
             BroadcastPlayerProtocolCommand::Pause,
             BroadcastPlayerProtocolCommand::Stop,
@@ -67,6 +71,7 @@ mod tests {
             .to_ascii_lowercase();
         assert!(text.contains("start_frame"));
         assert!(text.contains("end_frame"));
+        assert!(text.contains("initial_frame"));
         assert!(text.contains("request_id"));
         assert!(!text.contains("path"));
     }
@@ -93,6 +98,20 @@ mod tests {
             .unwrap_err();
 
         assert!(err.contains("rate_num"));
+    }
+
+    #[test]
+    fn playback_request_rejects_initial_frame_outside_range() {
+        let source = SourceRuntime::new("src", 100, Timebase::new(25, 1).unwrap()).unwrap();
+
+        let err = BroadcastPlaybackRequest::new("request-1", source)
+            .unwrap()
+            .with_range(FrameRange::new(10, 20).unwrap())
+            .unwrap()
+            .with_initial_frame(21)
+            .unwrap_err();
+
+        assert!(err.contains("initial frame"));
     }
 
     #[test]
