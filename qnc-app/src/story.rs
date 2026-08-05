@@ -28,7 +28,9 @@ use crate::api::{HostClient, TimelineModel};
 use crate::composition::EditorialRole;
 use crate::editorial::common::{shot_id, truncate};
 use crate::editorial::{marker_cover_panel, media_pool, segment_panel};
-use crate::frame_time::{normalize_fps, seconds_to_timecode, snap_seconds_to_frame, DEFAULT_FPS};
+use crate::frame_time::{
+    frame_to_seconds, normalize_fps, seconds_to_timecode, snap_seconds_to_frame, DEFAULT_FPS,
+};
 use crate::player_contract::BroadcastHostSourceRef;
 use crate::qnc_filmstrip_background::FilmFrame;
 use crate::qnc_timeline::{ExpandedAudio, TimelineFocusPaint};
@@ -96,8 +98,7 @@ pub struct StoryScreen {
     source_media_loader: async_media::AsyncSourceMediaLoader,
     repaint_ctx: Option<egui::Context>,
     source_media_retry_at: Option<Instant>,
-    /// While set, player frames must not yank playhead away from UI target.
-    playhead_ui_lock_until: Option<Instant>,
+    /// Pending progress-bar target while the player cue catches up.
     playhead_ui_target: Option<f64>,
     source_timebase_ready: bool,
     pending_playback_commands: Vec<StoryPlaybackCommand>,
@@ -174,7 +175,6 @@ impl StoryScreen {
             source_media_loader: async_media::AsyncSourceMediaLoader::new(),
             repaint_ctx: None,
             source_media_retry_at: None,
-            playhead_ui_lock_until: None,
             playhead_ui_target: None,
             source_timebase_ready: false,
             pending_playback_commands: Vec::new(),
@@ -449,10 +449,9 @@ impl StoryScreen {
         }
     }
 
-    /// Keep timeline playhead on UI target while still cue is in flight.
+    /// Keep timeline playhead on UI target until the player confirms it.
     fn lock_playhead_ui(&mut self) {
         self.playhead_ui_target = Some(self.virtual_sec);
-        self.playhead_ui_lock_until = Some(Instant::now() + Duration::from_millis(450));
     }
 
     /// Scrub drag → coalesced still (PlayerRemote debounce).
@@ -985,6 +984,7 @@ impl StoryScreen {
             FocusTarget::In => TimelineFocusPaint::In,
             FocusTarget::Out => TimelineFocusPaint::Out,
         };
+        let timebase_fps = self.source_timebase_fps().unwrap_or(DEFAULT_FPS);
         let action = source_editor::show(
             ui,
             source_editor::SourceEditorInput {
@@ -993,6 +993,7 @@ impl StoryScreen {
                 source_out: self.source_out,
                 clip_duration: clip_dur,
                 playhead_sec: self.virtual_sec,
+                timebase_fps,
                 focus: focus_paint,
                 a1_peaks: &self.a1_peaks,
                 a2_peaks: &self.a2_peaks,
@@ -1009,8 +1010,9 @@ impl StoryScreen {
             source_editor::SourceEditorAction::ToggleAudioExpand(lane) => {
                 self.expanded_audio = self.expanded_audio.toggle(lane);
             }
-            source_editor::SourceEditorAction::Seek(sec) => {
+            source_editor::SourceEditorAction::CueFrame(frame) => {
                 // Scrub always moves playhead only. IN/OUT focus is for frame nudge after select_mark_*.
+                let sec = frame_to_seconds(frame, timebase_fps);
                 self.virtual_sec = self.snap_source_sec(sec.clamp(0.0, clip_dur));
                 if self.view_mode != ViewMode::Source {
                     let clip = self.selected_clip_id.clone();
@@ -1524,34 +1526,10 @@ impl StoryScreen {
 impl crate::player_bridge::PlayerClient for StoryScreen {
     fn drain_playback_commands(&mut self) -> Vec<crate::player_bridge::PlaybackCommand> {
         let raw = std::mem::take(&mut self.pending_playback_commands);
-        let mut out = Vec::with_capacity(raw.len());
-        let mut seek_to = false;
-        let mut pause_and_seek = false;
-        let mut toggle = false;
-        for cmd in raw {
-            match cmd {
-                StoryPlaybackCommand::SeekToPlayhead => seek_to = true,
-                StoryPlaybackCommand::PauseAndSeek => pause_and_seek = true,
-                StoryPlaybackCommand::TogglePlay => toggle = true,
-            }
-        }
-        if toggle {
-            self.playhead_ui_lock_until = None;
-            self.playhead_ui_target = None;
-            out.push(StoryPlaybackCommand::TogglePlay);
-            return out;
-        }
-        if pause_and_seek {
-            out.push(StoryPlaybackCommand::PauseAndSeek);
-        } else if seek_to && !self.playing {
-            // Ignore auto-seeks while playing — they fight the transport.
-            out.push(StoryPlaybackCommand::SeekToPlayhead);
-        }
-        out
+        crate::player_bridge::compact_playback_commands(raw, self.playing)
     }
 
     fn clear_pending_seeks(&mut self) {
-        self.playhead_ui_lock_until = None;
         self.playhead_ui_target = None;
     }
 
@@ -1605,7 +1583,11 @@ impl crate::player_bridge::PlayerClient for StoryScreen {
 
     fn playback_source_sec(&self) -> f64 {
         // Source mode: media seconds. Wrap mode: program/carrier seconds (part timeline).
-        self.virtual_sec.max(0.0)
+        self.playhead_ui_target.unwrap_or(self.virtual_sec).max(0.0)
+    }
+
+    fn playback_is_playing(&self) -> bool {
+        self.playing
     }
 
     fn missing_source_message(&self) -> String {
@@ -1632,22 +1614,16 @@ impl crate::player_bridge::PlayerClient for StoryScreen {
             self.snap_source_sec(source_sec.max(0.0))
         };
         let eps = self.frame_eps_sec();
-        let locked = self
-            .playhead_ui_lock_until
-            .is_some_and(|until| Instant::now() < until);
-        let near_ui = self
-            .playhead_ui_target
-            .map(|t| (snapped - t).abs() <= eps)
-            .unwrap_or(false);
+        let apply_progress = crate::player_bridge::should_apply_player_progress(
+            snapped,
+            self.playhead_ui_target,
+            eps,
+            playing,
+        );
         self.pending_player_image = Some(image);
         self.broadcast_preview_active = true;
         self.playing = playing;
-        if locked && !near_ui && !playing {
-            self.status = "Broadcast player".into();
-            return;
-        }
-        if near_ui || !locked {
-            self.playhead_ui_lock_until = None;
+        if apply_progress {
             self.playhead_ui_target = None;
             self.virtual_sec = snapped;
         }
@@ -1661,27 +1637,18 @@ impl crate::player_bridge::PlayerClient for StoryScreen {
             self.snap_source_sec(source_sec.max(0.0))
         };
         let eps = self.frame_eps_sec();
-        let locked = self
-            .playhead_ui_lock_until
-            .is_some_and(|until| Instant::now() < until);
-        let near_ui = self
-            .playhead_ui_target
-            .map(|t| (snapped - t).abs() <= eps)
-            .unwrap_or(false);
+        let apply_progress = crate::player_bridge::should_apply_player_progress(
+            snapped,
+            self.playhead_ui_target,
+            eps,
+            playing,
+        );
         self.playing = playing;
         self.status = status.into();
-        if playing {
-            self.playhead_ui_lock_until = None;
+        if apply_progress {
             self.playhead_ui_target = None;
             self.virtual_sec = snapped;
-            return;
         }
-        if locked && !near_ui {
-            return;
-        }
-        self.playhead_ui_lock_until = None;
-        self.playhead_ui_target = None;
-        self.virtual_sec = snapped;
     }
 
     fn apply_player_error(&mut self, status: impl Into<String>) {

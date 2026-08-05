@@ -14,6 +14,7 @@ use eframe::egui::{self, ColorImage, TextureHandle, TextureOptions};
 use crate::api::{FsEntry, HostClient, IngestClip, IngestState};
 use crate::editorial::media_pool::{self, MediaPoolAction};
 use crate::editorial::types::LibraryTab;
+use crate::frame_time::frame_to_seconds;
 use crate::ingest_player::IngestPlaybackCommand;
 use crate::player_contract::BroadcastHostSourceRef;
 use crate::qnc_filmstrip_background::FilmFrame;
@@ -58,8 +59,8 @@ pub struct IngestScreen {
     pub(crate) pending_player_image: Option<ColorImage>,
     pub(crate) player_preview_active: bool,
     pub(crate) pending_playback_commands: Vec<IngestPlaybackCommand>,
-    pub(crate) playhead_ui_lock_until: Option<Instant>,
-    pub(crate) playhead_ui_target: Option<f64>,
+    /// Pending progress-bar target while the player cue catches up.
+    pub(crate) playhead_ui_target_frame: Option<crate::player_contract::FrameNumber>,
     project_id: String,
     /// Web kodak: click A1/A2 label expands that wave lane.
     expanded_audio: ExpandedAudio,
@@ -117,8 +118,7 @@ impl Default for IngestScreen {
             pending_player_image: None,
             player_preview_active: false,
             pending_playback_commands: Vec::new(),
-            playhead_ui_lock_until: None,
-            playhead_ui_target: None,
+            playhead_ui_target_frame: None,
             project_id: String::new(),
             expanded_audio: ExpandedAudio::default(),
             library_tab: LibraryTab::default(),
@@ -453,14 +453,15 @@ impl IngestScreen {
                 source_out: dur,
                 clip_duration: dur,
                 playhead_sec: self.virtual_sec.clamp(0.0, dur),
+                timebase_fps: self.selected_source_fps,
                 focus: TimelineFocusPaint::Playhead,
                 a1_peaks: empty,
                 a2_peaks: empty,
                 frames: &frames,
                 tc: &tc,
                 show_header: true,
-                show_story_actions: false,
-                show_ingest_actions: true,
+                show_edit_actions: false,
+                show_import_actions: true,
                 archive_original: self.archive_local,
                 ai_mining: self.ai_mining,
                 import_enabled: !self.busy && selected_n > 0,
@@ -470,8 +471,8 @@ impl IngestScreen {
         );
         match dock {
             SourceDockAction::None => IngestAction::None,
-            SourceDockAction::Seek(sec) => {
-                self.scrub_to(sec);
+            SourceDockAction::CueFrame(frame) => {
+                self.scrub_to_frame(frame);
                 IngestAction::None
             }
             SourceDockAction::ToggleAudioExpand(lane) => {

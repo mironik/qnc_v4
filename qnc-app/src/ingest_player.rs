@@ -1,13 +1,12 @@
 //! Ingest native playback — same [`PlayerClient`] bridge as Story / Media Assist.
 
-use std::time::{Duration, Instant};
-
 use eframe::egui::{self, ColorImage, TextureHandle, TextureOptions};
 
 use crate::api::HostClient;
+use crate::frame_time::{frame_to_seconds, seconds_to_frame};
 use crate::ingest::IngestScreen;
 use crate::player_bridge::{PlaybackCommand, PlayerClient};
-use crate::player_contract::BroadcastHostSourceRef;
+use crate::player_contract::{BroadcastHostSourceRef, FrameNumber};
 
 pub use crate::player_bridge::PlaybackCommand as IngestPlaybackCommand;
 
@@ -37,7 +36,11 @@ impl IngestScreen {
     }
 
     pub fn playback_source_sec(&self) -> f64 {
-        PlayerClient::playback_source_sec(self)
+        frame_to_seconds(PlayerClient::playback_source_frame(self).0, self.selected_source_fps)
+    }
+
+    pub fn playback_source_frame(&self) -> FrameNumber {
+        PlayerClient::playback_source_frame(self)
     }
 
     pub fn playback_media_path(&self) -> Option<String> {
@@ -221,14 +224,23 @@ impl IngestScreen {
         (frame / fps).max(0.0)
     }
 
-    fn lock_playhead_ui(&mut self) {
-        self.playhead_ui_target = Some(self.virtual_sec);
-        self.playhead_ui_lock_until = Some(Instant::now() + Duration::from_millis(120));
+    fn source_frame_from_sec(&self, sec: f64) -> FrameNumber {
+        FrameNumber(seconds_to_frame(sec, self.selected_source_fps))
+    }
+
+    fn lock_playhead_ui_frame(&mut self, frame: FrameNumber) {
+        self.playhead_ui_target_frame = Some(frame);
     }
 
     pub(crate) fn scrub_to(&mut self, sec: f64) {
-        self.virtual_sec = self.snap_source_sec(sec.max(0.0));
-        self.lock_playhead_ui();
+        let frame = self.source_frame_from_sec(sec.max(0.0));
+        self.scrub_to_frame(frame.0);
+    }
+
+    pub(crate) fn scrub_to_frame(&mut self, frame: i64) {
+        let frame = FrameNumber(frame.max(0));
+        self.virtual_sec = frame_to_seconds(frame.0, self.selected_source_fps);
+        self.lock_playhead_ui_frame(frame);
         self.queue_pause_and_seek();
     }
 
@@ -249,32 +261,14 @@ impl IngestScreen {
 
 impl PlayerClient for IngestScreen {
     fn drain_playback_commands(&mut self) -> Vec<PlaybackCommand> {
-        let mut seek_to = false;
-        let mut pause_and_seek = false;
-        let mut toggle = false;
-        for c in self.pending_playback_commands.drain(..) {
-            match c {
-                PlaybackCommand::SeekToPlayhead => seek_to = true,
-                PlaybackCommand::PauseAndSeek => pause_and_seek = true,
-                PlaybackCommand::TogglePlay => toggle = true,
-            }
-        }
-        // Toggle alone — never Play+Seek in the same drain (that pauses immediately).
-        if toggle {
-            return vec![PlaybackCommand::TogglePlay];
-        }
-        if pause_and_seek {
-            vec![PlaybackCommand::PauseAndSeek]
-        } else if seek_to && !self.playing {
-            vec![PlaybackCommand::SeekToPlayhead]
-        } else {
-            Vec::new()
-        }
+        crate::player_bridge::compact_playback_commands(
+            self.pending_playback_commands.drain(..),
+            self.playing,
+        )
     }
 
     fn clear_pending_seeks(&mut self) {
-        self.playhead_ui_lock_until = None;
-        self.playhead_ui_target = None;
+        self.playhead_ui_target_frame = None;
     }
 
     fn playback_source_ref(&self) -> Option<&BroadcastHostSourceRef> {
@@ -321,8 +315,13 @@ impl PlayerClient for IngestScreen {
         }
     }
 
-    fn playback_source_sec(&self) -> f64 {
-        self.virtual_sec.max(0.0)
+    fn playback_source_frame(&self) -> FrameNumber {
+        self.playhead_ui_target_frame
+            .unwrap_or_else(|| self.source_frame_from_sec(self.virtual_sec))
+    }
+
+    fn playback_is_playing(&self) -> bool {
+        self.playing
     }
 
     fn missing_source_message(&self) -> String {
@@ -348,53 +347,47 @@ impl PlayerClient for IngestScreen {
         self.player_status = status.into();
     }
 
-    fn apply_player_frame(&mut self, image: ColorImage, source_sec: f64, playing: bool) {
+    fn apply_player_frame(
+        &mut self,
+        image: ColorImage,
+        source_frame: FrameNumber,
+        source_sec: f64,
+        playing: bool,
+    ) {
         let snapped = self.snap_source_sec(source_sec.max(0.0));
-        let eps = self.frame_eps_sec();
-        let locked = self
-            .playhead_ui_lock_until
-            .is_some_and(|until| Instant::now() < until);
-        let near_ui = self
-            .playhead_ui_target
-            .map(|t| (snapped - t).abs() <= eps)
-            .unwrap_or(false);
+        let apply_progress = crate::player_bridge::should_apply_player_progress(
+            source_frame,
+            self.playhead_ui_target_frame,
+            playing,
+        );
         self.pending_player_image = Some(image);
         self.player_preview_active = true;
         self.playing = playing;
-        if locked && !near_ui && !playing {
-            return;
-        }
-        if near_ui || !locked {
-            self.playhead_ui_lock_until = None;
-            self.playhead_ui_target = None;
+        if apply_progress {
+            self.playhead_ui_target_frame = None;
             self.virtual_sec = snapped;
         }
         self.player_status = "Broadcast player".into();
     }
 
-    fn apply_player_state(&mut self, source_sec: f64, playing: bool, status: impl Into<String>) {
+    fn apply_player_state(
+        &mut self,
+        source_frame: FrameNumber,
+        source_sec: f64,
+        playing: bool,
+        status: impl Into<String>,
+    ) {
         let snapped = self.snap_source_sec(source_sec.max(0.0));
-        let eps = self.frame_eps_sec();
-        let locked = self
-            .playhead_ui_lock_until
-            .is_some_and(|until| Instant::now() < until);
-        let near_ui = self
-            .playhead_ui_target
-            .map(|t| (snapped - t).abs() <= eps)
-            .unwrap_or(false);
+        let apply_progress = crate::player_bridge::should_apply_player_progress(
+            source_frame,
+            self.playhead_ui_target_frame,
+            playing,
+        );
         self.playing = playing;
         self.player_status = status.into();
-        if playing {
-            self.playhead_ui_lock_until = None;
-            self.playhead_ui_target = None;
+        if apply_progress {
+            self.playhead_ui_target_frame = None;
             self.virtual_sec = snapped;
-            return;
         }
-        if locked && !near_ui {
-            return;
-        }
-        self.playhead_ui_lock_until = None;
-        self.playhead_ui_target = None;
-        self.virtual_sec = snapped;
     }
 }

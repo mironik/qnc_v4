@@ -59,7 +59,7 @@ pub struct BroadcastPlayerOpenRequest {
     pub source_fps: f64,
     pub has_audio: bool,
     pub audio_channels: u8,
-    pub start_source_sec: f64,
+    pub start_source_frame: FrameNumber,
 }
 
 #[derive(Debug, Clone)]
@@ -68,11 +68,6 @@ pub enum PlayerCommand {
     Play,
     Pause,
     TogglePlay,
-    Seek {
-        source_sec: f64,
-        still: bool,
-        coalesce: bool,
-    },
     SeekFrame {
         frame: FrameNumber,
         still: bool,
@@ -367,11 +362,6 @@ impl PlayerRemote {
                     self.play(ctx);
                 }
             }
-            PlayerCommand::Seek {
-                source_sec,
-                coalesce,
-                ..
-            } => self.seek_core_frame(self.frame_at_seconds(source_sec), coalesce, ctx),
             PlayerCommand::SeekFrame {
                 frame, coalesce, ..
             } => self.seek_core_frame(old_to_core_frame(frame), coalesce, ctx),
@@ -437,8 +427,7 @@ impl PlayerRemote {
 
         match build_runtime_session(&request, &self.decode_policy) {
             Ok(session) => {
-                let start_frame =
-                    frame_at_seconds(request.start_source_sec, session.source.timebase);
+                let start_frame = old_to_core_frame(request.start_source_frame);
                 let start_frame = clamp_core_frame(start_frame, session.range);
                 let startup_warnings = session.startup_warnings.clone();
                 let playback_request = playback_request_from_source(
@@ -498,7 +487,7 @@ impl PlayerRemote {
     }
 
     fn play(&mut self, ctx: &egui::Context) {
-        self.pending_still = None;
+        self.commit_pending_still_before_play(ctx);
         if self.runtime.is_none() {
             let Some(request) = self.last_request.clone() else {
                 self.status = "Odaberi source kadar prije play".into();
@@ -520,6 +509,19 @@ impl PlayerRemote {
             self.status = "Source nije otvoren".into();
             self.pending_error = Some(self.status.clone());
         }
+    }
+
+    fn commit_pending_still_before_play(&mut self, ctx: &egui::Context) {
+        let Some(frame) = self.take_pending_still_for_play() else {
+            return;
+        };
+        if self.runtime.is_some() {
+            self.cue_still_frame(frame, ctx);
+        }
+    }
+
+    fn take_pending_still_for_play(&mut self) -> Option<CoreFrameNumber> {
+        self.pending_still.take().map(|(frame, _)| frame)
     }
 
     fn pause(&mut self) {
@@ -1131,6 +1133,15 @@ mod tests {
 
         assert_eq!(request.execution_range, range);
         assert_eq!(request.initial_frame, 14);
+    }
+
+    #[test]
+    fn play_path_takes_pending_still_frame_before_transport_play() {
+        let mut remote = PlayerRemote::new();
+        remote.pending_still = Some((37, Instant::now() + Duration::from_secs(1)));
+
+        assert_eq!(remote.take_pending_still_for_play(), Some(37));
+        assert!(remote.pending_still.is_none());
     }
 
     #[test]

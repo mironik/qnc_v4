@@ -1,10 +1,13 @@
-//! Universal source dock — Story/Ingest chrome around standalone `QncTimeline`.
+//! Universal source dock chrome around standalone `QncTimeline` progress view.
 
 use eframe::egui::{self, RichText};
 
 use crate::qnc_filmstrip_background::FilmFrame;
 use crate::qnc_theme::{self, MUTED, TEXT};
 use crate::qnc_timeline::{ExpandedAudio, LayerFlags, QncTimeline, TimelineFocusPaint};
+use crate::qnc_timeline_progress::{
+    self, TimelineProgressInput, TimelineProgressIntent, TimelineProgressModel,
+};
 
 pub struct SourceDockInput<'a> {
     pub clip_label: &'a str,
@@ -12,17 +15,18 @@ pub struct SourceDockInput<'a> {
     pub source_out: f64,
     pub clip_duration: f64,
     pub playhead_sec: f64,
+    pub timebase_fps: f64,
     pub focus: TimelineFocusPaint,
     pub a1_peaks: &'a [f32],
     pub a2_peaks: &'a [f32],
     pub frames: &'a [FilmFrame],
     pub tc: &'a dyn Fn(f64) -> String,
-    /// Clip name + IN/OUT row above the timeline (Story + Ingest — full-width chrome).
+    /// Clip name + IN/OUT row above the timeline.
     pub show_header: bool,
-    /// Story edit buttons (virtual / parts).
-    pub show_story_actions: bool,
-    /// Ingest import / selection actions in the same full-width header as Story.
-    pub show_ingest_actions: bool,
+    /// Edit buttons (virtual / parts).
+    pub show_edit_actions: bool,
+    /// Import / selection actions.
+    pub show_import_actions: bool,
     pub archive_original: bool,
     pub ai_mining: bool,
     pub import_enabled: bool,
@@ -35,7 +39,7 @@ pub struct SourceDockInput<'a> {
 #[derive(Debug, Clone, PartialEq)]
 pub enum SourceDockAction {
     None,
-    Seek(f64),
+    CueFrame(i64),
     /// Toggle expand for A1 or A2 (same lane collapses).
     ToggleAudioExpand(ExpandedAudio),
     SaveVirtualShot,
@@ -140,7 +144,7 @@ pub fn show(ui: &mut egui::Ui, input: SourceDockInput<'_>) -> SourceDockAction {
                         (input.tc)((input.source_out - input.source_in).max(0.0)),
                         false,
                     );
-                    if input.show_story_actions {
+                    if input.show_edit_actions {
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if qnc_theme::action_btn(ui, "Pokrivalice").clicked() {
                                 action = SourceDockAction::CreatePart("tonovi");
@@ -155,7 +159,7 @@ pub fn show(ui: &mut egui::Ui, input: SourceDockInput<'_>) -> SourceDockAction {
                                 action = SourceDockAction::SaveVirtualShot;
                             }
                         });
-                    } else if input.show_ingest_actions {
+                    } else if input.show_import_actions {
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             ui.spacing_mut().item_spacing.x = 8.0;
                             if !input.ingest_status.is_empty() {
@@ -212,30 +216,40 @@ pub fn show(ui: &mut egui::Ui, input: SourceDockInput<'_>) -> SourceDockAction {
                 Some(&filmstrip_background as &dyn Fn(&mut egui::Ui, egui::Rect))
             };
 
-            let interact = QncTimeline {
-                layers: source_layers(),
-                duration_sec: input.clip_duration,
-                playhead_sec: input.playhead_sec,
-                source_in: input.source_in,
-                source_out: input.source_out,
-                video_background,
-                focus: input.focus,
-                expanded_audio: input.expanded_audio,
-                a1_peaks: input.a1_peaks,
-                a2_peaks: input.a2_peaks,
-                a3_peaks: &[],
-                a4_peaks: &[],
-                covers: &[],
-                marker_slots: &[],
-                markers: &[],
-                base_video_blank: false,
-            }
-            .show(ui);
+            let model = TimelineProgressModel::from_seconds(
+                input.timebase_fps,
+                input.clip_duration,
+                input.playhead_sec,
+                input.source_in,
+                input.source_out,
+            );
+            let intent = qnc_timeline_progress::show(
+                ui,
+                TimelineProgressInput {
+                    model,
+                    layers: source_layers(),
+                    video_background,
+                    focus: input.focus,
+                    expanded_audio: input.expanded_audio,
+                    a1_peaks: input.a1_peaks,
+                    a2_peaks: input.a2_peaks,
+                    a3_peaks: &[],
+                    a4_peaks: &[],
+                    covers: &[],
+                    marker_slots: &[],
+                    markers: &[],
+                    base_video_blank: false,
+                },
+            );
             if matches!(action, SourceDockAction::None) {
-                if let Some(lane) = interact.expand_click {
-                    action = SourceDockAction::ToggleAudioExpand(lane);
-                } else if let Some(sec) = interact.seek_sec {
-                    action = SourceDockAction::Seek(sec);
+                match intent {
+                    TimelineProgressIntent::ToggleAudioExpand(lane) => {
+                        action = SourceDockAction::ToggleAudioExpand(lane);
+                    }
+                    TimelineProgressIntent::CueFrame(frame) => {
+                        action = SourceDockAction::CueFrame(frame);
+                    }
+                    TimelineProgressIntent::None => {}
                 }
             }
         });

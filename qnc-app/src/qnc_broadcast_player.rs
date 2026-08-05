@@ -115,18 +115,6 @@ impl BroadcastPlayerTx {
         self.send(PlayerCommand::TogglePlay)
     }
 
-    pub fn seek_sec(&self, source_sec: f64, still: bool, coalesce: bool) -> Result<(), String> {
-        self.send(PlayerCommand::Seek {
-            source_sec,
-            still,
-            coalesce,
-        })
-    }
-
-    pub fn goto_sec(&self, source_sec: f64) -> Result<(), String> {
-        self.seek_sec(source_sec, true, false)
-    }
-
     pub fn seek_frame(
         &self,
         frame: FrameNumber,
