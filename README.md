@@ -1,4 +1,4 @@
-# QNC — native (v0.4.5)
+# QNC — native (v0.4.6)
 
 Aktivna radna kopija: **`qnc-app` + `qnc-host`**. Web UI nije dio `qnc_v4`
 produkta i legacy `web-arhive/` folder nije prisutan u ovom treeu.
@@ -40,12 +40,18 @@ LAN: `QNC_BIND_HOST=0.0.0.0` zahtijeva `QNC_TRUSTED_LAN=1`. Internet bez auth/pr
 | `media_pool` (Rust) | shared helperi za Ingest/Story |
 | design-tools HTTP | API only (nema web UI) |
 
+## v0.4.6 — PlaybackStack + carrier timeline
+
+- One `PlaybackStack`: timeline is progress-bar projection (`CarrierSync`); click/`step_*` = `CueFrame`; Space = toggle only.
+- Probe-authoritative fps/field + yadif; large forward cues respawn (`-ss`) to avoid RGB OOM; stale monitor frames rejected.
+- Transport shortcuts (`play_pause`, `step_back_frame`, `step_forward_frame`) only from `seed/keyboard-shortcuts.json`.
+- Tag `v0.4.6` is the current playback reference point.
+
 ## v0.4.5 — runtime protocol path
 
 - `qnc-app` player remote now goes through `qnc-player-runtime`, the same runtime/protocol path used by `qnc-player-runner`.
 - `BroadcastPlaybackRequest` carries `initial_frame`, so opening a bounded source can cue the requested frame without app-side transport calls.
 - `CueFrame` is a neutral protocol command for frame-position cueing and still-frame presentation.
-- Tag `v0.4.5` is the current clean player-runtime reference point.
 
 ## v0.4.4 — broadcast player truth
 
