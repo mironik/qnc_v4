@@ -40,6 +40,26 @@ impl TimelineProgressModel {
         }
     }
 
+    /// Carrier/playhead authority — use in [`crate::carrier_sync`], not form seconds.
+    pub fn from_carrier(
+        fps: f64,
+        duration_frames: i64,
+        playhead_frame: i64,
+        in_frame: i64,
+        out_frame: i64,
+    ) -> Self {
+        let fps = normalize_fps(fps);
+        let duration_frames = duration_frames.max(1);
+        let clamp = |frame: i64| frame.clamp(0, duration_frames);
+        Self {
+            fps,
+            duration_frames,
+            playhead_frame: clamp(playhead_frame),
+            in_frame: clamp(in_frame),
+            out_frame: clamp(out_frame.max(in_frame)),
+        }
+    }
+
     pub fn duration_frames(self) -> i64 {
         self.duration_frames
     }
@@ -146,5 +166,24 @@ mod tests {
 
         assert_eq!(model.frame_at_seconds(1.5), 75);
         assert_eq!(model.seconds_at_frame(75), 1.5);
+    }
+
+    #[test]
+    fn from_carrier_uses_frame_authority_not_seconds() {
+        let model = TimelineProgressModel::from_carrier(25.0, 250, 100, 10, 200);
+
+        assert_eq!(model.playhead_frame(), 100);
+        assert_eq!(model.duration_frames(), 250);
+        assert_eq!(model.in_sec(), 0.4);
+        assert_eq!(model.out_sec(), 8.0);
+    }
+
+    #[test]
+    fn from_carrier_clamps_playhead_and_marks() {
+        let model = TimelineProgressModel::from_carrier(25.0, 100, 999, -5, 50);
+
+        assert_eq!(model.playhead_frame(), 100);
+        assert_eq!(model.in_sec(), 0.0);
+        assert_eq!(model.out_sec(), 2.0);
     }
 }

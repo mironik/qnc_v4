@@ -78,6 +78,15 @@ pub enum PlayerCommand {
 
 #[derive(Debug, Clone)]
 pub enum PlayerEvent {
+    /// Program loaded — timeline paint bounds (once per open).
+    SourceReady {
+        fps: f64,
+        duration_frames: i64,
+        in_frame: i64,
+        out_frame: i64,
+        /// Probed from file (`progressive` / upper-first / lower-first).
+        field_mode: FieldMode,
+    },
     Frame {
         image: ColorImage,
         source_frame: FrameNumber,
@@ -253,6 +262,17 @@ pub struct PlayerRemote {
     pending_still: Option<(CoreFrameNumber, Instant)>,
     last_still_frame: Option<CoreFrameNumber>,
     started_at: Instant,
+    loaded_program: Option<SourceReadyBounds>,
+    source_ready_sent: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SourceReadyBounds {
+    fps: f64,
+    duration_frames: i64,
+    in_frame: i64,
+    out_frame: i64,
+    field_mode: FieldMode,
 }
 
 const STILL_SEEK_DEBOUNCE: Duration = Duration::from_millis(80);
@@ -281,6 +301,8 @@ impl PlayerRemote {
             pending_still: None,
             last_still_frame: None,
             started_at: Instant::now(),
+            loaded_program: None,
+            source_ready_sent: false,
         }
     }
 
@@ -404,9 +426,28 @@ impl PlayerRemote {
         self.runtime = None;
         self.identity = None;
         self.last_request = None;
+        self.loaded_program = None;
+        self.source_ready_sent = false;
         self.playing = false;
         self.active = false;
         self.status = "Stopped".into();
+    }
+
+    fn push_source_ready(&mut self, out: &mut Vec<PlayerEvent>) {
+        if self.source_ready_sent {
+            return;
+        }
+        let Some(bounds) = self.loaded_program else {
+            return;
+        };
+        self.source_ready_sent = true;
+        out.push(PlayerEvent::SourceReady {
+            fps: bounds.fps,
+            duration_frames: bounds.duration_frames,
+            in_frame: bounds.in_frame,
+            out_frame: bounds.out_frame,
+            field_mode: bounds.field_mode,
+        });
     }
 
     fn open(&mut self, request: BroadcastPlayerOpenRequest, ctx: &egui::Context) {
@@ -438,6 +479,8 @@ impl PlayerRemote {
                 );
                 match playback_request {
                     Ok(playback_request) => {
+                        self.loaded_program = Some(source_ready_bounds_from_session(&session));
+                        self.source_ready_sent = false;
                         self.runtime = Some(session);
                         self.identity = Some(identity_from_request(&request));
                         self.last_request = Some(request);
@@ -638,6 +681,7 @@ impl PlayerRemote {
                     self.playing = status == TransportStatus::Playing;
                     self.active = true;
                     self.status = status_label(status).to_string();
+                    self.push_source_ready(&mut out);
                     out.push(PlayerEvent::State {
                         source_frame: self.source_frame,
                         source_sec: self.source_sec,
@@ -646,9 +690,14 @@ impl PlayerRemote {
                     });
                 }
                 BroadcastPlayerProtocolEvent::TransportStatusChanged { status } => {
+                    // Playhead authority is transport carrier — never a stale monitor buffer.
+                    self.sync_display_from_transport();
                     self.playing = status == TransportStatus::Playing;
                     self.active = status != TransportStatus::Empty;
                     self.status = status_label(status).to_string();
+                    if matches!(status, TransportStatus::Ready | TransportStatus::Paused) {
+                        self.push_source_ready(&mut out);
+                    }
                     out.push(PlayerEvent::State {
                         source_frame: self.source_frame,
                         source_sec: self.source_sec,
@@ -677,8 +726,9 @@ impl PlayerRemote {
     }
 
     fn take_monitor_frame_event(&mut self) -> Vec<PlayerEvent> {
+        let mut out = Vec::new();
         let Some(runtime) = self.runtime.as_mut() else {
-            return Vec::new();
+            return out;
         };
         let Ok(snapshot) = runtime.monitor.snapshot() else {
             return Vec::new();
@@ -686,10 +736,17 @@ impl PlayerRemote {
         if snapshot.frame_revision == runtime.last_frame_revision {
             return Vec::new();
         }
-        runtime.last_frame_revision = snapshot.frame_revision;
+        let carrier = runtime.runtime.transport().state().carrier_frame;
         let Some(frame_buffer) = snapshot.last_frame_buffer else {
+            runtime.last_frame_revision = snapshot.frame_revision;
             return Vec::new();
         };
+        // Drop late/wrong decode — do not move playhead from monitor pixels.
+        if frame_buffer.frame != carrier {
+            runtime.last_frame_revision = snapshot.frame_revision;
+            return Vec::new();
+        }
+        runtime.last_frame_revision = snapshot.frame_revision;
         let image = ColorImage::from_rgb(
             [
                 frame_buffer.video_format.width as usize,
@@ -697,13 +754,23 @@ impl PlayerRemote {
             ],
             &frame_buffer.bytes,
         );
-        self.set_display_core_frame(frame_buffer.frame);
-        vec![PlayerEvent::Frame {
+        self.set_display_core_frame(carrier);
+        self.push_source_ready(&mut out);
+        out.push(PlayerEvent::Frame {
             image,
             source_frame: self.source_frame,
             source_sec: self.source_sec,
             playing: self.playing,
-        }]
+        });
+        out
+    }
+
+    fn sync_display_from_transport(&mut self) {
+        let Some(runtime) = self.runtime.as_ref() else {
+            return;
+        };
+        let carrier = runtime.runtime.transport().state().carrier_frame;
+        self.set_display_core_frame(carrier);
     }
 
     fn frame_at_seconds(&self, seconds: f64) -> CoreFrameNumber {
@@ -762,6 +829,34 @@ fn build_runtime_session(
     )
     .or_else(|_| fallback_source_runtime(request, source_id.clone()))?
     .source;
+
+    let field_label = source
+        .video_format
+        .as_ref()
+        .map(|vf| match vf.field_mode {
+            FieldMode::Progressive => "progressive",
+            FieldMode::InterlacedUpperFirst => "interlaced-tff",
+            FieldMode::InterlacedLowerFirst => "interlaced-bff",
+        })
+        .unwrap_or("no-video");
+    let (w, h) = source
+        .video_format
+        .as_ref()
+        .map(|vf| (vf.width, vf.height))
+        .unwrap_or((0, 0));
+    crate::player_log::log_info(
+        "probe",
+        &format!(
+            "file={} {}x{} timebase={}/{} field={} audio={}",
+            media_path.display(),
+            w,
+            h,
+            source.timebase.frame_rate_num,
+            source.timebase.frame_rate_den,
+            field_label,
+            source.audio_format.is_some()
+        ),
+    );
 
     if !request.has_audio {
         source.audio_format = None;
@@ -983,6 +1078,24 @@ fn fallback_source_runtime(
         has_video: true,
         has_audio: request.has_audio,
     })
+}
+
+fn source_ready_bounds_from_session(session: &PlayerRuntimeSession) -> SourceReadyBounds {
+    let timebase = session.source.timebase;
+    let fps = f64::from(timebase.frame_rate_num) / f64::from(timebase.frame_rate_den);
+    let field_mode = session
+        .source
+        .video_format
+        .as_ref()
+        .map(|vf| vf.field_mode)
+        .unwrap_or(FieldMode::Progressive);
+    SourceReadyBounds {
+        fps,
+        duration_frames: i64::try_from(session.source.duration_frames).unwrap_or(i64::MAX),
+        in_frame: i64::try_from(session.range.start_frame).unwrap_or(i64::MAX),
+        out_frame: i64::try_from(session.range.end_frame).unwrap_or(i64::MAX),
+        field_mode,
+    }
 }
 
 fn range_from_request(
@@ -1224,5 +1337,67 @@ mod tests {
         assert_eq!(policy.recommended_backend, None);
         assert_eq!(policy.video_prefetch_frames, None);
         assert!(policy.video_prefetch_rules.is_empty());
+    }
+
+    #[test]
+    fn push_source_ready_emits_once_per_open() {
+        let mut remote = PlayerRemote::new();
+        remote.loaded_program = Some(SourceReadyBounds {
+            fps: 25.0,
+            duration_frames: 100,
+            in_frame: 0,
+            out_frame: 100,
+            field_mode: FieldMode::Progressive,
+        });
+        let mut out = Vec::new();
+        remote.push_source_ready(&mut out);
+        remote.push_source_ready(&mut out);
+        assert_eq!(out.len(), 1);
+        assert!(matches!(
+            out[0],
+            PlayerEvent::SourceReady {
+                duration_frames: 100,
+                field_mode: FieldMode::Progressive,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn stop_clears_loaded_program_and_source_ready_flag() {
+        let mut remote = PlayerRemote::new();
+        remote.loaded_program = Some(SourceReadyBounds {
+            fps: 25.0,
+            duration_frames: 100,
+            in_frame: 0,
+            out_frame: 100,
+            field_mode: FieldMode::Progressive,
+        });
+        remote.source_ready_sent = true;
+        remote.stop();
+        assert!(remote.loaded_program.is_none());
+        assert!(!remote.source_ready_sent);
+        assert!(!remote.has_source());
+    }
+
+    #[test]
+    fn source_ready_bounds_maps_timebase_and_range() {
+        let source =
+            SourceRuntime::new("src", 250, CoreTimebase::new(25, 1).unwrap()).unwrap();
+        let range = CoreFrameRange::new(10, 200).unwrap();
+        let timebase = source.timebase;
+        let fps = f64::from(timebase.frame_rate_num) / f64::from(timebase.frame_rate_den);
+        let bounds = SourceReadyBounds {
+            fps,
+            duration_frames: i64::try_from(source.duration_frames).unwrap_or(i64::MAX),
+            in_frame: i64::try_from(range.start_frame).unwrap_or(i64::MAX),
+            out_frame: i64::try_from(range.end_frame).unwrap_or(i64::MAX),
+            field_mode: FieldMode::Progressive,
+        };
+        assert!((bounds.fps - 25.0).abs() < 0.001);
+        assert_eq!(bounds.duration_frames, 250);
+        assert_eq!(bounds.in_frame, 10);
+        assert_eq!(bounds.out_frame, 200);
+        assert_eq!(bounds.field_mode, FieldMode::Progressive);
     }
 }

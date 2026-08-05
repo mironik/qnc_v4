@@ -9,18 +9,21 @@ mod poster_loader;
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-use eframe::egui::{self, ColorImage, TextureHandle, TextureOptions};
+use eframe::egui::{self, TextureHandle, TextureOptions};
 
 use crate::api::{FsEntry, HostClient, IngestClip, IngestState};
 use crate::editorial::media_pool::{self, MediaPoolAction};
 use crate::editorial::types::LibraryTab;
-use crate::frame_time::frame_to_seconds;
-use crate::ingest_player::IngestPlaybackCommand;
+use crate::frame_time::{frame_to_seconds, seconds_to_frame};
+use crate::playback_stack::PlaybackStack;
+use crate::player_bridge::PlaybackCommand;
 use crate::player_contract::BroadcastHostSourceRef;
 use crate::qnc_filmstrip_background::FilmFrame;
 use crate::qnc_source_dock::{self, SourceDockAction, SourceDockInput};
 use crate::qnc_timeline::{ExpandedAudio, TimelineFocusPaint};
 use crate::qnc_ui;
+use crate::shortcuts::{load_story_bindings, StoryBindings};
+use crate::story::playback_controls::{self, PlaybackAction};
 
 use dir_list::{DirBrowserKind, DirListAction, DirListInput};
 use poster_loader::AsyncPosterLoader;
@@ -55,17 +58,14 @@ pub struct IngestScreen {
     pub(crate) virtual_sec: f64,
     pub(crate) playing: bool,
     pub(crate) player_status: String,
-    pub(crate) player_texture: Option<TextureHandle>,
-    pub(crate) pending_player_image: Option<ColorImage>,
-    pub(crate) player_preview_active: bool,
-    pub(crate) pending_playback_commands: Vec<IngestPlaybackCommand>,
-    /// Pending progress-bar target while the player cue catches up.
-    pub(crate) playhead_ui_target_frame: Option<crate::player_contract::FrameNumber>,
+    pub(crate) pending_playback_commands: Vec<PlaybackCommand>,
     project_id: String,
     /// Web kodak: click A1/A2 label expands that wave lane.
     expanded_audio: ExpandedAudio,
     /// Same pool-head tabs as Story / Media Assist (`media_pool::show_head`).
     library_tab: LibraryTab,
+    /// QNC keyboard-shortcuts (storyboard scope) — no hardcoded chords.
+    bindings: StoryBindings,
 }
 
 pub enum IngestAction {
@@ -114,19 +114,33 @@ impl Default for IngestScreen {
             virtual_sec: 0.0,
             playing: false,
             player_status: String::new(),
-            player_texture: None,
-            pending_player_image: None,
-            player_preview_active: false,
             pending_playback_commands: Vec::new(),
-            playhead_ui_target_frame: None,
             project_id: String::new(),
             expanded_audio: ExpandedAudio::default(),
             library_tab: LibraryTab::default(),
+            bindings: StoryBindings::empty(),
         }
     }
 }
 
 impl IngestScreen {
+    pub fn handle_shortcuts(&mut self, ctx: &egui::Context, host: &HostClient) {
+        if self.bindings.by_action.is_empty() {
+            self.bindings = load_story_bindings(host, "storyboard");
+        }
+        if self.preview_clip_id.is_empty() {
+            return;
+        }
+        // play_pause / step_back_frame / step_forward_frame from catalog only.
+        for action in playback_controls::shortcut_actions(ctx, &self.bindings) {
+            match action {
+                PlaybackAction::TogglePlay => self.queue_toggle_play(),
+                PlaybackAction::SeekFrames(frames) => self.nudge_frames(frames),
+                _ => {}
+            }
+        }
+    }
+
     pub fn ensure_loaded(&mut self, host: &HostClient, project_id: &str) {
         if self.loaded_for_project == project_id && self.state.is_some() {
             return;
@@ -255,14 +269,10 @@ impl IngestScreen {
         project_id: &str,
         host: &HostClient,
         ctx: &egui::Context,
+        playback: &PlaybackStack,
     ) -> IngestAction {
         self.pump_posters(host, project_id, ctx);
-        self.prepare_player_frame(ctx);
-        // Space = play/pause (same as Story/Media Assist transport)
-        if ui.input(|i| i.key_pressed(egui::Key::Space)) && !self.preview_clip_id.is_empty() {
-            self.queue_toggle_play();
-        }
-        if self.playing || self.player_preview_active {
+        if self.playing {
             ctx.request_repaint();
         }
         if self.state.as_ref().is_some_and(|st| {
@@ -288,22 +298,15 @@ impl IngestScreen {
             .as_ref()
             .map(|s| s.clips.clone())
             .unwrap_or_default();
-        let preview_tex = self
-            .player_texture
-            .as_ref()
-            .or_else(|| self.poster_textures.get(&self.preview_clip_id))
-            .cloned();
-
         qnc_ui::editorial_shell(ui, |ui, m, side| match side {
             qnc_ui::ShellSide::Left => {
-                qnc_ui::media_column(
+                qnc_ui::media_column_monitor(
                     ui,
                     m,
-                    preview_tex.as_ref(),
-                    "Odaberi klip",
-                    egui::Sense::click(),
+                    |ui, preview_h| {
+                        playback.show_monitor(ui, preview_h, "Odaberi klip");
+                    },
                     |ui, _rest| {
-                        // Same player chrome as Story / MA — do not invent a parallel bar.
                         ui.spacing_mut().item_spacing.y = 0.0;
                         let head = media_pool::show_head(
                             ui,
@@ -406,11 +409,25 @@ impl IngestScreen {
     }
 
     pub fn timeline_dock_height(&self) -> f32 {
-        // Same as Story: full-width header chrome + timeline (grows when A1/A2 expanded).
-        qnc_source_dock::dock_height(self.expanded_audio, true)
+        let dur = self
+            .state
+            .as_ref()
+            .and_then(|st| {
+                st.clips
+                    .iter()
+                    .find(|c| c.clip_id == self.preview_clip_id)
+                    .map(|c| c.duration_sec)
+            })
+            .unwrap_or(1.0)
+            .max(0.04);
+        qnc_source_dock::dock_height(self.expanded_audio, true, dur)
     }
 
-    pub fn ui_timeline_dock(&mut self, ui: &mut egui::Ui) -> IngestAction {
+    pub fn ui_timeline_dock(
+        &mut self,
+        ui: &mut egui::Ui,
+        playback: &mut PlaybackStack,
+    ) -> IngestAction {
         let clips = self
             .state
             .as_ref()
@@ -445,15 +462,25 @@ impl IngestScreen {
         }
         let empty: &[f32] = &[];
         let tc = |s: f64| format_tc(s, self.selected_source_fps);
+        let fps = if self.selected_source_fps.is_finite() && self.selected_source_fps > 0.0 {
+            self.selected_source_fps
+        } else {
+            25.0
+        };
+        if playback.carrier().is_active() {
+            let frame = playback.carrier().display_frame().0;
+            self.virtual_sec = frame_to_seconds(frame, fps).clamp(0.0, dur);
+        }
+        let fallback_frame = seconds_to_frame(self.virtual_sec.clamp(0.0, dur), fps);
+        let timeline_model =
+            playback.timeline_model_for_clip(fps, dur, 0, seconds_to_frame(dur, fps), fallback_frame);
         let dock = qnc_source_dock::show(
             ui,
             SourceDockInput {
                 clip_label: label,
                 source_in: 0.0,
                 source_out: dur,
-                clip_duration: dur,
-                playhead_sec: self.virtual_sec.clamp(0.0, dur),
-                timebase_fps: self.selected_source_fps,
+                timeline_model,
                 focus: TimelineFocusPaint::Playhead,
                 a1_peaks: empty,
                 a2_peaks: empty,
@@ -472,7 +499,12 @@ impl IngestScreen {
         match dock {
             SourceDockAction::None => IngestAction::None,
             SourceDockAction::CueFrame(frame) => {
-                self.scrub_to_frame(frame);
+                // Progress bar → CueFrame; Space plays from this position.
+                if let Err(err) = crate::player_bridge::build_open_request(self)
+                    .and_then(|request| playback.cue_timeline_click(request, frame))
+                {
+                    self.player_status = err;
+                }
                 IngestAction::None
             }
             SourceDockAction::ToggleAudioExpand(lane) => {

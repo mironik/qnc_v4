@@ -30,6 +30,9 @@ const FFMPEG_CHILD_TERMINATE_WAIT: Duration = Duration::from_millis(5);
 const FFMPEG_CHILD_TERMINATE_POLL: Duration = Duration::from_millis(1);
 const FFMPEG_PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const FFMPEG_INPUT_SEEK_PREROLL_FRAMES: u64 = 25;
+/// Small forward scrub: drain in-pipe. Large progress-bar jumps respawn with `-ss`
+/// so we never materialize thousands of RGB frames in RAM (OOM).
+const MAX_INPIPE_FORWARD_SKIP_FRAMES: u64 = 48;
 const DEFAULT_FFMPEG_BINARY: &str = "ffmpeg";
 const DEFAULT_FFPROBE_BINARY: &str = "ffprobe";
 const QNC_FFMPEG_ENV: &str = "QNC_FFMPEG";
@@ -55,6 +58,7 @@ struct FfmpegVideoStreamRequest<'a> {
     toolchain: &'a FfmpegToolchain,
     hardware_decode: &'a FfmpegHardwareDecode,
     timebase: Timebase,
+    field_mode: FieldMode,
     frame_byte_len: usize,
     read_ahead_frames: usize,
     read_timeout: Duration,
@@ -199,8 +203,11 @@ pub fn probe_source_runtime_with_toolchain(
         .with_source_id(source_id));
     }
 
-    let timebase = timebase_hint
-        .or_else(|| video_probe.as_ref().map(|probe| probe.timebase))
+    // File probe wins — form/UI fps is only a fallback when probe has no video.
+    let timebase = video_probe
+        .as_ref()
+        .map(|probe| probe.timebase)
+        .or(timebase_hint)
         .unwrap_or(Timebase::new(25, 1).map_err(contract_error)?);
     let duration_frames = if let Some(video_probe) = &video_probe {
         video_probe.duration_frames
@@ -578,6 +585,8 @@ impl FfmpegVideoSession {
             }
             self.cache.insert(payload.frame, payload);
         }
+        // Oldest-first: keeps forward prefetch ahead of the playhead.
+        // Backward cues rely on cache.clear() at stream discontinuity, not trim pin.
         self.trim_cache(max_cache_frames, max_cache_bytes);
         Ok(())
     }
@@ -590,18 +599,13 @@ impl FfmpegVideoSession {
         request: FfmpegVideoCacheRequest<'_>,
     ) -> Result<(), BroadcastEngineError> {
         let frame_byte_len = self.frame_byte_len()?;
-        if !self.can_reuse_stream_for(start_frame) {
-            let read_ahead_frames = frame_span_len(start_frame, end_frame)?;
-            let stream_request = FfmpegVideoStreamRequest {
-                toolchain: request.toolchain,
-                hardware_decode: request.hardware_decode,
-                timebase: request.timebase,
-                frame_byte_len,
-                read_ahead_frames,
-                read_timeout: request.cache_config.read_timeout,
-            };
-            self.stream = Some(FfmpegVideoStream::spawn(path, start_frame, stream_request)?);
-        }
+        self.ensure_stream_at(
+            path,
+            start_frame,
+            end_frame,
+            frame_byte_len,
+            request,
+        )?;
         let stream = self.stream.as_mut().ok_or_else(|| {
             BroadcastEngineError::new(
                 BroadcastEngineErrorKind::VideoDecode,
@@ -627,6 +631,62 @@ impl FfmpegVideoSession {
             request.cache_config.max_cache_frames,
             request.cache_config.max_cache_bytes,
         )
+    }
+
+    /// Align ffmpeg pipe to `start_frame` without needless `-ss` respawns.
+    ///
+    /// - backward (start < next): clear cache + respawn (progress-bar cue)
+    /// - small forward gap: discard in-pipe (no flicker, no giant Vec)
+    /// - large forward gap: clear + `-ss` respawn (progress-bar jump must not OOM)
+    /// - matching next: reuse
+    fn ensure_stream_at(
+        &mut self,
+        path: &Path,
+        start_frame: u64,
+        end_frame: u64,
+        frame_byte_len: usize,
+        request: FfmpegVideoCacheRequest<'_>,
+    ) -> Result<(), BroadcastEngineError> {
+        if self.can_reuse_stream_for(start_frame) {
+            return Ok(());
+        }
+
+        if let Some(next) = stream_next_frame(self.stream.as_ref()) {
+            if start_frame > next {
+                let gap = start_frame - next;
+                if should_drain_forward_gap(gap) {
+                    let stream = self.stream.as_mut().expect("stream checked above");
+                    let skip_end = start_frame.saturating_sub(1);
+                    if let Err(error) = stream.discard_frames_until(skip_end) {
+                        self.stream = None;
+                        return Err(error);
+                    }
+                    if self.can_reuse_stream_for(start_frame) {
+                        return Ok(());
+                    }
+                } else {
+                    // Far cue (e.g. 180 → 3180): never decode the gap into RAM.
+                    self.cache.clear();
+                }
+            } else if start_frame < next {
+                // Progress-bar jump back — drop forward window so cue isn't trimmed away.
+                self.cache.clear();
+            }
+        }
+
+        self.stream = None;
+        let read_ahead_frames = frame_span_len(start_frame, end_frame)?;
+        let stream_request = FfmpegVideoStreamRequest {
+            toolchain: request.toolchain,
+            hardware_decode: request.hardware_decode,
+            timebase: request.timebase,
+            field_mode: self.video_format.field_mode,
+            frame_byte_len,
+            read_ahead_frames,
+            read_timeout: request.cache_config.read_timeout,
+        };
+        self.stream = Some(FfmpegVideoStream::spawn(path, start_frame, stream_request)?);
+        Ok(())
     }
 
     fn cache_ready_streamed_frames(
@@ -714,7 +774,7 @@ impl FfmpegVideoStream {
             request.timebase,
             BroadcastEngineErrorKind::VideoDecode,
         )?;
-        let filter = format!("select=gte(n\\,{})", seek.relative_start_frame);
+        let filter = video_decode_filter(seek.relative_start_frame, request.field_mode);
         let mut command = Command::new(request.toolchain.ffmpeg());
         command.args(["-hide_banner", "-nostdin", "-loglevel", "error"]);
         for arg in request.hardware_decode.ffmpeg_input_args() {
@@ -766,6 +826,16 @@ impl FfmpegVideoStream {
             self.next_frame = self.next_frame.saturating_add(1);
         }
         Ok(frames)
+    }
+
+    /// Advance the pipe without retaining decoded RGB (forward scrub / small gap).
+    fn discard_frames_until(&mut self, end_frame: u64) -> Result<(), BroadcastEngineError> {
+        while self.next_frame <= end_frame {
+            let frame = self.next_frame;
+            let _bytes = self.read_next_frame(frame)?;
+            self.next_frame = self.next_frame.saturating_add(1);
+        }
+        Ok(())
     }
 
     fn read_next_frame(&mut self, frame: u64) -> Result<Vec<u8>, BroadcastEngineError> {
@@ -911,6 +981,10 @@ fn synchronous_cache_end_frame(start_frame: u64, prefetch_end_frame: u64) -> u64
         .saturating_add(DEFAULT_SYNCHRONOUS_CACHE_FRAMES)
         .saturating_sub(1)
         .min(prefetch_end_frame)
+}
+
+fn should_drain_forward_gap(gap_frames: u64) -> bool {
+    gap_frames > 0 && gap_frames <= MAX_INPIPE_FORWARD_SKIP_FRAMES
 }
 
 #[derive(Debug)]
@@ -1474,18 +1548,14 @@ impl FfmpegAudioSession {
         end_frame: u64,
         cache_config: FfmpegStreamCacheConfig,
     ) -> Result<(), BroadcastEngineError> {
-        if !self.can_reuse_stream_for(start_frame) {
-            let read_ahead_packets = audio_frame_span_len(start_frame, end_frame)?;
-            self.stream = Some(FfmpegAudioStream::spawn(
-                path,
-                toolchain,
-                &self.audio_format,
-                timebase,
-                start_frame,
-                read_ahead_packets,
-                cache_config.read_timeout,
-            )?);
-        }
+        self.ensure_stream_at(
+            path,
+            toolchain,
+            timebase,
+            start_frame,
+            end_frame,
+            cache_config,
+        )?;
         let stream = self.stream.as_mut().ok_or_else(|| {
             BroadcastEngineError::new(
                 BroadcastEngineErrorKind::AudioOutput,
@@ -1514,6 +1584,60 @@ impl FfmpegAudioSession {
             cache_config.max_cache_frames,
             cache_config.max_cache_bytes,
         )
+    }
+
+    fn ensure_stream_at(
+        &mut self,
+        path: &Path,
+        toolchain: &FfmpegToolchain,
+        timebase: Timebase,
+        start_frame: u64,
+        end_frame: u64,
+        cache_config: FfmpegStreamCacheConfig,
+    ) -> Result<(), BroadcastEngineError> {
+        if self.can_reuse_stream_for(start_frame) {
+            return Ok(());
+        }
+
+        if let Some(next) = audio_stream_next_frame(self.stream.as_ref()) {
+            if start_frame > next {
+                let gap = start_frame - next;
+                if should_drain_forward_gap(gap) {
+                    let stream = self.stream.as_mut().expect("stream checked above");
+                    let skip_end = start_frame.saturating_sub(1);
+                    match stream.discard_packets_until(skip_end) {
+                        Ok(stream_ended) if stream_ended => {
+                            self.stream = None;
+                        }
+                        Ok(_) => {}
+                        Err(error) => {
+                            self.stream = None;
+                            return Err(error);
+                        }
+                    }
+                    if self.can_reuse_stream_for(start_frame) {
+                        return Ok(());
+                    }
+                } else {
+                    self.cache.clear();
+                }
+            } else if start_frame < next {
+                self.cache.clear();
+            }
+        }
+
+        self.stream = None;
+        let read_ahead_packets = audio_frame_span_len(start_frame, end_frame)?;
+        self.stream = Some(FfmpegAudioStream::spawn(
+            path,
+            toolchain,
+            &self.audio_format,
+            timebase,
+            start_frame,
+            read_ahead_packets,
+            cache_config.read_timeout,
+        )?);
+        Ok(())
     }
 
     fn cache_ready_streamed_packets(
@@ -1788,6 +1912,30 @@ impl FfmpegAudioStream {
             packets,
             stream_ended,
         })
+    }
+
+    /// Advance audio pipe without retaining PCM for a large skip window.
+    fn discard_packets_until(&mut self, end_frame: u64) -> Result<bool, BroadcastEngineError> {
+        let mut saw_packet = false;
+        while self.next_frame <= end_frame {
+            match self.read_next_packet() {
+                Ok(packet) => {
+                    self.next_frame = packet.frame.saturating_add(1);
+                    saw_packet = true;
+                }
+                Err(error)
+                    if error.kind == BroadcastEngineErrorKind::AudioOutput
+                        && error
+                            .message
+                            .starts_with("ffmpeg audio stream ended before requested frame")
+                        && saw_packet =>
+                {
+                    return Ok(true);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(false)
     }
 
     fn read_ready_packets_until(
@@ -2602,10 +2750,26 @@ fn parse_u32_ratio(value: &str) -> Option<(u32, u32)> {
 }
 
 fn parse_field_mode(value: Option<&String>) -> FieldMode {
-    match value.map(String::as_str) {
+    match value.map(|v| v.to_ascii_lowercase()).as_deref() {
         Some("tt") | Some("tb") => FieldMode::InterlacedUpperFirst,
         Some("bb") | Some("bt") => FieldMode::InterlacedLowerFirst,
+        Some("progressive") | None => FieldMode::Progressive,
         _ => FieldMode::Progressive,
+    }
+}
+
+/// Build `-vf` chain from probed field mode + frame select.
+/// Interlaced sources are bobbed to progressive frames (same frame count).
+fn video_decode_filter(relative_start_frame: u64, field_mode: FieldMode) -> String {
+    let select = format!("select=gte(n\\,{relative_start_frame})");
+    match field_mode {
+        FieldMode::Progressive => select,
+        FieldMode::InterlacedUpperFirst => {
+            format!("yadif=mode=send_frame:parity=tff:deint=all,{select}")
+        }
+        FieldMode::InterlacedLowerFirst => {
+            format!("yadif=mode=send_frame:parity=bff:deint=all,{select}")
+        }
     }
 }
 
@@ -3034,6 +3198,46 @@ mod tests {
     }
 
     #[test]
+    fn large_forward_gap_respawns_instead_of_inpipe_drain() {
+        // Progress-bar cue 180 → 3180 must not decode ~3000 RGB frames into RAM.
+        assert!(should_drain_forward_gap(1));
+        assert!(should_drain_forward_gap(MAX_INPIPE_FORWARD_SKIP_FRAMES));
+        assert!(!should_drain_forward_gap(MAX_INPIPE_FORWARD_SKIP_FRAMES + 1));
+        assert!(!should_drain_forward_gap(3_000));
+    }
+
+    #[test]
+    fn video_seek_discontinuity_clears_stale_forward_cache() {
+        let mut session = video_session(2, 1, 200);
+        let forward: Vec<_> = (90..122)
+            .map(|frame| FfmpegVideoPayload {
+                frame,
+                bytes: vec![frame as u8; 6],
+            })
+            .collect();
+        session
+            .cache_decoded_frames(forward, 32, usize::MAX)
+            .unwrap();
+        assert!(session.cached_frame(121).is_some());
+
+        // Same as stream respawn on progress-bar cue: clear then cache cue frame.
+        session.cache.clear();
+        session
+            .cache_decoded_frames(
+                vec![FfmpegVideoPayload {
+                    frame: 31,
+                    bytes: vec![31; 6],
+                }],
+                32,
+                usize::MAX,
+            )
+            .unwrap();
+
+        assert!(session.cached_frame(31).is_some());
+        assert!(session.cached_frame(121).is_none());
+    }
+
+    #[test]
     fn video_session_prefetch_end_stays_inside_decodable_frames() {
         let session = video_session(2, 1, 20);
 
@@ -3151,6 +3355,36 @@ mod tests {
 
         assert!(session.payload_for_request(12).is_none());
         assert_eq!(session.cache_byte_len(), 0);
+    }
+
+    #[test]
+    fn audio_seek_discontinuity_clears_stale_forward_cache() {
+        let mut session = audio_session(200);
+        let forward: Vec<_> = (90..154)
+            .map(|frame| FfmpegAudioPayload {
+                frame,
+                bytes: vec![frame as u8; 4],
+            })
+            .collect();
+        session
+            .cache_decoded_packets(forward, 64, usize::MAX)
+            .unwrap();
+        assert!(session.payload_for_request(153).is_some());
+
+        session.cache.clear();
+        session
+            .cache_decoded_packets(
+                vec![FfmpegAudioPayload {
+                    frame: 31,
+                    bytes: vec![31; 4],
+                }],
+                64,
+                usize::MAX,
+            )
+            .unwrap();
+
+        assert!(session.payload_for_request(31).is_some());
+        assert!(session.payload_for_request(153).is_none());
     }
 
     #[test]
@@ -3326,5 +3560,33 @@ mod tests {
             audio_format: Some(AudioFormat::new(48_000, 1).unwrap()),
         };
         FfmpegAudioSession::new(&source).unwrap()
+    }
+
+    #[test]
+    fn parse_field_mode_maps_ffprobe_orders() {
+        assert_eq!(
+            parse_field_mode(Some(&"tt".into())),
+            FieldMode::InterlacedUpperFirst
+        );
+        assert_eq!(
+            parse_field_mode(Some(&"bb".into())),
+            FieldMode::InterlacedLowerFirst
+        );
+        assert_eq!(
+            parse_field_mode(Some(&"Progressive".into())),
+            FieldMode::Progressive
+        );
+        assert_eq!(parse_field_mode(None), FieldMode::Progressive);
+    }
+
+    #[test]
+    fn video_decode_filter_adds_yadif_for_interlace() {
+        assert_eq!(
+            video_decode_filter(10, FieldMode::Progressive),
+            "select=gte(n\\,10)"
+        );
+        assert!(video_decode_filter(0, FieldMode::InterlacedUpperFirst).starts_with("yadif="));
+        assert!(video_decode_filter(0, FieldMode::InterlacedUpperFirst).contains("parity=tff"));
+        assert!(video_decode_filter(0, FieldMode::InterlacedLowerFirst).contains("parity=bff"));
     }
 }

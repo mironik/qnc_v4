@@ -2,12 +2,14 @@
 
 mod api;
 mod app;
+mod carrier_sync;
 mod composition;
 mod editorial;
 mod frame_time;
 mod ingest;
 mod ingest_player;
 mod media_assist;
+mod playback_stack;
 mod player_bridge;
 mod player_contract;
 mod player_log;

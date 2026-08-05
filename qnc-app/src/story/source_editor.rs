@@ -5,14 +5,13 @@ use eframe::egui;
 use crate::qnc_filmstrip_background::FilmFrame;
 use crate::qnc_source_dock::{self, SourceDockAction, SourceDockInput};
 use crate::qnc_timeline::{ExpandedAudio, TimelineFocusPaint};
+use crate::qnc_timeline_progress::TimelineProgressModel;
 
 pub(super) struct SourceEditorInput<'a> {
     pub clip_label: &'a str,
     pub source_in: f64,
     pub source_out: f64,
-    pub clip_duration: f64,
-    pub playhead_sec: f64,
-    pub timebase_fps: f64,
+    pub timeline_model: TimelineProgressModel,
     pub focus: TimelineFocusPaint,
     pub a1_peaks: &'a [f32],
     pub a2_peaks: &'a [f32],
@@ -30,8 +29,8 @@ pub(super) enum SourceEditorAction {
     ToggleAudioExpand(ExpandedAudio),
 }
 
-pub(super) fn dock_height(expanded_audio: ExpandedAudio) -> f32 {
-    qnc_source_dock::dock_height(expanded_audio, true)
+pub(super) fn dock_height(expanded_audio: ExpandedAudio, duration_sec: f64) -> f32 {
+    qnc_source_dock::dock_height(expanded_audio, true, duration_sec)
 }
 
 pub(super) fn show(ui: &mut egui::Ui, input: SourceEditorInput<'_>) -> SourceEditorAction {
@@ -41,9 +40,7 @@ pub(super) fn show(ui: &mut egui::Ui, input: SourceEditorInput<'_>) -> SourceEdi
             clip_label: input.clip_label,
             source_in: input.source_in,
             source_out: input.source_out,
-            clip_duration: input.clip_duration,
-            playhead_sec: input.playhead_sec,
-            timebase_fps: input.timebase_fps,
+            timeline_model: input.timeline_model,
             focus: input.focus,
             a1_peaks: input.a1_peaks,
             a2_peaks: input.a2_peaks,

@@ -1,17 +1,18 @@
-//! Transitional: form model still mirrors player via Rx.
-//! Target: components hold Tx/Rx only; this file shrinks away.
+//! Form → [`PlaybackStack`] bridge (open metadata + command queue only).
+//! Playhead authority lives in [`CarrierSync`] — not in forms.
 
 use eframe::egui::{self, ColorImage};
 
+use crate::playback_stack::PlaybackStack;
 use crate::player_contract::{BroadcastHostSourceRef, FrameNumber};
-use crate::qnc_broadcast_player::{
-    BroadcastPlayerOpenRequest, BroadcastPlayerRx, PlayerEvent, QncBroadcastPlayer,
-};
+use crate::qnc_broadcast_player::{BroadcastPlayerOpenRequest, BroadcastPlayerRx, PlayerEvent};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PlaybackCommand {
-    SeekToPlayhead,
-    PauseAndSeek,
+    /// Discrete seek (IO, marks, timeline click).
+    CueFrame(FrameNumber),
+    /// Scrub drag — coalesced still.
+    ScrubFrame(FrameNumber),
     TogglePlay,
 }
 
@@ -19,51 +20,29 @@ pub fn compact_playback_commands(
     raw: impl IntoIterator<Item = PlaybackCommand>,
     playing: bool,
 ) -> Vec<PlaybackCommand> {
-    let mut seek_to = false;
-    let mut pause_and_seek = false;
+    let mut cue = None;
+    let mut scrub = None;
     let mut toggle = false;
     for command in raw {
         match command {
-            PlaybackCommand::SeekToPlayhead => seek_to = true,
-            PlaybackCommand::PauseAndSeek => pause_and_seek = true,
+            PlaybackCommand::CueFrame(frame) => cue = Some(frame),
+            PlaybackCommand::ScrubFrame(frame) => scrub = Some(frame),
             PlaybackCommand::TogglePlay => toggle = true,
         }
     }
 
     let mut out = Vec::with_capacity(2);
-    if pause_and_seek {
-        out.push(PlaybackCommand::PauseAndSeek);
-    } else if seek_to && !playing {
-        out.push(PlaybackCommand::SeekToPlayhead);
+    if let Some(frame) = scrub {
+        out.push(PlaybackCommand::ScrubFrame(frame));
+    } else if let Some(frame) = cue {
+        if !playing {
+            out.push(PlaybackCommand::CueFrame(frame));
+        }
     }
     if toggle {
         out.push(PlaybackCommand::TogglePlay);
     }
     out
-}
-
-fn should_cue_playhead_before_toggle(playing: bool) -> bool {
-    !playing
-}
-
-pub fn should_apply_player_progress(
-    player_frame: FrameNumber,
-    pending_playhead_target: Option<FrameNumber>,
-    playing: bool,
-) -> bool {
-    if playing {
-        return true;
-    }
-    pending_playhead_target
-        .map(|target| player_frame == target)
-        .unwrap_or(true)
-}
-
-fn projected_playing_after_command(playing: bool, command: PlaybackCommand) -> bool {
-    match command {
-        PlaybackCommand::SeekToPlayhead | PlaybackCommand::PauseAndSeek => false,
-        PlaybackCommand::TogglePlay => !playing,
-    }
 }
 
 pub trait PlayerClient {
@@ -76,7 +55,6 @@ pub trait PlayerClient {
     fn playback_source_fps(&self) -> f64;
     fn playback_source_has_audio(&self) -> bool;
     fn playback_source_audio_channels(&self) -> u8;
-    fn playback_source_frame(&self) -> FrameNumber;
     fn playback_is_playing(&self) -> bool;
 
     fn missing_source_message(&self) -> String;
@@ -84,27 +62,13 @@ pub trait PlayerClient {
 
     fn set_player_preview_active(&mut self, active: bool);
     fn apply_playback_command_state(&mut self, playing: bool, status: impl Into<String>);
-    fn apply_player_frame(
-        &mut self,
-        image: ColorImage,
-        source_frame: FrameNumber,
-        source_sec: f64,
-        playing: bool,
-    );
-    fn apply_player_state(
-        &mut self,
-        source_frame: FrameNumber,
-        source_sec: f64,
-        playing: bool,
-        status: impl Into<String>,
-    );
+    fn apply_player_frame(&mut self, image: ColorImage, source_sec: f64, playing: bool);
+    fn apply_player_state(&mut self, source_sec: f64, playing: bool, status: impl Into<String>);
     fn apply_player_error(&mut self, status: impl Into<String>);
 }
 
-fn open_request(
-    client: &impl PlayerClient,
-    _ctx: &egui::Context,
-) -> Result<BroadcastPlayerOpenRequest, String> {
+/// Build open request from form source metadata (no playhead — carrier owns that).
+pub fn build_open_request(client: &impl PlayerClient) -> Result<BroadcastPlayerOpenRequest, String> {
     let Some(source_ref) = client.playback_source_ref().cloned() else {
         return Err(client.missing_source_message());
     };
@@ -121,54 +85,57 @@ fn open_request(
         source_fps: client.playback_source_fps(),
         has_audio: client.playback_source_has_audio(),
         audio_channels: client.playback_source_audio_channels(),
-        start_source_frame: client.playback_source_frame(),
+        start_source_frame: FrameNumber(0),
     })
 }
 
-/// Queue onto player TX. Player owns idempotent Open (same source = no restart).
+/// Drain form queue → shared playback stack (carrier + player).
 pub fn handle_playback_commands(
     client: &mut impl PlayerClient,
-    player: &QncBroadcastPlayer,
-    ctx: &egui::Context,
+    stack: &mut PlaybackStack,
+    _ctx: &egui::Context,
 ) {
-    let tx = player.tx();
-    let mut projected_playing = client.playback_is_playing();
     for command in client.drain_playback_commands() {
         match command {
-            PlaybackCommand::SeekToPlayhead | PlaybackCommand::PauseAndSeek => {
-                let coalesce = matches!(command, PlaybackCommand::PauseAndSeek);
-                match open_request(client, ctx) {
+            PlaybackCommand::CueFrame(frame) => {
+                match build_open_request(client) {
                     Ok(request) => {
-                        let frame = request.start_source_frame;
-                        let _ = tx.open(request);
-                        let _ = tx.seek_frame(frame, true, coalesce);
-                        projected_playing =
-                            projected_playing_after_command(projected_playing, command);
+                        if let Err(err) = stack.ensure_open(request) {
+                            client.apply_player_error(err);
+                            continue;
+                        }
+                        if !stack.cue_frame(frame.0) {
+                            client.apply_player_error("Timeline nije spreman — pričekaj SourceReady");
+                        }
+                    }
+                    Err(err) => client.apply_player_error(err),
+                }
+            }
+            PlaybackCommand::ScrubFrame(frame) => {
+                match build_open_request(client) {
+                    Ok(request) => {
+                        if let Err(err) = stack.ensure_open(request) {
+                            client.apply_player_error(err);
+                            continue;
+                        }
+                        let _ = stack.scrub_frame(frame.0);
                     }
                     Err(err) => client.apply_player_error(err),
                 }
             }
             PlaybackCommand::TogglePlay => {
-                let cue_playhead = should_cue_playhead_before_toggle(projected_playing);
-                if !cue_playhead {
-                    client.clear_pending_seeks();
-                }
-                crate::player_log::log_info("bridge", "TogglePlay / Space");
-                match open_request(client, ctx) {
+                client.clear_pending_seeks();
+                match build_open_request(client) {
                     Ok(request) => {
-                        let frame = request.start_source_frame;
-                        let _ = tx.open(request);
-                        if cue_playhead {
-                            let _ = tx.goto_frame(frame);
+                        if let Err(err) = stack.ensure_open(request) {
+                            client.apply_player_error(err);
+                            continue;
                         }
-                        let _ = tx.toggle_play();
-                        projected_playing =
-                            projected_playing_after_command(projected_playing, command);
+                        if let Err(err) = stack.toggle_play() {
+                            client.apply_player_error(err);
+                        }
                     }
-                    Err(err) => {
-                        crate::player_log::log_error("bridge", &err);
-                        client.apply_player_error(err);
-                    }
+                    Err(err) => client.apply_player_error(err),
                 }
             }
         }
@@ -180,87 +147,56 @@ mod tests {
     use super::*;
 
     #[test]
-    fn compact_keeps_pending_seek_before_toggle_when_paused() {
+    fn compact_keeps_scrub_before_toggle_when_paused() {
         let commands = compact_playback_commands(
-            [PlaybackCommand::PauseAndSeek, PlaybackCommand::TogglePlay],
+            [
+                PlaybackCommand::ScrubFrame(FrameNumber(50)),
+                PlaybackCommand::TogglePlay,
+            ],
             false,
         );
-
         assert_eq!(
             commands,
-            vec![PlaybackCommand::PauseAndSeek, PlaybackCommand::TogglePlay]
+            vec![
+                PlaybackCommand::ScrubFrame(FrameNumber(50)),
+                PlaybackCommand::TogglePlay,
+            ]
         );
     }
 
     #[test]
-    fn compact_keeps_playing_toggle_as_pause_only_without_auto_seek() {
+    fn compact_skips_cue_when_playing_toggle_only() {
         let commands = compact_playback_commands(
-            [PlaybackCommand::SeekToPlayhead, PlaybackCommand::TogglePlay],
+            [
+                PlaybackCommand::CueFrame(FrameNumber(10)),
+                PlaybackCommand::TogglePlay,
+            ],
             true,
         );
-
         assert_eq!(commands, vec![PlaybackCommand::TogglePlay]);
-    }
-
-    #[test]
-    fn toggle_cues_playhead_only_when_starting_playback() {
-        assert!(should_cue_playhead_before_toggle(false));
-        assert!(!should_cue_playhead_before_toggle(true));
-    }
-
-    #[test]
-    fn pause_seek_then_toggle_projects_as_start_from_target() {
-        let mut projected = true;
-        projected = projected_playing_after_command(projected, PlaybackCommand::PauseAndSeek);
-
-        assert!(should_cue_playhead_before_toggle(projected));
-        assert!(projected_playing_after_command(
-            projected,
-            PlaybackCommand::TogglePlay
-        ));
-    }
-
-    #[test]
-    fn paused_progress_does_not_override_pending_playhead_target_until_confirmed() {
-        assert!(!should_apply_player_progress(
-            FrameNumber(8),
-            Some(FrameNumber(4)),
-            false
-        ));
-        assert!(should_apply_player_progress(
-            FrameNumber(4),
-            Some(FrameNumber(4)),
-            false
-        ));
-        assert!(should_apply_player_progress(
-            FrameNumber(8),
-            Some(FrameNumber(4)),
-            true
-        ));
-        assert!(should_apply_player_progress(FrameNumber(8), None, false));
     }
 }
 
-/// Drain a subscriber RX into the form projection.
-pub fn poll_player_remote(
+/// Apply already-drained RX events — transport flags (+ optional editorial mirror in client).
+pub fn apply_player_events(
     client: &mut impl PlayerClient,
-    rx: &BroadcastPlayerRx,
-    player: &QncBroadcastPlayer,
+    events: &[PlayerEvent],
+    player: &crate::qnc_broadcast_player::QncBroadcastPlayer,
 ) {
-    for event in rx.try_recv_all() {
+    for event in events {
         match event {
             PlayerEvent::Frame {
                 image,
-                source_frame,
                 source_sec,
                 playing,
-            } => client.apply_player_frame(image, source_frame, source_sec, playing),
+                ..
+            } => client.apply_player_frame(image.clone(), *source_sec, *playing),
             PlayerEvent::State {
-                source_frame,
                 source_sec,
                 playing,
                 status,
-            } => client.apply_player_state(source_frame, source_sec, playing, status),
+                ..
+            } => client.apply_player_state(*source_sec, *playing, status.clone()),
             PlayerEvent::Error(err) => {
                 crate::player_log::log_error("bridge-rx", &err);
                 client.apply_player_error(err);
@@ -269,8 +205,17 @@ pub fn poll_player_remote(
                 client.set_player_preview_active(false);
                 client.apply_playback_command_state(false, "Stopped");
             }
+            PlayerEvent::SourceReady { .. } => {}
         }
     }
     let snap = player.snapshot();
     client.set_player_preview_active(snap.active || snap.playing);
+}
+
+pub fn poll_player_remote(
+    client: &mut impl PlayerClient,
+    rx: &BroadcastPlayerRx,
+    player: &crate::qnc_broadcast_player::QncBroadcastPlayer,
+) {
+    apply_player_events(client, &rx.try_recv_all(), player);
 }

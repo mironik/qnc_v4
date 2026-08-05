@@ -12,10 +12,11 @@ use eframe::egui;
 
 use crate::shortcuts::StoryBindings;
 
-pub(super) const SEEK_STEP_FRAMES: i64 = 1;
+/// Frame delta for catalog actions `step_back_frame` / `step_forward_frame`.
+pub(crate) const SEEK_STEP_FRAMES: i64 = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum PlaybackAction {
+pub(crate) enum PlaybackAction {
     TogglePlay,
     MarkIn,
     MarkOut,
@@ -29,7 +30,8 @@ pub(super) enum PlaybackAction {
     SeekFrames(i64),
 }
 
-pub(super) fn shortcut_actions(
+/// Resolve pressed keys → actions **only** from loaded QNC keyboard-shortcuts bindings.
+pub(crate) fn shortcut_actions(
     ctx: &egui::Context,
     bindings: &StoryBindings,
 ) -> Vec<PlaybackAction> {

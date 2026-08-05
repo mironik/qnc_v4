@@ -5,7 +5,7 @@
 
 mod async_media;
 mod focus;
-mod playback_controls;
+pub(crate) mod playback_controls;
 mod playback_runtime;
 mod preview_monitor;
 mod source_editor;
@@ -29,8 +29,11 @@ use crate::composition::EditorialRole;
 use crate::editorial::common::{shot_id, truncate};
 use crate::editorial::{marker_cover_panel, media_pool, segment_panel};
 use crate::frame_time::{
-    frame_to_seconds, normalize_fps, seconds_to_timecode, snap_seconds_to_frame, DEFAULT_FPS,
+    frame_to_seconds, normalize_fps, seconds_to_frame, seconds_to_timecode,
+    snap_seconds_to_frame, DEFAULT_FPS,
 };
+use crate::player_contract::FrameNumber;
+use crate::playback_stack::PlaybackStack;
 use crate::player_contract::BroadcastHostSourceRef;
 use crate::qnc_filmstrip_background::FilmFrame;
 use crate::qnc_timeline::{ExpandedAudio, TimelineFocusPaint};
@@ -81,11 +84,11 @@ pub struct StoryScreen {
     story_summary: String,
     draft_status: String,
     virtual_sec: f64,
+    /// Frame playhead — synced from player / carrier (timeline authority).
+    playhead_frame: i64,
     playing: bool,
     layer: String,
     status: String,
-    texture: Option<TextureHandle>,
-    pending_player_image: Option<ColorImage>,
     /// True while broadcast PlayerRemote owns the monitor.
     broadcast_preview_active: bool,
     thumb_textures: HashMap<String, TextureHandle>,
@@ -98,8 +101,7 @@ pub struct StoryScreen {
     source_media_loader: async_media::AsyncSourceMediaLoader,
     repaint_ctx: Option<egui::Context>,
     source_media_retry_at: Option<Instant>,
-    /// Pending progress-bar target while the player cue catches up.
-    playhead_ui_target: Option<f64>,
+    /// Pending frame target while the player cue catches up.
     source_timebase_ready: bool,
     pending_playback_commands: Vec<StoryPlaybackCommand>,
     /// Keyboard chords from host catalog + DB (or local file / builtin).
@@ -159,11 +161,10 @@ impl StoryScreen {
             story_summary: String::new(),
             draft_status: "draft".into(),
             virtual_sec: 0.0,
+            playhead_frame: 0,
             playing: false,
             layer: String::new(),
             status: role.idle_status().into(),
-            texture: None,
-            pending_player_image: None,
             broadcast_preview_active: false,
             thumb_textures: HashMap::new(),
             thumbs_queued: Vec::new(),
@@ -175,7 +176,6 @@ impl StoryScreen {
             source_media_loader: async_media::AsyncSourceMediaLoader::new(),
             repaint_ctx: None,
             source_media_retry_at: None,
-            playhead_ui_target: None,
             source_timebase_ready: false,
             pending_playback_commands: Vec::new(),
             bindings: StoryBindings::empty(),
@@ -437,38 +437,31 @@ impl StoryScreen {
 
     fn queue_seek_to_playhead(&mut self) {
         if self.selected_source_ref.is_some() {
+            let frame = FrameNumber(seconds_to_frame(
+                self.virtual_sec,
+                self.source_timebase_fps().unwrap_or(DEFAULT_FPS),
+            ));
             self.pending_playback_commands
-                .push(StoryPlaybackCommand::SeekToPlayhead);
+                .push(StoryPlaybackCommand::CueFrame(frame));
         }
     }
 
     fn queue_pause_and_seek(&mut self) {
         if self.selected_source_ref.is_some() {
+            let frame = FrameNumber(seconds_to_frame(
+                self.virtual_sec,
+                self.source_timebase_fps().unwrap_or(DEFAULT_FPS),
+            ));
             self.pending_playback_commands
-                .push(StoryPlaybackCommand::PauseAndSeek);
+                .push(StoryPlaybackCommand::ScrubFrame(frame));
         }
     }
 
-    /// Keep timeline playhead on UI target until the player confirms it.
-    fn lock_playhead_ui(&mut self) {
-        self.playhead_ui_target = Some(self.virtual_sec);
-    }
-
-    /// Scrub drag → coalesced still (PlayerRemote debounce).
     fn schedule_native_seek(&mut self) {
-        if self.selected_source_ref.is_none() {
-            return;
-        }
-        self.lock_playhead_ui();
         self.queue_pause_and_seek();
     }
 
-    /// Discrete ←→ / I·O → immediate still (no debounce).
     fn schedule_native_seek_io(&mut self) {
-        if self.selected_source_ref.is_none() {
-            return;
-        }
-        self.lock_playhead_ui();
         self.queue_seek_to_playhead();
     }
 
@@ -620,25 +613,23 @@ impl StoryScreen {
         }
     }
 
-    pub fn handle_shortcuts(&mut self, ctx: &egui::Context, host: &HostClient) {
-        if self.bindings.by_action.is_empty() || !self.bindings.by_action.contains_key("play_pause")
-        {
+    pub fn handle_shortcuts(
+        &mut self,
+        ctx: &egui::Context,
+        host: &HostClient,
+        playback: &mut crate::playback_stack::PlaybackStack,
+    ) {
+        if self.bindings.by_action.is_empty() {
             self.reload_shortcuts(host);
         }
+        // Keys come only from seed/DB keyboard-shortcuts (storyboard scope).
         for action in playback_controls::shortcut_actions(ctx, &self.bindings) {
-            self.dispatch_playback_action(host, action);
-        }
-        // Hard fallback — same as Ingest — so Space always toggles even if
-        // host keyboard catalog is missing play_pause for this scope.
-        if ctx.input(|i| i.key_pressed(egui::Key::Space))
-            && self.selected_source_ref.is_some()
-            && !self
-                .pending_playback_commands
-                .iter()
-                .any(|c| matches!(c, StoryPlaybackCommand::TogglePlay))
-        {
-            self.pending_playback_commands
-                .push(StoryPlaybackCommand::TogglePlay);
+            match action {
+                playback_controls::PlaybackAction::SeekFrames(frames) => {
+                    self.step_focus(host, playback, frames);
+                }
+                other => self.dispatch_playback_action(host, other),
+            }
         }
     }
 
@@ -672,7 +663,7 @@ impl StoryScreen {
     }
 
     pub fn playback_source_sec(&self) -> f64 {
-        <Self as crate::player_bridge::PlayerClient>::playback_source_sec(self)
+        self.virtual_sec
     }
 
     /// Local disk path for native ffmpeg (never an HTTP virtual-stream URL).
@@ -726,11 +717,6 @@ impl StoryScreen {
     pub fn prepare_frame(&mut self, host: &HostClient, ctx: &egui::Context) {
         self.repaint_ctx = Some(ctx.clone());
         self.poll_async_media(host, ctx);
-        if let Some(img) = self.pending_player_image.take() {
-            let tex =
-                ctx.load_texture("story_broadcast_preview_frame", img, TextureOptions::LINEAR);
-            self.texture = Some(tex);
-        }
         if let Some(retry_at) = self.source_media_retry_at {
             let now = Instant::now();
             if now >= retry_at {
@@ -747,24 +733,35 @@ impl StoryScreen {
 
     /// Docked bottom bar — web `story-source-editor-col` + `qnc-timeline` source.
     pub fn source_dock_height(&self) -> f32 {
-        source_editor::dock_height(self.expanded_audio)
+        let dur = self.selected_clip_duration().max(0.04);
+        source_editor::dock_height(self.expanded_audio, dur)
     }
 
-    pub fn ui_source_dock(&mut self, ui: &mut egui::Ui, host: &HostClient) {
-        self.ui_source_editor(ui, host, self.source_dock_height());
+    pub fn ui_source_dock(
+        &mut self,
+        ui: &mut egui::Ui,
+        host: &HostClient,
+        playback: &mut PlaybackStack,
+    ) {
+        self.ui_source_editor(ui, host, self.source_dock_height(), playback);
     }
 
     /// Central workspace — composed from `qnc_ui` (Story is the reference form).
-    pub fn ui_main(&mut self, ui: &mut egui::Ui, host: &HostClient, _ctx: &egui::Context) {
-        let texture = self.texture.clone();
+    pub fn ui_main(
+        &mut self,
+        ui: &mut egui::Ui,
+        host: &HostClient,
+        _ctx: &egui::Context,
+        playback: &PlaybackStack,
+    ) {
         crate::qnc_ui::editorial_shell(ui, |ui, m, side| match side {
             crate::qnc_ui::ShellSide::Left => {
-                crate::qnc_ui::media_column(
+                crate::qnc_ui::media_column_monitor(
                     ui,
                     m,
-                    texture.as_ref(),
-                    "Odaberi klip",
-                    egui::Sense::hover(),
+                    |ui, preview_h| {
+                        playback.show_monitor(ui, preview_h, "Odaberi klip");
+                    },
                     |ui, _rest| {
                         ui.spacing_mut().item_spacing.y = 0.0;
                         ui.allocate_ui(Vec2::new(m.left_w, crate::qnc_ui::space::CHROME_H), |ui| {
@@ -969,7 +966,13 @@ impl StoryScreen {
         }
     }
 
-    fn ui_source_editor(&mut self, ui: &mut egui::Ui, host: &HostClient, _height: f32) {
+    fn ui_source_editor(
+        &mut self,
+        ui: &mut egui::Ui,
+        host: &HostClient,
+        _height: f32,
+        playback: &mut PlaybackStack,
+    ) {
         let clip_label = self.selected_clip_label();
         let clip_dur = self
             .all_clips
@@ -978,22 +981,37 @@ impl StoryScreen {
             .map(|c| c.duration_sec)
             .unwrap_or(0.0)
             .max((self.source_out).max(1.0));
+        let timebase_fps = self.source_timebase_fps().unwrap_or(DEFAULT_FPS);
+        // Editorial mirror from carrier projection (marks), not a local clock.
+        if playback.carrier().is_active() {
+            let frame = playback.carrier().display_frame().0;
+            self.playhead_frame = frame;
+            self.virtual_sec = self.snap_source_sec(frame_to_seconds(frame, timebase_fps));
+        }
         let tc = |sec| self.source_tc(sec);
         let focus_paint = match self.focus.target {
             FocusTarget::Playhead => TimelineFocusPaint::Playhead,
             FocusTarget::In => TimelineFocusPaint::In,
             FocusTarget::Out => TimelineFocusPaint::Out,
         };
-        let timebase_fps = self.source_timebase_fps().unwrap_or(DEFAULT_FPS);
+        let in_frame = seconds_to_frame(self.source_in.max(0.0), timebase_fps);
+        let out_frame = seconds_to_frame(self.source_out.max(self.source_in), timebase_fps);
+        let fallback_frame =
+            seconds_to_frame(self.virtual_sec.clamp(0.0, clip_dur), timebase_fps);
+        let timeline_model = playback.timeline_model_for_clip(
+            timebase_fps,
+            clip_dur,
+            in_frame,
+            out_frame,
+            fallback_frame,
+        );
         let action = source_editor::show(
             ui,
             source_editor::SourceEditorInput {
                 clip_label: &clip_label,
                 source_in: self.source_in,
                 source_out: self.source_out,
-                clip_duration: clip_dur,
-                playhead_sec: self.virtual_sec,
-                timebase_fps,
+                timeline_model,
                 focus: focus_paint,
                 a1_peaks: &self.a1_peaks,
                 a2_peaks: &self.a2_peaks,
@@ -1011,16 +1029,13 @@ impl StoryScreen {
                 self.expanded_audio = self.expanded_audio.toggle(lane);
             }
             source_editor::SourceEditorAction::CueFrame(frame) => {
-                // Scrub always moves playhead only. IN/OUT focus is for frame nudge after select_mark_*.
-                let sec = frame_to_seconds(frame, timebase_fps);
-                self.virtual_sec = self.snap_source_sec(sec.clamp(0.0, clip_dur));
-                if self.view_mode != ViewMode::Source {
-                    let clip = self.selected_clip_id.clone();
-                    if !clip.is_empty() {
-                        self.activate_source_ui(host, &clip);
-                    }
+                // Progress bar → CueFrame; Space plays from this position.
+                match crate::player_bridge::build_open_request(self)
+                    .and_then(|request| playback.cue_timeline_click(request, frame))
+                {
+                    Ok(()) => {}
+                    Err(err) => self.status = err,
                 }
-                self.scrub_soft(host);
             }
         }
     }
@@ -1057,9 +1072,8 @@ impl StoryScreen {
                 }
             }
             playback_controls::PlaybackAction::QuickCover => self.quick_cover(host),
-            playback_controls::PlaybackAction::SeekFrames(frames) => {
-                self.step_focus(host, frames);
-            }
+            // SeekFrames is handled in handle_shortcuts (needs PlaybackStack).
+            playback_controls::PlaybackAction::SeekFrames(_) => {}
         }
     }
 
@@ -1380,16 +1394,54 @@ impl StoryScreen {
     }
 
     fn scrub_soft(&mut self, _host: &HostClient) {
-        self.lock_playhead_ui();
         self.schedule_native_seek();
     }
 
     /// ←/→: nudge focused IN/OUT, otherwise seek playhead by frames.
-    fn step_focus(&mut self, host: &HostClient, frames: i64) {
+    fn step_focus(
+        &mut self,
+        host: &HostClient,
+        playback: &mut crate::playback_stack::PlaybackStack,
+        frames: i64,
+    ) {
         match self.focus.target {
             FocusTarget::In => self.nudge_in(host, frames),
             FocusTarget::Out => self.nudge_out(host, frames),
-            FocusTarget::Playhead => self.seek_by_frames(host, frames),
+            FocusTarget::Playhead => self.seek_playhead(host, playback, frames),
+        }
+    }
+
+    /// Playhead step via carrier + CueFrame (same path as progress-bar click).
+    fn seek_playhead(
+        &mut self,
+        host: &HostClient,
+        playback: &mut crate::playback_stack::PlaybackStack,
+        frames: i64,
+    ) {
+        if self.view_mode != ViewMode::Source {
+            self.seek_by_frames(host, frames);
+            return;
+        }
+        let Some(fps) = self.source_timebase_fps() else {
+            self.status = "Source FPS još nije potvrđen — frame seek nije moguć".into();
+            return;
+        };
+        let clip_end = seconds_to_frame(self.selected_clip_duration(), fps);
+        let current = if playback.carrier().is_active() {
+            playback.carrier().display_frame().0
+        } else {
+            seconds_to_frame(self.virtual_sec, fps)
+        };
+        let next = (current + frames).clamp(0, clip_end);
+        self.playhead_frame = next;
+        self.virtual_sec = self.snap_source_sec(frame_to_seconds(next, fps));
+        match crate::player_bridge::build_open_request(self)
+            .and_then(|request| playback.cue_timeline_click(request, next))
+        {
+            Ok(()) => {
+                self.status = format!("Playhead → {} (1f)", self.source_tc(self.virtual_sec));
+            }
+            Err(err) => self.status = err,
         }
     }
 
@@ -1529,9 +1581,7 @@ impl crate::player_bridge::PlayerClient for StoryScreen {
         crate::player_bridge::compact_playback_commands(raw, self.playing)
     }
 
-    fn clear_pending_seeks(&mut self) {
-        self.playhead_ui_target = None;
-    }
+    fn clear_pending_seeks(&mut self) {}
 
     fn playback_source_ref(&self) -> Option<&BroadcastHostSourceRef> {
         self.selected_source_ref.as_ref()
@@ -1581,11 +1631,6 @@ impl crate::player_bridge::PlayerClient for StoryScreen {
         }
     }
 
-    fn playback_source_sec(&self) -> f64 {
-        // Source mode: media seconds. Wrap mode: program/carrier seconds (part timeline).
-        self.playhead_ui_target.unwrap_or(self.virtual_sec).max(0.0)
-    }
-
     fn playback_is_playing(&self) -> bool {
         self.playing
     }
@@ -1607,47 +1652,24 @@ impl crate::player_bridge::PlayerClient for StoryScreen {
         self.status = status.into();
     }
 
-    fn apply_player_frame(&mut self, image: ColorImage, source_sec: f64, playing: bool) {
-        let snapped = if self.view_mode == ViewMode::Wrap {
-            self.snap_sec(source_sec.max(0.0))
-        } else {
-            self.snap_source_sec(source_sec.max(0.0))
-        };
-        let eps = self.frame_eps_sec();
-        let apply_progress = crate::player_bridge::should_apply_player_progress(
-            snapped,
-            self.playhead_ui_target,
-            eps,
-            playing,
-        );
-        self.pending_player_image = Some(image);
-        self.broadcast_preview_active = true;
+    fn apply_player_frame(&mut self, _image: ColorImage, source_sec: f64, playing: bool) {
         self.playing = playing;
-        if apply_progress {
-            self.playhead_ui_target = None;
-            self.virtual_sec = snapped;
-        }
         self.status = "Broadcast player".into();
+        // Editorial mirror of player clock (Source view). Timeline paint uses carrier.
+        if self.view_mode == ViewMode::Source {
+            let fps = self.source_timebase_fps().unwrap_or(DEFAULT_FPS);
+            self.playhead_frame = seconds_to_frame(source_sec.max(0.0), fps);
+            self.virtual_sec = self.snap_source_sec(source_sec.max(0.0));
+        }
     }
 
     fn apply_player_state(&mut self, source_sec: f64, playing: bool, status: impl Into<String>) {
-        let snapped = if self.view_mode == ViewMode::Wrap {
-            self.snap_sec(source_sec.max(0.0))
-        } else {
-            self.snap_source_sec(source_sec.max(0.0))
-        };
-        let eps = self.frame_eps_sec();
-        let apply_progress = crate::player_bridge::should_apply_player_progress(
-            snapped,
-            self.playhead_ui_target,
-            eps,
-            playing,
-        );
         self.playing = playing;
         self.status = status.into();
-        if apply_progress {
-            self.playhead_ui_target = None;
-            self.virtual_sec = snapped;
+        if self.view_mode == ViewMode::Source {
+            let fps = self.source_timebase_fps().unwrap_or(DEFAULT_FPS);
+            self.playhead_frame = seconds_to_frame(source_sec.max(0.0), fps);
+            self.virtual_sec = self.snap_source_sec(source_sec.max(0.0));
         }
     }
 

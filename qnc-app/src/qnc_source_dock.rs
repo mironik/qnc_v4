@@ -13,9 +13,8 @@ pub struct SourceDockInput<'a> {
     pub clip_label: &'a str,
     pub source_in: f64,
     pub source_out: f64,
-    pub clip_duration: f64,
-    pub playhead_sec: f64,
-    pub timebase_fps: f64,
+    /// Frame-based paint model — from [`crate::playback_stack::PlaybackStack`], not form seconds.
+    pub timeline_model: TimelineProgressModel,
     pub focus: TimelineFocusPaint,
     pub a1_peaks: &'a [f32],
     pub a2_peaks: &'a [f32],
@@ -73,10 +72,10 @@ fn source_layers() -> LayerFlags {
 }
 
 /// Exact dock height so timeline fits fully; upper CentralPanel flex-shrinks.
-pub fn dock_height(expanded_audio: ExpandedAudio, show_header: bool) -> f32 {
+pub fn dock_height(expanded_audio: ExpandedAudio, show_header: bool, duration_sec: f64) -> f32 {
     let track = QncTimeline {
         layers: source_layers(),
-        duration_sec: 1.0,
+        duration_sec: duration_sec.max(0.04),
         playhead_sec: 0.0,
         source_in: 0.0,
         source_out: 1.0,
@@ -216,13 +215,7 @@ pub fn show(ui: &mut egui::Ui, input: SourceDockInput<'_>) -> SourceDockAction {
                 Some(&filmstrip_background as &dyn Fn(&mut egui::Ui, egui::Rect))
             };
 
-            let model = TimelineProgressModel::from_seconds(
-                input.timebase_fps,
-                input.clip_duration,
-                input.playhead_sec,
-                input.source_in,
-                input.source_out,
-            );
+            let model = input.timeline_model;
             let intent = qnc_timeline_progress::show(
                 ui,
                 TimelineProgressInput {

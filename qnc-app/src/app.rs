@@ -7,9 +7,10 @@ use crate::api::{self, HostClient, ProjectRow, Workspace};
 use crate::composition::{ScreenComposition, WorkflowScreen};
 use crate::ingest::IngestScreen;
 use crate::media_assist::MediaAssistScreen;
+use crate::playback_stack::PlaybackStack;
 use crate::player_bridge;
 use crate::project::{ProjectAction, ProjectScreen};
-use crate::qnc_broadcast_player::{BroadcastPlayerRx, QncBroadcastPlayer};
+use crate::qnc_broadcast_player::BroadcastPlayerRx;
 use crate::qnc_theme::{self, ThemeId};
 use crate::story::StoryScreen;
 
@@ -60,11 +61,9 @@ pub struct QncApp {
     ingest: IngestScreen,
     media_assist: MediaAssistScreen,
     story: StoryScreen,
-    /// Standalone broadcast player (own TX/RX channel — not form-owned).
-    player: QncBroadcastPlayer,
-    story_player_rx: BroadcastPlayerRx,
-    ingest_player_rx: BroadcastPlayerRx,
-    media_assist_player_rx: BroadcastPlayerRx,
+    /// Sole broadcast player (+ carrier / monitor). Screens only host the UI slots.
+    playback: PlaybackStack,
+    playback_rx: BroadcastPlayerRx,
     /// User-selected UI theme (host SQLite `ui_appearance_user`).
     theme_id: ThemeId,
 }
@@ -87,10 +86,8 @@ impl QncApp {
     }
 
     pub fn new(base_url: String) -> Self {
-        let player = QncBroadcastPlayer::new();
-        let story_player_rx = player.subscribe();
-        let ingest_player_rx = player.subscribe();
-        let media_assist_player_rx = player.subscribe();
+        let playback = PlaybackStack::new();
+        let playback_rx = playback.subscribe();
         Self {
             host: HostClient::new(&base_url),
             host_url_edit: base_url,
@@ -111,10 +108,8 @@ impl QncApp {
             ingest: IngestScreen::default(),
             media_assist: StoryScreen::media_assist(),
             story: StoryScreen::story(),
-            player,
-            story_player_rx,
-            ingest_player_rx,
-            media_assist_player_rx,
+            playback,
+            playback_rx,
             theme_id: ThemeId::Dark,
         }
     }
@@ -150,7 +145,7 @@ impl QncApp {
                         .get("plugins_loaded_count")
                         .and_then(|v| v.as_u64())
                         .unwrap_or(0);
-                    self.player.configure_runtime_profile(&rt);
+                    self.playback.player_mut().configure_runtime_profile(&rt);
                     self.runtime_summary = format!("port={port}  plugins={plugins}");
                 } else {
                     self.runtime_summary.clear();
@@ -243,7 +238,7 @@ impl QncApp {
                 self.story = StoryScreen::story();
                 self.media_assist.reset_session(&self.host);
                 self.media_assist = StoryScreen::media_assist();
-                self.player.stop();
+                self.playback.stop();
                 match self.host.workspace(&project.project_id) {
                     Ok(ws) => {
                         self.workspace = Some(ws);
@@ -280,7 +275,7 @@ impl QncApp {
     fn close_project(&mut self) {
         self.story.reset_session(&self.host);
         self.media_assist.reset_session(&self.host);
-        self.player.stop();
+        self.playback.stop();
         self.open_project = None;
         self.workspace = None;
         self.ingest = IngestScreen::default();
@@ -341,22 +336,19 @@ impl QncApp {
         if self.screen == Screen::Story && next != Screen::Story {
             self.story.reset_session(&self.host);
             self.story = StoryScreen::story();
-            self.player.stop();
+            self.playback.stop();
         }
         if self.screen == Screen::MediaAssist && next != Screen::MediaAssist {
             self.media_assist.reset_session(&self.host);
             self.media_assist = StoryScreen::media_assist();
-            self.player.stop();
+            self.playback.stop();
         }
         if self.screen == Screen::Ingest && next != Screen::Ingest {
             self.ingest.reset_player_session();
-            self.player.stop();
+            self.playback.stop();
         }
-        // Inactive form RXs fill while another tab plays — drain so Story/MA
-        // do not apply a backlog of foreign frames after switch.
-        let _ = self.story_player_rx.try_recv_all();
-        let _ = self.ingest_player_rx.try_recv_all();
-        let _ = self.media_assist_player_rx.try_recv_all();
+        // Drain stale RX before switching forms — one shared player, one subscriber.
+        let _ = self.playback_rx.try_recv_all();
         self.screen = next;
         self.on_screen_entered();
     }
@@ -902,68 +894,59 @@ impl QncApp {
     }
 
     fn handle_story_playback_commands(&mut self, ctx: &egui::Context) {
-        player_bridge::handle_playback_commands(&mut self.story, &self.player, ctx);
-    }
-
-    fn poll_story_player_remote(&mut self) {
-        player_bridge::poll_player_remote(&mut self.story, &self.story_player_rx, &self.player);
+        player_bridge::handle_playback_commands(&mut self.story, &mut self.playback, ctx);
     }
 
     fn handle_ingest_playback_commands(&mut self, ctx: &egui::Context) {
-        player_bridge::handle_playback_commands(&mut self.ingest, &self.player, ctx);
-    }
-
-    fn poll_ingest_player_remote(&mut self) {
-        player_bridge::poll_player_remote(&mut self.ingest, &self.ingest_player_rx, &self.player);
+        player_bridge::handle_playback_commands(&mut self.ingest, &mut self.playback, ctx);
     }
 
     fn handle_media_assist_playback_commands(&mut self, ctx: &egui::Context) {
-        player_bridge::handle_playback_commands(&mut self.media_assist, &self.player, ctx);
+        player_bridge::handle_playback_commands(&mut self.media_assist, &mut self.playback, ctx);
     }
 
-    fn poll_media_assist_player_remote(&mut self) {
-        player_bridge::poll_player_remote(
-            &mut self.media_assist,
-            &self.media_assist_player_rx,
-            &self.player,
-        );
-    }
-
-    /// Form → TX, then player pump (TX→decode→RX fan-out), then screen RX → form.
-    fn tick_active_player(&mut self, ctx: &egui::Context) {
-        match self.screen {
-            Screen::Ingest if self.phase == Phase::Workspace => {
-                self.handle_ingest_playback_commands(ctx);
-                self.player.pump(ctx);
-                self.poll_ingest_player_remote();
-            }
-            Screen::Story if self.phase == Phase::Workspace => {
-                self.handle_story_playback_commands(ctx);
-                self.player.pump(ctx);
-                self.poll_story_player_remote();
-            }
-            Screen::MediaAssist if self.phase == Phase::Workspace => {
-                self.handle_media_assist_playback_commands(ctx);
-                self.player.pump(ctx);
-                self.poll_media_assist_player_remote();
-            }
-            _ => {
-                self.player.pump(ctx);
+    fn tick_playback(&mut self, ctx: &egui::Context, drain_commands: bool) {
+        if drain_commands && self.phase == Phase::Workspace {
+            match self.screen {
+                Screen::Ingest => self.handle_ingest_playback_commands(ctx),
+                Screen::Story => self.handle_story_playback_commands(ctx),
+                Screen::MediaAssist => self.handle_media_assist_playback_commands(ctx),
+                _ => {}
             }
         }
+        self.playback.player_mut().pump(ctx);
+        let events = self.playback_rx.try_recv_all();
+        self.playback.ingest_events(&events);
+        if self.phase == Phase::Workspace {
+            match self.screen {
+                Screen::Ingest => player_bridge::apply_player_events(
+                    &mut self.ingest,
+                    &events,
+                    self.playback.player(),
+                ),
+                Screen::Story => player_bridge::apply_player_events(
+                    &mut self.story,
+                    &events,
+                    self.playback.player(),
+                ),
+                Screen::MediaAssist => player_bridge::apply_player_events(
+                    &mut self.media_assist,
+                    &events,
+                    self.playback.player(),
+                ),
+                _ => {}
+            }
+        }
+    }
+
+    /// Form → TX, then playback pump (TX→decode→RX→carrier), then transport mirror.
+    fn tick_active_player(&mut self, ctx: &egui::Context) {
+        self.tick_playback(ctx, true);
     }
 
     /// Clock only — no command drain (avoids double-open / double-seek in one frame).
     fn pump_active_player(&mut self, ctx: &egui::Context) {
-        self.player.pump(ctx);
-        match self.screen {
-            Screen::Ingest if self.phase == Phase::Workspace => self.poll_ingest_player_remote(),
-            Screen::Story if self.phase == Phase::Workspace => self.poll_story_player_remote(),
-            Screen::MediaAssist if self.phase == Phase::Workspace => {
-                self.poll_media_assist_player_remote()
-            }
-            _ => {}
-        }
+        self.tick_playback(ctx, false);
     }
 }
 
@@ -998,14 +981,25 @@ impl eframe::App for QncApp {
         // Pre-UI: keep decode clock + apply RX (no command drain — UI may queue seeks).
         self.pump_active_player(ctx);
 
+        let ingest_active =
+            self.phase == Phase::Workspace && matches!(self.screen, Screen::Ingest);
+
         if story_active {
-            self.story.handle_shortcuts(ctx, &self.host);
+            self.story
+                .handle_shortcuts(ctx, &self.host, &mut self.playback);
+            // Apply catalog CueFrame before dock paint so playhead moves this frame.
+            self.tick_playback(ctx, true);
             self.story.prepare_frame(&self.host, ctx);
             self.story.tick(&self.host, ctx);
         } else if media_assist_active {
-            self.media_assist.handle_shortcuts(ctx, &self.host);
+            self.media_assist
+                .handle_shortcuts(ctx, &self.host, &mut self.playback);
+            self.tick_playback(ctx, true);
             self.media_assist.prepare_frame(&self.host, ctx);
             self.media_assist.tick(&self.host, ctx);
+        } else if ingest_active {
+            self.ingest.handle_shortcuts(ctx, &self.host);
+            self.tick_playback(ctx, true);
         }
 
         // Host chrome only on HostGate. Project / editorial / ingest = empty shell (web).
@@ -1162,7 +1156,7 @@ impl eframe::App for QncApp {
                 .exact_height(h)
                 .frame(egui::Frame::NONE.fill(panel_bg).inner_margin(0.0))
                 .show(ctx, |ui| {
-                    self.story.ui_source_dock(ui, &self.host);
+                    self.story.ui_source_dock(ui, &self.host, &mut self.playback);
                 });
         } else if comp.dock.show && media_assist_active {
             let h = self.media_assist.source_dock_height();
@@ -1170,7 +1164,8 @@ impl eframe::App for QncApp {
                 .exact_height(h)
                 .frame(egui::Frame::NONE.fill(panel_bg).inner_margin(0.0))
                 .show(ctx, |ui| {
-                    self.media_assist.ui_source_dock(ui, &self.host);
+                    self.media_assist
+                        .ui_source_dock(ui, &self.host, &mut self.playback);
                 });
         } else if comp.dock.show
             && self.phase == Phase::Workspace
@@ -1186,7 +1181,7 @@ impl eframe::App for QncApp {
                         .as_ref()
                         .map(|p| p.project_id.clone())
                         .unwrap_or_default();
-                    let action = self.ingest.ui_timeline_dock(ui);
+                    let action = self.ingest.ui_timeline_dock(ui, &mut self.playback);
                     if !pid.is_empty() {
                         self.dispatch_ingest(&pid, action);
                     }
@@ -1223,14 +1218,15 @@ impl eframe::App for QncApp {
                                     ui.label("No open project.");
                                     return;
                                 }
-                                let action = self.ingest.ui(ui, &name, &pid, &self.host, ctx);
+                                let action =
+                                    self.ingest.ui(ui, &name, &pid, &self.host, ctx, &self.playback);
                                 self.dispatch_ingest(&pid, action);
                             }
                             Screen::MediaAssist => {
-                                self.media_assist.ui_main(ui, &self.host, ctx);
+                                self.media_assist.ui_main(ui, &self.host, ctx, &self.playback);
                             }
                             Screen::Story => {
-                                self.story.ui_main(ui, &self.host, ctx);
+                                self.story.ui_main(ui, &self.host, ctx, &self.playback);
                             }
                             Screen::Unsupported(tab) => {
                                 ui.vertical_centered(|ui| {

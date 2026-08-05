@@ -6,10 +6,10 @@
       "label": "Play / Pauza"
     },
     "step_back_frame": {
-      "label": "Korak unazad (kadar)"
+      "label": "Playhead −1 frame (točan rez IN/OUT)"
     },
     "step_forward_frame": {
-      "label": "Korak naprijed (kadar)"
+      "label": "Playhead +1 frame (točan rez IN/OUT)"
     },
     "step_prev_part": {
       "label": "Prethodni blok"
@@ -124,16 +124,8 @@
             "key": " "
           }
         ],
-        "step_back_frame": [
-          {
-            "key": "ArrowLeft"
-          }
-        ],
-        "step_forward_frame": [
-          {
-            "key": "ArrowRight"
-          }
-        ],
+        "step_back_frame": [ { "code": "ArrowLeft", "key": "ArrowLeft" } ],
+        "step_forward_frame": [ { "code": "ArrowRight", "key": "ArrowRight" } ],
         "step_prev_part": [
           {
             "key": "ArrowUp"
@@ -344,16 +336,8 @@
             "key": "Enter"
           }
         ],
-        "step_back_frame": [
-          {
-            "key": "ArrowLeft"
-          }
-        ],
-        "step_forward_frame": [
-          {
-            "key": "ArrowRight"
-          }
-        ],
+        "step_back_frame": [ { "code": "ArrowLeft", "key": "ArrowLeft" } ],
+        "step_forward_frame": [ { "code": "ArrowRight", "key": "ArrowRight" } ],
         "add_marker": [
           {
             "key": "m"
@@ -470,16 +454,8 @@
             "key": "Enter"
           }
         ],
-        "step_back_frame": [
-          {
-            "key": "ArrowLeft"
-          }
-        ],
-        "step_forward_frame": [
-          {
-            "key": "ArrowRight"
-          }
-        ],
+        "step_back_frame": [ { "code": "ArrowLeft", "key": "ArrowLeft" } ],
+        "step_forward_frame": [ { "code": "ArrowRight", "key": "ArrowRight" } ],
         "record_toggle": [
           {
             "key": "r"
@@ -540,16 +516,8 @@
             "key": " "
           }
         ],
-        "step_back_frame": [
-          {
-            "key": "ArrowLeft"
-          }
-        ],
-        "step_forward_frame": [
-          {
-            "key": "ArrowRight"
-          }
-        ],
+        "step_back_frame": [ { "code": "ArrowLeft", "key": "ArrowLeft" } ],
+        "step_forward_frame": [ { "code": "ArrowRight", "key": "ArrowRight" } ],
         "step_prev_part": [
           {
             "key": "ArrowUp"
@@ -760,16 +728,8 @@
             "key": "Enter"
           }
         ],
-        "step_back_frame": [
-          {
-            "key": "ArrowLeft"
-          }
-        ],
-        "step_forward_frame": [
-          {
-            "key": "ArrowRight"
-          }
-        ],
+        "step_back_frame": [ { "code": "ArrowLeft", "key": "ArrowLeft" } ],
+        "step_forward_frame": [ { "code": "ArrowRight", "key": "ArrowRight" } ],
         "step_prev_part": [
           {
             "key": "ArrowUp"
@@ -903,16 +863,8 @@
             "key": "Enter"
           }
         ],
-        "step_back_frame": [
-          {
-            "key": "ArrowLeft"
-          }
-        ],
-        "step_forward_frame": [
-          {
-            "key": "ArrowRight"
-          }
-        ],
+        "step_back_frame": [ { "code": "ArrowLeft", "key": "ArrowLeft" } ],
+        "step_forward_frame": [ { "code": "ArrowRight", "key": "ArrowRight" } ],
         "record_toggle": [
           {
             "key": "r"
@@ -973,16 +925,8 @@
             "key": " "
           }
         ],
-        "step_back_frame": [
-          {
-            "key": "ArrowLeft"
-          }
-        ],
-        "step_forward_frame": [
-          {
-            "key": "ArrowRight"
-          }
-        ],
+        "step_back_frame": [ { "code": "ArrowLeft", "key": "ArrowLeft" } ],
+        "step_forward_frame": [ { "code": "ArrowRight", "key": "ArrowRight" } ],
         "step_prev_part": [
           {
             "key": "ArrowUp"
@@ -1193,16 +1137,8 @@
             "key": "Enter"
           }
         ],
-        "step_back_frame": [
-          {
-            "key": "ArrowLeft"
-          }
-        ],
-        "step_forward_frame": [
-          {
-            "key": "ArrowRight"
-          }
-        ],
+        "step_back_frame": [ { "code": "ArrowLeft", "key": "ArrowLeft" } ],
+        "step_forward_frame": [ { "code": "ArrowRight", "key": "ArrowRight" } ],
         "add_marker": [
           {
             "key": "m"
@@ -1319,16 +1255,8 @@
             "key": "Enter"
           }
         ],
-        "step_back_frame": [
-          {
-            "key": "ArrowLeft"
-          }
-        ],
-        "step_forward_frame": [
-          {
-            "key": "ArrowRight"
-          }
-        ],
+        "step_back_frame": [ { "code": "ArrowLeft", "key": "ArrowLeft" } ],
+        "step_forward_frame": [ { "code": "ArrowRight", "key": "ArrowRight" } ],
         "record_toggle": [
           {
             "key": "r"
@@ -1389,16 +1317,8 @@
             "key": " "
           }
         ],
-        "step_back_frame": [
-          {
-            "key": "ArrowLeft"
-          }
-        ],
-        "step_forward_frame": [
-          {
-            "key": "ArrowRight"
-          }
-        ],
+        "step_back_frame": [ { "code": "ArrowLeft", "key": "ArrowLeft" } ],
+        "step_forward_frame": [ { "code": "ArrowRight", "key": "ArrowRight" } ],
         "step_prev_part": [
           {
             "key": "ArrowUp"
@@ -1609,16 +1529,8 @@
             "key": "Enter"
           }
         ],
-        "step_back_frame": [
-          {
-            "key": "ArrowLeft"
-          }
-        ],
-        "step_forward_frame": [
-          {
-            "key": "ArrowRight"
-          }
-        ],
+        "step_back_frame": [ { "code": "ArrowLeft", "key": "ArrowLeft" } ],
+        "step_forward_frame": [ { "code": "ArrowRight", "key": "ArrowRight" } ],
         "add_marker": [
           {
             "key": "m"
@@ -1735,16 +1647,8 @@
             "key": "Enter"
           }
         ],
-        "step_back_frame": [
-          {
-            "key": "ArrowLeft"
-          }
-        ],
-        "step_forward_frame": [
-          {
-            "key": "ArrowRight"
-          }
-        ],
+        "step_back_frame": [ { "code": "ArrowLeft", "key": "ArrowLeft" } ],
+        "step_forward_frame": [ { "code": "ArrowRight", "key": "ArrowRight" } ],
         "record_toggle": [
           {
             "key": "r"
@@ -1805,16 +1709,8 @@
             "key": " "
           }
         ],
-        "step_back_frame": [
-          {
-            "key": "ArrowLeft"
-          }
-        ],
-        "step_forward_frame": [
-          {
-            "key": "ArrowRight"
-          }
-        ],
+        "step_back_frame": [ { "code": "ArrowLeft", "key": "ArrowLeft" } ],
+        "step_forward_frame": [ { "code": "ArrowRight", "key": "ArrowRight" } ],
         "step_prev_part": [
           {
             "key": "ArrowUp"
@@ -2025,16 +1921,8 @@
             "key": "Enter"
           }
         ],
-        "step_back_frame": [
-          {
-            "key": "ArrowLeft"
-          }
-        ],
-        "step_forward_frame": [
-          {
-            "key": "ArrowRight"
-          }
-        ],
+        "step_back_frame": [ { "code": "ArrowLeft", "key": "ArrowLeft" } ],
+        "step_forward_frame": [ { "code": "ArrowRight", "key": "ArrowRight" } ],
         "step_prev_part": [
           {
             "key": "ArrowUp"
@@ -2168,16 +2056,8 @@
             "key": "Enter"
           }
         ],
-        "step_back_frame": [
-          {
-            "key": "ArrowLeft"
-          }
-        ],
-        "step_forward_frame": [
-          {
-            "key": "ArrowRight"
-          }
-        ],
+        "step_back_frame": [ { "code": "ArrowLeft", "key": "ArrowLeft" } ],
+        "step_forward_frame": [ { "code": "ArrowRight", "key": "ArrowRight" } ],
         "record_toggle": [
           {
             "key": "r"
@@ -2238,16 +2118,8 @@
             "key": " "
           }
         ],
-        "step_back_frame": [
-          {
-            "key": "ArrowLeft"
-          }
-        ],
-        "step_forward_frame": [
-          {
-            "key": "ArrowRight"
-          }
-        ],
+        "step_back_frame": [ { "code": "ArrowLeft", "key": "ArrowLeft" } ],
+        "step_forward_frame": [ { "code": "ArrowRight", "key": "ArrowRight" } ],
         "step_prev_part": [
           {
             "key": "ArrowUp"
@@ -2455,16 +2327,8 @@
             "key": "Enter"
           }
         ],
-        "step_back_frame": [
-          {
-            "key": "ArrowLeft"
-          }
-        ],
-        "step_forward_frame": [
-          {
-            "key": "ArrowRight"
-          }
-        ],
+        "step_back_frame": [ { "code": "ArrowLeft", "key": "ArrowLeft" } ],
+        "step_forward_frame": [ { "code": "ArrowRight", "key": "ArrowRight" } ],
         "add_marker": [
           {
             "key": "'"
@@ -2578,16 +2442,8 @@
             "key": "Enter"
           }
         ],
-        "step_back_frame": [
-          {
-            "key": "ArrowLeft"
-          }
-        ],
-        "step_forward_frame": [
-          {
-            "key": "ArrowRight"
-          }
-        ],
+        "step_back_frame": [ { "code": "ArrowLeft", "key": "ArrowLeft" } ],
+        "step_forward_frame": [ { "code": "ArrowRight", "key": "ArrowRight" } ],
         "record_toggle": [
           {
             "key": "r"

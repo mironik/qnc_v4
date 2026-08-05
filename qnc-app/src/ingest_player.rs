@@ -1,6 +1,7 @@
-//! Ingest native playback — same [`PlayerClient`] bridge as Story / Media Assist.
+//! Ingest **form** adapter for the shared broadcast player ([`PlayerClient`]).
+//! Not a separate player — only open metadata + command queue into [`PlaybackStack`].
 
-use eframe::egui::{self, ColorImage, TextureHandle, TextureOptions};
+use eframe::egui::ColorImage;
 
 use crate::api::HostClient;
 use crate::frame_time::{frame_to_seconds, seconds_to_frame};
@@ -8,10 +9,8 @@ use crate::ingest::IngestScreen;
 use crate::player_bridge::{PlaybackCommand, PlayerClient};
 use crate::player_contract::{BroadcastHostSourceRef, FrameNumber};
 
-pub use crate::player_bridge::PlaybackCommand as IngestPlaybackCommand;
-
 impl IngestScreen {
-    pub fn drain_playback_commands(&mut self) -> Vec<IngestPlaybackCommand> {
+    pub fn drain_playback_commands(&mut self) -> Vec<PlaybackCommand> {
         PlayerClient::drain_playback_commands(self)
     }
 
@@ -36,11 +35,7 @@ impl IngestScreen {
     }
 
     pub fn playback_source_sec(&self) -> f64 {
-        frame_to_seconds(PlayerClient::playback_source_frame(self).0, self.selected_source_fps)
-    }
-
-    pub fn playback_source_frame(&self) -> FrameNumber {
-        PlayerClient::playback_source_frame(self)
+        self.virtual_sec
     }
 
     pub fn playback_media_path(&self) -> Option<String> {
@@ -76,35 +71,28 @@ impl IngestScreen {
         PlayerClient::apply_player_state(self, source_sec, playing, status)
     }
 
-    pub fn prepare_player_frame(&mut self, ctx: &egui::Context) {
-        if let Some(img) = self.pending_player_image.take() {
-            let tex = ctx.load_texture("ingest_player_preview", img, TextureOptions::LINEAR);
-            self.player_texture = Some(tex);
-        }
+    fn source_frame_now(&self) -> FrameNumber {
+        FrameNumber(seconds_to_frame(self.virtual_sec, self.selected_source_fps))
     }
 
     pub fn queue_seek_to_playhead(&mut self) {
         self.pending_playback_commands
-            .push(IngestPlaybackCommand::SeekToPlayhead);
+            .push(PlaybackCommand::CueFrame(self.source_frame_now()));
     }
 
     pub fn queue_pause_and_seek(&mut self) {
-        self.lock_playhead_ui();
         self.pending_playback_commands
-            .push(IngestPlaybackCommand::PauseAndSeek);
+            .push(PlaybackCommand::ScrubFrame(self.source_frame_now()));
     }
 
     pub fn queue_toggle_play(&mut self) {
         self.pending_playback_commands
-            .push(IngestPlaybackCommand::TogglePlay);
+            .push(PlaybackCommand::TogglePlay);
     }
 
     pub fn reset_player_session(&mut self) {
         self.selected_play_path.clear();
         self.selected_source_ref = None;
-        self.player_texture = None;
-        self.pending_player_image = None;
-        self.player_preview_active = false;
         self.playing = false;
         self.virtual_sec = 0.0;
         self.pending_playback_commands.clear();
@@ -123,9 +111,6 @@ impl IngestScreen {
         self.preview_clip_id = clip_id.to_string();
         self.virtual_sec = 0.0;
         self.playing = false;
-        self.player_preview_active = false;
-        self.player_texture = None;
-        self.pending_player_image = None;
 
         let (fps, has_audio, channels, duration) = self
             .state
@@ -173,7 +158,6 @@ impl IngestScreen {
         self.queue_seek_to_playhead();
     }
 
-    /// Ingest play source = kartica / folder (snapshot paths). Not Story project-proxy API.
     fn resolve_play_path(&mut self, clip_id: &str) {
         self.selected_play_path.clear();
         let Some(clip) = self
@@ -184,7 +168,6 @@ impl IngestScreen {
             self.player_status = format!("Nema klipa · {clip_id}");
             return;
         };
-        // Source-first: camera proxy on card → original/source on card → project proxy only if already copied.
         for (candidate, label) in [
             (clip.proxy_path.as_str(), "card proxy"),
             (clip.original_path.as_str(), "card original"),
@@ -205,42 +188,16 @@ impl IngestScreen {
         self.player_status = format!("Nema play path na sourceu · {clip_id}");
     }
 
-    fn frame_eps_sec(&self) -> f64 {
-        let fps = if self.selected_source_fps.is_finite() && self.selected_source_fps > 0.0 {
-            self.selected_source_fps
-        } else {
-            25.0
-        };
-        (0.5 / fps).max(1e-4)
-    }
-
-    fn snap_source_sec(&self, sec: f64) -> f64 {
-        let fps = if self.selected_source_fps.is_finite() && self.selected_source_fps > 0.0 {
-            self.selected_source_fps
-        } else {
-            25.0
-        };
-        let frame = (sec * fps).round();
-        (frame / fps).max(0.0)
-    }
-
-    fn source_frame_from_sec(&self, sec: f64) -> FrameNumber {
-        FrameNumber(seconds_to_frame(sec, self.selected_source_fps))
-    }
-
-    fn lock_playhead_ui_frame(&mut self, frame: FrameNumber) {
-        self.playhead_ui_target_frame = Some(frame);
-    }
-
     pub(crate) fn scrub_to(&mut self, sec: f64) {
-        let frame = self.source_frame_from_sec(sec.max(0.0));
-        self.scrub_to_frame(frame.0);
+        self.virtual_sec = frame_to_seconds(
+            seconds_to_frame(sec.max(0.0), self.selected_source_fps),
+            self.selected_source_fps,
+        );
+        self.queue_pause_and_seek();
     }
 
     pub(crate) fn scrub_to_frame(&mut self, frame: i64) {
-        let frame = FrameNumber(frame.max(0));
-        self.virtual_sec = frame_to_seconds(frame.0, self.selected_source_fps);
-        self.lock_playhead_ui_frame(frame);
+        self.virtual_sec = frame_to_seconds(frame.max(0), self.selected_source_fps);
         self.queue_pause_and_seek();
     }
 
@@ -251,11 +208,12 @@ impl IngestScreen {
             25.0
         };
         let next = self.virtual_sec + (frames as f64) / fps;
-        self.scrub_to(next);
-    }
-
-    pub(crate) fn player_texture(&self) -> Option<&TextureHandle> {
-        self.player_texture.as_ref()
+        self.virtual_sec = frame_to_seconds(
+            seconds_to_frame(next.max(0.0), fps),
+            fps,
+        );
+        // CueFrame (not scrub debounce) — same as Story ←/→ for exact IN/OUT.
+        self.queue_seek_to_playhead();
     }
 }
 
@@ -267,9 +225,7 @@ impl PlayerClient for IngestScreen {
         )
     }
 
-    fn clear_pending_seeks(&mut self) {
-        self.playhead_ui_target_frame = None;
-    }
+    fn clear_pending_seeks(&mut self) {}
 
     fn playback_source_ref(&self) -> Option<&BroadcastHostSourceRef> {
         self.selected_source_ref.as_ref()
@@ -315,11 +271,6 @@ impl PlayerClient for IngestScreen {
         }
     }
 
-    fn playback_source_frame(&self) -> FrameNumber {
-        self.playhead_ui_target_frame
-            .unwrap_or_else(|| self.source_frame_from_sec(self.virtual_sec))
-    }
-
     fn playback_is_playing(&self) -> bool {
         self.playing
     }
@@ -332,9 +283,7 @@ impl PlayerClient for IngestScreen {
         "Nema play path na sourceu (kartica / folder) — odaberi klip s medijem".into()
     }
 
-    fn set_player_preview_active(&mut self, active: bool) {
-        self.player_preview_active = active;
-    }
+    fn set_player_preview_active(&mut self, _active: bool) {}
 
     fn apply_playback_command_state(&mut self, playing: bool, status: impl Into<String>) {
         self.playing = playing;
@@ -342,52 +291,26 @@ impl PlayerClient for IngestScreen {
     }
 
     fn apply_player_error(&mut self, status: impl Into<String>) {
-        self.player_preview_active = false;
         self.playing = false;
         self.player_status = status.into();
     }
 
-    fn apply_player_frame(
-        &mut self,
-        image: ColorImage,
-        source_frame: FrameNumber,
-        source_sec: f64,
-        playing: bool,
-    ) {
-        let snapped = self.snap_source_sec(source_sec.max(0.0));
-        let apply_progress = crate::player_bridge::should_apply_player_progress(
-            source_frame,
-            self.playhead_ui_target_frame,
-            playing,
-        );
-        self.pending_player_image = Some(image);
-        self.player_preview_active = true;
+    fn apply_player_frame(&mut self, _image: ColorImage, source_sec: f64, playing: bool) {
         self.playing = playing;
-        if apply_progress {
-            self.playhead_ui_target_frame = None;
-            self.virtual_sec = snapped;
-        }
         self.player_status = "Broadcast player".into();
+        // Editorial mirror — timeline paint uses PlaybackStack carrier, not this field.
+        self.virtual_sec = frame_to_seconds(
+            seconds_to_frame(source_sec.max(0.0), self.selected_source_fps),
+            self.selected_source_fps,
+        );
     }
 
-    fn apply_player_state(
-        &mut self,
-        source_frame: FrameNumber,
-        source_sec: f64,
-        playing: bool,
-        status: impl Into<String>,
-    ) {
-        let snapped = self.snap_source_sec(source_sec.max(0.0));
-        let apply_progress = crate::player_bridge::should_apply_player_progress(
-            source_frame,
-            self.playhead_ui_target_frame,
-            playing,
-        );
+    fn apply_player_state(&mut self, source_sec: f64, playing: bool, status: impl Into<String>) {
         self.playing = playing;
         self.player_status = status.into();
-        if apply_progress {
-            self.playhead_ui_target_frame = None;
-            self.virtual_sec = snapped;
-        }
+        self.virtual_sec = frame_to_seconds(
+            seconds_to_frame(source_sec.max(0.0), self.selected_source_fps),
+            self.selected_source_fps,
+        );
     }
 }

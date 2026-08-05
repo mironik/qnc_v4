@@ -265,6 +265,7 @@ impl QncBroadcastPlayer {
                         *source_sec,
                     );
                 }
+                PlayerEvent::SourceReady { .. } => {}
             }
             self.fanout_event(event);
         }

@@ -220,7 +220,9 @@ fn shell_split(
     );
 }
 
-/// Block (Story left col): preview, then one callback for chrome + body.
+/// Block (left col): monitor slot, then chrome + body.
+///
+/// Prefer [`media_column_monitor`] — paint via broadcast monitor, not a raw texture.
 ///
 /// `after_preview` receives the **remaining height after preview** (exact column
 /// remainder). Caller must tile chrome + body inside that budget with
@@ -232,18 +234,30 @@ pub fn media_column(
     texture: Option<&TextureHandle>,
     empty_label: &str,
     preview_sense: Sense,
+    after_preview: impl FnMut(&mut egui::Ui, f32),
+) {
+    media_column_monitor(ui, m, |ui, preview_h| {
+        preview(
+            ui,
+            PreviewInput {
+                height: preview_h,
+                texture,
+                empty_label,
+                sense: preview_sense,
+            },
+        );
+    }, after_preview);
+}
+
+/// Left media column with an injected monitor paint (broadcast player monitor).
+pub fn media_column_monitor(
+    ui: &mut egui::Ui,
+    m: &ShellMetrics,
+    mut paint_monitor: impl FnMut(&mut egui::Ui, f32),
     mut after_preview: impl FnMut(&mut egui::Ui, f32),
 ) {
     let preview_h = m.preview_h().min(ui.available_height().max(0.0));
-    preview(
-        ui,
-        PreviewInput {
-            height: preview_h,
-            texture,
-            empty_label,
-            sense: preview_sense,
-        },
-    );
+    paint_monitor(ui, preview_h);
     let rest = ui.available_height().max(0.0);
     after_preview(ui, rest);
 }
