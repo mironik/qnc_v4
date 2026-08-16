@@ -16,6 +16,7 @@ use tracing::{info, warn};
 use crate::frame_time::{normalize_fps, rational_fps, DEFAULT_FPS};
 use crate::ingest::db::open_ingest;
 use crate::ingest::project_media::sanitize_clip_id;
+use crate::ingest::proxy_source::{classify_tv_source, recipe_for_source};
 use crate::ingest::thumb::{probe_media, resolve_ffmpeg};
 use crate::media::is_audio_media_file;
 use crate::project::db::{bump_project_data_revision, project_effective_settings, ProjectPaths};
@@ -329,9 +330,41 @@ pub fn record_audio_wrap(
     let preferred =
         prefer_wrap_path(&wraps, region).unwrap_or_else(|| wrap_path.to_string_lossy().to_string());
     let probe = probe_media(wrap_path);
-    let (duration_sec, fps_db, resolution, codec) = probe
-        .map(|p| (p.duration_sec, p.fps, p.resolution, p.codec))
-        .unwrap_or((0.0, fps, "1920x1080".into(), "h264".into()));
+    let (
+        duration_sec,
+        fps_db,
+        resolution,
+        codec,
+        field_order,
+        interlaced,
+        source_class,
+        proxy_recipe,
+    ) = probe
+        .as_ref()
+        .map(|p| {
+            let source_class = classify_tv_source(p);
+            let proxy_recipe = recipe_for_source(source_class);
+            (
+                p.duration_sec,
+                p.fps,
+                p.resolution.clone(),
+                p.codec.clone(),
+                p.field_order.clone(),
+                p.interlaced,
+                source_class.label().to_string(),
+                proxy_recipe.id().to_string(),
+            )
+        })
+        .unwrap_or((
+            0.0,
+            fps,
+            "1920x1080".into(),
+            "h264".into(),
+            String::new(),
+            false,
+            String::new(),
+            String::new(),
+        ));
 
     conn.execute(
         "UPDATE ingest_assets SET
@@ -340,7 +373,11 @@ pub fn record_audio_wrap(
             fps = ?5,
             resolution = CASE WHEN TRIM(?6) = '' THEN resolution ELSE ?6 END,
             codec = CASE WHEN TRIM(?7) = '' THEN codec ELSE ?7 END,
-            metadata_json = ?8
+            field_order = ?8,
+            interlaced = ?9,
+            source_class = ?10,
+            proxy_recipe = ?11,
+            metadata_json = ?12
          WHERE source_id = ?1 AND clip_id = ?2",
         params![
             source_id,
@@ -350,6 +387,10 @@ pub fn record_audio_wrap(
             fps_db,
             resolution,
             codec,
+            field_order,
+            if interlaced { 1 } else { 0 },
+            source_class,
+            proxy_recipe,
             meta.to_string(),
         ],
     )

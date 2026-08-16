@@ -24,10 +24,6 @@ pub fn frame_to_seconds(frame: i64, fps: f64) -> f64 {
     (frame.max(0) as f64) / fps
 }
 
-pub fn snap_seconds_to_frame(seconds: f64, fps: f64) -> f64 {
-    frame_to_seconds(seconds_to_frame(seconds, fps), fps)
-}
-
 pub fn seconds_to_timecode(seconds: f64, fps: f64) -> String {
     if !seconds.is_finite() || seconds < 0.0 {
         return "00:00:00:00".into();

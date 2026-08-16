@@ -4,29 +4,29 @@
 //! Posters: snapshot `thumb_url` (DB) → async fetch → texture. UI never writes DB.
 
 mod dir_list;
-mod poster_loader;
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use eframe::egui::{self, TextureHandle, TextureOptions};
+use serde_json::Value;
 
-use crate::api::{FsEntry, HostClient, IngestClip, IngestState};
+use crate::api::{FsEntry, FsList, HostClient, IngestClip, IngestState};
 use crate::editorial::media_pool::{self, MediaPoolAction};
 use crate::editorial::types::LibraryTab;
 use crate::frame_time::{frame_to_seconds, seconds_to_frame};
+use crate::media_assets::{self, AsyncImageAssetLoader, ImageAssetKey};
 use crate::playback_stack::PlaybackStack;
-use crate::player_bridge::PlaybackCommand;
 use crate::player_contract::BroadcastHostSourceRef;
 use crate::qnc_filmstrip_background::FilmFrame;
+use crate::qnc_location_browser::clean_location_path;
 use crate::qnc_source_dock::{self, SourceDockAction, SourceDockInput};
 use crate::qnc_timeline::{ExpandedAudio, TimelineFocusPaint};
 use crate::qnc_ui;
-use crate::shortcuts::{load_story_bindings, StoryBindings};
+use crate::shortcuts::{StoryBindings, STORYBOARD_SHORTCUT_SCOPE};
 use crate::story::playback_controls::{self, PlaybackAction};
 
 use dir_list::{DirBrowserKind, DirListAction, DirListInput};
-use poster_loader::AsyncPosterLoader;
 
 const POLL_INTERVAL: Duration = Duration::from_millis(1500);
 
@@ -38,7 +38,7 @@ pub struct IngestScreen {
     pub loaded_for_project: String,
     pub message: Option<String>,
     poster_textures: HashMap<String, TextureHandle>,
-    poster_loader: AsyncPosterLoader,
+    image_asset_loader: AsyncImageAssetLoader,
     archive_local: bool,
     ai_mining: bool,
     pub(crate) preview_clip_id: String,
@@ -48,6 +48,7 @@ pub struct IngestScreen {
     dir_parent: Option<String>,
     dir_entries: Vec<FsEntry>,
     dir_error: Option<String>,
+    dir_busy: bool,
     dir_browser: DirBrowserKind,
     // Broadcast player projection (PlayerRemote via app).
     pub(crate) selected_play_path: String,
@@ -55,10 +56,9 @@ pub struct IngestScreen {
     pub(crate) selected_source_fps: f64,
     pub(crate) selected_source_has_audio: bool,
     pub(crate) selected_source_audio_channels: u8,
-    pub(crate) virtual_sec: f64,
+    pub(crate) virtual_frame: i64,
     pub(crate) playing: bool,
     pub(crate) player_status: String,
-    pub(crate) pending_playback_commands: Vec<PlaybackCommand>,
     project_id: String,
     /// Web kodak: click A1/A2 label expands that wave lane.
     expanded_audio: ExpandedAudio,
@@ -66,18 +66,32 @@ pub struct IngestScreen {
     library_tab: LibraryTab,
     /// QNC keyboard-shortcuts (storyboard scope) — no hardcoded chords.
     bindings: StoryBindings,
+    shortcuts_loading: bool,
+    shortcuts_pending: usize,
+    shortcuts_loaded: bool,
+    shortcut_catalog: Option<Value>,
+    shortcut_user: Option<Value>,
 }
 
 pub enum IngestAction {
     None,
+    /// Progress-bar scrub — app routes to [`PlaybackStack`].
+    CueFrame(i64),
+    TogglePlay,
+    RequestState(String),
+    RequestDirList(String),
+    #[allow(dead_code)]
     PickFolder,
+    #[allow(dead_code)]
     BrowsePath,
+    #[allow(dead_code)]
     Discover,
     Reload,
     SelectAll,
     ClearSelection,
     ImportSelected,
     Toggle(String),
+    #[allow(dead_code)]
     FocusPreview(String),
     SetArchive(bool),
     /// Confirm dir-tree path → ingest browse/discover.
@@ -95,7 +109,7 @@ impl Default for IngestScreen {
             loaded_for_project: String::new(),
             message: None,
             poster_textures: HashMap::new(),
-            poster_loader: AsyncPosterLoader::new(),
+            image_asset_loader: AsyncImageAssetLoader::new(),
             archive_local: false,
             ai_mining: false,
             preview_clip_id: String::new(),
@@ -105,40 +119,117 @@ impl Default for IngestScreen {
             dir_parent: None,
             dir_entries: Vec::new(),
             dir_error: None,
+            dir_busy: false,
             dir_browser: DirBrowserKind::default(),
             selected_play_path: String::new(),
             selected_source_ref: None,
-            selected_source_fps: 25.0,
-            selected_source_has_audio: true,
-            selected_source_audio_channels: 2,
-            virtual_sec: 0.0,
+            selected_source_fps: 0.0,
+            selected_source_has_audio: false,
+            selected_source_audio_channels: 0,
+            virtual_frame: 0,
             playing: false,
             player_status: String::new(),
-            pending_playback_commands: Vec::new(),
             project_id: String::new(),
             expanded_audio: ExpandedAudio::default(),
             library_tab: LibraryTab::default(),
             bindings: StoryBindings::empty(),
+            shortcuts_loading: false,
+            shortcuts_pending: 0,
+            shortcuts_loaded: false,
+            shortcut_catalog: None,
+            shortcut_user: None,
         }
     }
 }
 
 impl IngestScreen {
-    pub fn handle_shortcuts(&mut self, ctx: &egui::Context, host: &HostClient) {
-        if self.bindings.by_action.is_empty() {
-            self.bindings = load_story_bindings(host, "storyboard");
+    pub fn handle_shortcuts(&mut self, ctx: &egui::Context) -> Vec<IngestAction> {
+        if !self.shortcuts_ready() {
+            return Vec::new();
         }
         if self.preview_clip_id.is_empty() {
-            return;
+            return Vec::new();
         }
+        let mut actions = Vec::new();
         // play_pause / step_back_frame / step_forward_frame from catalog only.
         for action in playback_controls::shortcut_actions(ctx, &self.bindings) {
             match action {
-                PlaybackAction::TogglePlay => self.queue_toggle_play(),
-                PlaybackAction::SeekFrames(frames) => self.nudge_frames(frames),
+                PlaybackAction::TogglePlay => actions.push(IngestAction::TogglePlay),
+                PlaybackAction::SeekFrames(frames) => actions.push(self.nudge_frames(frames)),
                 _ => {}
             }
         }
+        actions
+    }
+
+    pub fn needs_shortcuts_load(&self) -> bool {
+        !self.shortcuts_loaded && !self.shortcuts_loading
+    }
+
+    pub fn begin_shortcuts_load(&mut self, expected_results: usize) {
+        self.shortcuts_loading = expected_results > 0;
+        self.shortcuts_pending = expected_results;
+        self.shortcut_catalog = None;
+        self.shortcut_user = None;
+    }
+
+    pub fn apply_shortcut_catalog(&mut self, scope: &str, catalog: Value) {
+        if scope != STORYBOARD_SHORTCUT_SCOPE {
+            return;
+        }
+        self.shortcut_catalog = Some(catalog);
+        self.finish_shortcut_result();
+    }
+
+    pub fn apply_shortcut_user(&mut self, scope: &str, user: Value) {
+        if scope != STORYBOARD_SHORTCUT_SCOPE {
+            return;
+        }
+        self.shortcut_user = Some(user);
+        self.finish_shortcut_result();
+    }
+
+    pub fn set_shortcuts_error(&mut self, scope: &str, port_id: &str, error: impl Into<String>) {
+        if scope != STORYBOARD_SHORTCUT_SCOPE {
+            return;
+        }
+        if port_id == "user" {
+            self.shortcut_user = Some(Value::Null);
+            self.finish_shortcut_result();
+            return;
+        }
+        self.shortcuts_loading = false;
+        self.shortcuts_pending = 0;
+        self.shortcuts_loaded = true;
+        self.message = Some(format!("shortcut catalog: {}", error.into()));
+    }
+
+    pub fn shortcuts_ready(&self) -> bool {
+        self.shortcuts_loaded
+    }
+
+    fn finish_shortcut_result(&mut self) {
+        self.shortcuts_pending = self.shortcuts_pending.saturating_sub(1);
+        if self.shortcuts_pending == 0 {
+            self.shortcuts_loading = false;
+        }
+        self.apply_shortcuts_if_ready();
+    }
+
+    fn apply_shortcuts_if_ready(&mut self) {
+        if self.shortcuts_loaded {
+            return;
+        }
+        let Some(catalog) = self.shortcut_catalog.as_ref() else {
+            return;
+        };
+        let Some(user) = self.shortcut_user.as_ref() else {
+            return;
+        };
+        self.bindings = StoryBindings::from_catalog(catalog, user, STORYBOARD_SHORTCUT_SCOPE);
+        self.shortcuts_loaded = true;
+        self.shortcuts_loading = false;
+        self.shortcuts_pending = 0;
     }
 
     pub fn ensure_loaded(&mut self, host: &HostClient, project_id: &str) {
@@ -148,26 +239,18 @@ impl IngestScreen {
         self.loaded_for_project = project_id.to_string();
         self.project_id = project_id.to_string();
         self.poster_textures.clear();
-        self.poster_loader.clear();
+        self.image_asset_loader.clear();
         self.preview_clip_id.clear();
         self.reset_player_session();
-        self.reload(host, project_id);
-        self.load_dir(host, "");
-    }
-
-    pub fn reload(&mut self, host: &HostClient, project_id: &str) {
-        self.busy = true;
-        match host.ingest_state(project_id) {
-            Ok(st) => {
-                self.apply(st);
-                self.message = None;
-            }
-            Err(e) => {
-                self.message = Some(e);
-            }
-        }
+        let _ = host;
+        self.state = None;
         self.busy = false;
-        self.last_poll = Some(Instant::now());
+        self.last_poll = None;
+        self.dir_path.clear();
+        self.dir_entries.clear();
+        self.dir_error = None;
+        self.dir_busy = false;
+        self.dir_loaded = false;
     }
 
     pub fn apply(&mut self, st: IngestState) {
@@ -181,6 +264,71 @@ impl IngestScreen {
             }
         }
         self.state = Some(st);
+        self.last_poll = Some(Instant::now());
+    }
+
+    pub fn begin_state_load(&mut self, project_id: &str) {
+        self.project_id = project_id.to_string();
+        self.loaded_for_project = project_id.to_string();
+        self.busy = true;
+        self.message = None;
+        self.last_poll = Some(Instant::now());
+    }
+
+    pub fn begin_state_poll(&mut self, project_id: &str) {
+        self.project_id = project_id.to_string();
+        self.loaded_for_project = project_id.to_string();
+        self.busy = true;
+        self.last_poll = Some(Instant::now());
+    }
+
+    pub fn apply_loaded_state(&mut self, st: IngestState) {
+        self.apply(st);
+        self.busy = false;
+        self.message = None;
+    }
+
+    pub fn apply_polled_state(&mut self, st: IngestState) {
+        let path_keep = self.path_edit.clone();
+        self.apply(st);
+        self.path_edit = path_keep;
+        self.busy = false;
+    }
+
+    pub fn begin_import_command(&mut self, project_id: &str) {
+        self.project_id = project_id.to_string();
+        self.loaded_for_project = project_id.to_string();
+        self.busy = true;
+        self.message = None;
+        self.last_poll = Some(Instant::now());
+    }
+
+    pub fn apply_import_command_state(&mut self, st: IngestState, message: impl Into<String>) {
+        self.apply(st);
+        self.busy = false;
+        self.message = Some(message.into());
+    }
+
+    pub fn selected_clip_ids(&self) -> Vec<String> {
+        self.state
+            .as_ref()
+            .map(|s| s.selected_clip_ids.clone())
+            .unwrap_or_default()
+    }
+
+    pub fn apply_archive_option_state(&mut self, st: IngestState, message: impl Into<String>) {
+        self.archive_local = st.archive_original;
+        if let Some(current) = self.state.as_mut() {
+            current.archive_original = st.archive_original;
+        }
+        self.busy = false;
+        self.message = Some(message.into());
+        self.last_poll = Some(Instant::now());
+    }
+
+    pub fn set_state_error(&mut self, error: impl Into<String>) {
+        self.message = Some(error.into());
+        self.busy = false;
         self.last_poll = Some(Instant::now());
     }
 
@@ -202,63 +350,142 @@ impl IngestScreen {
         })
     }
 
-    pub fn maybe_poll(&mut self, host: &HostClient, project_id: &str) {
+    pub fn should_request_poll(&self) -> bool {
         if self.busy {
-            return;
+            return false;
         }
         let due = self
             .last_poll
             .map(|t| t.elapsed() >= POLL_INTERVAL)
             .unwrap_or(true);
-        if due && self.needs_poll() {
-            if let Ok(st) = host.ingest_state(project_id) {
-                let path_keep = self.path_edit.clone();
-                self.apply(st);
-                self.path_edit = path_keep;
-            }
+        due && self.needs_poll()
+    }
+
+    pub fn selected_clip_count(&self) -> usize {
+        self.selected_clip_ids().len()
+    }
+
+    pub fn confirm_dir_path(&mut self) -> Result<String, String> {
+        let path = self.dir_path.trim().to_string();
+        if path.is_empty() || self.dir_roots {
+            return Err("Odaberi mapu u stablu.".into());
+        }
+        self.path_edit = path.clone();
+        Ok(path)
+    }
+
+    pub fn browse_path_candidate(&mut self) -> Result<String, String> {
+        let path = if !self.dir_path.is_empty() && !self.dir_roots {
+            self.dir_path.clone()
+        } else {
+            self.path_edit.trim().to_string()
+        };
+        if path.is_empty() {
+            return Err("Odaberi mapu (U redu) ili upiši putanju.".into());
+        }
+        self.path_edit = path.clone();
+        Ok(path)
+    }
+
+    pub fn cancel_dir_browser(&mut self) {
+        self.dir_browser = DirBrowserKind::Local;
+        self.dir_roots = true;
+        self.dir_path.clear();
+        self.dir_parent = None;
+        self.dir_entries.clear();
+        self.dir_error = None;
+        self.dir_loaded = false;
+        self.dir_busy = false;
+        self.message = Some("Stablo: računalo.".into());
+    }
+
+    pub fn set_archive_draft(&mut self, archive_original: bool) {
+        self.archive_local = archive_original;
+    }
+
+    pub fn begin_dir_listing(&mut self, path: &str) {
+        self.dir_busy = true;
+        self.dir_error = None;
+        self.dir_loaded = true;
+        if path.trim().is_empty() {
+            self.dir_roots = true;
+            self.dir_path.clear();
+            self.dir_parent = None;
         }
     }
 
-    fn load_dir(&mut self, host: &HostClient, path: &str) {
-        match host.fs_list(path) {
-            Ok(list) => {
-                self.dir_roots = list.roots;
-                self.dir_path = list.path;
-                self.dir_parent = list.parent;
-                self.dir_entries = list.entries;
-                self.dir_error = None;
-                self.dir_loaded = true;
-            }
-            Err(e) => {
-                self.dir_error = Some(e);
-                self.dir_entries.clear();
-                self.dir_loaded = true;
-            }
-        }
+    pub fn apply_dir_listing(&mut self, list: FsList) {
+        self.dir_roots = list.roots;
+        self.dir_path = clean_location_path(&list.path);
+        self.dir_parent = list.parent.map(|p| clean_location_path(&p));
+        self.dir_entries = list
+            .entries
+            .into_iter()
+            .map(|mut entry| {
+                entry.path = clean_location_path(&entry.path);
+                entry.name = clean_location_path(&entry.name);
+                entry
+            })
+            .collect();
+        self.dir_error = None;
+        self.dir_busy = false;
+        self.dir_loaded = true;
+    }
+
+    pub fn set_dir_listing_error(&mut self, error: impl Into<String>) {
+        self.dir_error = Some(error.into());
+        self.dir_entries.clear();
+        self.dir_busy = false;
+        self.dir_loaded = true;
     }
 
     fn pump_posters(&mut self, host: &HostClient, project_id: &str, ctx: &egui::Context) {
-        for result in self.poster_loader.poll() {
+        for result in self.image_asset_loader.poll() {
             if let Ok(color) = result.image {
+                let clip_id = result.key.item_id;
                 let tex = ctx.load_texture(
-                    format!("ingest_poster_{}", result.clip_id),
+                    format!("ingest_poster_{clip_id}"),
                     color,
                     TextureOptions::LINEAR,
                 );
-                self.poster_textures.insert(result.clip_id, tex);
+                self.poster_textures.insert(clip_id, tex);
             }
         }
         let Some(st) = &self.state else {
             return;
         };
+        let mut requested = false;
+        if !self.preview_clip_id.trim().is_empty() {
+            if let Some(c) = st.clips.iter().find(|c| c.clip_id == self.preview_clip_id) {
+                if !c.thumb_url.trim().is_empty() && !self.poster_textures.contains_key(&c.clip_id)
+                {
+                    let url = media_assets::ingest_thumbnail_url(host, project_id, &c.clip_id);
+                    requested = self.image_asset_loader.request(
+                        ImageAssetKey::new("ingest.poster", c.clip_id.clone(), "thumb"),
+                        url,
+                        Some(ctx.clone()),
+                    );
+                }
+            }
+        }
         for c in &st.clips {
             // Snapshot (DB) must expose thumb_url before we fetch — no 404 probing.
-            if c.thumb_url.trim().is_empty() || self.poster_textures.contains_key(&c.clip_id) {
+            if requested
+                || c.clip_id == self.preview_clip_id
+                || c.thumb_url.trim().is_empty()
+                || self.poster_textures.contains_key(&c.clip_id)
+            {
                 continue;
             }
-            let url = host.ingest_thumbnail_url(project_id, &c.clip_id);
-            self.poster_loader
-                .request(c.clip_id.clone(), url, Some(ctx.clone()));
+            let url = media_assets::ingest_thumbnail_url(host, project_id, &c.clip_id);
+            requested = self.image_asset_loader.request(
+                ImageAssetKey::new("ingest.poster", c.clip_id.clone(), "thumb"),
+                url,
+                Some(ctx.clone()),
+            );
+            if requested {
+                break;
+            }
         }
     }
 
@@ -282,14 +509,19 @@ impl IngestScreen {
         }) {
             ctx.request_repaint_after(Duration::from_millis(80));
         }
-        if !self.dir_loaded {
-            self.load_dir(host, "");
-        }
         if self.project_id != project_id {
             self.project_id = project_id.to_string();
         }
 
         let mut action = IngestAction::None;
+        if self.state.is_none() && !self.busy && !project_id.trim().is_empty() {
+            action = IngestAction::RequestState(project_id.to_string());
+        } else if !self.dir_loaded
+            && !self.dir_busy
+            && matches!(self.dir_browser, DirBrowserKind::Local)
+        {
+            action = IngestAction::RequestDirList(self.dir_path.clone());
+        }
         let _ = project_name;
 
         // Story shell (reference). Ingest only fills domain bodies — never own layout math.
@@ -313,7 +545,10 @@ impl IngestScreen {
                             crate::composition::HeadFeatures::INGEST
                                 .to_pool_head(self.library_tab, self.playing),
                         );
-                        self.dispatch_pool_head(head);
+                        let head_action = self.dispatch_pool_head(head);
+                        if !matches!(head_action, IngestAction::None) {
+                            action = head_action;
+                        }
                         let body = ui.available_height().max(0.0);
                         qnc_ui::content_panel(ui, body, |ui| {
                             // Component: dir_list
@@ -324,7 +559,7 @@ impl IngestScreen {
                                 parent: self.dir_parent.as_deref(),
                                 entries: &self.dir_entries,
                                 error: self.dir_error.as_deref(),
-                                busy: self.busy,
+                                busy: self.busy || self.dir_busy,
                             };
                             match dir_list::show(ui, input) {
                                 DirListAction::None => {}
@@ -332,7 +567,9 @@ impl IngestScreen {
                                     self.dir_browser = kind;
                                     self.dir_error = None;
                                     match kind {
-                                        DirBrowserKind::Local => self.load_dir(host, ""),
+                                        DirBrowserKind::Local => {
+                                            action = IngestAction::RequestDirList(String::new());
+                                        }
                                         DirBrowserKind::Lan | DirBrowserKind::Internet => {
                                             self.dir_roots = true;
                                             self.dir_path.clear();
@@ -341,7 +578,9 @@ impl IngestScreen {
                                         }
                                     }
                                 }
-                                DirListAction::OpenPath(path) => self.load_dir(host, &path),
+                                DirListAction::OpenPath(path) => {
+                                    action = IngestAction::RequestDirList(path);
+                                }
                                 DirListAction::Confirm => action = IngestAction::ConfirmDir,
                                 DirListAction::Cancel => action = IngestAction::CancelDir,
                             }
@@ -361,6 +600,9 @@ impl IngestScreen {
                 );
                 match strip {
                     MediaPoolAction::SelectClipId(id) => {
+                        if self.preview_clip_id != id {
+                            self.image_asset_loader.cancel_pending();
+                        }
                         self.preview_clip_id = id.clone();
                         action = IngestAction::Toggle(id);
                     }
@@ -369,6 +611,7 @@ impl IngestScreen {
                     | MediaPoolAction::SelectShot(_)
                     | MediaPoolAction::SelectPart(_)
                     | MediaPoolAction::DeletePart(_)
+                    | MediaPoolAction::ReorderPart { .. }
                     | MediaPoolAction::TogglePlay
                     | MediaPoolAction::MarkIn
                     | MediaPoolAction::MarkOut
@@ -382,18 +625,19 @@ impl IngestScreen {
     }
 
     /// Shared pool-head transport (Story / MA) — map to ingest playback only.
-    fn dispatch_pool_head(&mut self, action: MediaPoolAction) {
+    fn dispatch_pool_head(&mut self, action: MediaPoolAction) -> IngestAction {
         let enabled = !self.preview_clip_id.is_empty();
         match action {
-            MediaPoolAction::None => {}
+            MediaPoolAction::None => IngestAction::None,
             MediaPoolAction::SwitchTab(tab) => {
                 // Ingest never uses Segment — clamp away if somehow selected.
                 self.library_tab = match tab {
                     LibraryTab::Segment => LibraryTab::All,
                     other => other,
                 };
+                IngestAction::None
             }
-            MediaPoolAction::TogglePlay if enabled => self.queue_toggle_play(),
+            MediaPoolAction::TogglePlay if enabled => IngestAction::TogglePlay,
             MediaPoolAction::MarkIn if enabled => self.nudge_frames(-1),
             MediaPoolAction::MarkOut if enabled => self.nudge_frames(1),
             MediaPoolAction::QuickCover
@@ -404,29 +648,19 @@ impl IngestScreen {
             | MediaPoolAction::SelectShot(_)
             | MediaPoolAction::SelectClipId(_)
             | MediaPoolAction::SelectPart(_)
-            | MediaPoolAction::DeletePart(_) => {}
+            | MediaPoolAction::DeletePart(_)
+            | MediaPoolAction::ReorderPart { .. } => IngestAction::None,
         }
     }
 
     pub fn timeline_dock_height(&self) -> f32 {
-        let dur = self
-            .state
-            .as_ref()
-            .and_then(|st| {
-                st.clips
-                    .iter()
-                    .find(|c| c.clip_id == self.preview_clip_id)
-                    .map(|c| c.duration_sec)
-            })
-            .unwrap_or(1.0)
-            .max(0.04);
-        qnc_source_dock::dock_height(self.expanded_audio, true, dur)
+        qnc_source_dock::dock_height(self.expanded_audio, true)
     }
 
     pub fn ui_timeline_dock(
         &mut self,
         ui: &mut egui::Ui,
-        playback: &mut PlaybackStack,
+        playback: &PlaybackStack,
     ) -> IngestAction {
         let clips = self
             .state
@@ -461,31 +695,52 @@ impl IngestScreen {
             }
         }
         let empty: &[f32] = &[];
-        let tc = |s: f64| format_tc(s, self.selected_source_fps);
-        let fps = if self.selected_source_fps.is_finite() && self.selected_source_fps > 0.0 {
-            self.selected_source_fps
-        } else {
-            25.0
+        let Some(fps) = clip
+            .and_then(|clip| (clip.fps.is_finite() && clip.fps > 0.0).then_some(clip.fps))
+            .or_else(|| {
+                (self.selected_source_fps.is_finite() && self.selected_source_fps > 0.0)
+                    .then_some(self.selected_source_fps)
+            })
+        else {
+            ui.label("Source FPS nije potvrđen");
+            return IngestAction::None;
         };
-        if playback.carrier().is_active() {
-            let frame = playback.carrier().display_frame().0;
-            self.virtual_sec = frame_to_seconds(frame, fps).clamp(0.0, dur);
+        let tc_frame = |frame: i64| format_tc(frame_to_seconds(frame.max(0), fps), fps);
+        let duration_frames = seconds_to_frame(dur, fps).max(1);
+        let live_source_ref = self.selected_source_ref.as_ref();
+        if live_source_ref.is_some_and(|source_ref| playback.active_source_matches(source_ref))
+            && playback.carrier().is_active()
+        {
+            self.virtual_frame = playback
+                .carrier()
+                .display_frame()
+                .0
+                .clamp(0, duration_frames);
+        } else {
+            self.virtual_frame = self.virtual_frame.clamp(0, duration_frames);
         }
-        let fallback_frame = seconds_to_frame(self.virtual_sec.clamp(0.0, dur), fps);
-        let timeline_model =
-            playback.timeline_model_for_clip(fps, dur, 0, seconds_to_frame(dur, fps), fallback_frame);
+        let timeline_model = playback.timeline_model_for_source_ref(
+            live_source_ref,
+            fps,
+            duration_frames,
+            0,
+            duration_frames,
+            0,
+            duration_frames,
+            self.virtual_frame,
+        );
         let dock = qnc_source_dock::show(
             ui,
             SourceDockInput {
                 clip_label: label,
-                source_in: 0.0,
-                source_out: dur,
+                source_in_frame: 0,
+                source_out_frame: duration_frames,
                 timeline_model,
                 focus: TimelineFocusPaint::Playhead,
                 a1_peaks: empty,
                 a2_peaks: empty,
                 frames: &frames,
-                tc: &tc,
+                tc_frame: &tc_frame,
                 show_header: true,
                 show_edit_actions: false,
                 show_import_actions: true,
@@ -498,15 +753,7 @@ impl IngestScreen {
         );
         match dock {
             SourceDockAction::None => IngestAction::None,
-            SourceDockAction::CueFrame(frame) => {
-                // Progress bar → CueFrame; Space plays from this position.
-                if let Err(err) = crate::player_bridge::build_open_request(self)
-                    .and_then(|request| playback.cue_timeline_click(request, frame))
-                {
-                    self.player_status = err;
-                }
-                IngestAction::None
-            }
+            SourceDockAction::CueFrame(frame) => IngestAction::CueFrame(frame),
             SourceDockAction::ToggleAudioExpand(lane) => {
                 self.expanded_audio = self.expanded_audio.toggle(lane);
                 IngestAction::None
@@ -520,9 +767,9 @@ impl IngestScreen {
                 self.ai_mining = v;
                 IngestAction::None
             }
-            SourceDockAction::SaveVirtualShot | SourceDockAction::CreatePart(_) => {
-                IngestAction::None
-            }
+            SourceDockAction::SaveVirtualShot
+            | SourceDockAction::CreatePart(_)
+            | SourceDockAction::CreateCover => IngestAction::None,
         }
     }
 
@@ -562,116 +809,29 @@ impl IngestScreen {
         project_id: &str,
         action: IngestAction,
     ) -> Result<(), String> {
+        let _ = host;
         match action {
-            IngestAction::None => Ok(()),
-            IngestAction::Reload => {
-                self.reload(host, project_id);
-                Ok(())
-            }
-            IngestAction::PickFolder => {
-                let initial = self.path_edit.clone();
-                match host.pick_directory(&initial)? {
-                    Some(path) => {
-                        self.path_edit = path.clone();
-                        self.load_dir(host, &path);
-                        self.busy = true;
-                        let st = host.ingest_browse(project_id, &path)?;
-                        self.apply(st);
-                        self.busy = false;
-                        self.message = Some(format!("Discovered from {path}"));
-                        Ok(())
-                    }
-                    None => {
-                        self.message = Some("Odustano.".into());
-                        Ok(())
-                    }
-                }
-            }
-            IngestAction::ConfirmDir => {
-                let path = self.dir_path.trim().to_string();
-                if path.is_empty() || self.dir_roots {
-                    return Err("Odaberi mapu u stablu.".into());
-                }
-                self.path_edit = path.clone();
-                self.busy = true;
-                let st = host.ingest_browse(project_id, &path)?;
-                self.apply(st);
-                self.busy = false;
-                self.message = Some(format!("Otkrij: {path}"));
-                Ok(())
-            }
+            IngestAction::None
+            | IngestAction::CueFrame(_)
+            | IngestAction::TogglePlay
+            | IngestAction::RequestState(_)
+            | IngestAction::RequestDirList(_)
+            | IngestAction::Toggle(_)
+            | IngestAction::Reload
+            | IngestAction::PickFolder
+            | IngestAction::ConfirmDir
+            | IngestAction::BrowsePath
+            | IngestAction::Discover
+            | IngestAction::SelectAll
+            | IngestAction::ClearSelection
+            | IngestAction::SetArchive(_)
+            | IngestAction::ImportSelected => Ok(()),
             IngestAction::CancelDir => {
-                self.dir_browser = DirBrowserKind::Local;
-                self.load_dir(host, "");
-                self.message = Some("Stablo: računalo.".into());
-                Ok(())
-            }
-            IngestAction::BrowsePath => {
-                let path = if !self.dir_path.is_empty() && !self.dir_roots {
-                    self.dir_path.clone()
-                } else {
-                    self.path_edit.trim().to_string()
-                };
-                if path.is_empty() {
-                    return Err("Odaberi mapu (U redu) ili upiši putanju.".into());
-                }
-                self.path_edit = path.clone();
-                self.busy = true;
-                let st = host.ingest_browse(project_id, &path)?;
-                self.apply(st);
-                self.busy = false;
-                self.message = Some("Otkrij gotov.".into());
-                Ok(())
-            }
-            IngestAction::Discover => {
-                self.busy = true;
-                let st = host.ingest_discover(project_id)?;
-                self.apply(st);
-                self.busy = false;
-                self.message = Some("Ponovo otkrij gotov.".into());
-                Ok(())
-            }
-            IngestAction::SelectAll => {
-                let st = host.ingest_select_all(project_id)?;
-                self.apply(st);
-                Ok(())
-            }
-            IngestAction::ClearSelection => {
-                let st = host.ingest_set_selection(project_id, &[])?;
-                self.apply(st);
-                Ok(())
-            }
-            IngestAction::Toggle(clip_id) => {
-                self.activate_preview_clip(host, project_id, &clip_id);
-                let st = host.ingest_toggle(project_id, &clip_id)?;
-                self.apply(st);
+                self.cancel_dir_browser();
                 Ok(())
             }
             IngestAction::FocusPreview(clip_id) => {
-                self.activate_preview_clip(host, project_id, &clip_id);
-                Ok(())
-            }
-            IngestAction::SetArchive(v) => {
-                let st = host.ingest_set_archive_original(project_id, v)?;
-                self.apply(st);
-                Ok(())
-            }
-            IngestAction::ImportSelected => {
-                let selected_n = self
-                    .state
-                    .as_ref()
-                    .map(|s| s.selected_clip_ids.len())
-                    .unwrap_or(0);
-                if selected_n == 0 {
-                    return Err("Nema odabranih klipova.".into());
-                }
-                self.busy = true;
-                // Empty clip_ids → host uvozi sve `selected=1` iz SQLite (video + audio).
-                let st = host.ingest_import(project_id, &[])?;
-                let queued = st.queued.unwrap_or(selected_n as u64);
-                self.apply(st);
-                self.busy = false;
-                self.message = Some(format!("Uvoz u bazi: {queued} klip(ova)."));
+                self.activate_preview_clip(project_id, &clip_id);
                 Ok(())
             }
         }
@@ -695,11 +855,9 @@ fn format_duration(sec: f64) -> String {
 
 /// Story-style timecode HH:MM:SS:FF for source dock.
 fn format_tc(sec: f64, fps: f64) -> String {
-    let fps = if fps.is_finite() && fps > 0.0 {
-        fps
-    } else {
-        25.0
-    };
+    if !fps.is_finite() || fps <= 0.0 {
+        return "--:--:--:--".into();
+    }
     let sec = if sec.is_finite() && sec > 0.0 {
         sec
     } else {

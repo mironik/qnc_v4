@@ -3197,7 +3197,7 @@ checksum = "d55d956fa96f5ec02be2e13af0e20391a5aa83d6a074e3ad368959d0fab299ea"
 
 [[package]]
 name = "qnc-app"
-version = "0.4.5"
+version = "0.4.6"
 dependencies = [
  "clap",
  "eframe",
@@ -3239,7 +3239,7 @@ dependencies = [
 
 [[package]]
 name = "qnc-host"
-version = "0.4.5"
+version = "0.4.6"
 dependencies = [
  "axum",
  "cpal 0.15.3",

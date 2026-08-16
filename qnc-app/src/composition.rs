@@ -33,10 +33,6 @@ impl EditorialRole {
         self.composition().head
     }
 
-    pub fn dock(self) -> DockFeatures {
-        self.composition().dock
-    }
-
     pub fn card_features(self) -> MediaCardFeatures {
         match self {
             Self::Story => MediaCardFeatures::STORY,

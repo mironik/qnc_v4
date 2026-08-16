@@ -10,20 +10,23 @@ use serde_json::Value;
 use crate::api::HostClient;
 use crate::audio::AudioEngine;
 use crate::editorial::{
-    apply_mark_in_fit_duration, create_cover_from_marks, create_segment, kind_for_action,
-    SourceMarks,
+    apply_mark_in_fit_frames, create_cover_from_marks, create_segment, kind_for_action, SourceMarks,
 };
-use crate::focus::{frame_sec, source_focus_chain, FocusTarget, TimelineFocus};
+use crate::focus::{
+    frame_to_seconds, seconds_to_frame, source_focus_chain, FocusTarget, TimelineFocus,
+};
 use crate::shortcuts::StoryBindings;
 
 const AUDIO_WINDOW_SEC: f64 = 6.0;
+#[allow(dead_code)]
 const DEFAULT_FPS: f64 = 25.0;
 
+#[allow(dead_code)]
 pub struct ClipPlayApp {
     host: HostClient,
     project_id: String,
     clip_id: String,
-    seek_sec: f64,
+    seek_frame: i64,
     status: String,
     texture: Option<TextureHandle>,
     pending_image: Option<ColorImage>,
@@ -36,6 +39,7 @@ pub struct ClipPlayApp {
     story_state: Value,
 }
 
+#[allow(dead_code)]
 impl ClipPlayApp {
     pub fn open(
         host: HostClient,
@@ -76,7 +80,7 @@ impl ClipPlayApp {
             host,
             project_id,
             clip_id,
-            seek_sec: seek.max(0.0),
+            seek_frame: seconds_to_frame(seek.max(0.0), DEFAULT_FPS),
             status,
             texture: None,
             pending_image: None,
@@ -100,14 +104,14 @@ impl ClipPlayApp {
         Ok(())
     }
 
-    fn step(&self) -> f64 {
-        frame_sec(self.fps)
+    fn seek_sec(&self) -> f64 {
+        frame_to_seconds(self.seek_frame, self.fps)
     }
 
     fn fetch_thumb(&mut self) -> Result<(), String> {
         let url = self
             .host
-            .story_thumbnail_url(&self.project_id, &self.clip_id, self.seek_sec);
+            .story_thumbnail_url(&self.project_id, &self.clip_id, self.seek_sec());
         let bytes = self.host.download_bytes(&url)?;
         let img = image::load_from_memory(&bytes)
             .map_err(|e| e.to_string())?
@@ -121,8 +125,11 @@ impl ClipPlayApp {
         let Some(engine) = self.audio.as_ref() else {
             return Err("audio engine nije dostupan".into());
         };
-        let in_sec = self.seek_sec.max(0.0);
-        let out_sec = in_sec + AUDIO_WINDOW_SEC;
+        let in_sec = self.seek_sec();
+        let out_sec = frame_to_seconds(
+            self.seek_frame + seconds_to_frame(AUDIO_WINDOW_SEC, self.fps),
+            self.fps,
+        );
         let url = self.host.story_virtual_stream_url(
             &self.project_id,
             &self.clip_id,
@@ -156,8 +163,8 @@ impl ClipPlayApp {
         }
     }
 
-    fn seek_to(&mut self, sec: f64) {
-        self.seek_sec = sec.max(0.0);
+    fn seek_to_frame(&mut self, frame: i64) {
+        self.seek_frame = frame.max(0);
         if self.playing {
             let _ = self.play_audio_window();
         }
@@ -165,8 +172,9 @@ impl ClipPlayApp {
             self.status = format!("thumb: {e}");
         } else {
             self.status = format!(
-                "seek {:.3}s · fokus={} · {}",
-                self.seek_sec,
+                "seek {}f ({:.3}s) · fokus={} · {}",
+                self.seek_frame,
+                self.seek_sec(),
                 self.focus.target.label(),
                 self.marks.summary()
             );
@@ -174,15 +182,15 @@ impl ClipPlayApp {
     }
 
     fn apply_mark_in(&mut self) {
-        self.marks.set_in(&self.clip_id, self.seek_sec);
+        self.marks.set_in(&self.clip_id, self.seek_frame);
         self.focus.select_in();
-        self.status = format!("Mark IN {:.3}s · {}", self.seek_sec, self.marks.summary());
+        self.status = format!("Mark IN {}f · {}", self.seek_frame, self.marks.summary());
     }
 
     fn apply_mark_out(&mut self) {
-        self.marks.set_out(&self.clip_id, self.seek_sec);
+        self.marks.set_out(&self.clip_id, self.seek_frame);
         self.focus.select_out();
-        self.status = format!("Mark OUT {:.3}s · {}", self.seek_sec, self.marks.summary());
+        self.status = format!("Mark OUT {}f · {}", self.seek_frame, self.marks.summary());
     }
 
     fn apply_create_segment(&mut self, action_id: &str) {
@@ -203,30 +211,30 @@ impl ClipPlayApp {
     }
 
     fn step_focus(&mut self, forward: bool) {
-        let delta = if forward { self.step() } else { -self.step() };
+        let delta = if forward { 1 } else { -1 };
         match self.focus.target.clone() {
             FocusTarget::Playhead | FocusTarget::Marker { .. } => {
                 // Source clip preview: no M pins here — marker focus falls back to playhead.
                 if matches!(self.focus.target, FocusTarget::Marker { .. }) {
                     self.focus.clear();
                 }
-                self.seek_to(self.seek_sec + delta);
+                self.seek_to_frame(self.seek_frame + delta);
             }
             FocusTarget::In => {
-                let cur = self.marks.mark_in.unwrap_or(self.seek_sec);
-                let next = (cur + delta).max(0.0);
+                let cur = self.marks.mark_in.unwrap_or(self.seek_frame);
+                let next = (cur + delta).max(0);
                 self.marks.set_in(&self.clip_id, next);
-                self.status = format!("IN → {:.3}s (1f)", next);
+                self.status = format!("IN → {next}f");
             }
             FocusTarget::Out => {
-                let cur = self.marks.mark_out.unwrap_or(self.seek_sec);
-                let next = (cur + delta).max(0.0);
+                let cur = self.marks.mark_out.unwrap_or(self.seek_frame);
+                let next = (cur + delta).max(0);
                 if self.marks.mark_in.is_some_and(|i| next <= i) {
                     self.status = "OUT ne smije prijeći ispred IN".into();
                     return;
                 }
                 self.marks.set_out(&self.clip_id, next);
-                self.status = format!("OUT → {:.3}s (1f)", next);
+                self.status = format!("OUT → {next}f");
             }
             FocusTarget::Slot { .. } => {
                 self.status = "Slot fokus: wrap play (play --gui)".into();
@@ -245,16 +253,16 @@ impl ClipPlayApp {
                 if let Ok(s) = self.host.story_state(&self.project_id) {
                     self.story_state = s;
                 }
-                match apply_mark_in_fit_duration(
+                match apply_mark_in_fit_frames(
                     &mut self.marks,
                     &self.clip_id,
-                    self.seek_sec,
+                    self.seek_frame,
                     &self.story_state,
                 ) {
                     Ok((inn, out)) => {
                         self.focus.select_out();
                         self.status =
-                            format!("IN={inn:.3} OUT={out:.3} (slot) · {}", self.marks.summary());
+                            format!("IN={inn}f OUT={out}f (slot) · {}", self.marks.summary());
                     }
                     Err(e) => self.status = e,
                 }
@@ -280,14 +288,14 @@ impl ClipPlayApp {
             }
             "select_mark_in" => {
                 if self.marks.mark_in.is_none() {
-                    self.marks.set_in(&self.clip_id, self.seek_sec);
+                    self.marks.set_in(&self.clip_id, self.seek_frame);
                 }
                 self.focus.select_in();
                 self.status = format!("Fokus IN · {}", self.marks.summary());
             }
             "select_mark_out" => {
                 if self.marks.mark_out.is_none() {
-                    self.marks.set_out(&self.clip_id, self.seek_sec);
+                    self.marks.set_out(&self.clip_id, self.seek_frame);
                 }
                 self.focus.select_out();
                 self.status = format!("Fokus OUT · {}", self.marks.summary());
@@ -395,7 +403,7 @@ impl eframe::App for ClipPlayApp {
                 }
                 ui.separator();
                 ui.label(format!("clip={}", self.clip_id));
-                ui.label(format!("t≈{:.3}s", self.seek_sec));
+                ui.label(format!("t={}f ({:.3}s)", self.seek_frame, self.seek_sec()));
                 ui.label(format!("fokus={}", self.focus.target.label()));
             });
             ui.label(format!("project={} · {}", self.project_id, self.status));

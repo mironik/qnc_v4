@@ -5,13 +5,15 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use crate::editor_assets::{ensure_virtual_stream_cached_kind, VirtualStreamKind};
+use crate::frame_time::{frame_to_seconds, seconds_to_frame};
 use crate::ingest::thumb::{extract_preview_jpeg_at_seek, media_has_audio_stream, resolve_ffmpeg};
 use crate::media::resolve_play_media;
 use crate::project::db::ProjectPaths;
 
 use super::db::{cover_stream_frames, part_stream_frames};
 use super::playback::{
-    find_cover, find_segment, resolve_active_layer_public, ActiveLayerKind, PlaybackSession,
+    find_cover_frame, find_segment_frame, resolve_active_layer_frame_public, ActiveLayerKind,
+    PlaybackSession,
 };
 
 const EPS: f64 = 0.001;
@@ -71,13 +73,16 @@ pub async fn render_mixed_audio(
         .map_err(|e| e.to_string())?
 }
 
-pub async fn render_preview_frame(
+pub async fn render_preview_frame_at_frame(
     paths: &ProjectPaths,
     session: &PlaybackSession,
-    virtual_sec: f64,
+    virtual_frame: i64,
 ) -> Result<PathBuf, String> {
     if let Some(src) = session.source_clip.as_ref() {
-        let source_sec = virtual_sec.max(src.in_sec).min(src.out_sec.max(src.in_sec));
+        let source_frame = virtual_frame
+            .max(0)
+            .clamp(src.in_frame, src.out_frame.max(src.in_frame));
+        let source_sec = frame_to_seconds(source_frame, src.fps);
         let clip_id = src.clip_id.clone();
         let pid = session.project_id.clone();
         let paths = paths.clone();
@@ -87,7 +92,7 @@ pub async fn render_preview_frame(
         .await
         .map_err(|e| e.to_string())?;
     }
-    let active = resolve_active_layer_public(session, virtual_sec);
+    let active = resolve_active_layer_frame_public(session, virtual_frame);
     if active.video_blank && active.layer != ActiveLayerKind::Cover {
         return render_blank_frame().await;
     }
@@ -97,14 +102,14 @@ pub async fn render_preview_frame(
     let part_id = active.part_id;
     let cover_id = active.cover_id;
     let source_sec = active.source_sec;
-    let local_sec = active.local_sec;
+    let local_frame = active.local_frame;
     let video_blank = active.video_blank;
     tokio::task::spawn_blocking(move || match layer {
         ActiveLayerKind::Cover if !cover_id.is_empty() => {
             frame_from_cover(&paths, &pid, &cover_id, source_sec)
         }
         ActiveLayerKind::Part if !part_id.is_empty() && !video_blank => {
-            frame_from_part(&paths, &pid, &part_id, local_sec)
+            frame_from_part_at_frame(&paths, &pid, &part_id, local_frame)
         }
         _ => render_blank_frame_sync(),
     })
@@ -187,6 +192,21 @@ fn frame_from_part(
     Ok(out)
 }
 
+fn frame_from_part_at_frame(
+    paths: &ProjectPaths,
+    project_id: &str,
+    part_id: &str,
+    local_frame: i64,
+) -> Result<PathBuf, String> {
+    let (_, _, _, fps) = part_stream_frames(paths, project_id, part_id)?;
+    frame_from_part(
+        paths,
+        project_id,
+        part_id,
+        frame_to_seconds(local_frame.max(0), fps),
+    )
+}
+
 fn frame_from_cover(
     paths: &ProjectPaths,
     project_id: &str,
@@ -264,34 +284,41 @@ pub(crate) fn plan_mix_slices(
     from_sec: f64,
     duration_sec: f64,
 ) -> Vec<MixSlice> {
-    let end = from_sec + duration_sec;
+    let fps = session.playlist.timeline_fps.max(1.0);
+    let from_frame = seconds_to_frame(from_sec.max(0.0), fps);
+    let duration_frames = seconds_to_frame(duration_sec.max(0.0), fps).max(1);
+    let end_frame = from_frame.saturating_add(duration_frames);
     let mut slices = Vec::new();
-    let mut t = from_sec;
-    while t < end - EPS {
-        let Some(segment) = find_segment(&session.playlist, t).0 else {
+    let mut frame = from_frame;
+    while frame < end_frame {
+        let (segment, local_frame) = find_segment_frame(&session.playlist, frame);
+        let Some(segment) = segment else {
             break;
         };
-        let slice_end = end.min(segment.global_end_sec);
-        let cover = find_cover(&segment.covers, t);
-        let mut boundary = slice_end;
+        let segment_end_frame = segment.global_end_frame.max(segment.global_start_frame + 1);
+        let cover = find_cover_frame(&segment.covers, frame);
+        let mut boundary_frame = end_frame.min(segment_end_frame);
         if let Some(cover) = cover {
-            boundary = boundary.min(cover.timeline_end_sec);
+            boundary_frame = boundary_frame.min(cover.timeline_end_frame.max(frame + 1));
         } else {
             for c in &segment.covers {
-                if c.streamable && c.timeline_start_sec > t + EPS {
-                    boundary = boundary.min(c.timeline_start_sec);
+                if c.streamable && c.timeline_start_frame > frame {
+                    boundary_frame = boundary_frame.min(c.timeline_start_frame);
                 }
             }
         }
-        let dur = (boundary - t).max(0.0);
+        let dur_frames = (boundary_frame - frame).max(0);
+        let dur = frame_to_seconds(dur_frames, fps).max(0.0);
         if dur <= EPS {
             break;
         }
-        let part_local_in = (t - segment.global_start_sec).max(0.0);
+        let part_local_in = frame_to_seconds(local_frame.max(0), fps);
         let (cover_id, cover_source_in) = if let Some(c) = cover {
+            let source_offset_frame =
+                (frame - c.timeline_start_frame).max(0) + c.source_offset_frames.max(0);
             (
                 Some(c.cover_id.clone()),
-                (t - c.timeline_start_sec).max(0.0) + c.source_offset_sec.max(0.0),
+                frame_to_seconds(source_offset_frame, fps),
             )
         } else {
             (None, 0.0)
@@ -303,7 +330,7 @@ pub(crate) fn plan_mix_slices(
             cover_id,
             cover_source_in_sec: cover_source_in,
         });
-        t = boundary;
+        frame = boundary_frame;
     }
     slices
 }

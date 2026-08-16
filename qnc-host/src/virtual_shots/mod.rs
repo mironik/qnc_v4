@@ -6,7 +6,8 @@
 pub(crate) mod db;
 
 pub(crate) use db::{
-    add_virtual_shot, cover_path_for_shot, derive_virtual_shot,
-    ensure_reserved_root_shots_for_project, ensure_root_virtual_shots, list_virtual_shots,
-    sync_root_virtual_shots_with_selection, update_virtual_shot, virtual_shot_frames,
+    add_virtual_shot, add_virtual_shot_from_frames, cover_path_for_shot, derive_virtual_shot,
+    derive_virtual_shot_from_frames, ensure_reserved_root_shots_for_project,
+    ensure_root_virtual_shots, list_virtual_shots, sync_root_virtual_shots_with_selection,
+    update_virtual_shot, update_virtual_shot_from_frames, virtual_shot_frames,
 };

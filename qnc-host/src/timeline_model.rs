@@ -7,6 +7,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::frame_time::{frame_to_seconds, require_fps, seconds_to_frame};
+
 /// UI / native row order (Kodak perforacije → classic NLE rows).
 pub const TIMELINE_ROWS: [&str; 3] = ["audio-1", "video", "audio-2"];
 
@@ -64,6 +66,10 @@ impl SegmentSchema {
 pub struct TimelineCover {
     pub cover_id: String,
     pub clip_id: String,
+    #[serde(default)]
+    pub timeline_start_frame: i64,
+    #[serde(default)]
+    pub timeline_end_frame: i64,
     pub timeline_start_sec: f64,
     pub timeline_end_sec: f64,
     pub streamable: bool,
@@ -75,6 +81,8 @@ pub struct TimelinePin {
     pub id: String,
     /// `in` | `out` | `marker`
     pub kind: String,
+    #[serde(default)]
+    pub timeline_frame: i64,
     pub timeline_sec: f64,
     #[serde(default)]
     pub label: String,
@@ -83,6 +91,10 @@ pub struct TimelinePin {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TimelineMarkerSlot {
     pub slot_id: String,
+    #[serde(default)]
+    pub start_frame: i64,
+    #[serde(default)]
+    pub end_frame: i64,
     pub start_sec: f64,
     pub end_sec: f64,
     #[serde(default)]
@@ -97,6 +109,12 @@ pub struct TimelineSegment {
     pub kind: String,
     pub schema: SegmentSchema,
     pub clip_id: String,
+    #[serde(default)]
+    pub global_start_frame: i64,
+    #[serde(default)]
+    pub global_end_frame: i64,
+    #[serde(default)]
+    pub duration_frames: i64,
     pub global_start_sec: f64,
     pub global_end_sec: f64,
     pub duration_sec: f64,
@@ -112,6 +130,8 @@ pub struct TimelineModel {
     pub project_id: String,
     pub application: TimelineApplication,
     pub timeline_fps: f64,
+    #[serde(default)]
+    pub duration_frames: i64,
     pub duration_sec: f64,
     /// Always A1 → V → A2.
     pub rows: Vec<String>,
@@ -135,23 +155,24 @@ pub fn build_source_timeline_model(
     in_sec: f64,
     out_sec: f64,
     timeline_fps: f64,
-) -> TimelineModel {
-    let duration = duration_sec.max(0.0);
-    let in_s = in_sec.clamp(0.0, duration);
-    let mut out_s = out_sec.clamp(0.0, duration);
-    if out_s < in_s {
-        out_s = in_s;
+) -> Result<TimelineModel, String> {
+    let fps = require_fps(timeline_fps, "source timeline fps")?;
+    let duration_frames = seconds_to_frame(duration_sec.max(0.0), fps).max(0);
+    let in_frame = seconds_to_frame(in_sec.max(0.0), fps).clamp(0, duration_frames);
+    let mut out_frame = seconds_to_frame(out_sec.max(0.0), fps).clamp(0, duration_frames);
+    if out_frame < in_frame {
+        out_frame = in_frame;
     }
+    let duration = frame_to_seconds(duration_frames, fps);
+    let in_s = frame_to_seconds(in_frame, fps);
+    let out_s = frame_to_seconds(out_frame, fps);
     let schema = SegmentSchema::Source;
     let clip = clip_id.trim().to_string();
-    TimelineModel {
+    Ok(TimelineModel {
         project_id: project_id.trim().to_string(),
         application: TimelineApplication::Source,
-        timeline_fps: if timeline_fps > 0.0 {
-            timeline_fps
-        } else {
-            25.0
-        },
+        timeline_fps: fps,
+        duration_frames,
         duration_sec: duration,
         rows: TIMELINE_ROWS.iter().map(|s| (*s).to_string()).collect(),
         segments: vec![TimelineSegment {
@@ -159,6 +180,9 @@ pub fn build_source_timeline_model(
             kind: "source".into(),
             schema,
             clip_id: clip.clone(),
+            global_start_frame: 0,
+            global_end_frame: duration_frames,
+            duration_frames,
             global_start_sec: 0.0,
             global_end_sec: duration,
             duration_sec: duration,
@@ -171,19 +195,21 @@ pub fn build_source_timeline_model(
             TimelinePin {
                 id: format!("{clip}:in"),
                 kind: "in".into(),
+                timeline_frame: in_frame,
                 timeline_sec: in_s,
                 label: "I".into(),
             },
             TimelinePin {
                 id: format!("{clip}:out"),
                 kind: "out".into(),
+                timeline_frame: out_frame,
                 timeline_sec: out_s,
                 label: "O".into(),
             },
         ],
         markers: vec![],
         marker_slots: vec![],
-    }
+    })
 }
 
 pub fn wrap_segment_io_pins(segments: &[TimelineSegment]) -> Vec<TimelinePin> {
@@ -192,12 +218,14 @@ pub fn wrap_segment_io_pins(segments: &[TimelineSegment]) -> Vec<TimelinePin> {
         pins.push(TimelinePin {
             id: format!("{}:in", seg.part_id),
             kind: "in".into(),
+            timeline_frame: seg.global_start_frame,
             timeline_sec: seg.global_start_sec,
             label: "I".into(),
         });
         pins.push(TimelinePin {
             id: format!("{}:out", seg.part_id),
             kind: "out".into(),
+            timeline_frame: seg.global_end_frame,
             timeline_sec: seg.global_end_sec,
             label: "O".into(),
         });
@@ -224,8 +252,9 @@ mod tests {
 
     #[test]
     fn source_model_has_io_only() {
-        let model = build_source_timeline_model("p1", "clip_a", 10.0, 2.0, 8.0, 25.0);
+        let model = build_source_timeline_model("p1", "clip_a", 10.0, 2.0, 8.0, 50.0).unwrap();
         assert_eq!(model.application, TimelineApplication::Source);
+        assert_eq!(model.timeline_fps, 50.0);
         assert!(model.segments[0].covers.is_empty());
         assert!(model.markers.is_empty());
         assert!(model.marker_slots.is_empty());

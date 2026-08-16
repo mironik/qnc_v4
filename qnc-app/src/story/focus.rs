@@ -7,16 +7,6 @@ pub(super) enum FocusTarget {
     Out,
 }
 
-impl FocusTarget {
-    pub fn label(&self) -> &'static str {
-        match self {
-            FocusTarget::Playhead => "playhead",
-            FocusTarget::In => "IN",
-            FocusTarget::Out => "OUT",
-        }
-    }
-}
-
 #[derive(Debug, Clone)]
 pub(super) struct TimelineFocus {
     pub target: FocusTarget,
@@ -75,6 +65,7 @@ impl TimelineFocus {
 }
 
 /// Source editing Tab cycle: playhead → IN → OUT.
+#[cfg(test)]
 pub(super) fn source_focus_chain() -> Vec<FocusTarget> {
     vec![FocusTarget::Playhead, FocusTarget::In, FocusTarget::Out]
 }

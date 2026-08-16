@@ -90,6 +90,7 @@ pub struct ThemeTokens {
 
 /// Timeline paint colors derived from the active theme (not a fixed dark palette).
 #[derive(Debug, Clone, Copy)]
+#[allow(dead_code)]
 pub struct TimelineColors {
     pub bg: Color32,
     pub video_bg: Color32,

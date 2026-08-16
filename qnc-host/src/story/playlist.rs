@@ -5,12 +5,14 @@
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 
-use crate::project::db::{open_project, project_timeline_fps, ProjectPaths};
+use crate::frame_time::{frame_to_seconds, is_valid_fps, seconds_to_frame};
+use crate::project::db::{open_project, ProjectPaths};
 
 use super::covers::{list_covers, StoryCoverRow};
 use super::db::{ensure_schema, list_parts, StoryPartRow};
 use super::markers::{
-    cover_slot_duration_sec, part_span_seconds, timeline_duration_from_parts, TIMELINE_EPS,
+    cover_slot_duration_sec, part_span_frames, part_span_seconds,
+    timeline_duration_frames_from_parts, TIMELINE_EPS,
 };
 
 /// Seconds before a cover slot to begin stream preload (playback worker, phase 4).
@@ -30,14 +32,22 @@ pub struct EditorialCover {
     pub clip_id: String,
     pub virtual_shot_id: String,
     pub title: String,
+    pub timeline_start_frame: i64,
+    pub timeline_end_frame: i64,
     pub timeline_start_sec: f64,
     pub timeline_end_sec: f64,
+    pub local_start_frame: i64,
+    pub local_end_frame: i64,
     pub local_start_sec: f64,
     pub local_end_sec: f64,
+    pub slot_duration_frames: i64,
     pub slot_duration_sec: f64,
+    pub source_in_frame: i64,
+    pub source_out_frame: i64,
     pub source_in_sec: f64,
     pub source_out_sec: f64,
     /// When cover timeline starts before segment global start (ton under cover).
+    pub source_offset_frames: i64,
     pub source_offset_sec: f64,
     pub streamable: bool,
     #[serde(skip_serializing_if = "String::is_empty")]
@@ -53,9 +63,15 @@ pub struct EditorialSegment {
     pub title: String,
     pub clip_id: String,
     pub virtual_shot_id: String,
+    pub global_start_frame: i64,
+    pub global_end_frame: i64,
+    pub duration_frames: i64,
     pub global_start_sec: f64,
     pub global_end_sec: f64,
     pub duration_sec: f64,
+    pub source_in_frame: i64,
+    pub source_out_frame: i64,
+    pub source_fps: f64,
     pub streamable: bool,
     pub source: StreamRef,
     pub covers: Vec<EditorialCover>,
@@ -65,6 +81,7 @@ pub struct EditorialSegment {
 pub struct EditorialPlaylist {
     pub project_id: String,
     pub timeline_fps: f64,
+    pub duration_frames: i64,
     pub duration_sec: f64,
     pub segments: Vec<EditorialSegment>,
 }
@@ -94,23 +111,40 @@ fn cover_is_streamable(cover: &StoryCoverRow) -> bool {
 fn map_covers_for_segment(
     conn: &Connection,
     covers: &[StoryCoverRow],
-    part_start: f64,
-    part_end: f64,
-    span: f64,
+    part_start_frame: i64,
+    part_end_frame: i64,
+    span_frames: i64,
+    timeline_fps: f64,
 ) -> Vec<EditorialCover> {
     let mut out = Vec::new();
+    let part_start = frame_to_seconds(part_start_frame, timeline_fps);
+    let part_end = frame_to_seconds(part_end_frame, timeline_fps);
     for cover in covers {
-        let c_start = cover.timeline_start_sec;
-        let c_end = cover.timeline_end_sec;
+        let c_start_frame = if cover.timeline_start_frame > 0 {
+            cover.timeline_start_frame
+        } else {
+            seconds_to_frame(cover.timeline_start_sec, timeline_fps)
+        };
+        let c_end_frame = if cover.timeline_end_frame > 0 {
+            cover.timeline_end_frame
+        } else {
+            seconds_to_frame(cover.timeline_end_sec, timeline_fps)
+        };
+        let c_start = frame_to_seconds(c_start_frame, timeline_fps);
+        let c_end = frame_to_seconds(c_end_frame, timeline_fps);
         if c_end <= part_start + TIMELINE_EPS || c_start >= part_end - TIMELINE_EPS {
             continue;
         }
-        let local_start = round3((c_start - part_start).max(0.0));
-        let local_end = round3((c_end - part_start).min(span));
-        if local_end <= local_start + TIMELINE_EPS {
+        let local_start_frame = (c_start_frame - part_start_frame).max(0);
+        let local_end_frame = (c_end_frame - part_start_frame).min(span_frames);
+        if local_end_frame <= local_start_frame {
             continue;
         }
         let (source_in, source_out, slot_duration) = cover_playback_trim(conn, cover);
+        let source_in_frame = seconds_to_frame(source_in, timeline_fps);
+        let source_out_frame = seconds_to_frame(source_out, timeline_fps).max(source_in_frame + 1);
+        let slot_duration_frames = seconds_to_frame(slot_duration, timeline_fps).max(0);
+        let source_offset_frames = (part_start_frame - c_start_frame).max(0);
         let streamable = cover_is_streamable(cover);
         let stream_error = if streamable {
             String::new()
@@ -124,13 +158,24 @@ fn map_covers_for_segment(
             clip_id: cover.clip_id.clone(),
             virtual_shot_id: cover.virtual_shot_id.clone(),
             title: cover.title.clone(),
+            timeline_start_frame: c_start_frame,
+            timeline_end_frame: c_end_frame,
             timeline_start_sec: round3(c_start),
             timeline_end_sec: round3(c_end),
-            local_start_sec: local_start,
-            local_end_sec: local_end,
-            slot_duration_sec: round3(local_end - local_start),
+            local_start_frame,
+            local_end_frame,
+            local_start_sec: round3(frame_to_seconds(local_start_frame, timeline_fps)),
+            local_end_sec: round3(frame_to_seconds(local_end_frame, timeline_fps)),
+            slot_duration_frames,
+            slot_duration_sec: round3(frame_to_seconds(
+                (local_end_frame - local_start_frame).max(0),
+                timeline_fps,
+            )),
+            source_in_frame,
+            source_out_frame,
             source_in_sec: round3(source_in),
             source_out_sec: round3(source_out),
+            source_offset_frames,
             source_offset_sec: round3((part_start - c_start).max(0.0)),
             streamable,
             stream_error,
@@ -139,7 +184,6 @@ fn map_covers_for_segment(
             },
             preload_lead_sec: DEFAULT_PRELOAD_LEAD_SEC,
         });
-        let _ = slot_duration;
     }
     out.sort_by(|a, b| {
         a.local_start_sec
@@ -153,13 +197,24 @@ fn build_segments(
     conn: &Connection,
     parts: &[StoryPartRow],
     covers: &[StoryCoverRow],
+    timeline_fps: f64,
 ) -> Vec<EditorialSegment> {
     let mut segments = Vec::new();
-    let mut global_start = 0.0;
+    let mut global_start_frame = 0;
+    let mut global_start_sec = 0.0;
     for part in parts {
+        let span_frames = part_span_frames(part, timeline_fps);
+        let global_end_frame = global_start_frame + span_frames;
         let span = part_span_seconds(part);
-        let global_end = round3(global_start + span);
-        let part_covers = map_covers_for_segment(conn, covers, global_start, global_end, span);
+        let global_end = global_start_sec + span;
+        let part_covers = map_covers_for_segment(
+            conn,
+            covers,
+            global_start_frame,
+            global_end_frame,
+            span_frames,
+            timeline_fps,
+        );
         let clip_id = part.clip_id.trim().to_string();
         segments.push(EditorialSegment {
             part_id: part.part_id.clone(),
@@ -167,18 +222,36 @@ fn build_segments(
             title: part.title.clone(),
             clip_id: clip_id.clone(),
             virtual_shot_id: part.virtual_shot_id.clone(),
-            global_start_sec: round3(global_start),
-            global_end_sec: global_end,
+            global_start_frame,
+            global_end_frame,
+            duration_frames: span_frames,
+            global_start_sec: round3(global_start_sec),
+            global_end_sec: round3(global_end),
             duration_sec: round3(span),
+            source_in_frame: part.in_frame.max(0),
+            source_out_frame: part.out_frame.max(part.in_frame + 1),
+            source_fps: part.fps,
             streamable: !clip_id.is_empty(),
             source: StreamRef::Part {
                 part_id: part.part_id.clone(),
             },
             covers: part_covers,
         });
-        global_start = global_end;
+        global_start_frame = global_end_frame;
+        global_start_sec = global_end;
     }
     segments
+}
+
+fn story_program_source_fps(parts: &[StoryPartRow]) -> Result<f64, String> {
+    if parts.is_empty() {
+        return Ok(0.0);
+    }
+    parts
+        .iter()
+        .map(|part| part.fps)
+        .find(|fps| is_valid_fps(*fps))
+        .ok_or_else(|| "story program nema valjan source FPS iz probe/DB".to_string())
 }
 
 /// Build the canonical editorial playlist from project DB rows.
@@ -192,18 +265,24 @@ pub fn build_editorial_playlist(
     }
     let conn = open_project(paths, pid).map_err(|e| e.to_string())?;
     ensure_schema(&conn).map_err(|e| e.to_string())?;
-    let timeline_fps = project_timeline_fps(paths, pid);
     let parts = list_parts(&conn).map_err(|e| e.to_string())?;
+    let timeline_fps = story_program_source_fps(&parts)?;
     let covers = list_covers(&conn).map_err(|e| e.to_string())?;
-    let segments = build_segments(&conn, &parts, &covers);
-    let duration_sec = if segments.is_empty() {
+    let segments = build_segments(&conn, &parts, &covers, timeline_fps);
+    let duration_frames = if segments.is_empty() {
+        0
+    } else {
+        timeline_duration_frames_from_parts(&parts, timeline_fps)
+    };
+    let duration_sec = if duration_frames <= 0 {
         0.0
     } else {
-        round3(timeline_duration_from_parts(&parts))
+        round3(segments.iter().map(|segment| segment.duration_sec).sum())
     };
     Ok(EditorialPlaylist {
         project_id: pid.to_string(),
         timeline_fps,
+        duration_frames,
         duration_sec,
         segments,
     })
@@ -270,7 +349,16 @@ mod tests {
         seed_virtual_shot(&paths, project_id, &conn);
         drop(conn);
 
-        create_part(&paths, project_id, "tonovi", Some("shot_a")).unwrap();
+        create_part(
+            &paths,
+            project_id,
+            "tonovi",
+            Some("shot_a"),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
         create_marker(&paths, project_id, Some(1.5), None, Some("slot-end"), None).unwrap();
         let state = load_state(&paths, project_id).unwrap();
         let slot_id = state
@@ -334,8 +422,26 @@ mod tests {
         seed_virtual_shot(&paths, project_id, &conn);
         drop(conn);
 
-        create_part(&paths, project_id, "tonovi", Some("shot_a")).unwrap();
-        create_part(&paths, project_id, "offovi", Some("shot_a")).unwrap();
+        create_part(
+            &paths,
+            project_id,
+            "tonovi",
+            Some("shot_a"),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        create_part(
+            &paths,
+            project_id,
+            "offovi",
+            Some("shot_a"),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
 
         let plan = build_editorial_playlist(&paths, project_id).unwrap();
         assert_eq!(plan.segments.len(), 2);

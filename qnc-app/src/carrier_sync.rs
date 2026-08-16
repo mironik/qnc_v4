@@ -21,6 +21,7 @@ pub struct ProgramBounds {
 }
 
 impl ProgramBounds {
+    #[allow(dead_code)]
     pub fn from_seconds(fps: f64, duration_sec: f64, in_sec: f64, out_sec: f64) -> Self {
         use crate::frame_time::{normalize_fps, seconds_to_frame};
         let fps = normalize_fps(fps);
@@ -67,14 +68,17 @@ impl CarrierSync {
         self.active
     }
 
+    #[allow(dead_code)]
     pub fn playing(&self) -> bool {
         self.playing
     }
 
+    #[allow(dead_code)]
     pub fn player_frame(&self) -> FrameNumber {
         self.player_frame
     }
 
+    #[allow(dead_code)]
     pub fn pending_cue(&self) -> Option<FrameNumber> {
         self.pending_cue
     }
@@ -136,11 +140,20 @@ impl CarrierSync {
                     self.pending_cue = None;
                 }
             }
+            PlayerEvent::BoundaryReached { source_frame } => {
+                self.player_frame = *source_frame;
+                self.playing = false;
+                self.active = true;
+                if self.pending_cue == Some(*source_frame) {
+                    self.pending_cue = None;
+                }
+            }
             PlayerEvent::Stopped => self.clear(),
             PlayerEvent::Error(_) => {}
         }
     }
 
+    #[allow(dead_code)]
     pub fn timeline_model(&self) -> Option<TimelineProgressModel> {
         let program = self.program?;
         Some(TimelineProgressModel::from_carrier(
@@ -152,24 +165,29 @@ impl CarrierSync {
         ))
     }
 
-    /// Carrier playhead + form IN/OUT marks (all frames).
-    pub fn timeline_model_with_marks(
+    /// Carrier playhead + selected shot range + draft IN/OUT marks (all frames).
+    pub fn timeline_model_with_ranges(
         &self,
-        in_frame: i64,
-        out_frame: i64,
+        shot_in_frame: i64,
+        shot_out_frame: i64,
+        draft_in_frame: i64,
+        draft_out_frame: i64,
     ) -> Option<TimelineProgressModel> {
         let program = self.program?;
         let duration_frames = program.duration_frames.max(1);
         let clamp = |frame: i64| frame.clamp(0, duration_frames);
-        Some(TimelineProgressModel::from_carrier(
+        Some(TimelineProgressModel::from_ranges(
             program.fps,
             duration_frames,
             clamp(self.display_frame().0),
-            clamp(in_frame),
-            clamp(out_frame.max(in_frame)),
+            clamp(shot_in_frame),
+            clamp(shot_out_frame.max(shot_in_frame)),
+            clamp(draft_in_frame),
+            clamp(draft_out_frame.max(draft_in_frame)),
         ))
     }
 
+    #[allow(dead_code)]
     pub fn dispatch_timeline_intent(
         &mut self,
         intent: TimelineProgressIntent,
@@ -181,7 +199,7 @@ impl CarrierSync {
         }
     }
 
-    /// Frame seek — shared by timeline scrub and form keyboard IO.
+    /// Frame seek — shared by progress-bar scrub and neutral command input.
     pub fn dispatch_seek_frame(&mut self, frame: i64, coalesce: bool) -> Option<PlayerCommand> {
         let program = self.program?;
         let frame = FrameNumber(frame.clamp(0, program.duration_frames));
@@ -193,6 +211,7 @@ impl CarrierSync {
         })
     }
 
+    #[allow(dead_code)]
     pub fn apply_audio_expand(
         &self,
         expanded: ExpandedAudio,
@@ -325,7 +344,25 @@ mod tests {
         sync.ingest_player_event(&ready());
         let model = sync.timeline_model().expect("model");
         assert_eq!(model.duration_frames(), 250);
-        assert_eq!(model.in_sec(), 0.0);
-        assert_eq!(model.out_sec(), 10.0);
+        assert_eq!(model.shot_in_frame(), 0);
+        assert_eq!(model.shot_out_frame(), 250);
+        assert_eq!(model.draft_in_frame(), 0);
+        assert_eq!(model.draft_out_frame(), 250);
+    }
+
+    #[test]
+    fn source_timeline_keeps_selected_range_and_draft_marks_separate() {
+        let mut sync = CarrierSync::new();
+        sync.ingest_player_event(&ready());
+        sync.ingest_player_event(&state(40, false));
+        let model = sync
+            .timeline_model_with_ranges(10, 200, 60, 120)
+            .expect("model");
+
+        assert_eq!(model.playhead_frame(), 40);
+        assert_eq!(model.shot_in_frame(), 10);
+        assert_eq!(model.shot_out_frame(), 200);
+        assert_eq!(model.draft_in_frame(), 60);
+        assert_eq!(model.draft_out_frame(), 120);
     }
 }

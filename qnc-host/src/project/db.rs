@@ -120,17 +120,30 @@ pub fn project_dir_in_root(root: &Path, project_id: &str) -> PathBuf {
 /// Resolve on-disk project folder from an already-open global DB connection.
 pub fn project_dir_from_conn(conn: &Connection, paths: &ProjectPaths, project_id: &str) -> PathBuf {
     let pid = project_id.trim();
-    let row: Option<String> = conn
+    let row: Option<Option<String>> = conn
         .query_row(
             "SELECT project_dir FROM projects WHERE project_id = ?1",
             params![pid],
             |r| r.get(0),
         )
         .ok();
-    if let Some(dir) = row.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) {
-        return PathBuf::from(dir);
+    if let Some(Some(dir)) = row.as_ref() {
+        let dir = dir.trim();
+        if !dir.is_empty() {
+            return PathBuf::from(dir);
+        }
     }
-    project_dir_in_root(&paths.projects_root, pid)
+    let fallback = project_dir_in_root(&paths.projects_root, pid);
+    if row.is_some() {
+        let stored = fallback.to_string_lossy().to_string();
+        let _ = conn.execute(
+            "UPDATE projects
+             SET project_dir = ?2
+             WHERE project_id = ?1 AND TRIM(COALESCE(project_dir, '')) = ''",
+            params![pid, stored],
+        );
+    }
+    fallback
 }
 
 pub fn project_is_registered(paths: &ProjectPaths, project_id: &str) -> bool {
@@ -180,7 +193,9 @@ pub fn project_effective_settings(paths: &ProjectPaths, project_id: &str) -> Val
         .unwrap_or_else(|| json!({}))
 }
 
-/// Sequence / timeline FPS from project settings (`settings.video.fps`).
+/// Export/sequence FPS from project settings (`settings.video.fps`).
+/// Do not use this for source, Story, Segment timeline, marker, or playback math.
+#[allow(dead_code)]
 pub fn project_timeline_fps(paths: &ProjectPaths, project_id: &str) -> f64 {
     project_effective_settings(paths, project_id)
         .get("video")
@@ -243,6 +258,7 @@ pub fn open_global(paths: &ProjectPaths) -> rusqlite::Result<Connection> {
     let conn = Connection::open(paths.global_db())?;
     configure_connection(&conn)?;
     init_global_schema(&conn)?;
+    backfill_project_dirs(&conn, &paths.projects_root)?;
     Ok(conn)
 }
 
@@ -253,17 +269,18 @@ pub fn open_project(paths: &ProjectPaths, project_id: &str) -> rusqlite::Result<
             "project_id".to_string(),
         ));
     }
+    let registered = project_is_registered(paths, pid);
+    if !registered {
+        #[cfg(not(test))]
+        {
+            return Err(rusqlite::Error::QueryReturnedNoRows);
+        }
+    }
     let dir = paths.project_dir(pid);
     let db_path = dir.join("qnc_project.db");
     // Never recreate folders for deleted / unknown projects in production.
     // (Unit tests still open ephemeral DBs without a global projects row.)
     if !db_path.exists() {
-        if !project_is_registered(paths, pid) {
-            #[cfg(not(test))]
-            {
-                return Err(rusqlite::Error::QueryReturnedNoRows);
-            }
-        }
         fs::create_dir_all(&dir).map_err(|e| {
             rusqlite::Error::SqliteFailure(
                 rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_IOERR),
@@ -286,12 +303,27 @@ pub fn open_project_strict(paths: &ProjectPaths, project_id: &str) -> rusqlite::
             "project_id".to_string(),
         ));
     }
-    let dir = paths.project_dir(pid);
-    let db_path = dir.join("qnc_project.db");
-    if !db_path.exists() && !project_is_registered(paths, pid) {
+    if !project_is_registered(paths, pid) {
         return Err(rusqlite::Error::QueryReturnedNoRows);
     }
     open_project(paths, project_id)
+}
+
+fn backfill_project_dirs(conn: &Connection, projects_root: &Path) -> rusqlite::Result<()> {
+    let mut stmt =
+        conn.prepare("SELECT project_id FROM projects WHERE TRIM(COALESCE(project_dir, '')) = ''")?;
+    let ids: Vec<String> = stmt
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    drop(stmt);
+    for project_id in ids {
+        let project_dir = project_dir_in_root(projects_root, &project_id);
+        conn.execute(
+            "UPDATE projects SET project_dir = ?2 WHERE project_id = ?1",
+            params![project_id, project_dir.to_string_lossy().to_string()],
+        )?;
+    }
+    Ok(())
 }
 
 fn init_global_schema(conn: &Connection) -> rusqlite::Result<()> {
@@ -752,4 +784,78 @@ pub fn ensure_project_dirs_at(base: &Path) -> std::io::Result<()> {
         fs::create_dir_all(dir)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_paths(base: &Path) -> ProjectPaths {
+        ProjectPaths {
+            data_dir: base.join("data"),
+            projects_root: base.join("projects"),
+            seed_path: base.join("seed.json"),
+        }
+    }
+
+    fn temp_base(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "qnc_project_db_first_{label}_{}_{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ))
+    }
+
+    #[test]
+    fn strict_open_rejects_orphan_project_db_even_when_folder_exists() {
+        let base = temp_base("orphan");
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+        let paths = test_paths(&base);
+        let project_id = "ghost_project";
+        let project_dir = project_dir_in_root(&paths.projects_root, project_id);
+        fs::create_dir_all(&project_dir).unwrap();
+        let orphan_db = project_dir.join("qnc_project.db");
+        let conn = Connection::open(&orphan_db).unwrap();
+        configure_connection(&conn).unwrap();
+        drop(conn);
+
+        let _global = open_global(&paths).unwrap();
+
+        assert!(
+            open_project_strict(&paths, project_id).is_err(),
+            "strict open must treat the global projects registry as source of truth"
+        );
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn project_dir_from_conn_backfills_known_project_dir_into_registry() {
+        let base = temp_base("backfill");
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+        let paths = test_paths(&base);
+        let conn = open_global(&paths).unwrap();
+        conn.execute(
+            "INSERT INTO projects (project_id, name, project_dir) VALUES (?1, ?2, '')",
+            params!["known_project", "Known Project"],
+        )
+        .unwrap();
+
+        let resolved = project_dir_from_conn(&conn, &paths, "known_project");
+        let stored: String = conn
+            .query_row(
+                "SELECT project_dir FROM projects WHERE project_id = 'known_project'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        assert_eq!(resolved, PathBuf::from(&stored));
+        assert!(!stored.trim().is_empty());
+        let _ = fs::remove_dir_all(&base);
+    }
 }

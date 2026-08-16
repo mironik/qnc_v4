@@ -6,6 +6,7 @@
 //! still read from `crate::media_pool` (ingest-backed reads); moving those reads
 //! into `crate::ingest` is a separate follow-up.
 
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -13,9 +14,9 @@ use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::{json, Value};
 
 use crate::frame_time::{
-    dual_fps_snapshot, duration_color_key_from_frames, duration_frames, normalize_fps,
-    rational_fps, seconds_frames_label_from_frames, seconds_to_frame, seconds_to_timecode,
-    snap_seconds_to_frame, DualFpsSnapshot,
+    dual_fps_snapshot, duration_color_key_from_frames, duration_frames, frame_to_seconds,
+    is_valid_fps, normalize_fps, rational_fps, seconds_frames_label_from_frames, seconds_to_frame,
+    seconds_to_timecode, snap_seconds_to_frame, DualFpsSnapshot,
 };
 use crate::ingest::thumb::{extract_poster_jpeg_at_seek, media_duration_sec};
 use crate::media::{
@@ -23,7 +24,7 @@ use crate::media::{
     virtual_name_for_root_clip,
 };
 use crate::media_pool::{proxy_path_for_clip, read_imported_clips, resolve_clip_fps};
-use crate::project::db::{now_str, open_project, project_timeline_fps, ProjectPaths};
+use crate::project::db::{now_str, open_project, ProjectPaths};
 
 /// Open the project DB and guarantee the virtual_shots schema is present.
 pub(crate) fn open(paths: &ProjectPaths, project_id: &str) -> Result<Connection, String> {
@@ -53,9 +54,13 @@ pub(crate) fn ensure(
             duration_seconds REAL NOT NULL DEFAULT 0,
             in_seconds REAL NOT NULL DEFAULT 0,
             out_seconds REAL NOT NULL DEFAULT 0,
-            fps REAL NOT NULL DEFAULT 25,
+            fps REAL NOT NULL DEFAULT 0,
             source_fps REAL NOT NULL DEFAULT 0,
             timeline_fps REAL NOT NULL DEFAULT 0,
+            field_order TEXT NOT NULL DEFAULT '',
+            interlaced INTEGER NOT NULL DEFAULT 0,
+            source_class TEXT NOT NULL DEFAULT '',
+            proxy_recipe TEXT NOT NULL DEFAULT '',
             source_fps_num INTEGER NOT NULL DEFAULT 0,
             source_fps_den INTEGER NOT NULL DEFAULT 1,
             timeline_fps_num INTEGER NOT NULL DEFAULT 0,
@@ -80,10 +85,11 @@ pub(crate) fn ensure(
     )
     .map_err(|e| e.to_string())?;
     migrate_columns(conn)?;
-    migrate_virtual_shots_json(conn)?;
+    migrate_virtual_shots_json(paths, project_id, conn)?;
     migrate_shot_identity_standard(conn)?;
-    backfill_frame_fields(conn)?;
+    backfill_frame_fields(paths, project_id, conn)?;
     backfill_dual_fps(paths, project_id, conn)?;
+    sync_virtual_shot_probe_meta(conn)?;
     Ok(())
 }
 
@@ -119,9 +125,13 @@ fn migrate_columns(conn: &Connection) -> Result<(), String> {
         ("out_cover_path", "TEXT NOT NULL DEFAULT ''"),
         ("in_tc", "TEXT NOT NULL DEFAULT ''"),
         ("out_tc", "TEXT NOT NULL DEFAULT ''"),
-        ("fps", "REAL NOT NULL DEFAULT 25"),
+        ("fps", "REAL NOT NULL DEFAULT 0"),
         ("source_fps", "REAL NOT NULL DEFAULT 0"),
         ("timeline_fps", "REAL NOT NULL DEFAULT 0"),
+        ("field_order", "TEXT NOT NULL DEFAULT ''"),
+        ("interlaced", "INTEGER NOT NULL DEFAULT 0"),
+        ("source_class", "TEXT NOT NULL DEFAULT ''"),
+        ("proxy_recipe", "TEXT NOT NULL DEFAULT ''"),
         ("source_fps_num", "INTEGER NOT NULL DEFAULT 0"),
         ("source_fps_den", "INTEGER NOT NULL DEFAULT 1"),
         ("timeline_fps_num", "INTEGER NOT NULL DEFAULT 0"),
@@ -145,16 +155,26 @@ fn migrate_columns(conn: &Connection) -> Result<(), String> {
     Ok(())
 }
 
-fn migrate_virtual_shots_json(conn: &Connection) -> Result<(), String> {
+fn migrate_virtual_shots_json(
+    paths: &ProjectPaths,
+    project_id: &str,
+    conn: &Connection,
+) -> Result<(), String> {
     let mut stmt = conn
-        .prepare("SELECT shot_id, data_json FROM virtual_shots WHERE data_json != '{}'")
+        .prepare("SELECT shot_id, clip_id, data_json FROM virtual_shots WHERE data_json != '{}'")
         .map_err(|e| e.to_string())?;
-    let rows: Vec<(String, String)> = stmt
-        .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+    let rows: Vec<(String, String, String)> = stmt
+        .query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+            ))
+        })
         .map_err(|e| e.to_string())?
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| e.to_string())?;
-    for (shot_id, raw) in rows {
+    for (shot_id, clip_id, raw) in rows {
         let data = serde_json::from_str::<Value>(&raw).unwrap_or(json!({}));
         let in_sec = data
             .get("in_seconds")
@@ -170,12 +190,22 @@ fn migrate_virtual_shots_json(conn: &Connection) -> Result<(), String> {
             .and_then(|arr| arr.first())
             .and_then(|v| v.as_str())
             .unwrap_or("");
-        let fps = 25.0;
-        let in_frame = seconds_to_frame(in_sec, fps);
-        let out_frame = seconds_to_frame(out_sec, fps);
-        let duration_frames = duration_frames(in_sec, out_sec, fps);
-        let duration_label = seconds_frames_label_from_frames(duration_frames, fps);
-        let duration_color_key = duration_color_key_from_frames(duration_frames, fps);
+        let fps = fps_for_clip(paths, project_id, &clip_id).unwrap_or(0.0);
+        let (in_frame, out_frame, duration_frames, duration_label, duration_color_key) =
+            if is_valid_fps(fps) {
+                let in_frame = seconds_to_frame(in_sec, fps);
+                let out_frame = seconds_to_frame(out_sec, fps);
+                let duration_frames = duration_frames(in_sec, out_sec, fps);
+                (
+                    in_frame,
+                    out_frame,
+                    duration_frames,
+                    seconds_frames_label_from_frames(duration_frames, fps),
+                    duration_color_key_from_frames(duration_frames, fps).to_string(),
+                )
+            } else {
+                (0, 0, 0, String::new(), String::new())
+            };
         conn.execute(
             "UPDATE virtual_shots SET
                 in_seconds = CASE WHEN in_seconds = 0 AND ?2 > 0 THEN ?2 ELSE in_seconds END,
@@ -187,6 +217,7 @@ fn migrate_virtual_shots_json(conn: &Connection) -> Result<(), String> {
                 description = CASE WHEN description = '' THEN ?8 ELSE description END,
                 category_key = CASE WHEN category_key = '' THEN ?9 ELSE category_key END,
                 fps = CASE WHEN fps <= 0 THEN ?10 ELSE fps END,
+                source_fps = CASE WHEN source_fps <= 0 THEN ?10 ELSE source_fps END,
                 in_frame = CASE WHEN in_frame = 0 THEN ?11 ELSE in_frame END,
                 out_frame = CASE WHEN out_frame = 0 THEN ?12 ELSE out_frame END,
                 duration_frames = CASE WHEN duration_frames = 0 THEN ?13 ELSE duration_frames END,
@@ -435,10 +466,14 @@ fn parse_shot_index(shot_id: &str) -> Option<u32> {
     rest.parse::<u32>().ok()
 }
 
-fn backfill_frame_fields(conn: &Connection) -> Result<(), String> {
+fn backfill_frame_fields(
+    paths: &ProjectPaths,
+    project_id: &str,
+    conn: &Connection,
+) -> Result<(), String> {
     let mut stmt = conn
         .prepare(
-            "SELECT shot_id, in_seconds, out_seconds, fps
+            "SELECT shot_id, clip_id, in_seconds, out_seconds, fps, source_fps
              FROM virtual_shots
              WHERE duration_frames = 0 OR duration_label = '' OR duration_color_key = '' OR out_frame = 0",
         )
@@ -447,16 +482,28 @@ fn backfill_frame_fields(conn: &Connection) -> Result<(), String> {
         .query_map([], |r| {
             Ok((
                 r.get::<_, String>(0)?,
-                r.get::<_, f64>(1)?,
+                r.get::<_, String>(1)?,
                 r.get::<_, f64>(2)?,
                 r.get::<_, f64>(3)?,
+                r.get::<_, f64>(4)?,
+                r.get::<_, f64>(5)?,
             ))
         })
         .map_err(|e| e.to_string())?
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| e.to_string())?;
-    for (shot_id, in_sec, out_sec, fps_raw) in rows {
-        let fps = normalize_fps(fps_raw);
+    for (shot_id, clip_id, in_sec, out_sec, _fps_raw, source_fps_raw) in rows {
+        let fps = if is_valid_fps(source_fps_raw) {
+            source_fps_raw
+        } else {
+            fps_for_clip(paths, project_id, &clip_id)
+                .ok()
+                .filter(|fps| is_valid_fps(*fps))
+                .unwrap_or(0.0)
+        };
+        if !is_valid_fps(fps) {
+            continue;
+        }
         let in_frame = seconds_to_frame(in_sec, fps);
         let out_frame = seconds_to_frame(out_sec, fps).max(in_frame);
         let frames = (out_frame - in_frame).max(0);
@@ -464,7 +511,7 @@ fn backfill_frame_fields(conn: &Connection) -> Result<(), String> {
         let color_key = duration_color_key_from_frames(frames, fps);
         conn.execute(
             "UPDATE virtual_shots
-             SET fps = ?1, in_frame = ?2, out_frame = ?3,
+             SET fps = ?1, source_fps = ?1, in_frame = ?2, out_frame = ?3,
                  duration_frames = ?4, duration_label = ?5, duration_color_key = ?6
              WHERE shot_id = ?7",
             params![fps, in_frame, out_frame, frames, label, color_key, shot_id],
@@ -482,10 +529,9 @@ fn backfill_dual_fps(
     if !column_exists(conn, "virtual_shots", "timeline_duration_frames") {
         return Ok(());
     }
-    let timeline_fps = project_timeline_fps(paths, project_id);
     let mut stmt = conn
         .prepare(
-            "SELECT shot_id, in_frame, out_frame, fps, source_fps, timeline_fps
+            "SELECT shot_id, clip_id, in_frame, out_frame, fps, source_fps, timeline_fps
              FROM virtual_shots
              WHERE timeline_duration_frames = 0 AND out_frame > in_frame",
         )
@@ -494,26 +540,33 @@ fn backfill_dual_fps(
         .query_map([], |r| {
             Ok((
                 r.get::<_, String>(0)?,
-                r.get::<_, i64>(1)?,
+                r.get::<_, String>(1)?,
                 r.get::<_, i64>(2)?,
-                r.get::<_, f64>(3)?,
+                r.get::<_, i64>(3)?,
                 r.get::<_, f64>(4)?,
                 r.get::<_, f64>(5)?,
+                r.get::<_, f64>(6)?,
             ))
         })
         .map_err(|e| e.to_string())?
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| e.to_string())?;
-    for (shot_id, in_frame, out_frame, fps, source_fps_raw, timeline_fps_raw) in rows {
-        let source_fps = if source_fps_raw > 0.0 {
+    for (shot_id, clip_id, in_frame, out_frame, _fps, source_fps_raw, timeline_fps_raw) in rows {
+        let source_fps = if is_valid_fps(source_fps_raw) {
             source_fps_raw
         } else {
-            normalize_fps(fps)
+            fps_for_clip(paths, project_id, &clip_id)
+                .ok()
+                .filter(|fps| is_valid_fps(*fps))
+                .unwrap_or(0.0)
         };
-        let stored_timeline_fps = if timeline_fps_raw > 0.0 {
+        if !is_valid_fps(source_fps) {
+            continue;
+        }
+        let stored_timeline_fps = if is_valid_fps(timeline_fps_raw) {
             timeline_fps_raw
         } else {
-            timeline_fps
+            source_fps
         };
         let dual = dual_fps_snapshot(in_frame, out_frame, source_fps, stored_timeline_fps);
         conn.execute(
@@ -533,14 +586,13 @@ fn backfill_dual_fps(
 }
 
 fn dual_fps_for_virtual_shot(
-    paths: &ProjectPaths,
-    project_id: &str,
+    _paths: &ProjectPaths,
+    _project_id: &str,
     in_frame: i64,
     out_frame: i64,
     source_fps: f64,
 ) -> DualFpsSnapshot {
-    let timeline_fps = project_timeline_fps(paths, project_id);
-    dual_fps_snapshot(in_frame, out_frame, source_fps, timeline_fps)
+    dual_fps_snapshot(in_frame, out_frame, source_fps, source_fps)
 }
 
 /// Persist rational source/timeline FPS (broadcast truth) for a shot.
@@ -571,6 +623,101 @@ fn fps_for_clip(paths: &ProjectPaths, project_id: &str, clip_id: &str) -> Result
     resolve_clip_fps(paths, project_id, clip_id)
 }
 
+#[derive(Debug, Clone, Default)]
+struct ClipProbeMeta {
+    field_order: String,
+    interlaced: bool,
+    source_class: String,
+    proxy_recipe: String,
+}
+
+fn probe_meta_for_clip(conn: &Connection, clip_id: &str) -> ClipProbeMeta {
+    conn.query_row(
+        "SELECT COALESCE(field_order, ''), COALESCE(interlaced, 0),
+                COALESCE(source_class, ''), COALESCE(proxy_recipe, '')
+         FROM ingest_assets
+         WHERE clip_id = ?1
+         ORDER BY CASE import_status WHEN 'imported' THEN 0 WHEN 'done' THEN 1 ELSE 2 END,
+                  CASE WHEN TRIM(COALESCE(project_proxy_path, '')) != '' THEN 0 ELSE 1 END,
+                  source_id
+         LIMIT 1",
+        params![clip_id],
+        |row| {
+            Ok(ClipProbeMeta {
+                field_order: row.get(0)?,
+                interlaced: row.get::<_, i64>(1)? != 0,
+                source_class: row.get(2)?,
+                proxy_recipe: row.get(3)?,
+            })
+        },
+    )
+    .unwrap_or_default()
+}
+
+fn sync_virtual_shot_probe_meta(conn: &Connection) -> Result<(), String> {
+    if !table_exists(conn, "ingest_assets")
+        || !column_exists(conn, "ingest_assets", "field_order")
+        || !column_exists(conn, "ingest_assets", "interlaced")
+        || !column_exists(conn, "ingest_assets", "source_class")
+        || !column_exists(conn, "ingest_assets", "proxy_recipe")
+    {
+        return Ok(());
+    }
+    let mut stmt = conn
+        .prepare(
+            "SELECT clip_id, COALESCE(field_order, ''), COALESCE(interlaced, 0),
+                    COALESCE(source_class, ''), COALESCE(proxy_recipe, '')
+             FROM ingest_assets
+             WHERE TRIM(COALESCE(clip_id, '')) != ''
+             ORDER BY clip_id,
+                      CASE import_status WHEN 'imported' THEN 0 WHEN 'done' THEN 1 ELSE 2 END,
+                      CASE WHEN TRIM(COALESCE(project_proxy_path, '')) != '' THEN 0 ELSE 1 END,
+                      source_id",
+        )
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                ClipProbeMeta {
+                    field_order: row.get(1)?,
+                    interlaced: row.get::<_, i64>(2)? != 0,
+                    source_class: row.get(3)?,
+                    proxy_recipe: row.get(4)?,
+                },
+            ))
+        })
+        .map_err(|e| e.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+    let mut by_clip = HashMap::new();
+    for (clip_id, meta) in rows {
+        by_clip.entry(clip_id.trim().to_string()).or_insert(meta);
+    }
+    for (clip_id, meta) in by_clip {
+        if clip_id.is_empty() {
+            continue;
+        }
+        conn.execute(
+            "UPDATE virtual_shots SET
+                field_order = CASE WHEN TRIM(?2) != '' THEN ?2 ELSE field_order END,
+                interlaced = CASE WHEN TRIM(?2) != '' THEN ?3 ELSE interlaced END,
+                source_class = CASE WHEN TRIM(?4) != '' THEN ?4 ELSE source_class END,
+                proxy_recipe = CASE WHEN TRIM(?5) != '' THEN ?5 ELSE proxy_recipe END
+             WHERE clip_id = ?1",
+            params![
+                clip_id,
+                meta.field_order,
+                if meta.interlaced { 1 } else { 0 },
+                meta.source_class,
+                meta.proxy_recipe,
+            ],
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
 pub fn list_virtual_shots(paths: &ProjectPaths, project_id: &str) -> Result<Vec<Value>, String> {
     let conn = open(paths, project_id)?;
     let mut stmt = conn
@@ -580,38 +727,52 @@ pub fn list_virtual_shots(paths: &ProjectPaths, project_id: &str) -> Result<Vec<
                     fps, source_fps, timeline_fps, in_frame, out_frame, duration_frames,
                     timeline_duration_frames, duration_label, duration_color_key, created_at,
                     kind, source_shot_id, locked, display_name, virtual_name,
-                    source_fps_num, source_fps_den, timeline_fps_num, timeline_fps_den
+                    source_fps_num, source_fps_den, timeline_fps_num, timeline_fps_den,
+                    COALESCE(field_order, ''), COALESCE(interlaced, 0),
+                    COALESCE(source_class, ''), COALESCE(proxy_recipe, '')
              FROM virtual_shots ORDER BY created_at",
         )
         .map_err(|e| e.to_string())?;
     let rows = stmt
         .query_map([], |row| {
-            let fps_raw: f64 = row.get(13)?;
+            let _fps_raw: f64 = row.get(13)?;
             let source_fps_raw: f64 = row.get(14)?;
             let timeline_fps_raw: f64 = row.get(15)?;
-            let source_fps = if source_fps_raw > 0.0 {
+            let clip_id: String = row.get(1)?;
+            let source_fps = if is_valid_fps(source_fps_raw) {
                 source_fps_raw
             } else {
-                normalize_fps(fps_raw)
+                fps_for_clip(paths, project_id, &clip_id)
+                    .ok()
+                    .filter(|fps| is_valid_fps(*fps))
+                    .unwrap_or(0.0)
             };
-            let timeline_fps = if timeline_fps_raw > 0.0 {
+            let timeline_fps = if is_valid_fps(timeline_fps_raw) {
                 timeline_fps_raw
             } else {
-                project_timeline_fps(paths, project_id)
+                source_fps
             };
             let timeline_duration_frames: i64 = row.get(19)?;
             let in_frame: i64 = row.get(16)?;
             let out_frame: i64 = row.get(17)?;
             let timeline_duration_frames = if timeline_duration_frames > 0 {
                 timeline_duration_frames
-            } else {
+            } else if is_valid_fps(source_fps) && is_valid_fps(timeline_fps) {
                 dual_fps_snapshot(in_frame, out_frame, source_fps, timeline_fps)
                     .timeline_duration_frames
+            } else {
+                0
+            };
+            let stored_probe = ClipProbeMeta {
+                field_order: row.get(32)?,
+                interlaced: row.get::<_, i64>(33)? != 0,
+                source_class: row.get(34)?,
+                proxy_recipe: row.get(35)?,
             };
             Ok(json!({
                 "id": row.get::<_, String>(0)?,
                 "shot_id": row.get::<_, String>(0)?,
-                "clip_id": row.get::<_, String>(1)?,
+                "clip_id": clip_id,
                 "source": row.get::<_, String>(2)?,
                 "quality": row.get::<_, String>(3)?,
                 "duration_seconds": row.get::<_, f64>(4)?,
@@ -644,6 +805,10 @@ pub fn list_virtual_shots(paths: &ProjectPaths, project_id: &str) -> Result<Vec<
                 "source_fps_den": row.get::<_, i64>(29)?,
                 "timeline_fps_num": row.get::<_, i64>(30)?,
                 "timeline_fps_den": row.get::<_, i64>(31)?,
+                "field_order": stored_probe.field_order,
+                "interlaced": stored_probe.interlaced,
+                "source_class": stored_probe.source_class,
+                "proxy_recipe": stored_probe.proxy_recipe,
             }))
         })
         .map_err(|e| e.to_string())?
@@ -659,21 +824,31 @@ pub fn add_virtual_shot(
     in_seconds: f64,
     out_seconds: f64,
 ) -> Result<Value, String> {
-    if out_seconds <= in_seconds {
-        return Err("OUT mora biti nakon IN".into());
-    }
+    let fps = fps_for_clip(paths, project_id, clip_id)?;
+    let in_frame = seconds_to_frame(snap_seconds_to_frame(in_seconds.max(0.0), fps), fps);
+    let out_frame = seconds_to_frame(snap_seconds_to_frame(out_seconds.max(0.0), fps), fps);
+    add_virtual_shot_from_frames(paths, project_id, clip_id, in_frame, out_frame)
+}
+
+pub fn add_virtual_shot_from_frames(
+    paths: &ProjectPaths,
+    project_id: &str,
+    clip_id: &str,
+    in_frame: i64,
+    out_frame: i64,
+) -> Result<Value, String> {
     if proxy_path_for_clip(paths, project_id, clip_id).is_none() {
         return Err(format!("Klip '{clip_id}' nije uvezen u ingest"));
     }
     let fps = fps_for_clip(paths, project_id, clip_id)?;
-    let in_r = round3(snap_seconds_to_frame(in_seconds, fps));
-    let out_r = round3(snap_seconds_to_frame(out_seconds, fps));
-    if out_r <= in_r {
+    let in_frame = in_frame.max(0);
+    if out_frame <= in_frame {
         return Err("OUT mora biti najmanje jedan frame nakon IN".into());
     }
+    let out_frame = out_frame.max(in_frame + 1);
+    let in_r = round3(frame_to_seconds(in_frame, fps));
+    let out_r = round3(frame_to_seconds(out_frame, fps));
     let duration = round3(out_r - in_r);
-    let in_frame = seconds_to_frame(in_r, fps);
-    let out_frame = seconds_to_frame(out_r, fps);
     let duration_frames = (out_frame - in_frame).max(0);
     let dual = dual_fps_for_virtual_shot(paths, project_id, in_frame, out_frame, fps);
     let duration_label = seconds_frames_label_from_frames(duration_frames, fps);
@@ -708,15 +883,18 @@ pub fn add_virtual_shot(
     let out_tc = seconds_to_timecode(out_r, fps);
     let description = "Ručno označen virtualni kadar.";
     let category_key = "manual_cut";
+    let probe = probe_meta_for_clip(&conn, clip_id);
     conn.execute(
         "INSERT INTO virtual_shots
             (shot_id, clip_id, source, quality, duration_seconds, in_seconds, out_seconds,
              fps, source_fps, timeline_fps, in_frame, out_frame, duration_frames,
              timeline_duration_frames, duration_label, duration_color_key,
              cover_path, out_cover_path, in_tc, out_tc, description, category_key,
-             display_name, virtual_name, kind, data_json, created_at, updated_at)
+             display_name, virtual_name, kind, field_order, interlaced, source_class,
+             proxy_recipe, data_json, created_at, updated_at)
          VALUES (?1, ?2, 'manual', 'ok', ?3, ?4, ?5, ?6, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
-                 ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, 'derived', '{}', ?22, ?22)",
+                 ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, 'derived', ?22, ?23, ?24, ?25,
+                 '{}', ?26, ?26)",
         params![
             shot_id,
             clip_id,
@@ -739,6 +917,10 @@ pub fn add_virtual_shot(
             category_key,
             virtual_name.clone(),
             virtual_name,
+            probe.field_order,
+            if probe.interlaced { 1 } else { 0 },
+            probe.source_class,
+            probe.proxy_recipe,
             now,
         ],
     )
@@ -767,6 +949,10 @@ pub fn add_virtual_shot(
         "in_tc": in_tc,
         "out_tc": out_tc,
         "virtual_name": virtual_name,
+        "field_order": probe.field_order,
+        "interlaced": probe.interlaced,
+        "source_class": probe.source_class,
+        "proxy_recipe": probe.proxy_recipe,
     }))
 }
 
@@ -808,6 +994,7 @@ fn reserve_root_virtual_shot(
     display_name: &str,
 ) -> Result<(), String> {
     let shot_id = root_shot_id(clip_id);
+    let probe = probe_meta_for_clip(conn, clip_id);
     if root_shot_is_finalized(conn, &shot_id)? {
         if !virtual_name.trim().is_empty() {
             let now = now_str();
@@ -826,9 +1013,11 @@ fn reserve_root_virtual_shot(
     conn.execute(
         "INSERT INTO virtual_shots
             (shot_id, clip_id, kind, source_shot_id, locked, display_name, virtual_name,
-             source, quality, description, category_key, data_json, created_at, updated_at)
+             source, quality, description, category_key, field_order, interlaced,
+             source_class, proxy_recipe, data_json, created_at, updated_at)
          VALUES (?1, ?2, 'import_root', '', 1, ?3, ?4,
-                 'import', 'pending', 'Rezervirani root virtualni kadar (čeka uvoz).', 'import_root', '{}', ?5, ?5)
+                 'import', 'pending', 'Rezervirani root virtualni kadar (čeka uvoz).', 'import_root',
+                 ?5, ?6, ?7, ?8, '{}', ?9, ?9)
          ON CONFLICT(shot_id) DO UPDATE SET
             display_name = CASE
                 WHEN TRIM(excluded.display_name) != '' THEN excluded.display_name
@@ -839,9 +1028,23 @@ fn reserve_root_virtual_shot(
                 ELSE virtual_shots.virtual_name
             END,
             kind = 'import_root',
+            field_order = CASE WHEN TRIM(excluded.field_order) != '' THEN excluded.field_order ELSE virtual_shots.field_order END,
+            interlaced = CASE WHEN excluded.interlaced != 0 THEN excluded.interlaced ELSE virtual_shots.interlaced END,
+            source_class = CASE WHEN TRIM(excluded.source_class) != '' THEN excluded.source_class ELSE virtual_shots.source_class END,
+            proxy_recipe = CASE WHEN TRIM(excluded.proxy_recipe) != '' THEN excluded.proxy_recipe ELSE virtual_shots.proxy_recipe END,
             updated_at = excluded.updated_at
          WHERE virtual_shots.duration_seconds <= 0 OR virtual_shots.quality = 'pending'",
-        params![shot_id, clip_id, dname, vname, now],
+        params![
+            shot_id,
+            clip_id,
+            dname,
+            vname,
+            probe.field_order,
+            if probe.interlaced { 1 } else { 0 },
+            probe.source_class,
+            probe.proxy_recipe,
+            now
+        ],
     )
     .map_err(|e| e.to_string())?;
     Ok(())
@@ -986,6 +1189,7 @@ fn finalize_root_virtual_shot(
     let duration_color_key = duration_color_key_from_frames(duration_frames, fps);
     let in_tc = seconds_to_timecode(0.0, fps);
     let out_tc = seconds_to_timecode(out_r, fps);
+    let probe = probe_meta_for_clip(conn, clip_id);
     let now = now_str();
     let exists = conn
         .query_row(
@@ -1008,7 +1212,8 @@ fn finalize_root_virtual_shot(
                 timeline_duration_frames = ?11, duration_label = ?12, duration_color_key = ?13,
                 in_tc = ?14, out_tc = ?15,
                 description = 'Originalni uvezeni kadar.', category_key = 'import_root',
-                updated_at = ?16
+                field_order = ?16, interlaced = ?17, source_class = ?18, proxy_recipe = ?19,
+                updated_at = ?20
              WHERE shot_id = ?1",
             params![
                 shot_id,
@@ -1026,6 +1231,10 @@ fn finalize_root_virtual_shot(
                 duration_color_key,
                 in_tc,
                 out_tc,
+                probe.field_order,
+                if probe.interlaced { 1 } else { 0 },
+                probe.source_class,
+                probe.proxy_recipe,
                 now,
             ],
         )
@@ -1037,14 +1246,16 @@ fn finalize_root_virtual_shot(
                  source, quality, duration_seconds, in_seconds, out_seconds,
                  fps, source_fps, timeline_fps, in_frame, out_frame, duration_frames,
                  timeline_duration_frames, duration_label, duration_color_key,
-                 cover_path, out_cover_path, in_tc, out_tc, description, category_key, data_json,
+                 cover_path, out_cover_path, in_tc, out_tc, description, category_key,
+                 field_order, interlaced, source_class, proxy_recipe, data_json,
                  created_at, updated_at)
              VALUES (?1, ?2, 'import_root', '', 1, ?3, ?4,
                      'import', 'ok', ?5, 0, ?6,
                      ?7, ?7, ?8, 0, ?9, ?10,
                      ?11, ?12, ?13,
-                     '', '', ?14, ?15, 'Originalni uvezeni kadar.', 'import_root', '{}',
-                     ?16, ?16)",
+                     '', '', ?14, ?15, 'Originalni uvezeni kadar.', 'import_root',
+                     ?16, ?17, ?18, ?19, '{}',
+                     ?20, ?20)",
             params![
                 shot_id,
                 clip_id,
@@ -1061,6 +1272,10 @@ fn finalize_root_virtual_shot(
                 duration_color_key,
                 in_tc,
                 out_tc,
+                probe.field_order,
+                if probe.interlaced { 1 } else { 0 },
+                probe.source_class,
+                probe.proxy_recipe,
                 now,
             ],
         )
@@ -1072,6 +1287,10 @@ fn finalize_root_virtual_shot(
         "kind": "import_root",
         "clip_id": clip_id,
         "virtual_name": virtual_name,
+        "field_order": probe.field_order,
+        "interlaced": probe.interlaced,
+        "source_class": probe.source_class,
+        "proxy_recipe": probe.proxy_recipe,
     }))
 }
 
@@ -1156,18 +1375,39 @@ pub fn derive_virtual_shot(
     local_in_seconds: f64,
     local_out_seconds: f64,
 ) -> Result<Value, String> {
+    let (_, _, _, fps) = virtual_shot_frames(paths, project_id, source_shot_id)?;
+    let local_in_frame =
+        seconds_to_frame(snap_seconds_to_frame(local_in_seconds.max(0.0), fps), fps);
+    let local_out_frame =
+        seconds_to_frame(snap_seconds_to_frame(local_out_seconds.max(0.0), fps), fps);
+    derive_virtual_shot_from_frames(
+        paths,
+        project_id,
+        source_shot_id,
+        local_in_frame,
+        local_out_frame,
+    )
+}
+
+pub fn derive_virtual_shot_from_frames(
+    paths: &ProjectPaths,
+    project_id: &str,
+    source_shot_id: &str,
+    local_in_frame: i64,
+    local_out_frame: i64,
+) -> Result<Value, String> {
     let source_shot_id = source_shot_id.trim();
     let conn = open(paths, project_id)?;
-    let (clip_id, src_in): (String, f64) = conn
+    let (clip_id, src_in_frame): (String, i64) = conn
         .query_row(
-            "SELECT clip_id, in_seconds FROM virtual_shots WHERE shot_id = ?1",
+            "SELECT clip_id, in_frame FROM virtual_shots WHERE shot_id = ?1",
             params![source_shot_id],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .map_err(|_| format!("Izvorni kadar '{source_shot_id}' nije pronađen"))?;
-    let abs_in = src_in + local_in_seconds.max(0.0);
-    let abs_out = src_in + local_out_seconds.max(0.0);
-    let created = add_virtual_shot(paths, project_id, &clip_id, abs_in, abs_out)?;
+    let abs_in = src_in_frame.max(0) + local_in_frame.max(0);
+    let abs_out = src_in_frame.max(0) + local_out_frame.max(0);
+    let created = add_virtual_shot_from_frames(paths, project_id, &clip_id, abs_in, abs_out)?;
     let new_shot_id = created
         .get("shot_id")
         .and_then(Value::as_str)
@@ -1194,6 +1434,27 @@ pub fn update_virtual_shot(
     out_seconds: f64,
 ) -> Result<Value, String> {
     let conn = open(paths, project_id)?;
+    let clip_id: String = conn
+        .query_row(
+            "SELECT clip_id FROM virtual_shots WHERE shot_id = ?1",
+            params![shot_id.trim()],
+            |row| row.get(0),
+        )
+        .map_err(|_| format!("Virtualni kadar '{}' nije pronađen", shot_id.trim()))?;
+    let fps = fps_for_clip(paths, project_id, &clip_id)?;
+    let in_frame = seconds_to_frame(snap_seconds_to_frame(in_seconds.max(0.0), fps), fps);
+    let out_frame = seconds_to_frame(snap_seconds_to_frame(out_seconds.max(0.0), fps), fps);
+    update_virtual_shot_from_frames(paths, project_id, shot_id, in_frame, out_frame)
+}
+
+pub fn update_virtual_shot_from_frames(
+    paths: &ProjectPaths,
+    project_id: &str,
+    shot_id: &str,
+    in_frame: i64,
+    out_frame: i64,
+) -> Result<Value, String> {
+    let conn = open(paths, project_id)?;
     let (clip_id, locked): (String, i64) = conn
         .query_row(
             "SELECT clip_id, locked FROM virtual_shots WHERE shot_id = ?1",
@@ -1205,13 +1466,13 @@ pub fn update_virtual_shot(
         return Err("Originalni (root) kadar je read-only.".into());
     }
     let fps = fps_for_clip(paths, project_id, &clip_id)?;
-    let in_r = round3(snap_seconds_to_frame(in_seconds, fps));
-    let out_r = round3(snap_seconds_to_frame(out_seconds, fps));
-    if out_r <= in_r {
+    let in_frame = in_frame.max(0);
+    if out_frame <= in_frame {
         return Err("OUT mora biti najmanje jedan frame nakon IN".into());
     }
-    let in_frame = seconds_to_frame(in_r, fps);
-    let out_frame = seconds_to_frame(out_r, fps);
+    let out_frame = out_frame.max(in_frame + 1);
+    let in_r = round3(frame_to_seconds(in_frame, fps));
+    let out_r = round3(frame_to_seconds(out_frame, fps));
     let duration_frames = out_frame - in_frame;
     let dual = dual_fps_for_virtual_shot(paths, project_id, in_frame, out_frame, fps);
     let duration = round3(out_r - in_r);
@@ -1220,6 +1481,7 @@ pub fn update_virtual_shot(
     let (cover, out_cover) = write_shot_covers(paths, project_id, shot_id, &clip_id, in_r, out_r)?;
     let in_tc = seconds_to_timecode(in_r, fps);
     let out_tc = seconds_to_timecode(out_r, fps);
+    let probe = probe_meta_for_clip(&conn, &clip_id);
     conn.execute(
         "UPDATE virtual_shots
          SET duration_seconds = ?1, in_seconds = ?2, out_seconds = ?3,
@@ -1228,8 +1490,9 @@ pub fn update_virtual_shot(
              timeline_duration_frames = ?9,
              duration_label = ?10, duration_color_key = ?11,
              cover_path = ?12, out_cover_path = ?13, in_tc = ?14, out_tc = ?15,
-             updated_at = ?16
-         WHERE shot_id = ?17",
+             field_order = ?16, interlaced = ?17, source_class = ?18, proxy_recipe = ?19,
+             updated_at = ?20
+         WHERE shot_id = ?21",
         params![
             duration,
             in_r,
@@ -1246,6 +1509,10 @@ pub fn update_virtual_shot(
             out_cover.to_string_lossy(),
             in_tc,
             out_tc,
+            probe.field_order,
+            if probe.interlaced { 1 } else { 0 },
+            probe.source_class,
+            probe.proxy_recipe,
             now_str(),
             shot_id.trim(),
         ],

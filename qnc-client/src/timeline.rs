@@ -4,7 +4,7 @@
 use eframe::egui::{self, Color32, Pos2, Rect, Sense, Stroke, Ui, Vec2};
 
 use crate::api::{SegmentSchema, TimelineApplication, TimelineModel, TimelinePin};
-use crate::focus::FocusTarget;
+use crate::focus::{frame_to_seconds, timeline_pin_frame, timeline_span_frames, FocusTarget};
 
 const ROW_H: f32 = 28.0;
 const LABEL_W: f32 = 44.0;
@@ -45,14 +45,25 @@ fn color_focus() -> Color32 {
     Color32::from_rgb(255, 180, 60)
 }
 
-/// Draw Kodak A1/V/A2 timeline. Returns seek time if user clicked the ruler.
+/// Draw Kodak A1/V/A2 timeline. Returns seek frame if user clicked the ruler.
 pub fn paint_timeline(
     ui: &mut Ui,
     model: &TimelineModel,
-    virtual_sec: f64,
+    virtual_frame: i64,
     focus: Option<&FocusTarget>,
-) -> Option<f64> {
-    let duration = model.duration_sec.max(0.001);
+) -> Option<i64> {
+    let fps = if model.timeline_fps.is_finite() && model.timeline_fps > 1.0 {
+        model.timeline_fps
+    } else {
+        25.0
+    };
+    let duration_frames = if model.duration_frames > 0 {
+        model.duration_frames
+    } else {
+        ((model.duration_sec.max(0.0) * fps).round() as i64).max(1)
+    }
+    .max(1);
+    let duration_sec = frame_to_seconds(duration_frames, fps);
     let available = ui.available_width();
     let height = ROW_H * 3.0 + PAD * 4.0 + 18.0;
     let (response, painter) = ui.allocate_painter(Vec2::new(available, height), Sense::click());
@@ -87,8 +98,15 @@ pub fn paint_timeline(
         painter.rect_filled(row, 2.0, color_grid());
 
         for seg in &model.segments {
-            let x0 = track.left() + ((seg.global_start_sec / duration) as f32) * track_w;
-            let x1 = track.left() + ((seg.global_end_sec / duration) as f32) * track_w;
+            let (seg_start, seg_end) = timeline_span_frames(
+                seg.global_start_frame,
+                seg.global_end_frame,
+                seg.global_start_sec,
+                seg.global_end_sec,
+                fps,
+            );
+            let x0 = track.left() + (seg_start as f32 / duration_frames as f32) * track_w;
+            let x1 = track.left() + (seg_end as f32 / duration_frames as f32) * track_w;
             let seg_rect = Rect::from_min_max(
                 Pos2::new(x0, row.top() + 2.0),
                 Pos2::new(x1.max(x0 + 2.0), row.bottom() - 2.0),
@@ -105,9 +123,16 @@ pub fn paint_timeline(
             // Yellow covers — wrap only (schema allows; source snapshot keeps covers empty).
             if i == 1 && seg.schema != SegmentSchema::Source {
                 for cover in &seg.covers {
+                    let (cover_start, cover_end) = timeline_span_frames(
+                        cover.timeline_start_frame,
+                        cover.timeline_end_frame,
+                        cover.timeline_start_sec,
+                        cover.timeline_end_sec,
+                        fps,
+                    );
                     let cx0 =
-                        track.left() + ((cover.timeline_start_sec / duration) as f32) * track_w;
-                    let cx1 = track.left() + ((cover.timeline_end_sec / duration) as f32) * track_w;
+                        track.left() + (cover_start as f32 / duration_frames as f32) * track_w;
+                    let cx1 = track.left() + (cover_end as f32 / duration_frames as f32) * track_w;
                     let cover_rect = Rect::from_min_max(
                         Pos2::new(cx0, row.top() + 6.0),
                         Pos2::new(cx1.max(cx0 + 2.0), row.bottom() - 6.0),
@@ -122,8 +147,15 @@ pub fn paint_timeline(
     if model.application != TimelineApplication::Source {
         let v_y0 = track.top() + 1.0 * (ROW_H + PAD);
         for slot in &model.marker_slots {
-            let sx0 = track.left() + ((slot.start_sec / duration) as f32) * track_w;
-            let sx1 = track.left() + ((slot.end_sec / duration) as f32) * track_w;
+            let (slot_start, slot_end) = timeline_span_frames(
+                slot.start_frame,
+                slot.end_frame,
+                slot.start_sec,
+                slot.end_sec,
+                fps,
+            );
+            let sx0 = track.left() + (slot_start as f32 / duration_frames as f32) * track_w;
+            let sx1 = track.left() + (slot_end as f32 / duration_frames as f32) * track_w;
             let focused = matches!(focus, Some(FocusTarget::Slot { id }) if id == &slot.slot_id);
             painter.rect_stroke(
                 Rect::from_min_max(
@@ -148,7 +180,8 @@ pub fn paint_timeline(
         &painter,
         track,
         track_w,
-        duration,
+        duration_frames,
+        fps,
         &model.io_pins,
         color_io_pin(),
         focus,
@@ -158,7 +191,8 @@ pub fn paint_timeline(
             &painter,
             track,
             track_w,
-            duration,
+            duration_frames,
+            fps,
             &model.markers,
             color_m_pin(),
             focus,
@@ -166,7 +200,8 @@ pub fn paint_timeline(
     }
 
     // Playhead
-    let px = track.left() + ((virtual_sec / duration) as f32).clamp(0.0, 1.0) * track_w;
+    let px = track.left()
+        + (virtual_frame.max(0) as f32 / duration_frames as f32).clamp(0.0, 1.0) * track_w;
     let ph_stroke = if matches!(focus, Some(FocusTarget::Playhead)) {
         Stroke::new(3.0, color_focus())
     } else {
@@ -184,14 +219,14 @@ pub fn paint_timeline(
     painter.text(
         Pos2::new(track.left(), rect.bottom() - 12.0),
         egui::Align2::LEFT_CENTER,
-        format!("0 / {duration:.1}s"),
+        format!("0 / {duration_sec:.1}s"),
         egui::FontId::proportional(11.0),
         Color32::from_rgb(140, 140, 140),
     );
     painter.text(
         Pos2::new(px, rect.bottom() - 12.0),
         egui::Align2::CENTER_CENTER,
-        format!("{virtual_sec:.2}s"),
+        format!("{:.2}s", frame_to_seconds(virtual_frame, fps)),
         egui::FontId::proportional(11.0),
         Color32::from_rgb(220, 220, 220),
     );
@@ -199,8 +234,9 @@ pub fn paint_timeline(
     if response.clicked() {
         if let Some(pos) = response.interact_pointer_pos() {
             if pos.x >= track.left() && pos.x <= track.right() {
-                let t = ((pos.x - track.left()) / track_w) as f64 * duration;
-                return Some(t.clamp(0.0, duration));
+                let frame =
+                    (((pos.x - track.left()) / track_w) * duration_frames as f32).round() as i64;
+                return Some(frame.clamp(0, duration_frames));
             }
         }
     }
@@ -211,7 +247,8 @@ fn paint_pins(
     painter: &egui::Painter,
     track: Rect,
     track_w: f32,
-    duration: f64,
+    duration_frames: i64,
+    fps: f64,
     pins: &[TimelinePin],
     color: Color32,
     focus: Option<&FocusTarget>,
@@ -228,7 +265,9 @@ fn paint_pins(
         } else {
             Stroke::new(1.5, color)
         };
-        let x = track.left() + ((pin.timeline_sec / duration) as f32).clamp(0.0, 1.0) * track_w;
+        let frame = timeline_pin_frame(pin.timeline_frame, pin.timeline_sec, fps);
+        let x = track.left()
+            + (frame.max(0) as f32 / duration_frames.max(1) as f32).clamp(0.0, 1.0) * track_w;
         painter.line_segment(
             [Pos2::new(x, track.top()), Pos2::new(x, track.bottom())],
             stroke,

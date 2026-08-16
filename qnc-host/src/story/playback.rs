@@ -5,7 +5,7 @@ use std::time::Instant;
 use serde::{Deserialize, Serialize};
 
 use crate::editor_assets::ensure_virtual_stream_cached;
-use crate::frame_time::frame_to_seconds;
+use crate::frame_time::{frame_to_seconds, seconds_to_frame};
 use crate::media::resolve_play_media;
 use crate::media_pool::resolve_clip_fps;
 use crate::project::db::ProjectPaths;
@@ -46,6 +46,7 @@ pub const PLAYBACK_AUDIO_BUSES: [AudioBus; 2] = [
 
 #[derive(Debug, Clone, Serialize)]
 pub struct PlaybackClock {
+    pub virtual_frame: i64,
     pub virtual_sec: f64,
     pub playing: bool,
     pub paused: bool,
@@ -78,6 +79,8 @@ struct CoverStreamRef {
 #[derive(Debug, Clone, Serialize)]
 pub struct SourceClipPlayback {
     pub clip_id: String,
+    pub in_frame: i64,
+    pub out_frame: i64,
     pub in_sec: f64,
     pub out_sec: f64,
     pub fps: f64,
@@ -138,6 +141,8 @@ pub struct ActiveLayer {
     pub has_video: bool,
     pub has_audio: bool,
     pub audio_channels: u8,
+    pub local_frame: i64,
+    pub source_frame: i64,
     pub local_sec: f64,
     pub source_sec: f64,
 }
@@ -145,6 +150,7 @@ pub struct ActiveLayer {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlaybackState {
     pub session_id: String,
+    pub virtual_frame: i64,
     pub virtual_sec: f64,
     pub playing: bool,
     pub paused: bool,
@@ -189,6 +195,7 @@ impl PlaybackStore {
         let (part_streams, cover_streams) = freeze_stream_refs(paths, pid, &playlist)?;
         let session_id = format!("story_play_{}", uuid::Uuid::new_v4().simple());
         let clock = PlaybackClock {
+            virtual_frame: 0,
             virtual_sec: 0.0,
             playing: false,
             paused: true,
@@ -229,7 +236,7 @@ impl PlaybackStore {
         Ok(state_from_session(&session))
     }
 
-    /// All/source preview: one clip, virtual_sec = source seconds on the proxy.
+    /// All/source preview legacy adapter: converts seconds to source frames.
     pub fn start_source(
         &self,
         paths: &ProjectPaths,
@@ -256,7 +263,30 @@ impl PlaybackStore {
             } else {
                 f64::MAX
             });
-        self.start_source_resolved(paths, pid, clip, in_s, out_s, &metadata)
+        let in_frame = seconds_to_frame(in_s, metadata.fps);
+        let out_frame = seconds_to_frame(out_s, metadata.fps).max(in_frame + 1);
+        self.start_source_frames(paths, pid, clip, in_frame, out_frame)
+    }
+
+    /// All/source preview: one clip, clock = source frame on the proxy.
+    pub fn start_source_frames(
+        &self,
+        paths: &ProjectPaths,
+        project_id: &str,
+        clip_id: &str,
+        in_frame: i64,
+        out_frame: i64,
+    ) -> Result<PlaybackState, String> {
+        let pid = project_id.trim();
+        let clip = clip_id.trim();
+        if pid.is_empty() {
+            return Err("project_id required".into());
+        }
+        if clip.is_empty() {
+            return Err("clip_id required".into());
+        }
+        let metadata = clip_playback_metadata(paths, pid, clip)?;
+        self.start_source_resolved(paths, pid, clip, in_frame, out_frame, &metadata)
     }
 
     /// Source preview from the editorial source of truth: virtual_shots row.
@@ -279,9 +309,7 @@ impl PlaybackStore {
             crate::virtual_shots::virtual_shot_frames(paths, pid, shot_id)?;
         let mut metadata = clip_playback_metadata(paths, pid, &clip_id)?;
         metadata.fps = fps;
-        let in_s = frame_to_seconds(in_frame, fps);
-        let out_s = frame_to_seconds(out_frame.max(in_frame + 1), fps).max(in_s + EPS);
-        self.start_source_resolved(paths, pid, &clip_id, in_s, out_s, &metadata)
+        self.start_source_resolved(paths, pid, &clip_id, in_frame, out_frame, &metadata)
     }
 
     fn start_source_resolved(
@@ -289,8 +317,8 @@ impl PlaybackStore {
         paths: &ProjectPaths,
         project_id: &str,
         clip_id: &str,
-        in_s: f64,
-        out_s: f64,
+        in_frame: i64,
+        out_frame: i64,
         metadata: &ClipPlaybackMetadata,
     ) -> Result<PlaybackState, String> {
         let pid = project_id.trim();
@@ -307,9 +335,15 @@ impl PlaybackStore {
                 "clip_fps_invalid: '{clip}' nema valjan source FPS za playback"
             ));
         }
+        let duration_frame = seconds_to_frame(metadata.duration_sec.max(0.0), metadata.fps).max(1);
+        let in_frame = in_frame.max(0).min(duration_frame.saturating_sub(1));
+        let out_frame = out_frame.max(in_frame + 1).min(duration_frame);
+        let in_s = frame_to_seconds(in_frame, metadata.fps);
+        let out_s = frame_to_seconds(out_frame, metadata.fps).max(in_s + EPS);
         let playlist = EditorialPlaylist {
             project_id: pid.to_string(),
             timeline_fps: metadata.fps,
+            duration_frames: (out_frame - in_frame).max(0),
             duration_sec: (out_s - in_s).max(0.0),
             segments: Vec::new(),
         };
@@ -319,6 +353,7 @@ impl PlaybackStore {
             project_id: pid.to_string(),
             playlist,
             clock: PlaybackClock {
+                virtual_frame: in_frame,
                 virtual_sec: in_s,
                 playing: false,
                 paused: true,
@@ -327,6 +362,8 @@ impl PlaybackStore {
             preload: HashMap::new(),
             source_clip: Some(SourceClipPlayback {
                 clip_id: clip.to_string(),
+                in_frame,
+                out_frame,
                 in_sec: in_s,
                 out_sec: out_s,
                 fps: metadata.fps,
@@ -357,7 +394,7 @@ impl PlaybackStore {
         Ok(())
     }
 
-    pub fn seek(&self, session_id: &str, virtual_sec: f64) -> Result<(), String> {
+    pub fn seek_frame(&self, session_id: &str, virtual_frame: i64) -> Result<(), String> {
         let sid = session_id.trim();
         let mut map = self
             .inner
@@ -366,8 +403,9 @@ impl PlaybackStore {
         let session = map
             .get_mut(sid)
             .ok_or_else(|| format!("playback session not found: {sid}"))?;
-        let t = clamp_and_snap_session_time(session, virtual_sec)?;
-        session.clock.virtual_sec = t;
+        let frame = clamp_session_frame(session, virtual_frame)?;
+        session.clock.virtual_frame = frame;
+        session.clock.virtual_sec = frame_to_seconds(frame, session_timebase_fps(session)?);
         session.clock.last_tick = Instant::now();
         Ok(())
     }
@@ -477,20 +515,25 @@ impl PlaybackStore {
 }
 
 fn state_from_session(session: &PlaybackSession) -> PlaybackState {
-    let virtual_sec = session.clock.virtual_sec.max(0.0);
-    let mut active = resolve_active_layer_frozen(session, virtual_sec);
+    let virtual_frame = session.clock.virtual_frame.max(0);
+    let timebase_fps =
+        session_timebase_fps(session).unwrap_or(session.playlist.timeline_fps.max(1.0));
+    let virtual_sec = frame_to_seconds(virtual_frame, timebase_fps);
+    let mut active = resolve_active_layer_frozen(session, virtual_frame);
     let sid = session.session_id.clone();
     active.mixed_audio_url = format!(
-        "/api/story/playback/audio?session_id={}&duration_sec=30",
-        url_encode_query_value(&sid)
+        "/api/story/playback/audio?session_id={}&duration_frames={}",
+        url_encode_query_value(&sid),
+        seconds_to_frame(30.0, timebase_fps).max(1)
     );
     active.preview_frame_url = format!(
-        "/api/story/playback/frame?session_id={}&virtual_sec={virtual_sec:.3}",
+        "/api/story/playback/frame?session_id={}&virtual_frame={virtual_frame}",
         url_encode_query_value(&sid)
     );
     let cover_preload = session.preload.values().cloned().collect::<Vec<_>>();
     PlaybackState {
         session_id: session.session_id.clone(),
+        virtual_frame,
         virtual_sec,
         playing: session.clock.playing,
         paused: session.clock.paused,
@@ -572,17 +615,21 @@ fn freeze_stream_refs(
     Ok((part_streams, cover_streams))
 }
 
-pub(crate) fn resolve_active_layer_public(
+pub(crate) fn resolve_active_layer_frame_public(
     session: &PlaybackSession,
-    virtual_sec: f64,
+    virtual_frame: i64,
 ) -> ActiveLayer {
-    resolve_active_layer_frozen(session, virtual_sec)
+    resolve_active_layer_frozen(session, virtual_frame)
 }
 
-fn resolve_active_layer_frozen(session: &PlaybackSession, virtual_sec: f64) -> ActiveLayer {
-    let v = virtual_sec.max(0.0);
+fn resolve_active_layer_frozen(session: &PlaybackSession, virtual_frame: i64) -> ActiveLayer {
+    let v = virtual_frame.max(0);
+    let timeline_fps =
+        session_timebase_fps(session).unwrap_or(session.playlist.timeline_fps.max(1.0));
     if let Some(src) = session.source_clip.as_ref() {
-        let source_sec = v.clamp(src.in_sec, src.out_sec.max(src.in_sec));
+        let source_frame = v.clamp(src.in_frame, src.out_frame.max(src.in_frame));
+        let source_sec = frame_to_seconds(source_frame, src.fps);
+        let local_frame = (source_frame - src.in_frame).max(0);
         let pid_enc = url_encode_project(&session.project_id);
         let clip_enc = url_encode_query_value(&src.clip_id);
         return ActiveLayer {
@@ -591,12 +638,12 @@ fn resolve_active_layer_frozen(session: &PlaybackSession, virtual_sec: f64) -> A
             cover_id: String::new(),
             clip_id: src.clip_id.clone(),
             stream_url: format!(
-                "/api/story/virtual-stream?project_id={pid_enc}&clip_id={clip_enc}&in_seconds={:.6}&out_seconds={:.6}",
-                src.in_sec, src.out_sec
+                "/api/story/virtual-stream?project_id={pid_enc}&clip_id={clip_enc}&in_frame={}&out_frame={}",
+                src.in_frame, src.out_frame
             ),
             a1_stream_url: format!(
-                "/api/story/virtual-stream?project_id={pid_enc}&clip_id={clip_enc}&in_seconds={:.6}&out_seconds={:.6}&audio_only=1",
-                src.in_sec, src.out_sec
+                "/api/story/virtual-stream?project_id={pid_enc}&clip_id={clip_enc}&in_frame={}&out_frame={}&audio_only=1",
+                src.in_frame, src.out_frame
             ),
             mixed_audio_url: String::new(),
             preview_frame_url: String::new(),
@@ -605,11 +652,13 @@ fn resolve_active_layer_frozen(session: &PlaybackSession, virtual_sec: f64) -> A
             has_video: true,
             has_audio: src.has_audio,
             audio_channels: src.audio_channels,
-            local_sec: (source_sec - src.in_sec).max(0.0),
+            local_frame,
+            source_frame,
+            local_sec: frame_to_seconds(local_frame, src.fps),
             source_sec,
         };
     }
-    let (segment, local_sec) = find_segment(&session.playlist, v);
+    let (segment, local_frame) = find_segment_frame(&session.playlist, v);
     let Some(segment) = segment else {
         return ActiveLayer {
             layer: ActiveLayerKind::None,
@@ -625,6 +674,8 @@ fn resolve_active_layer_frozen(session: &PlaybackSession, virtual_sec: f64) -> A
             has_video: false,
             has_audio: false,
             audio_channels: 0,
+            local_frame: 0,
+            source_frame: 0,
             local_sec: 0.0,
             source_sec: 0.0,
         };
@@ -640,7 +691,7 @@ fn resolve_active_layer_frozen(session: &PlaybackSession, virtual_sec: f64) -> A
     let part_has_audio = part_ref.map(|row| row.has_audio).unwrap_or(false);
     let part_audio_channels = part_ref.map(|row| row.audio_channels).unwrap_or(0);
 
-    if let Some(cover) = find_cover(&segment.covers, v) {
+    if let Some(cover) = find_cover_frame(&segment.covers, v) {
         let cover_ref = session.cover_streams.get(&cover.cover_id);
         let stream_url = cover_ref
             .map(|row| row.stream_url.clone())
@@ -648,7 +699,8 @@ fn resolve_active_layer_frozen(session: &PlaybackSession, virtual_sec: f64) -> A
         let cover_has_audio = cover_ref.map(|row| row.has_audio).unwrap_or(false);
         let cover_audio_channels = cover_ref.map(|row| row.audio_channels).unwrap_or(0);
         let has_video = !stream_url.trim().is_empty();
-        let source_sec = (v - cover.timeline_start_sec).max(0.0);
+        let source_frame = (v - cover.timeline_start_frame).max(0);
+        let source_sec = frame_to_seconds(source_frame, timeline_fps);
         return ActiveLayer {
             layer: ActiveLayerKind::Cover,
             part_id: segment.part_id.clone(),
@@ -663,7 +715,9 @@ fn resolve_active_layer_frozen(session: &PlaybackSession, virtual_sec: f64) -> A
             has_video,
             has_audio: part_has_audio || cover_has_audio,
             audio_channels: part_audio_channels.max(cover_audio_channels),
-            local_sec: (v - segment.global_start_sec).max(0.0),
+            local_frame,
+            source_frame,
+            local_sec: frame_to_seconds(local_frame, timeline_fps),
             source_sec,
         };
     }
@@ -683,8 +737,10 @@ fn resolve_active_layer_frozen(session: &PlaybackSession, virtual_sec: f64) -> A
             has_video: false,
             has_audio: part_has_audio,
             audio_channels: part_audio_channels,
-            local_sec,
-            source_sec: local_sec.max(0.0),
+            local_frame,
+            source_frame: local_frame,
+            local_sec: frame_to_seconds(local_frame, timeline_fps),
+            source_sec: frame_to_seconds(local_frame, timeline_fps),
         };
     }
 
@@ -702,8 +758,10 @@ fn resolve_active_layer_frozen(session: &PlaybackSession, virtual_sec: f64) -> A
         has_video: !mux_url.trim().is_empty(),
         has_audio: part_has_audio,
         audio_channels: part_audio_channels,
-        local_sec,
-        source_sec: local_sec.max(0.0),
+        local_frame,
+        source_frame: local_frame,
+        local_sec: frame_to_seconds(local_frame, timeline_fps),
+        source_sec: frame_to_seconds(local_frame, timeline_fps),
     }
 }
 
@@ -749,19 +807,19 @@ fn clip_playback_metadata(
     })
 }
 
-pub(crate) fn find_segment<'a>(
+pub(crate) fn find_segment_frame<'a>(
     playlist: &'a EditorialPlaylist,
-    virtual_sec: f64,
-) -> (Option<&'a EditorialSegment>, f64) {
+    virtual_frame: i64,
+) -> (Option<&'a EditorialSegment>, i64) {
     for segment in &playlist.segments {
-        if virtual_sec + EPS >= segment.global_start_sec
-            && virtual_sec < segment.global_end_sec - EPS
-        {
-            let local_sec = (virtual_sec - segment.global_start_sec).max(0.0);
-            return (Some(segment), local_sec);
+        let start = segment.global_start_frame.max(0);
+        let end = segment.global_end_frame.max(start + 1);
+        if virtual_frame >= start && virtual_frame < end {
+            let local_frame = (virtual_frame - start).max(0);
+            return (Some(segment), local_frame);
         }
     }
-    (None, 0.0)
+    (None, 0)
 }
 
 fn url_encode_project(project_id: &str) -> String {
@@ -780,28 +838,28 @@ fn url_encode_query_value(value: &str) -> String {
         .collect()
 }
 
-pub(crate) fn find_cover<'a>(
+pub(crate) fn find_cover_frame<'a>(
     covers: &'a [EditorialCover],
-    virtual_sec: f64,
+    virtual_frame: i64,
 ) -> Option<&'a EditorialCover> {
     for cover in covers {
         if !cover.streamable {
             continue;
         }
-        if virtual_sec + EPS >= cover.timeline_start_sec
-            && virtual_sec < cover.timeline_end_sec - EPS
-        {
+        let start = cover.timeline_start_frame.max(0);
+        let end = cover.timeline_end_frame.max(start + 1);
+        if virtual_frame >= start && virtual_frame < end {
             return Some(cover);
         }
     }
     None
 }
 
-fn session_end_sec(session: &PlaybackSession) -> f64 {
+fn session_end_frame(session: &PlaybackSession) -> i64 {
     if let Some(src) = session.source_clip.as_ref() {
-        src.out_sec.max(src.in_sec)
+        src.out_frame.max(src.in_frame)
     } else {
-        session.playlist.duration_sec.max(0.0)
+        session.playlist.duration_frames.max(0)
     }
 }
 
@@ -823,32 +881,17 @@ fn session_timebase_fps(session: &PlaybackSession) -> Result<f64, String> {
     }
 }
 
-fn snap_sec_to_session_frame(session: &PlaybackSession, sec: f64) -> Result<f64, String> {
-    let fps = session_timebase_fps(session)?;
-    Ok((sec * fps).round() / fps)
-}
-
-fn clamp_and_snap_session_time(session: &PlaybackSession, virtual_sec: f64) -> Result<f64, String> {
-    let mut t = virtual_sec.max(0.0);
+fn clamp_session_frame(session: &PlaybackSession, virtual_frame: i64) -> Result<i64, String> {
+    let mut frame = virtual_frame.max(0);
     if let Some(src) = session.source_clip.as_ref() {
-        t = t.clamp(src.in_sec, src.out_sec.max(src.in_sec));
+        frame = frame.clamp(src.in_frame, src.out_frame.max(src.in_frame));
     } else {
-        let end = session_end_sec(session);
-        if end > 0.0 {
-            t = t.min(end);
+        let end = session_end_frame(session);
+        if end > 0 {
+            frame = frame.min(end);
         }
     }
-    let snapped = snap_sec_to_session_frame(session, t)?;
-    if let Some(src) = session.source_clip.as_ref() {
-        Ok(snapped.clamp(src.in_sec, src.out_sec.max(src.in_sec)))
-    } else {
-        let end = session_end_sec(session);
-        Ok(if end > 0.0 {
-            snapped.min(end).max(0.0)
-        } else {
-            snapped.max(0.0)
-        })
-    }
+    Ok(frame.max(0))
 }
 
 fn advance_session_clock(session: &mut PlaybackSession, now: Instant) -> Result<(), String> {
@@ -864,14 +907,21 @@ fn advance_session_clock(session: &mut PlaybackSession, now: Instant) -> Result<
         return Ok(());
     }
 
-    let end = session_end_sec(session);
-    let raw_next = session.clock.virtual_sec.max(0.0) + dt;
-    let reached_end = end > 0.0 && raw_next >= end;
-    session.clock.virtual_sec = if reached_end {
+    let fps = session_timebase_fps(session)?;
+    let end = session_end_frame(session);
+    let raw_next_sec = frame_to_seconds(session.clock.virtual_frame.max(0), fps) + dt;
+    let mut next_frame = seconds_to_frame(raw_next_sec, fps);
+    let reached_end = end > 0 && next_frame >= end;
+    next_frame = if reached_end {
         end
     } else {
-        clamp_and_snap_session_time(session, raw_next)?
+        clamp_session_frame(session, next_frame)?
     };
+    if next_frame == session.clock.virtual_frame {
+        return Ok(());
+    }
+    session.clock.virtual_frame = next_frame;
+    session.clock.virtual_sec = frame_to_seconds(next_frame, fps);
     session.clock.last_tick = now;
     if reached_end {
         session.clock.playing = false;
@@ -898,6 +948,7 @@ mod tests {
         EditorialPlaylist {
             project_id: "p".into(),
             timeline_fps: 25.0,
+            duration_frames: 250,
             duration_sec: 10.0,
             segments: vec![EditorialSegment {
                 part_id: "part_a".into(),
@@ -907,7 +958,13 @@ mod tests {
                 virtual_shot_id: "shot_a".into(),
                 global_start_sec: 0.0,
                 global_end_sec: 10.0,
+                global_start_frame: 0,
+                global_end_frame: 250,
+                duration_frames: 250,
                 duration_sec: 10.0,
+                source_in_frame: 0,
+                source_out_frame: 250,
+                source_fps: 25.0,
                 streamable: true,
                 source: StreamRef::Part {
                     part_id: "part_a".into(),
@@ -919,9 +976,17 @@ mod tests {
                     title: "".into(),
                     timeline_start_sec: 2.0,
                     timeline_end_sec: 4.0,
+                    timeline_start_frame: 50,
+                    timeline_end_frame: 100,
                     local_start_sec: 2.0,
                     local_end_sec: 4.0,
+                    local_start_frame: 50,
+                    local_end_frame: 100,
+                    slot_duration_frames: 50,
                     slot_duration_sec: 2.0,
+                    source_in_frame: 25,
+                    source_out_frame: 75,
+                    source_offset_frames: 0,
                     source_in_sec: 1.0,
                     source_out_sec: 3.0,
                     source_offset_sec: 0.0,
@@ -966,6 +1031,7 @@ mod tests {
             project_id: "p".into(),
             playlist,
             clock: PlaybackClock {
+                virtual_frame: 0,
                 virtual_sec: 0.0,
                 playing: true,
                 paused: false,
@@ -982,6 +1048,7 @@ mod tests {
     fn playback_clock_advances_inside_session_state() {
         let mut session = frozen_session(playlist_one());
         let now = Instant::now();
+        session.clock.virtual_frame = 25;
         session.clock.virtual_sec = 1.0;
         session.clock.playing = true;
         session.clock.paused = false;
@@ -999,11 +1066,14 @@ mod tests {
         let mut session = frozen_session(EditorialPlaylist {
             project_id: "p".into(),
             timeline_fps: 25.0,
+            duration_frames: 200,
             duration_sec: 4.0,
             segments: Vec::new(),
         });
         session.source_clip = Some(SourceClipPlayback {
             clip_id: "clip_a".into(),
+            in_frame: 50,
+            out_frame: 250,
             in_sec: 1.0,
             out_sec: 5.0,
             fps: 50.0,
@@ -1011,6 +1081,7 @@ mod tests {
             audio_channels: 2,
         });
         let now = Instant::now();
+        session.clock.virtual_frame = 50;
         session.clock.virtual_sec = 1.0;
         session.clock.playing = true;
         session.clock.paused = false;
@@ -1025,6 +1096,7 @@ mod tests {
     fn playback_clock_stops_at_session_end() {
         let mut session = frozen_session(playlist_one());
         let now = Instant::now();
+        session.clock.virtual_frame = 249;
         session.clock.virtual_sec = 9.98;
         session.clock.playing = true;
         session.clock.paused = false;
@@ -1052,17 +1124,21 @@ mod tests {
         let mut session = frozen_session(EditorialPlaylist {
             project_id: "p".into(),
             timeline_fps: 25.0,
+            duration_frames: 125,
             duration_sec: 5.0,
             segments: Vec::new(),
         });
         session.source_clip = Some(SourceClipPlayback {
             clip_id: "clip_a".into(),
+            in_frame: 25,
+            out_frame: 150,
             in_sec: 1.0,
             out_sec: 6.0,
             fps: 25.0,
             has_audio: true,
             audio_channels: 2,
         });
+        session.clock.virtual_frame = 50;
         session.clock.virtual_sec = 2.0;
 
         let state = state_from_session(&session);
@@ -1074,7 +1150,8 @@ mod tests {
             .stream_url
             .contains("/api/story/virtual-stream"));
         assert!(state.active.stream_url.contains("clip_id=clip_a"));
-        assert!(state.active.stream_url.contains("in_seconds=1.000000"));
+        assert!(state.active.stream_url.contains("in_frame=25"));
+        assert!(state.active.stream_url.contains("out_frame=150"));
         assert!(!state.active.stream_url.contains("/filmstrip"));
         assert!(state.active.has_video);
         assert!(state.active.has_audio);
@@ -1086,17 +1163,21 @@ mod tests {
         let mut session = frozen_session(EditorialPlaylist {
             project_id: "p".into(),
             timeline_fps: 25.0,
+            duration_frames: 125,
             duration_sec: 5.0,
             segments: Vec::new(),
         });
         session.source_clip = Some(SourceClipPlayback {
             clip_id: "clip_a".into(),
+            in_frame: 25,
+            out_frame: 150,
             in_sec: 1.0,
             out_sec: 6.0,
             fps: 25.0,
             has_audio: false,
             audio_channels: 0,
         });
+        session.clock.virtual_frame = 50;
         session.clock.virtual_sec = 2.0;
 
         let state = state_from_session(&session);
@@ -1149,21 +1230,26 @@ mod tests {
             .unwrap();
 
         assert_eq!(state.timebase_fps, 50.0);
+        assert_eq!(state.virtual_frame, 50);
         assert_eq!(state.virtual_sec, 1.0);
         assert_eq!(state.active.clip_id, "clip_a");
+        assert_eq!(state.active.source_frame, 50);
         assert_eq!(state.active.source_sec, 1.0);
         assert!(state.active.stream_url.contains("clip_id=clip_a"));
-        assert!(state.active.stream_url.contains("in_seconds=1.000000"));
-        assert!(state.active.stream_url.contains("out_seconds=3.000000"));
+        assert!(state.active.stream_url.contains("in_frame=50"));
+        assert!(state.active.stream_url.contains("out_frame=150"));
         let _ = std::fs::remove_dir_all(base);
     }
 
     #[test]
     fn find_cover_prefers_cover_window() {
         let p = playlist_one();
-        let (seg, _) = find_segment(&p, 3.0);
+        let cover_range = &p.segments[0].covers[0];
+        let inside_frame =
+            cover_range.timeline_start_frame + (cover_range.slot_duration_frames / 2).max(1);
+        let (seg, _) = find_segment_frame(&p, inside_frame);
         assert!(seg.is_some());
-        let cover = find_cover(&seg.unwrap().covers, 3.0);
+        let cover = find_cover_frame(&seg.unwrap().covers, inside_frame);
         assert!(cover.is_some());
         assert_eq!(cover.unwrap().cover_id, "cover_a");
     }
@@ -1171,9 +1257,12 @@ mod tests {
     #[test]
     fn find_cover_none_outside_window() {
         let p = playlist_one();
-        let (seg, _) = find_segment(&p, 1.0);
+        let before_cover_frame = p.segments[0].covers[0]
+            .timeline_start_frame
+            .saturating_sub(1);
+        let (seg, _) = find_segment_frame(&p, before_cover_frame);
         assert!(seg.is_some());
-        assert!(find_cover(&seg.unwrap().covers, 1.0).is_none());
+        assert!(find_cover_frame(&seg.unwrap().covers, before_cover_frame).is_none());
     }
 
     #[test]
@@ -1191,6 +1280,7 @@ mod tests {
                 audio_channels: 2,
             },
         );
+        session.clock.virtual_frame = 25;
         session.clock.virtual_sec = 1.0;
         let state = state_from_session(&session);
         assert_eq!(state.active.layer, ActiveLayerKind::Part);
@@ -1213,6 +1303,7 @@ mod tests {
     #[test]
     fn frozen_state_uses_session_urls_without_db() {
         let mut session = frozen_session(playlist_one());
+        session.clock.virtual_frame = 75;
         session.clock.virtual_sec = 3.0;
         let state = state_from_session(&session);
         assert_eq!(state.active.layer, ActiveLayerKind::Cover);

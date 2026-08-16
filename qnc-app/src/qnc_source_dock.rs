@@ -11,15 +11,15 @@ use crate::qnc_timeline_progress::{
 
 pub struct SourceDockInput<'a> {
     pub clip_label: &'a str,
-    pub source_in: f64,
-    pub source_out: f64,
+    pub source_in_frame: i64,
+    pub source_out_frame: i64,
     /// Frame-based paint model — from [`crate::playback_stack::PlaybackStack`], not form seconds.
     pub timeline_model: TimelineProgressModel,
     pub focus: TimelineFocusPaint,
     pub a1_peaks: &'a [f32],
     pub a2_peaks: &'a [f32],
     pub frames: &'a [FilmFrame],
-    pub tc: &'a dyn Fn(f64) -> String,
+    pub tc_frame: &'a dyn Fn(i64) -> String,
     /// Clip name + IN/OUT row above the timeline.
     pub show_header: bool,
     /// Edit buttons (virtual / parts).
@@ -43,6 +43,7 @@ pub enum SourceDockAction {
     ToggleAudioExpand(ExpandedAudio),
     SaveVirtualShot,
     CreatePart(&'static str),
+    CreateCover,
     ImportSelected,
     SelectAll,
     ClearSelection,
@@ -63,6 +64,7 @@ fn source_layers() -> LayerFlags {
         audio_a3: false,
         audio_a4: false,
         base_video: false,
+        shot_range: true,
         covers: false,
         markers: false,
         marker_slots: false,
@@ -72,13 +74,15 @@ fn source_layers() -> LayerFlags {
 }
 
 /// Exact dock height so timeline fits fully; upper CentralPanel flex-shrinks.
-pub fn dock_height(expanded_audio: ExpandedAudio, show_header: bool, duration_sec: f64) -> f32 {
+pub fn dock_height(expanded_audio: ExpandedAudio, show_header: bool) -> f32 {
     let track = QncTimeline {
         layers: source_layers(),
-        duration_sec: duration_sec.max(0.04),
-        playhead_sec: 0.0,
-        source_in: 0.0,
-        source_out: 1.0,
+        duration_frames: 1,
+        playhead_frame: 0,
+        shot_in_frame: 0,
+        shot_out_frame: 1,
+        draft_in_frame: 0,
+        draft_out_frame: 1,
         video_background: None,
         focus: TimelineFocusPaint::Playhead,
         expanded_audio,
@@ -105,6 +109,9 @@ pub fn show(ui: &mut egui::Ui, input: SourceDockInput<'_>) -> SourceDockAction {
     let mut archive = input.archive_original;
     let mut ai_mining = input.ai_mining;
     let tl_colors = qnc_theme::current(ui).timeline();
+    let source_in_frame = input.source_in_frame.max(0);
+    let source_out_frame = input.source_out_frame.max(source_in_frame);
+    let source_duration_frames = (source_out_frame - source_in_frame).max(0);
 
     egui::Frame::NONE
         .fill(tl_colors.bg)
@@ -118,47 +125,60 @@ pub fn show(ui: &mut egui::Ui, input: SourceDockInput<'_>) -> SourceDockAction {
             ui.spacing_mut().item_spacing.y = 0.0;
             if input.show_header {
                 qnc_theme::chrome_row(ui, true, |ui| {
-                    ui.label(
-                        RichText::new(input.clip_label)
-                            .color(TEXT)
-                            .strong()
-                            .size(qnc_theme::FONT_UI),
-                    );
-                    ui.add_space(10.0);
-                    timecode_label(
-                        ui,
-                        "IN",
-                        (input.tc)(input.source_in),
-                        input.focus == TimelineFocusPaint::In,
-                    );
-                    timecode_label(
-                        ui,
-                        "OUT",
-                        (input.tc)(input.source_out),
-                        input.focus == TimelineFocusPaint::Out,
-                    );
-                    timecode_label(
-                        ui,
-                        "Trajanje",
-                        (input.tc)((input.source_out - input.source_in).max(0.0)),
-                        false,
-                    );
                     if input.show_edit_actions {
+                        // RTL first: action buttons keep hit-targets; labels take leftover.
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if qnc_theme::action_btn(ui, "Pokrivalice").clicked() {
-                                action = SourceDockAction::CreatePart("tonovi");
+                                action = SourceDockAction::CreateCover;
                             }
                             if qnc_theme::action_btn(ui, "Voice over").clicked() {
                                 action = SourceDockAction::CreatePart("offovi");
                             }
                             if qnc_theme::action_btn(ui, "Talking Head").clicked() {
-                                action = SourceDockAction::CreatePart("offovi");
+                                action = SourceDockAction::CreatePart("tonovi");
                             }
-                            if qnc_theme::action_btn(ui, "Spremi virtualni kadar").clicked() {
+                            if qnc_theme::action_btn(ui, "Add virtual clip").clicked() {
                                 action = SourceDockAction::SaveVirtualShot;
                             }
+                            ui.with_layout(
+                                egui::Layout::left_to_right(egui::Align::Center),
+                                |ui| {
+                                    ui.label(
+                                        RichText::new(input.clip_label)
+                                            .color(TEXT)
+                                            .strong()
+                                            .size(qnc_theme::FONT_UI),
+                                    );
+                                    ui.add_space(10.0);
+                                    timecode_label(
+                                        ui,
+                                        "IN",
+                                        (input.tc_frame)(source_in_frame),
+                                        input.focus == TimelineFocusPaint::In,
+                                    );
+                                    timecode_label(
+                                        ui,
+                                        "OUT",
+                                        (input.tc_frame)(source_out_frame),
+                                        input.focus == TimelineFocusPaint::Out,
+                                    );
+                                    timecode_label(
+                                        ui,
+                                        "Trajanje",
+                                        (input.tc_frame)(source_duration_frames),
+                                        false,
+                                    );
+                                },
+                            );
                         });
                     } else if input.show_import_actions {
+                        ui.label(
+                            RichText::new(input.clip_label)
+                                .color(TEXT)
+                                .strong()
+                                .size(qnc_theme::FONT_UI),
+                        );
+                        ui.add_space(10.0);
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             ui.spacing_mut().item_spacing.x = 8.0;
                             if !input.ingest_status.is_empty() {
@@ -202,6 +222,32 @@ pub fn show(ui: &mut egui::Ui, input: SourceDockInput<'_>) -> SourceDockAction {
                                 action = SourceDockAction::SetAiMining(ai_mining);
                             }
                         });
+                    } else {
+                        ui.label(
+                            RichText::new(input.clip_label)
+                                .color(TEXT)
+                                .strong()
+                                .size(qnc_theme::FONT_UI),
+                        );
+                        ui.add_space(10.0);
+                        timecode_label(
+                            ui,
+                            "IN",
+                            (input.tc_frame)(source_in_frame),
+                            input.focus == TimelineFocusPaint::In,
+                        );
+                        timecode_label(
+                            ui,
+                            "OUT",
+                            (input.tc_frame)(source_out_frame),
+                            input.focus == TimelineFocusPaint::Out,
+                        );
+                        timecode_label(
+                            ui,
+                            "Trajanje",
+                            (input.tc_frame)(source_duration_frames),
+                            false,
+                        );
                     }
                 });
             }

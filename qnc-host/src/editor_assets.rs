@@ -26,8 +26,9 @@ use crate::ingest::thumb::{
 use crate::media::resolve_play_media;
 use crate::media_pool::{list_clips_enriched, mark_filmstrip_building, resolve_clip_fps};
 use crate::virtual_shots::{
-    add_virtual_shot, cover_path_for_shot, derive_virtual_shot, list_virtual_shots,
-    update_virtual_shot, virtual_shot_frames,
+    add_virtual_shot, add_virtual_shot_from_frames, cover_path_for_shot, derive_virtual_shot,
+    derive_virtual_shot_from_frames, list_virtual_shots, update_virtual_shot,
+    update_virtual_shot_from_frames, virtual_shot_frames,
 };
 use crate::waveform::{ready as waveform_ready, snapshot as waveform_snapshot};
 
@@ -178,7 +179,13 @@ struct VirtualShotBody {
     /// New editorial path: derive from an existing virtual shot (in/out are local to it).
     #[serde(default)]
     source_shot_id: String,
+    #[serde(default)]
+    in_frame: Option<i64>,
+    #[serde(default)]
+    out_frame: Option<i64>,
+    #[serde(default)]
     in_seconds: f64,
+    #[serde(default)]
     out_seconds: f64,
 }
 
@@ -188,7 +195,13 @@ struct VirtualShotUpdateBody {
     project_id: String,
     #[serde(default)]
     shot_id: String,
+    #[serde(default)]
+    in_frame: Option<i64>,
+    #[serde(default)]
+    out_frame: Option<i64>,
+    #[serde(default)]
     in_seconds: f64,
+    #[serde(default)]
     out_seconds: f64,
 }
 
@@ -564,22 +577,36 @@ async fn api_virtual_shot(
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let pid = resolve_project_id(&app, &body.project_id)?;
     let shot = if !body.source_shot_id.trim().is_empty() {
-        derive_virtual_shot(
-            &app.project.paths,
-            &pid,
-            body.source_shot_id.trim(),
-            body.in_seconds,
-            body.out_seconds,
-        )
+        match (body.in_frame, body.out_frame) {
+            (Some(in_frame), Some(out_frame)) => derive_virtual_shot_from_frames(
+                &app.project.paths,
+                &pid,
+                body.source_shot_id.trim(),
+                in_frame,
+                out_frame,
+            ),
+            _ => derive_virtual_shot(
+                &app.project.paths,
+                &pid,
+                body.source_shot_id.trim(),
+                body.in_seconds,
+                body.out_seconds,
+            ),
+        }
     } else {
         let clip_id = required_clip_id(&body.clip_id)?;
-        add_virtual_shot(
-            &app.project.paths,
-            &pid,
-            clip_id,
-            body.in_seconds,
-            body.out_seconds,
-        )
+        match (body.in_frame, body.out_frame) {
+            (Some(in_frame), Some(out_frame)) => {
+                add_virtual_shot_from_frames(&app.project.paths, &pid, clip_id, in_frame, out_frame)
+            }
+            _ => add_virtual_shot(
+                &app.project.paths,
+                &pid,
+                clip_id,
+                body.in_seconds,
+                body.out_seconds,
+            ),
+        }
     }
     .map_err(|error| (StatusCode::BAD_REQUEST, error))?;
     let virtual_shots = list_virtual_shots(&app.project.paths, &pid).map_err(internal)?;
@@ -595,13 +622,22 @@ async fn api_virtual_shot_update(
     Json(body): Json<VirtualShotUpdateBody>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let pid = resolve_project_id(&app, &body.project_id)?;
-    let shot = update_virtual_shot(
-        &app.project.paths,
-        &pid,
-        body.shot_id.trim(),
-        body.in_seconds,
-        body.out_seconds,
-    )
+    let shot = match (body.in_frame, body.out_frame) {
+        (Some(in_frame), Some(out_frame)) => update_virtual_shot_from_frames(
+            &app.project.paths,
+            &pid,
+            body.shot_id.trim(),
+            in_frame,
+            out_frame,
+        ),
+        _ => update_virtual_shot(
+            &app.project.paths,
+            &pid,
+            body.shot_id.trim(),
+            body.in_seconds,
+            body.out_seconds,
+        ),
+    }
     .map_err(|error| (StatusCode::BAD_REQUEST, error))?;
     let virtual_shots = list_virtual_shots(&app.project.paths, &pid).map_err(internal)?;
     Ok(Json(json!({

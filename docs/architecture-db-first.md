@@ -132,27 +132,36 @@ Modules enable flags live in **`project_store.db` → `module_state`** (Phase 1)
 
 ## 4.1 Story editorial truth
 
-Story montage is based on **virtual shots**, not transient UI trims.
+Story montage is based on durable virtual entities, not transient UI trims.
 
 There are two virtual-shot types:
 
 - **Source virtual shot** (`kind = 'import_root'`) — the whole source clip; shown in Story **All** tab.
 - **Derived virtual shot** (`kind = 'derived'`) — a frame range derived from one source virtual shot; shown in Story **Virtual** tab.
 
+Story also has **virtual segments**:
+
+- **Virtual segment** (`story_parts.part_id`) — TON/OFF/Story segment shown in Story **Segment** tab.
+- A virtual segment may reference a `virtual_shot_id`, or it may store its own `clip_id + in_frame/out_frame` source range directly in `story_parts`.
+- Creating a Segment-tab virtual segment must not implicitly create a derived Virtual-tab shot.
+
 | Field | Durable source of truth |
 |-------|-------------------------|
 | Source clip identity | `virtual_shots.clip_id` / `ingest_assets.clip_id` |
 | Source IN/OUT | `virtual_shots.in_frame` / `virtual_shots.out_frame` |
 | Source FPS/timebase | source file probe stored in `ingest_assets.fps`, mirrored to virtual-shot source metadata |
-| Story parts/covers | references to `virtual_shot_id`; host resolves clip/frame range from SQLite |
+| Story virtual segments | `story_parts.part_id` with `clip_id`, `virtual_shot_id` when applicable, `in_frame`, `out_frame`, `fps` |
+| Story covers | references to `virtual_shot_id`; host resolves clip/frame range from SQLite |
 | UI playhead/scrub | runtime-only cursor; never authoritative editorial state |
 
 Rules:
 
-1. A saved edit must become a derived `virtual_shot_id` or a Story row that references a `virtual_shot_id`.
-2. Playback/export must resolve source clip, frame range and FPS from Rust API + SQLite, not from client-only state.
-3. FPS is source-file metadata. Project/timeline FPS is only the editorial timeline timebase and must not replace source FPS for source playback.
-4. If client and host disagree, host database wins; client state is discarded/reloaded.
+1. A saved Virtual-tab edit must become a derived `virtual_shot_id`.
+2. A saved Segment-tab edit must become a durable virtual segment in `story_parts`; it does not have to create or reference a derived `virtual_shot_id`.
+3. Playback/export must resolve source clip, frame range and FPS from Rust API + SQLite, not from client-only state.
+4. FPS is source-file metadata from probe/DB. Project/export FPS is only an export setting and must not set source, virtual-shot, Segment/Story timeline, marker, slot, or playback math.
+5. News export may be p50 or i50; `fps=25 + upper_first + i50` is interlaced 50-field delivery, not p25. Progressive 25 export is allowed only as explicit Telekino PsF25.
+6. If client and host disagree, host database wins; client state is discarded/reloaded.
 
 ---
 

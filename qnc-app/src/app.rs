@@ -4,25 +4,45 @@ use eframe::egui::{self, Color32, RichText};
 use serde_json::Value;
 
 use crate::api::{self, HostClient, ProjectRow, Workspace};
+use crate::component_errors::{ComponentErrorBoundary, ComponentErrorKey};
+use crate::component_runtime::{ComponentBackendCommand, ComponentBackendRuntime};
+use crate::components::{
+    EditorialEditComponent, EditorialEditData, EditorialEditKind, EditorialStateComponent,
+    EditorialStateData, FilesystemListComponent, ProjectCatalogComponent, ProjectCommandComponent,
+    ProjectCommandData, ProjectCommandKind, ProjectRegistryComponent, ShellStateComponent,
+    ShellStateData, ShortcutBindingsComponent, ShortcutBindingsData, SourceImportCommandComponent,
+    SourceImportCommandKind, SourceImportSelectionComponent, SourceImportStateComponent,
+    SourceImportStateKind, ThemePickerComponent,
+};
 use crate::composition::{ScreenComposition, WorkflowScreen};
 use crate::ingest::IngestScreen;
 use crate::media_assist::MediaAssistScreen;
+use crate::playback_routing::PlaybackTransportIntent;
 use crate::playback_stack::PlaybackStack;
 use crate::player_bridge;
 use crate::project::{ProjectAction, ProjectScreen};
-use crate::qnc_broadcast_player::BroadcastPlayerRx;
-use crate::qnc_theme::{self, ThemeId};
+use crate::qnc_broadcast_player::{BroadcastPlayerRx, PlayerEvent};
+use crate::qnc_theme;
+use crate::shortcuts::{PROJECT_SHORTCUT_SCOPE, STORYBOARD_SHORTCUT_SCOPE};
 use crate::story::StoryScreen;
 
+const FS_INSTANCE_PROJECTS_ROOT: &str = "settings.storage.projects_root";
+const FS_INSTANCE_EXPORT_DIR: &str = "settings.export.directory";
+const FS_INSTANCE_IMPORT_SOURCE: &str = "source.import.location";
+const EDITORIAL_INSTANCE_STORY: &str = "story";
+const EDITORIAL_INSTANCE_MEDIA_ASSIST: &str = "media_assist";
+const SHORTCUT_INSTANCE_INGEST: &str = "ingest";
+const SHORTCUT_INSTANCE_PROJECT: &str = "project";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum Phase {
+pub(crate) enum Phase {
     HostGate,
     ProjectOnly,
     Workspace,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum Screen {
+pub(crate) enum Screen {
     Project,
     Ingest,
     MediaAssist,
@@ -34,17 +54,22 @@ enum Screen {
 enum WorkflowGo<'a> {
     /// Explicit tab id (footer).
     Tab(&'a str),
-    /// First workflow tab after open (`workspace.tabs` entry).
+    /// First workflow tab after open (DB workflow entry step).
     Entry,
-    /// Next tab after `from` in `workspace.tabs`.
+    /// Next tab after `from` in DB workflow step graph.
     Next { from: &'a str },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum WorkspaceGo {
+    Entry,
 }
 
 pub struct QncApp {
     host: HostClient,
     host_url_edit: String,
-    phase: Phase,
-    screen: Screen,
+    pub(crate) phase: Phase,
+    pub(crate) screen: Screen,
     status: String,
     error: Option<String>,
     health_ok: bool,
@@ -58,14 +83,17 @@ pub struct QncApp {
     /// One-shot maximize — belt-and-suspenders if ViewportBuilder missed it (any OS).
     maximize_once: bool,
     project_ui: ProjectScreen,
-    ingest: IngestScreen,
-    media_assist: MediaAssistScreen,
-    story: StoryScreen,
+    pub(crate) ingest: IngestScreen,
+    pub(crate) media_assist: MediaAssistScreen,
+    pub(crate) story: StoryScreen,
     /// Sole broadcast player (+ carrier / monitor). Screens only host the UI slots.
-    playback: PlaybackStack,
+    pub(crate) playback: PlaybackStack,
     playback_rx: BroadcastPlayerRx,
-    /// User-selected UI theme (host SQLite `ui_appearance_user`).
-    theme_id: ThemeId,
+    component_backend: ComponentBackendRuntime,
+    component_errors: ComponentErrorBoundary,
+    theme_picker: ThemePickerComponent,
+    next_project_request_id: u64,
+    pending_workspace_go: Option<WorkspaceGo>,
 }
 
 impl QncApp {
@@ -110,7 +138,11 @@ impl QncApp {
             story: StoryScreen::story(),
             playback,
             playback_rx,
-            theme_id: ThemeId::Dark,
+            component_backend: ComponentBackendRuntime::new(),
+            component_errors: ComponentErrorBoundary::default(),
+            theme_picker: ThemePickerComponent::default(),
+            next_project_request_id: 1,
+            pending_workspace_go: None,
         }
     }
 
@@ -128,139 +160,164 @@ impl QncApp {
         }
     }
 
-    fn connect_and_load(&mut self) {
+    fn connect_and_load(&mut self, ctx: Option<egui::Context>) {
         self.error = None;
         self.host.set_base_url(&self.host_url_edit);
-        match self.host.health() {
-            Ok(h) if h.status == "ok" || !h.status.is_empty() => {
-                self.health_ok = true;
-                self.status = format!("Host OK ({})", h.status);
-                if let Ok(rt) = self.host.runtime() {
-                    let port = rt
-                        .get("api_port")
-                        .and_then(|v| v.as_u64())
-                        .map(|p| p.to_string())
-                        .unwrap_or_else(|| "?".into());
-                    let plugins = rt
-                        .get("plugins_loaded_count")
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or(0);
-                    self.playback.player_mut().configure_runtime_profile(&rt);
-                    self.runtime_summary = format!("port={port}  plugins={plugins}");
-                } else {
-                    self.runtime_summary.clear();
-                }
-                self.reload_projects();
-                self.project_ui.reload_meta(&self.host);
-                self.load_appearance();
-                if self.phase == Phase::HostGate {
-                    self.phase = Phase::ProjectOnly;
-                    self.screen = Screen::Project;
-                }
-            }
-            Ok(h) => {
-                self.health_ok = false;
-                self.phase = Phase::HostGate;
-                self.error = Some(format!("Unexpected health status: {}", h.status));
-                self.status = "HostDisconnected".into();
-            }
-            Err(e) => {
-                self.health_ok = false;
-                self.phase = Phase::HostGate;
-                self.error = Some(e);
-                self.status = "HostDisconnected".into();
-                self.projects.clear();
-            }
-        }
+        self.status = "Connecting…".into();
+        self.submit_shell_state_command(ShellStateComponent::health(), ctx);
     }
 
-    fn load_appearance(&mut self) {
-        match self.host.appearance_user() {
-            Ok(v) => {
-                let id = v
-                    .get("user")
-                    .and_then(|u| u.get("theme_id"))
-                    .or_else(|| v.get("theme_id"))
-                    .and_then(|x| x.as_str())
-                    .and_then(ThemeId::parse)
-                    .unwrap_or_default();
-                self.theme_id = id;
-            }
-            Err(_e) => {
-                // Keep current theme; host may be older without this route.
-            }
-        }
+    fn load_appearance(&mut self, ctx: Option<egui::Context>) {
+        self.submit_shell_state_command(ShellStateComponent::appearance(), ctx);
     }
 
     fn apply_theme(&self, ctx: &egui::Context) {
-        let tokens = self.theme_id.tokens();
-        qnc_theme::set_active(ctx, self.theme_id);
+        let theme = self.theme_picker.active();
+        let tokens = theme.tokens();
+        qnc_theme::set_active(ctx, theme);
         qnc_theme::apply_egui_visuals(ctx, &tokens);
     }
 
-    fn reload_projects(&mut self) {
-        match self.host.list_projects() {
-            Ok(list) => {
-                self.projects = list.projects;
-                self.active_project_id = list.active_project_id;
-                if self.selected_index.is_none() && !self.projects.is_empty() {
-                    let prefer = self
-                        .projects
-                        .iter()
-                        .position(|p| p.project_id == self.active_project_id);
-                    self.selected_index = Some(prefer.unwrap_or(0));
-                }
-                if let Some(idx) = self.selected_index {
-                    if idx >= self.projects.len() {
-                        self.selected_index = if self.projects.is_empty() {
-                            None
-                        } else {
-                            Some(0)
-                        };
-                    }
-                }
-                self.status = format!("{} project(s)", self.projects.len());
-            }
-            Err(e) => {
-                self.error = Some(e);
-            }
+    fn global_error_message(&self) -> Option<String> {
+        self.error
+            .clone()
+            .or_else(|| self.component_errors.last_message())
+    }
+
+    fn short_error_label(message: &str) -> String {
+        const MAX_CHARS: usize = 96;
+        if message.chars().count() <= MAX_CHARS {
+            return message.to_string();
+        }
+        let mut out: String = message.chars().take(MAX_CHARS.saturating_sub(3)).collect();
+        out.push_str("...");
+        out
+    }
+
+    fn load_project_list(&mut self, ctx: Option<egui::Context>) {
+        let command = ProjectRegistryComponent::list_projects();
+        if let Err(e) = self.submit_component_backend_command(command, ctx) {
+            self.error = Some(e);
         }
     }
 
-    fn open_project_id(&mut self, project_id: &str) {
+    fn apply_project_list(&mut self, list: crate::api::ProjectsList) {
+        self.projects = list.projects;
+        self.active_project_id = list.active_project_id;
+        let active_index = self
+            .projects
+            .iter()
+            .position(|p| p.project_id == self.active_project_id);
+        if active_index.is_some() || (self.selected_index.is_none() && !self.projects.is_empty()) {
+            self.selected_index = Some(active_index.unwrap_or(0));
+        }
+        if let Some(idx) = self.selected_index {
+            if idx >= self.projects.len() {
+                self.selected_index = if self.projects.is_empty() {
+                    None
+                } else {
+                    Some(0)
+                };
+            }
+        }
+        self.status = format!("{} project(s)", self.projects.len());
+    }
+
+    fn next_project_request_id(&mut self) -> u64 {
+        let id = self.next_project_request_id;
+        self.next_project_request_id = self.next_project_request_id.saturating_add(1);
+        id
+    }
+
+    fn submit_component_backend_command(
+        &mut self,
+        command: ComponentBackendCommand,
+        ctx: Option<egui::Context>,
+    ) -> Result<u64, String> {
+        let key = ComponentErrorKey::from_command(&command);
+        self.component_backend
+            .submit(&self.host, command, ctx)
+            .map_err(|e| self.record_component_error(key, e))
+    }
+
+    fn record_component_error(
+        &mut self,
+        key: ComponentErrorKey,
+        error: impl Into<String>,
+    ) -> String {
+        let error = error.into();
+        self.component_errors.record(key, error.clone());
+        error
+    }
+
+    fn clear_component_error(&mut self, key: &ComponentErrorKey) {
+        self.component_errors.clear(key);
+    }
+
+    fn submit_shell_state_command(
+        &mut self,
+        command: ComponentBackendCommand,
+        ctx: Option<egui::Context>,
+    ) {
+        if let Err(e) = self.submit_component_backend_command(command, ctx) {
+            self.error = Some(e);
+        }
+    }
+
+    fn submit_project_command(
+        &mut self,
+        command: ComponentBackendCommand,
+        ctx: Option<egui::Context>,
+    ) {
+        if let Err(e) = self.submit_component_backend_command(command, ctx) {
+            self.error = Some(e);
+        }
+    }
+
+    fn request_workspace(
+        &mut self,
+        project_id: &str,
+        followup: Option<WorkspaceGo>,
+        ctx: Option<egui::Context>,
+    ) {
+        if project_id.trim().is_empty() {
+            return;
+        }
+        if followup.is_some() {
+            self.pending_workspace_go = followup;
+        }
+        self.submit_shell_state_command(ShellStateComponent::workspace(project_id), ctx);
+    }
+
+    fn apply_open_project(
+        &mut self,
+        project: ProjectRow,
+        active_project_id: String,
+        ctx: Option<egui::Context>,
+    ) {
+        let name = project.name.clone();
+        let project_id = project.project_id.clone();
+        self.active_project_id = active_project_id;
+        self.open_project = Some(project);
+        self.workspace = None;
+        self.ingest = IngestScreen::default();
+        self.story.reset_session(&self.host);
+        self.story = StoryScreen::story();
+        self.media_assist.reset_session(&self.host);
+        self.media_assist = StoryScreen::media_assist();
+        self.playback.stop();
+        self.status = format!("Opening {name}…");
+        self.request_workspace(&project_id, Some(WorkspaceGo::Entry), ctx);
+    }
+
+    fn open_project_id(&mut self, project_id: &str, ctx: Option<egui::Context>) {
         self.error = None;
-        match self.host.open_project(project_id) {
-            Ok((project, active)) => {
-                self.active_project_id = active;
-                self.open_project = Some(project.clone());
-                self.ingest = IngestScreen::default();
-                self.story.reset_session(&self.host);
-                self.story = StoryScreen::story();
-                self.media_assist.reset_session(&self.host);
-                self.media_assist = StoryScreen::media_assist();
-                self.playback.stop();
-                match self.host.workspace(&project.project_id) {
-                    Ok(ws) => {
-                        self.workspace = Some(ws);
-                        self.phase = Phase::Workspace;
-                        if let Some(entry) = self.go_workflow(WorkflowGo::Entry) {
-                            self.status = format!("Opened {} → entry `{entry}`", project.name);
-                        }
-                    }
-                    Err(e) => {
-                        self.error = Some(e);
-                        self.phase = Phase::ProjectOnly;
-                        self.screen = Screen::Project;
-                    }
-                }
-            }
-            Err(e) => {
-                self.error = Some(e);
-            }
-        }
+        let command =
+            ProjectCommandComponent::open_project(self.next_project_request_id(), project_id);
+        self.submit_project_command(command, ctx);
     }
 
-    fn open_selected(&mut self) {
+    fn open_selected(&mut self, ctx: Option<egui::Context>) {
         let Some(idx) = self.selected_index else {
             self.error = Some("Select a project first.".into());
             return;
@@ -269,7 +326,7 @@ impl QncApp {
             self.error = Some("Invalid selection.".into());
             return;
         };
-        self.open_project_id(&row.project_id);
+        self.open_project_id(&row.project_id, ctx);
     }
 
     fn close_project(&mut self) {
@@ -288,25 +345,23 @@ impl QncApp {
         };
         self.screen = Screen::Project;
         self.status = "Project closed (local UI; host active id unchanged)".into();
-        self.project_ui.ensure_loaded(&self.host);
     }
 
     /// Single workflow navigation — Project open, footer, Uvezi all use this.
     fn go_workflow(&mut self, go: WorkflowGo<'_>) -> Option<String> {
-        match go {
-            WorkflowGo::Tab(_) => {}
-            WorkflowGo::Entry | WorkflowGo::Next { .. } => self.reload_workspace(),
-        }
-        let tabs = self
-            .workspace
-            .as_ref()
-            .map(|w| w.tabs.clone())
-            .unwrap_or_default();
         let tab = match go {
             WorkflowGo::Tab(t) => t.to_string(),
-            WorkflowGo::Entry => api::workflow_entry_tab(&tabs),
+            WorkflowGo::Entry => self
+                .workspace
+                .as_ref()
+                .map(api::workflow_entry_tab)
+                .unwrap_or_else(|| "project".into()),
             WorkflowGo::Next { from } => {
-                let Some(next) = api::workflow_next_tab(&tabs, from) else {
+                let Some(next) = self
+                    .workspace
+                    .as_ref()
+                    .and_then(|workspace| api::workflow_next_tab(workspace, from))
+                else {
                     self.status = "Nema sljedećeg workflow taba.".into();
                     return None;
                 };
@@ -317,13 +372,11 @@ impl QncApp {
         Some(tab)
     }
 
-    fn reload_workspace(&mut self) {
+    fn reload_workspace(&mut self, ctx: Option<egui::Context>) {
         let Some(pid) = self.open_project.as_ref().map(|p| p.project_id.clone()) else {
             return;
         };
-        if let Ok(ws) = self.host.workspace(&pid) {
-            self.workspace = Some(ws);
-        }
+        self.request_workspace(&pid, None, ctx);
     }
 
     fn activate_screen(&mut self, tab: &str) {
@@ -353,53 +406,385 @@ impl QncApp {
         self.on_screen_entered();
     }
 
-    fn dispatch_ingest(&mut self, pid: &str, action: crate::ingest::IngestAction) {
-        let advance = matches!(action, crate::ingest::IngestAction::ImportSelected);
+    fn dispatch_ingest(
+        &mut self,
+        pid: &str,
+        action: crate::ingest::IngestAction,
+        ctx: &egui::Context,
+    ) {
+        match action {
+            crate::ingest::IngestAction::CueFrame(frame) => {
+                self.playback_transport_cue_frame(frame);
+                return;
+            }
+            crate::ingest::IngestAction::TogglePlay => {
+                self.playback_transport_toggle();
+                return;
+            }
+            crate::ingest::IngestAction::RequestState(project_id) => {
+                self.load_ingest_state(&project_id, Some(ctx.clone()));
+                return;
+            }
+            crate::ingest::IngestAction::RequestDirList(path) => {
+                self.load_ingest_dir_browser(&path, Some(ctx.clone()));
+                return;
+            }
+            crate::ingest::IngestAction::Reload => {
+                self.load_ingest_state(pid, Some(ctx.clone()));
+                return;
+            }
+            crate::ingest::IngestAction::ConfirmDir => {
+                match self.ingest.confirm_dir_path() {
+                    Ok(path) => self.browse_import_source(pid, &path, Some(ctx.clone())),
+                    Err(e) => self.error = Some(e),
+                }
+                return;
+            }
+            crate::ingest::IngestAction::BrowsePath => {
+                match self.ingest.browse_path_candidate() {
+                    Ok(path) => self.browse_import_source(pid, &path, Some(ctx.clone())),
+                    Err(e) => self.error = Some(e),
+                }
+                return;
+            }
+            crate::ingest::IngestAction::Discover => {
+                self.submit_source_import_command(
+                    pid,
+                    SourceImportCommandComponent::discover(pid),
+                    Some(ctx.clone()),
+                );
+                return;
+            }
+            crate::ingest::IngestAction::SelectAll => {
+                self.submit_source_import_command(
+                    pid,
+                    SourceImportCommandComponent::select_all(pid),
+                    Some(ctx.clone()),
+                );
+                return;
+            }
+            crate::ingest::IngestAction::ClearSelection => {
+                self.submit_source_import_command(
+                    pid,
+                    SourceImportCommandComponent::clear_selection(pid),
+                    Some(ctx.clone()),
+                );
+                return;
+            }
+            crate::ingest::IngestAction::SetArchive(archive_original) => {
+                self.ingest.set_archive_draft(archive_original);
+                self.submit_source_import_command(
+                    pid,
+                    SourceImportCommandComponent::set_archive_original(pid, archive_original),
+                    Some(ctx.clone()),
+                );
+                return;
+            }
+            crate::ingest::IngestAction::ImportSelected => {
+                if self.ingest.selected_clip_count() == 0 {
+                    self.error = Some("Nema odabranih klipova.".into());
+                    return;
+                }
+                self.submit_source_import_command(
+                    pid,
+                    SourceImportCommandComponent::import_selected(pid, &[]),
+                    Some(ctx.clone()),
+                );
+                return;
+            }
+            crate::ingest::IngestAction::Toggle(clip_id) => {
+                self.ingest.activate_preview_clip(pid, &clip_id);
+                if let Some(frame) = self.ingest.transport_cue_frame() {
+                    self.playback_transport_cue_frame(frame);
+                }
+                self.toggle_import_selection(pid, &clip_id, Some(ctx.clone()));
+                return;
+            }
+            _ => {}
+        }
+        let cue_after_dispatch = matches!(
+            &action,
+            crate::ingest::IngestAction::Toggle(_) | crate::ingest::IngestAction::FocusPreview(_)
+        );
         if let Err(e) = self.ingest.dispatch(&self.host, pid, action) {
             self.error = Some(e);
-        } else if advance {
-            if let Some(next) = self.go_workflow(WorkflowGo::Next { from: "ingest" }) {
-                self.status = format!("Uvoz pokrenut → {next}");
+        } else {
+            if cue_after_dispatch {
+                if let Some(frame) = self.ingest.transport_cue_frame() {
+                    self.playback_transport_cue_frame(frame);
+                }
             }
         }
     }
 
     fn on_screen_entered(&mut self) {
-        if matches!(self.screen, Screen::Project) {
-            self.project_ui.ensure_loaded(&self.host);
-        }
         let Some(p) = self.open_project.clone() else {
             return;
         };
         match self.screen {
             Screen::Ingest => self.ingest.ensure_loaded(&self.host, &p.project_id),
-            Screen::MediaAssist => self.media_assist.ensure_loaded(&self.host, &p.project_id),
-            Screen::Story => self.story.ensure_loaded(&self.host, &p.project_id),
             _ => {}
         }
     }
 
-    fn load_project_root_browser(&mut self, path: &str) {
-        match self.host.fs_list(path) {
-            Ok(list) => self.project_ui.apply_projects_root_listing(
-                list.roots,
-                list.path,
-                list.parent,
-                list.entries,
-            ),
-            Err(e) => self.project_ui.set_projects_root_browser_error(e),
+    fn request_editorial_state_if_needed(
+        &mut self,
+        instance_id: &str,
+        project_id: &str,
+        ctx: Option<egui::Context>,
+    ) {
+        let needs_load = match instance_id {
+            EDITORIAL_INSTANCE_STORY => self.story.needs_meta_load(project_id),
+            EDITORIAL_INSTANCE_MEDIA_ASSIST => self.media_assist.needs_meta_load(project_id),
+            _ => false,
+        };
+        if needs_load {
+            self.load_editorial_state(instance_id, project_id, ctx);
         }
     }
 
-    fn load_export_dir_browser(&mut self, path: &str) {
-        match self.host.fs_list(path) {
-            Ok(list) => self.project_ui.apply_export_dir_listing(
-                list.roots,
-                list.path,
-                list.parent,
-                list.entries,
-            ),
-            Err(e) => self.project_ui.set_export_dir_browser_error(e),
+    fn load_editorial_state(
+        &mut self,
+        instance_id: &str,
+        project_id: &str,
+        ctx: Option<egui::Context>,
+    ) {
+        if project_id.trim().is_empty() {
+            return;
+        }
+        let commands = EditorialStateComponent::load_all(instance_id, project_id);
+        match instance_id {
+            EDITORIAL_INSTANCE_STORY => self.story.begin_meta_load(project_id, commands.len()),
+            EDITORIAL_INSTANCE_MEDIA_ASSIST => self
+                .media_assist
+                .begin_meta_load(project_id, commands.len()),
+            _ => return,
+        }
+        for command in commands {
+            if let Err(e) = self.submit_component_backend_command(command, ctx.clone()) {
+                self.set_editorial_state_error(instance_id, project_id, e);
+            }
+        }
+    }
+
+    fn load_editorial_timeline_model(
+        &mut self,
+        instance_id: &str,
+        project_id: &str,
+        ctx: Option<egui::Context>,
+    ) {
+        if project_id.trim().is_empty() {
+            return;
+        }
+        let commands = [
+            EditorialStateComponent::load_timeline_model(instance_id, project_id),
+            EditorialStateComponent::load_playlist(instance_id, project_id),
+        ];
+        for command in commands {
+            if let Err(e) = self.submit_component_backend_command(command, ctx.clone()) {
+                self.set_editorial_state_error(instance_id, project_id, e);
+            }
+        }
+    }
+
+    fn submit_editorial_backend_commands(&mut self, instance_id: &str, ctx: Option<egui::Context>) {
+        let commands = match instance_id {
+            EDITORIAL_INSTANCE_STORY => self.story.drain_backend_commands(),
+            EDITORIAL_INSTANCE_MEDIA_ASSIST => self.media_assist.drain_backend_commands(),
+            _ => Vec::new(),
+        };
+        for command in commands {
+            if let Err(e) = self.submit_component_backend_command(command, ctx.clone()) {
+                self.set_editorial_edit_error(instance_id, "", EditorialEditKind::Commit, e);
+            }
+        }
+    }
+
+    fn set_editorial_state_error(
+        &mut self,
+        instance_id: &str,
+        project_id: &str,
+        error: impl Into<String>,
+    ) {
+        match instance_id {
+            EDITORIAL_INSTANCE_STORY => self.story.set_editorial_meta_error(project_id, error),
+            EDITORIAL_INSTANCE_MEDIA_ASSIST => self
+                .media_assist
+                .set_editorial_meta_error(project_id, error),
+            _ => self.error = Some(error.into()),
+        }
+    }
+
+    fn set_editorial_edit_error(
+        &mut self,
+        instance_id: &str,
+        project_id: &str,
+        kind: EditorialEditKind,
+        error: impl Into<String>,
+    ) {
+        match instance_id {
+            EDITORIAL_INSTANCE_STORY => {
+                self.story.set_editorial_edit_error(project_id, kind, error)
+            }
+            EDITORIAL_INSTANCE_MEDIA_ASSIST => self
+                .media_assist
+                .set_editorial_edit_error(project_id, kind, error),
+            _ => self.error = Some(error.into()),
+        }
+    }
+
+    fn request_shortcuts_if_needed(&mut self, instance_id: &str, ctx: Option<egui::Context>) {
+        let needs_load = match instance_id {
+            SHORTCUT_INSTANCE_PROJECT => self.project_ui.needs_shortcuts_load(),
+            EDITORIAL_INSTANCE_STORY => self.story.needs_shortcuts_load(),
+            EDITORIAL_INSTANCE_MEDIA_ASSIST => self.media_assist.needs_shortcuts_load(),
+            SHORTCUT_INSTANCE_INGEST => self.ingest.needs_shortcuts_load(),
+            _ => false,
+        };
+        if needs_load {
+            let scope = match instance_id {
+                SHORTCUT_INSTANCE_PROJECT => PROJECT_SHORTCUT_SCOPE,
+                _ => STORYBOARD_SHORTCUT_SCOPE,
+            };
+            self.load_shortcuts(instance_id, scope, ctx);
+        }
+    }
+
+    fn load_shortcuts(&mut self, instance_id: &str, scope: &str, ctx: Option<egui::Context>) {
+        let commands = ShortcutBindingsComponent::load_all(instance_id, scope);
+        match instance_id {
+            SHORTCUT_INSTANCE_PROJECT => self.project_ui.begin_shortcuts_load(commands.len()),
+            EDITORIAL_INSTANCE_STORY => self.story.begin_shortcuts_load(commands.len()),
+            EDITORIAL_INSTANCE_MEDIA_ASSIST => {
+                self.media_assist.begin_shortcuts_load(commands.len())
+            }
+            SHORTCUT_INSTANCE_INGEST => self.ingest.begin_shortcuts_load(commands.len()),
+            _ => return,
+        }
+        for command in commands {
+            if let Err(e) = self.submit_component_backend_command(command, ctx.clone()) {
+                self.set_shortcuts_error(instance_id, scope, "catalog", e);
+            }
+        }
+    }
+
+    fn set_shortcuts_error(
+        &mut self,
+        instance_id: &str,
+        scope: &str,
+        port_id: &str,
+        error: impl Into<String>,
+    ) {
+        match instance_id {
+            SHORTCUT_INSTANCE_PROJECT => self.project_ui.set_shortcuts_error(scope, port_id, error),
+            EDITORIAL_INSTANCE_STORY => self.story.set_shortcuts_error(scope, port_id, error),
+            EDITORIAL_INSTANCE_MEDIA_ASSIST => {
+                self.media_assist.set_shortcuts_error(scope, port_id, error)
+            }
+            SHORTCUT_INSTANCE_INGEST => self.ingest.set_shortcuts_error(scope, port_id, error),
+            _ => self.error = Some(error.into()),
+        }
+    }
+
+    fn request_project_meta_if_needed(&mut self, ctx: Option<egui::Context>) {
+        if self.project_ui.needs_meta_load() {
+            self.load_project_meta(ctx);
+        }
+    }
+
+    fn load_project_meta(&mut self, ctx: Option<egui::Context>) {
+        let commands = ProjectCatalogComponent::load_all();
+        self.project_ui.begin_meta_load(commands.len());
+        for command in commands {
+            if let Err(e) = self.submit_component_backend_command(command, ctx.clone()) {
+                self.project_ui.set_meta_error(e);
+            }
+        }
+    }
+
+    fn load_project_root_browser(&mut self, path: &str, ctx: Option<egui::Context>) {
+        self.project_ui.projects_root_browser_busy = true;
+        self.project_ui.projects_root_browser_error = None;
+        let command = FilesystemListComponent::load(FS_INSTANCE_PROJECTS_ROOT, path);
+        if let Err(e) = self.submit_component_backend_command(command, ctx) {
+            self.project_ui.set_projects_root_browser_error(e);
+        }
+    }
+
+    fn load_export_dir_browser(&mut self, path: &str, ctx: Option<egui::Context>) {
+        self.project_ui.export_dir_browser_busy = true;
+        self.project_ui.export_dir_browser_error = None;
+        let command = FilesystemListComponent::load(FS_INSTANCE_EXPORT_DIR, path);
+        if let Err(e) = self.submit_component_backend_command(command, ctx) {
+            self.project_ui.set_export_dir_browser_error(e);
+        }
+    }
+
+    fn load_ingest_dir_browser(&mut self, path: &str, ctx: Option<egui::Context>) {
+        self.ingest.begin_dir_listing(path);
+        let command = FilesystemListComponent::load(FS_INSTANCE_IMPORT_SOURCE, path);
+        if let Err(e) = self.submit_component_backend_command(command, ctx) {
+            self.ingest.set_dir_listing_error(e);
+        }
+    }
+
+    fn load_ingest_state(&mut self, project_id: &str, ctx: Option<egui::Context>) {
+        if project_id.trim().is_empty() {
+            return;
+        }
+        self.ingest.begin_state_load(project_id);
+        let command = SourceImportStateComponent::load(project_id);
+        if let Err(e) = self.submit_component_backend_command(command, ctx) {
+            self.ingest.set_state_error(e);
+        }
+    }
+
+    fn poll_ingest_state(&mut self, project_id: &str, ctx: Option<egui::Context>) {
+        if project_id.trim().is_empty() {
+            return;
+        }
+        self.ingest.begin_state_poll(project_id);
+        let command = SourceImportStateComponent::poll(project_id);
+        if let Err(e) = self.submit_component_backend_command(command, ctx) {
+            self.ingest.set_state_error(e);
+        }
+    }
+
+    fn toggle_import_selection(
+        &mut self,
+        project_id: &str,
+        clip_id: &str,
+        ctx: Option<egui::Context>,
+    ) {
+        if project_id.trim().is_empty() || clip_id.trim().is_empty() {
+            return;
+        }
+        let command = SourceImportSelectionComponent::toggle(project_id, clip_id);
+        if let Err(e) = self.submit_component_backend_command(command, ctx) {
+            self.error = Some(e);
+        }
+    }
+
+    fn browse_import_source(&mut self, project_id: &str, path: &str, ctx: Option<egui::Context>) {
+        self.submit_source_import_command(
+            project_id,
+            SourceImportCommandComponent::browse(project_id, path),
+            ctx,
+        );
+    }
+
+    fn submit_source_import_command(
+        &mut self,
+        project_id: &str,
+        command: ComponentBackendCommand,
+        ctx: Option<egui::Context>,
+    ) {
+        if project_id.trim().is_empty() {
+            return;
+        }
+        self.ingest.begin_import_command(project_id);
+        if let Err(e) = self.submit_component_backend_command(command, ctx) {
+            self.ingest.set_state_error(e);
         }
     }
 
@@ -412,14 +797,14 @@ impl QncApp {
         }
     }
 
-    fn dispatch_project(&mut self, action: ProjectAction) {
+    fn dispatch_project(&mut self, action: ProjectAction, ctx: &egui::Context) {
         match action {
             ProjectAction::None => {}
             ProjectAction::Reload => {
-                self.reload_projects();
-                self.project_ui.reload_meta(&self.host);
+                self.load_project_list(Some(ctx.clone()));
+                self.load_project_meta(Some(ctx.clone()));
             }
-            ProjectAction::OpenSelected => self.open_selected(),
+            ProjectAction::OpenSelected => self.open_selected(Some(ctx.clone())),
             ProjectAction::Create => {
                 let name = self.project_ui.new_name.trim().to_string();
                 let tpl = self.project_ui.selected_template_id.clone();
@@ -427,25 +812,22 @@ impl QncApp {
                     self.error = Some("Unesi ime projekta.".into());
                     return;
                 }
-                let _ = self.host.save_ui_state(serde_json::json!({
-                    "selected_template_id": tpl,
-                    "project_name": name,
-                }));
-                match self.host.create_from_template(&name, &tpl) {
-                    Ok((project, _)) => {
-                        self.project_ui.new_name.clear();
-                        self.reload_projects();
-                        if let Some(i) = self
-                            .projects
-                            .iter()
-                            .position(|p| p.project_id == project.project_id)
-                        {
-                            self.selected_index = Some(i);
-                        }
-                        self.open_project_id(&project.project_id);
-                    }
-                    Err(e) => self.error = Some(e),
-                }
+                let save_draft = ProjectCommandComponent::save_ui_state(
+                    self.next_project_request_id(),
+                    "project.create.draft",
+                    serde_json::json!({
+                        "selected_template_id": tpl.clone(),
+                        "project_name": name.clone(),
+                    }),
+                );
+                self.submit_project_command(save_draft, Some(ctx.clone()));
+                let create = ProjectCommandComponent::create_from_template(
+                    self.next_project_request_id(),
+                    &name,
+                    &tpl,
+                );
+                self.submit_project_command(create, Some(ctx.clone()));
+                self.status = format!("Creating project {name}…");
             }
             ProjectAction::DeleteSelected => {
                 let Some(idx) = self.selected_index else {
@@ -454,28 +836,13 @@ impl QncApp {
                 let Some(row) = self.projects.get(idx).cloned() else {
                     return;
                 };
-                match self.host.delete_projects(&[row.project_id.clone()]) {
-                    Ok(list) => {
-                        if self
-                            .open_project
-                            .as_ref()
-                            .map(|p| p.project_id == row.project_id)
-                            .unwrap_or(false)
-                        {
-                            self.close_project();
-                        }
-                        self.projects = list.projects;
-                        self.active_project_id = list.active_project_id;
-                        self.selected_index = if self.projects.is_empty() {
-                            None
-                        } else {
-                            Some(0)
-                        };
-                        self.status = format!("Deleted {}", row.name);
-                        self.project_ui.message = Some(format!("Obrisan {}", row.name));
-                    }
-                    Err(e) => self.error = Some(e),
-                }
+                let command = ProjectCommandComponent::delete_projects(
+                    self.next_project_request_id(),
+                    &[row.project_id.clone()],
+                    &row.project_id,
+                );
+                self.submit_project_command(command, Some(ctx.clone()));
+                self.status = format!("Deleting {}…", row.name);
             }
             ProjectAction::ToggleProjectsRootBrowser => {
                 let opening = !self.project_ui.projects_root_browser_open;
@@ -485,10 +852,7 @@ impl QncApp {
                         == crate::qnc_location_browser::LocationSourceKind::Local
                 {
                     let start = Self::browser_start_path(&self.project_ui.projects_root_draft);
-                    self.load_project_root_browser(&start);
-                    if self.project_ui.projects_root_browser_error.is_some() {
-                        self.load_project_root_browser("");
-                    }
+                    self.load_project_root_browser(&start, Some(ctx.clone()));
                 }
             }
             ProjectAction::SelectProjectsRootKind(kind) => {
@@ -497,14 +861,14 @@ impl QncApp {
                     && self.project_ui.projects_root_browser_entries.is_empty()
                     && self.project_ui.projects_root_browser_path.trim().is_empty()
                 {
-                    self.load_project_root_browser("");
+                    self.load_project_root_browser("", Some(ctx.clone()));
                 }
             }
             ProjectAction::OpenProjectsRootPath(path) => {
                 if self.project_ui.projects_root_browser_kind
                     == crate::qnc_location_browser::LocationSourceKind::Local
                 {
-                    self.load_project_root_browser(&path);
+                    self.load_project_root_browser(&path, Some(ctx.clone()));
                 }
             }
             ProjectAction::ConfirmProjectsRootBrowser => {
@@ -514,17 +878,13 @@ impl QncApp {
                     .trim()
                     .to_string();
                 if !path.is_empty() {
-                    match self
-                        .host
-                        .save_settings_path("storage.projects_root", Value::String(path.clone()))
-                    {
-                        Ok(ui) => {
-                            self.project_ui.apply_ui_state(ui);
-                            self.project_ui.projects_root_browser_open = false;
-                            self.project_ui.message = Some(format!("Projects root → {path}"));
-                        }
-                        Err(e) => self.error = Some(e),
-                    }
+                    let command = ProjectCommandComponent::save_settings_path(
+                        self.next_project_request_id(),
+                        &format!("projects_root:{path}"),
+                        "storage.projects_root",
+                        Value::String(path.clone()),
+                    );
+                    self.submit_project_command(command, Some(ctx.clone()));
                 }
             }
             ProjectAction::CancelProjectsRootBrowser => {
@@ -538,10 +898,7 @@ impl QncApp {
                         == crate::qnc_location_browser::LocationSourceKind::Local
                 {
                     let start = Self::browser_start_path(&self.project_ui.export_dir_draft);
-                    self.load_export_dir_browser(&start);
-                    if self.project_ui.export_dir_browser_error.is_some() {
-                        self.load_export_dir_browser("");
-                    }
+                    self.load_export_dir_browser(&start, Some(ctx.clone()));
                 }
             }
             ProjectAction::SelectExportDirKind(kind) => {
@@ -550,30 +907,26 @@ impl QncApp {
                     && self.project_ui.export_dir_browser_entries.is_empty()
                     && self.project_ui.export_dir_browser_path.trim().is_empty()
                 {
-                    self.load_export_dir_browser("");
+                    self.load_export_dir_browser("", Some(ctx.clone()));
                 }
             }
             ProjectAction::OpenExportDirPath(path) => {
                 if self.project_ui.export_dir_browser_kind
                     == crate::qnc_location_browser::LocationSourceKind::Local
                 {
-                    self.load_export_dir_browser(&path);
+                    self.load_export_dir_browser(&path, Some(ctx.clone()));
                 }
             }
             ProjectAction::ConfirmExportDirBrowser => {
                 let path = self.project_ui.export_dir_browser_path.trim().to_string();
                 if !path.is_empty() {
-                    match self
-                        .host
-                        .save_settings_path("export.directory", Value::String(path.clone()))
-                    {
-                        Ok(ui) => {
-                            self.project_ui.apply_ui_state(ui);
-                            self.project_ui.export_dir_browser_open = false;
-                            self.project_ui.message = Some(format!("Export dir → {path}"));
-                        }
-                        Err(e) => self.error = Some(e),
-                    }
+                    let command = ProjectCommandComponent::save_settings_path(
+                        self.next_project_request_id(),
+                        &format!("export_dir:{path}"),
+                        "export.directory",
+                        Value::String(path.clone()),
+                    );
+                    self.submit_project_command(command, Some(ctx.clone()));
                 }
             }
             ProjectAction::CancelExportDirBrowser => {
@@ -581,16 +934,15 @@ impl QncApp {
             }
             ProjectAction::SelectTemplate(id) => {
                 self.project_ui.selected_template_id = id.clone();
-                match self.host.save_ui_state(serde_json::json!({
-                    "selected_template_id": id,
-                    "reset_settings_override": true,
-                })) {
-                    Ok(ui) => {
-                        self.project_ui.apply_ui_state(ui);
-                        self.project_ui.message = None;
-                    }
-                    Err(e) => self.error = Some(e),
-                }
+                let command = ProjectCommandComponent::save_ui_state(
+                    self.next_project_request_id(),
+                    "template.select",
+                    serde_json::json!({
+                        "selected_template_id": id,
+                        "reset_settings_override": true,
+                    }),
+                );
+                self.submit_project_command(command, Some(ctx.clone()));
             }
             ProjectAction::ToggleWorkflowTab(tab_id, on) => {
                 let mut tabs: Vec<String> = self
@@ -634,30 +986,30 @@ impl QncApp {
                     tabs.retain(|t| t != &tab_id);
                 }
                 let arr = Value::Array(tabs.into_iter().map(Value::String).collect());
-                match self.host.save_settings_path("workspace.tabs", arr) {
-                    Ok(ui) => {
-                        self.project_ui.apply_ui_state(ui);
-                    }
-                    Err(e) => self.error = Some(e),
-                }
+                let command = ProjectCommandComponent::save_settings_path(
+                    self.next_project_request_id(),
+                    "workspace.tabs",
+                    "workspace.tabs",
+                    arr,
+                );
+                self.submit_project_command(command, Some(ctx.clone()));
             }
             ProjectAction::SetSettingsPath(path, value) => {
-                match self.host.save_settings_path(&path, value) {
-                    Ok(ui) => {
-                        self.project_ui.apply_ui_state(ui);
-                        self.project_ui.message = None;
-                    }
-                    Err(e) => self.error = Some(e),
-                }
+                let command = ProjectCommandComponent::save_settings_path(
+                    self.next_project_request_id(),
+                    "settings.path",
+                    &path,
+                    value,
+                );
+                self.submit_project_command(command, Some(ctx.clone()));
             }
             ProjectAction::MergeSettingsOverride(patch) => {
-                match self.host.merge_settings_override(patch) {
-                    Ok(ui) => {
-                        self.project_ui.apply_ui_state(ui);
-                        self.project_ui.message = None;
-                    }
-                    Err(e) => self.error = Some(e),
-                }
+                let command = ProjectCommandComponent::merge_settings_override(
+                    self.next_project_request_id(),
+                    "settings.merge",
+                    patch,
+                );
+                self.submit_project_command(command, Some(ctx.clone()));
             }
             ProjectAction::ApplyExportPreset(preset_id) => {
                 let eff = self
@@ -668,13 +1020,12 @@ impl QncApp {
                     .cloned()
                     .unwrap_or(Value::Null);
                 let patch = crate::project_pts::export_preset_override_patch(&eff, &preset_id);
-                match self.host.merge_settings_override(patch) {
-                    Ok(ui) => {
-                        self.project_ui.apply_ui_state(ui);
-                        self.project_ui.message = None;
-                    }
-                    Err(e) => self.error = Some(e),
-                }
+                let command = ProjectCommandComponent::merge_settings_override(
+                    self.next_project_request_id(),
+                    "export.preset.apply",
+                    patch,
+                );
+                self.submit_project_command(command, Some(ctx.clone()));
             }
             ProjectAction::SaveExportPreset => {
                 let name = self.project_ui.export_preset_draft_name.trim().to_string();
@@ -707,6 +1058,13 @@ impl QncApp {
                         "audio_channels": crate::project_pts::path_i64(&eff, &["export", "audio_channels"], 2),
                     }
                 });
+                let values_for_validation = preset.get("values").cloned().unwrap_or(Value::Null);
+                if let Err(error) =
+                    crate::project_pts::validate_export_profile(&id, &name, &values_for_validation)
+                {
+                    self.error = Some(error);
+                    return;
+                }
                 let mut existing: Vec<Value> = cur
                     .get("custom_presets")
                     .and_then(|v| v.as_array())
@@ -735,42 +1093,19 @@ impl QncApp {
                         obj.insert(k.clone(), v.clone());
                     }
                 }
-                match self
-                    .host
-                    .merge_settings_override(serde_json::json!({ "export": export }))
-                {
-                    Ok(ui) => {
-                        self.project_ui.export_preset_draft_name.clear();
-                        self.project_ui.apply_ui_state(ui);
-                        self.project_ui.message =
-                            Some("Export preset spremljen u template draft.".into());
-                        self.error = None;
-                    }
-                    Err(e) => self.error = Some(e),
-                }
+                let command = ProjectCommandComponent::merge_settings_override(
+                    self.next_project_request_id(),
+                    "export.preset.save",
+                    serde_json::json!({ "export": export }),
+                );
+                self.submit_project_command(command, Some(ctx.clone()));
             }
             ProjectAction::DeleteTemplate(template_id) => {
-                match self.host.delete_user_template(&template_id) {
-                    Ok((templates, ui)) => {
-                        self.project_ui.templates = templates;
-                        if !ui.is_null() {
-                            self.project_ui.apply_ui_state(ui);
-                        } else {
-                            self.project_ui.reload_meta(&self.host);
-                        }
-                        if self.project_ui.selected_template_id == template_id {
-                            if let Some(first) = self.project_ui.templates.first() {
-                                self.project_ui.selected_template_id = first.template_id.clone();
-                            } else {
-                                self.project_ui.selected_template_id.clear();
-                            }
-                        }
-                        self.project_ui.message = Some("Template obrisan.".into());
-                        self.status = "Template deleted".into();
-                        self.error = None;
-                    }
-                    Err(e) => self.error = Some(e),
-                }
+                let command = ProjectCommandComponent::delete_user_template(
+                    self.next_project_request_id(),
+                    &template_id,
+                );
+                self.submit_project_command(command, Some(ctx.clone()));
             }
             ProjectAction::SaveCustomTemplate => {
                 let name = self.project_ui.template_draft_name.trim().to_string();
@@ -789,36 +1124,26 @@ impl QncApp {
                     return;
                 }
                 // Host bakes effective_settings when settings is null.
-                let _ = self.host.save_ui_state(serde_json::json!({
-                    "template_create_open": true,
-                    "template_draft_name": name,
-                    "template_draft_description": description,
-                    "selected_template_id": base,
-                }));
-                match self
-                    .host
-                    .create_user_template(&name, &description, &base, None, &[])
-                {
-                    Ok(tpl) => {
-                        self.project_ui.template_create_open = false;
-                        self.project_ui.template_draft_name.clear();
-                        self.project_ui.template_draft_description.clear();
-                        self.project_ui.selected_template_id = tpl.template_id.clone();
-                        let _ = self.host.save_ui_state(serde_json::json!({
-                            "selected_template_id": tpl.template_id,
-                            "template_create_open": false,
-                            "template_draft_name": "",
-                            "template_draft_description": "",
-                            "reset_settings_override": true,
-                        }));
-                        self.project_ui.reload_meta(&self.host);
-                        self.project_ui.message =
-                            Some(format!("Novi template spremljen: {}", tpl.name));
-                        self.status = format!("Template: {}", tpl.name);
-                        self.error = None;
-                    }
-                    Err(e) => self.error = Some(e),
-                }
+                let save_draft = ProjectCommandComponent::save_ui_state(
+                    self.next_project_request_id(),
+                    "template.create.draft",
+                    serde_json::json!({
+                        "template_create_open": true,
+                        "template_draft_name": name.clone(),
+                        "template_draft_description": description.clone(),
+                        "selected_template_id": base.clone(),
+                    }),
+                );
+                self.submit_project_command(save_draft, Some(ctx.clone()));
+                let create = ProjectCommandComponent::create_user_template(
+                    self.next_project_request_id(),
+                    &name,
+                    &description,
+                    &base,
+                    None,
+                    &[],
+                );
+                self.submit_project_command(create, Some(ctx.clone()));
             }
             ProjectAction::SetTemplateCreateOpen(open) => {
                 self.project_ui.template_create_open = open;
@@ -840,82 +1165,661 @@ impl QncApp {
                     self.project_ui.template_draft_name.clear();
                     self.project_ui.template_draft_description.clear();
                 }
-                match self.host.save_ui_state(serde_json::json!({
-                    "template_create_open": open,
-                    "template_draft_name": self.project_ui.template_draft_name,
-                    "template_draft_description": self.project_ui.template_draft_description,
-                })) {
-                    Ok(ui) => {
-                        self.project_ui.apply_ui_state(ui);
-                        self.project_ui.template_create_open = open;
-                        self.project_ui.advanced_open = open;
-                        self.project_ui.message = if open {
-                            Some("Novi template — upiši naziv i Spremi.".into())
-                        } else {
-                            None
-                        };
+                let command = ProjectCommandComponent::save_ui_state(
+                    self.next_project_request_id(),
+                    if open {
+                        "template.create.open"
+                    } else {
+                        "template.create.close"
+                    },
+                    serde_json::json!({
+                        "template_create_open": open,
+                        "template_draft_name": self.project_ui.template_draft_name.clone(),
+                        "template_draft_description": self.project_ui.template_draft_description.clone(),
+                    }),
+                );
+                self.submit_project_command(command, Some(ctx.clone()));
+            }
+        }
+    }
+
+    fn apply_shell_state_data(&mut self, data: ShellStateData, ctx: Option<egui::Context>) {
+        match data {
+            ShellStateData::Health(h) if h.status == "ok" || !h.status.is_empty() => {
+                self.health_ok = true;
+                self.status = format!("Host OK ({})", h.status);
+                self.submit_shell_state_command(ShellStateComponent::runtime(), ctx.clone());
+                self.load_project_list(ctx.clone());
+                self.load_project_meta(ctx.clone());
+                self.load_appearance(ctx);
+                if self.phase == Phase::HostGate {
+                    self.phase = Phase::ProjectOnly;
+                    self.screen = Screen::Project;
+                }
+            }
+            ShellStateData::Health(h) => {
+                self.health_ok = false;
+                self.phase = Phase::HostGate;
+                self.error = Some(format!("Unexpected health status: {}", h.status));
+                self.status = "HostDisconnected".into();
+            }
+            ShellStateData::Runtime(rt) => {
+                let port = rt
+                    .get("api_port")
+                    .and_then(|v| v.as_u64())
+                    .map(|p| p.to_string())
+                    .unwrap_or_else(|| "?".into());
+                let plugins = rt
+                    .get("plugins_loaded_count")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
+                self.playback.player_mut().configure_runtime_profile(&rt);
+                self.runtime_summary = format!("port={port}  plugins={plugins}");
+            }
+            ShellStateData::Appearance(theme_id) => {
+                self.theme_picker.set_active(theme_id);
+            }
+            ShellStateData::Workspace {
+                project_id,
+                workspace,
+            } => {
+                let is_current = self
+                    .open_project
+                    .as_ref()
+                    .map(|p| p.project_id == project_id)
+                    .unwrap_or(false);
+                if !is_current {
+                    return;
+                }
+                self.workspace = Some(workspace);
+                self.phase = Phase::Workspace;
+                if self.pending_workspace_go.take() == Some(WorkspaceGo::Entry) {
+                    let name = self
+                        .open_project
+                        .as_ref()
+                        .map(|p| p.name.clone())
+                        .unwrap_or_else(|| project_id.clone());
+                    if let Some(entry) = self.go_workflow(WorkflowGo::Entry) {
+                        self.status = format!("Opened {name} → entry `{entry}`");
                     }
-                    Err(e) => self.error = Some(e),
                 }
             }
         }
     }
 
-    fn set_theme(&mut self, theme: ThemeId) {
-        match self.host.save_appearance_user(theme.as_str()) {
-            Ok(_) => {
-                self.theme_id = theme;
-                self.status = format!("Tema: {}", theme.label());
+    fn set_shell_state_error(&mut self, port_id: &str, error: impl Into<String>) {
+        let error = error.into();
+        match port_id {
+            "health" => {
+                self.health_ok = false;
+                self.phase = Phase::HostGate;
+                self.error = Some(error);
+                self.status = "HostDisconnected".into();
+                self.projects.clear();
+            }
+            "runtime" => {
+                self.runtime_summary.clear();
+            }
+            "appearance" => {
+                // Keep current theme; host may be older without this route.
+            }
+            "workspace" => {
+                self.pending_workspace_go = None;
+                self.error = Some(error);
+                self.phase = Phase::ProjectOnly;
+                self.screen = Screen::Project;
+            }
+            _ => self.error = Some(error),
+        }
+    }
+
+    fn apply_project_command_data(
+        &mut self,
+        kind: ProjectCommandKind,
+        detail: &str,
+        data: ProjectCommandData,
+        ctx: Option<egui::Context>,
+    ) {
+        match data {
+            ProjectCommandData::OpenProject {
+                project,
+                active_project_id,
+            } => {
+                self.apply_open_project(project, active_project_id, ctx);
                 self.error = None;
             }
-            Err(e) => {
-                // Still apply locally if host is older / offline write failed.
-                self.theme_id = theme;
-                self.error = Some(format!("Tema lokalno ({e})"));
+            ProjectCommandData::CreatedProject {
+                project,
+                active_project_id,
+            } => {
+                self.project_ui.new_name.clear();
+                self.load_project_list(ctx.clone());
+                self.apply_open_project(project, active_project_id, ctx);
+                self.error = None;
+            }
+            ProjectCommandData::ProjectsDeleted(list) => {
+                let deleted_id = detail;
+                let deleted_name = self
+                    .projects
+                    .iter()
+                    .find(|p| p.project_id == deleted_id)
+                    .map(|p| p.name.clone())
+                    .unwrap_or_else(|| deleted_id.to_string());
+                if self
+                    .open_project
+                    .as_ref()
+                    .map(|p| p.project_id == deleted_id)
+                    .unwrap_or(false)
+                {
+                    self.close_project();
+                }
+                self.projects = list.projects;
+                self.active_project_id = list.active_project_id;
+                self.selected_index = if self.projects.is_empty() {
+                    None
+                } else {
+                    Some(0)
+                };
+                self.status = format!("Deleted {deleted_name}");
+                self.project_ui.message = Some(format!("Obrisan {deleted_name}"));
+                self.error = None;
+            }
+            ProjectCommandData::UiState(ui_state) => {
+                self.apply_project_ui_state(detail, ui_state, ctx);
+                self.error = None;
+            }
+            ProjectCommandData::TemplateDeleted {
+                templates,
+                ui_state,
+            } => {
+                self.project_ui.templates = templates;
+                if !ui_state.is_null() {
+                    self.project_ui.apply_ui_state(ui_state);
+                } else {
+                    self.load_project_meta(ctx);
+                }
+                if self.project_ui.selected_template_id == detail {
+                    if let Some(first) = self.project_ui.templates.first() {
+                        self.project_ui.selected_template_id = first.template_id.clone();
+                    } else {
+                        self.project_ui.selected_template_id.clear();
+                    }
+                }
+                self.project_ui.message = Some("Template obrisan.".into());
+                self.status = "Template deleted".into();
+                self.error = None;
+            }
+            ProjectCommandData::TemplateCreated(tpl) => {
+                let template_name = tpl.name.clone();
+                let template_id = tpl.template_id.clone();
+                self.project_ui.template_create_open = false;
+                self.project_ui.advanced_open = false;
+                self.project_ui.template_draft_name.clear();
+                self.project_ui.template_draft_description.clear();
+                self.project_ui.selected_template_id = template_id.clone();
+                let command = ProjectCommandComponent::save_ui_state(
+                    self.next_project_request_id(),
+                    "template.create.after",
+                    serde_json::json!({
+                        "selected_template_id": template_id,
+                        "template_create_open": false,
+                        "template_draft_name": "",
+                        "template_draft_description": "",
+                        "reset_settings_override": true,
+                    }),
+                );
+                self.submit_project_command(command, ctx.clone());
+                self.load_project_meta(ctx);
+                self.project_ui.message = Some(format!("Novi template spremljen: {template_name}"));
+                self.status = format!("Template: {template_name}");
+                self.error = None;
+            }
+        }
+        let _ = kind;
+    }
+
+    fn apply_project_ui_state(
+        &mut self,
+        detail: &str,
+        ui_state: Value,
+        ctx: Option<egui::Context>,
+    ) {
+        match detail {
+            "project.create.draft" | "template.create.draft" => {}
+            "workspace.tabs" => {
+                self.project_ui.apply_ui_state(ui_state);
+                self.project_ui.message = None;
+                self.reload_workspace(ctx);
+            }
+            "export.preset.save" => {
+                self.project_ui.export_preset_draft_name.clear();
+                self.project_ui.apply_ui_state(ui_state);
+                self.project_ui.message = Some("Export preset spremljen u template draft.".into());
+            }
+            "template.create.open" => {
+                self.project_ui.apply_ui_state(ui_state);
+                self.project_ui.template_create_open = true;
+                self.project_ui.advanced_open = true;
+                self.project_ui.message = Some("Novi template — upiši naziv i Spremi.".into());
+            }
+            "template.create.close" => {
+                self.project_ui.apply_ui_state(ui_state);
+                self.project_ui.template_create_open = false;
+                self.project_ui.advanced_open = false;
+                self.project_ui.message = None;
+            }
+            "template.create.after" => {
+                self.project_ui.apply_ui_state(ui_state);
+            }
+            _ if detail.starts_with("projects_root:") => {
+                let path = detail.trim_start_matches("projects_root:");
+                self.project_ui.apply_ui_state(ui_state);
+                self.project_ui.projects_root_browser_open = false;
+                self.project_ui.message = Some(format!("Projects root → {path}"));
+            }
+            _ if detail.starts_with("export_dir:") => {
+                let path = detail.trim_start_matches("export_dir:");
+                self.project_ui.apply_ui_state(ui_state);
+                self.project_ui.export_dir_browser_open = false;
+                self.project_ui.message = Some(format!("Export dir → {path}"));
+            }
+            _ => {
+                self.project_ui.apply_ui_state(ui_state);
+                self.project_ui.message = None;
+            }
+        }
+    }
+
+    fn set_project_command_error(
+        &mut self,
+        kind: ProjectCommandKind,
+        _detail: &str,
+        error: impl Into<String>,
+    ) {
+        match kind {
+            ProjectCommandKind::SaveUiState
+            | ProjectCommandKind::OpenProject
+            | ProjectCommandKind::CreateFromTemplate
+            | ProjectCommandKind::DeleteProjects
+            | ProjectCommandKind::DeleteUserTemplate
+            | ProjectCommandKind::CreateUserTemplate => self.error = Some(error.into()),
+        }
+    }
+
+    fn poll_component_backend(&mut self, ctx: Option<egui::Context>) {
+        for event in self.component_backend.poll() {
+            let error_key = ComponentErrorKey::from_event(&event);
+            if ShellStateComponent::accepts_event(&event) {
+                let port_id = event.port_id.clone();
+                let Some(result) = ShellStateComponent::into_data(event) else {
+                    continue;
+                };
+                match result {
+                    Ok(data) => {
+                        self.clear_component_error(&error_key);
+                        self.apply_shell_state_data(data, ctx.clone());
+                    }
+                    Err(e) => {
+                        let e = self.record_component_error(error_key, e);
+                        self.set_shell_state_error(&port_id, e);
+                    }
+                }
+            } else if ProjectCommandComponent::accepts_event(&event) {
+                let Some((kind, detail, result)) = ProjectCommandComponent::into_data(event) else {
+                    continue;
+                };
+                match result {
+                    Ok(data) => {
+                        self.clear_component_error(&error_key);
+                        self.apply_project_command_data(kind, &detail, data, ctx.clone());
+                    }
+                    Err(e) => {
+                        let e = self.record_component_error(error_key, e);
+                        self.set_project_command_error(kind, &detail, e);
+                    }
+                }
+            } else if self.theme_picker.accepts_event(&event) {
+                if let Err(e) = self.theme_picker.handle_event(event) {
+                    let e = self.record_component_error(error_key, e);
+                    self.error = Some(e);
+                } else {
+                    self.clear_component_error(&error_key);
+                    self.error = None;
+                }
+            } else if ProjectCatalogComponent::accepts_event(&event) {
+                let Some(result) = ProjectCatalogComponent::into_data(event) else {
+                    continue;
+                };
+                match result {
+                    Ok(data) => {
+                        self.clear_component_error(&error_key);
+                        self.project_ui.apply_catalog_data(data);
+                    }
+                    Err(e) => {
+                        let e = self.record_component_error(error_key, e);
+                        self.project_ui.set_meta_error(e);
+                    }
+                }
+            } else if ProjectRegistryComponent::accepts_event(&event) {
+                let Some(result) = ProjectRegistryComponent::into_projects(event) else {
+                    continue;
+                };
+                match result {
+                    Ok(list) => {
+                        self.clear_component_error(&error_key);
+                        self.apply_project_list(list);
+                    }
+                    Err(e) => {
+                        let e = self.record_component_error(error_key, e);
+                        self.error = Some(e);
+                    }
+                }
+            } else if EditorialEditComponent::accepts_event(&event) {
+                let Some((instance_id, project_id, kind, _detail, result)) =
+                    EditorialEditComponent::into_data(event)
+                else {
+                    continue;
+                };
+                match result {
+                    Ok(data) => {
+                        self.clear_component_error(&error_key);
+                        self.apply_editorial_edit_data(data, ctx.clone());
+                    }
+                    Err(e) => {
+                        let e = self.record_component_error(error_key, e);
+                        self.set_editorial_edit_error(&instance_id, &project_id, kind, e);
+                    }
+                }
+            } else if EditorialStateComponent::accepts_event(&event) {
+                let Some((instance_id, project_id, result)) =
+                    EditorialStateComponent::into_data(event)
+                else {
+                    continue;
+                };
+                match result {
+                    Ok(data) => {
+                        self.clear_component_error(&error_key);
+                        self.apply_editorial_state_data(data);
+                    }
+                    Err(e) => {
+                        let e = self.record_component_error(error_key, e);
+                        self.set_editorial_state_error(&instance_id, &project_id, e);
+                    }
+                }
+            } else if ShortcutBindingsComponent::accepts_event(&event) {
+                let Some((instance_id, scope, port_id, result)) =
+                    ShortcutBindingsComponent::into_data(event)
+                else {
+                    continue;
+                };
+                match result {
+                    Ok(data) => {
+                        self.clear_component_error(&error_key);
+                        self.apply_shortcut_bindings_data(data);
+                    }
+                    Err(e) => {
+                        let e = self.record_component_error(error_key, e);
+                        self.set_shortcuts_error(&instance_id, &scope, port_id, e);
+                    }
+                }
+            } else if FilesystemListComponent::event_instance(&event).is_some() {
+                let Some((instance_id, result)) = FilesystemListComponent::into_listing(event)
+                else {
+                    continue;
+                };
+                match (instance_id.as_str(), result) {
+                    (FS_INSTANCE_PROJECTS_ROOT, Ok(list)) => {
+                        self.clear_component_error(&error_key);
+                        self.project_ui.apply_projects_root_listing(
+                            list.roots,
+                            list.path,
+                            list.parent,
+                            list.entries,
+                        );
+                    }
+                    (FS_INSTANCE_PROJECTS_ROOT, Err(e)) => {
+                        let e = self.record_component_error(error_key, e);
+                        self.project_ui.set_projects_root_browser_error(e);
+                    }
+                    (FS_INSTANCE_EXPORT_DIR, Ok(list)) => {
+                        self.clear_component_error(&error_key);
+                        self.project_ui.apply_export_dir_listing(
+                            list.roots,
+                            list.path,
+                            list.parent,
+                            list.entries,
+                        );
+                    }
+                    (FS_INSTANCE_EXPORT_DIR, Err(e)) => {
+                        let e = self.record_component_error(error_key, e);
+                        self.project_ui.set_export_dir_browser_error(e);
+                    }
+                    (FS_INSTANCE_IMPORT_SOURCE, Ok(list)) => {
+                        self.clear_component_error(&error_key);
+                        self.ingest.apply_dir_listing(list);
+                    }
+                    (FS_INSTANCE_IMPORT_SOURCE, Err(e)) => {
+                        let e = self.record_component_error(error_key, e);
+                        self.ingest.set_dir_listing_error(e);
+                    }
+                    _ => {}
+                }
+            } else if SourceImportSelectionComponent::accepts_event(&event) {
+                let Some(result) = SourceImportSelectionComponent::into_state(event) else {
+                    continue;
+                };
+                match result {
+                    Ok(state) => {
+                        self.clear_component_error(&error_key);
+                        self.ingest.apply(state);
+                    }
+                    Err(e) => {
+                        let e = self.record_component_error(error_key, e);
+                        self.error = Some(e);
+                    }
+                }
+            } else if SourceImportCommandComponent::accepts_event(&event) {
+                let Some((kind, result)) = SourceImportCommandComponent::into_state(event) else {
+                    continue;
+                };
+                match result {
+                    Ok(state) => {
+                        self.clear_component_error(&error_key);
+                        self.apply_source_import_command_result(kind, state);
+                    }
+                    Err(e) => {
+                        let e = self.record_component_error(error_key, e);
+                        self.ingest.set_state_error(e);
+                    }
+                }
+            } else if SourceImportStateComponent::accepts_event(&event) {
+                let Some((kind, result)) = SourceImportStateComponent::into_state(event) else {
+                    continue;
+                };
+                match (kind, result) {
+                    (SourceImportStateKind::Load, Ok(state)) => {
+                        self.clear_component_error(&error_key);
+                        self.ingest.apply_loaded_state(state)
+                    }
+                    (SourceImportStateKind::Poll, Ok(state)) => {
+                        self.clear_component_error(&error_key);
+                        self.ingest.apply_polled_state(state)
+                    }
+                    (_, Err(e)) => {
+                        let e = self.record_component_error(error_key, e);
+                        self.ingest.set_state_error(e);
+                    }
+                }
+            }
+        }
+    }
+
+    fn apply_editorial_state_data(&mut self, data: EditorialStateData) {
+        match data {
+            EditorialStateData::StoryState {
+                instance_id,
+                project_id,
+                state,
+            } => match instance_id.as_str() {
+                EDITORIAL_INSTANCE_STORY => {
+                    self.story.apply_editorial_story_state(&project_id, state)
+                }
+                EDITORIAL_INSTANCE_MEDIA_ASSIST => self
+                    .media_assist
+                    .apply_editorial_story_state(&project_id, state),
+                _ => {}
+            },
+            EditorialStateData::TimelineModel {
+                instance_id,
+                project_id,
+                timeline,
+            } => match instance_id.as_str() {
+                EDITORIAL_INSTANCE_STORY => {
+                    let intent = self
+                        .story
+                        .apply_editorial_timeline_model(&project_id, timeline);
+                    self.playback_transport_intent(intent);
+                }
+                EDITORIAL_INSTANCE_MEDIA_ASSIST => {
+                    let intent = self
+                        .media_assist
+                        .apply_editorial_timeline_model(&project_id, timeline);
+                    self.playback_transport_intent(intent);
+                }
+                _ => {}
+            },
+            EditorialStateData::Playlist {
+                instance_id,
+                project_id,
+                playlist,
+            } => match instance_id.as_str() {
+                EDITORIAL_INSTANCE_STORY => {
+                    let intent = self.story.apply_editorial_playlist(&project_id, playlist);
+                    self.playback_transport_intent(intent);
+                }
+                EDITORIAL_INSTANCE_MEDIA_ASSIST => {
+                    let intent = self
+                        .media_assist
+                        .apply_editorial_playlist(&project_id, playlist);
+                    self.playback_transport_intent(intent);
+                }
+                _ => {}
+            },
+        }
+    }
+
+    fn apply_editorial_edit_data(&mut self, data: EditorialEditData, ctx: Option<egui::Context>) {
+        let instance_id = data.instance_id.clone();
+        let project_id = data.project_id.clone();
+        let intent = match instance_id.as_str() {
+            EDITORIAL_INSTANCE_STORY => self.story.apply_editorial_edit_data(data),
+            EDITORIAL_INSTANCE_MEDIA_ASSIST => self.media_assist.apply_editorial_edit_data(data),
+            _ => PlaybackTransportIntent::None,
+        };
+        self.playback_transport_intent(intent);
+        self.load_editorial_timeline_model(&instance_id, &project_id, ctx);
+    }
+
+    fn apply_shortcut_bindings_data(&mut self, data: ShortcutBindingsData) {
+        match data {
+            ShortcutBindingsData::Catalog {
+                instance_id,
+                scope,
+                catalog,
+            } => match instance_id.as_str() {
+                SHORTCUT_INSTANCE_PROJECT => {
+                    self.project_ui.apply_shortcut_catalog(&scope, catalog)
+                }
+                EDITORIAL_INSTANCE_STORY => self.story.apply_shortcut_catalog(&scope, catalog),
+                EDITORIAL_INSTANCE_MEDIA_ASSIST => {
+                    self.media_assist.apply_shortcut_catalog(&scope, catalog)
+                }
+                SHORTCUT_INSTANCE_INGEST => self.ingest.apply_shortcut_catalog(&scope, catalog),
+                _ => {}
+            },
+            ShortcutBindingsData::User {
+                instance_id,
+                scope,
+                user,
+            } => match instance_id.as_str() {
+                SHORTCUT_INSTANCE_PROJECT => self.project_ui.apply_shortcut_user(&scope, user),
+                EDITORIAL_INSTANCE_STORY => self.story.apply_shortcut_user(&scope, user),
+                EDITORIAL_INSTANCE_MEDIA_ASSIST => {
+                    self.media_assist.apply_shortcut_user(&scope, user)
+                }
+                SHORTCUT_INSTANCE_INGEST => self.ingest.apply_shortcut_user(&scope, user),
+                _ => {}
+            },
+        }
+    }
+
+    fn apply_source_import_command_result(
+        &mut self,
+        kind: SourceImportCommandKind,
+        state: crate::api::IngestState,
+    ) {
+        if kind == SourceImportCommandKind::SetArchive {
+            self.ingest
+                .apply_archive_option_state(state, "Import opcije spremljene.");
+            return;
+        }
+        let message = match kind {
+            SourceImportCommandKind::Browse => {
+                if state.browse_path.trim().is_empty() {
+                    "Otkrij gotov.".into()
+                } else {
+                    format!("Otkrij: {}", state.browse_path)
+                }
+            }
+            SourceImportCommandKind::Discover => "Ponovo otkrij gotov.".into(),
+            SourceImportCommandKind::SelectAll => "Odabrani su svi klipovi.".into(),
+            SourceImportCommandKind::ClearSelection => "Odabir očišćen.".into(),
+            SourceImportCommandKind::SetArchive => unreachable!("handled above"),
+            SourceImportCommandKind::ImportSelected => {
+                let queued = state
+                    .queued
+                    .unwrap_or_else(|| state.selected_clip_ids.len() as u64);
+                format!("Uvoz u bazi: {queued} klip(ova).")
+            }
+        };
+        self.ingest.apply_import_command_state(state, message);
+        if kind == SourceImportCommandKind::ImportSelected {
+            if let Some(next) = self.go_workflow(WorkflowGo::Next { from: "ingest" }) {
+                self.status = format!("Uvoz pokrenut → {next}");
             }
         }
     }
 
     /// Shell footer — theme picker far left (global, not project settings).
     fn ui_shell_theme_picker(&mut self, ui: &mut egui::Ui) {
-        ui.label(RichText::new("Tema").weak());
-        let mut selected = self.theme_id;
-        egui::ComboBox::from_id_salt("shell_theme_picker")
-            .selected_text(selected.label())
-            .width(110.0)
-            .show_ui(ui, |ui| {
-                for id in ThemeId::ALL {
-                    ui.selectable_value(&mut selected, id, id.label());
-                }
-            });
-        if selected != self.theme_id {
-            self.set_theme(selected);
-        }
-    }
-
-    fn handle_story_playback_commands(&mut self, ctx: &egui::Context) {
-        player_bridge::handle_playback_commands(&mut self.story, &mut self.playback, ctx);
-    }
-
-    fn handle_ingest_playback_commands(&mut self, ctx: &egui::Context) {
-        player_bridge::handle_playback_commands(&mut self.ingest, &mut self.playback, ctx);
-    }
-
-    fn handle_media_assist_playback_commands(&mut self, ctx: &egui::Context) {
-        player_bridge::handle_playback_commands(&mut self.media_assist, &mut self.playback, ctx);
-    }
-
-    fn tick_playback(&mut self, ctx: &egui::Context, drain_commands: bool) {
-        if drain_commands && self.phase == Phase::Workspace {
-            match self.screen {
-                Screen::Ingest => self.handle_ingest_playback_commands(ctx),
-                Screen::Story => self.handle_story_playback_commands(ctx),
-                Screen::MediaAssist => self.handle_media_assist_playback_commands(ctx),
-                _ => {}
+        if let Some(command) = self.theme_picker.ui(ui) {
+            self.status = format!("Tema: {}", self.theme_picker.active().label());
+            if let Err(e) = self.submit_component_backend_command(command, Some(ui.ctx().clone())) {
+                self.error = Some(e);
             }
         }
+    }
+
+    fn tick_playback(&mut self, ctx: &egui::Context) {
         self.playback.player_mut().pump(ctx);
         let events = self.playback_rx.try_recv_all();
+        let segment_boundary_frames: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                PlayerEvent::BoundaryReached { source_frame } => Some(*source_frame),
+                PlayerEvent::Frame {
+                    source_frame,
+                    playing: true,
+                    ..
+                }
+                | PlayerEvent::State {
+                    source_frame,
+                    playing: true,
+                    ..
+                } => Some(*source_frame),
+                _ => None,
+            })
+            .collect();
         self.playback.ingest_events(&events);
         if self.phase == Phase::Workspace {
             match self.screen {
@@ -936,17 +1840,27 @@ impl QncApp {
                 ),
                 _ => {}
             }
+            for source_frame in segment_boundary_frames {
+                let intents = match self.screen {
+                    Screen::Story => self.story.playback_boundary_intents(source_frame),
+                    Screen::MediaAssist => {
+                        self.media_assist.playback_boundary_intents(source_frame)
+                    }
+                    _ => Vec::new(),
+                };
+                self.playback_transport_intents(intents);
+            }
         }
     }
 
-    /// Form → TX, then playback pump (TX→decode→RX→carrier), then transport mirror.
+    /// Player pump (TX->decode->RX->carrier), then transport mirror.
     fn tick_active_player(&mut self, ctx: &egui::Context) {
-        self.tick_playback(ctx, true);
+        self.tick_playback(ctx);
     }
 
-    /// Clock only — no command drain (avoids double-open / double-seek in one frame).
+    /// Clock only before paint; commands are routed explicitly by app-owned transport intents.
     fn pump_active_player(&mut self, ctx: &egui::Context) {
-        self.tick_playback(ctx, false);
+        self.tick_playback(ctx);
     }
 }
 
@@ -959,14 +1873,17 @@ impl eframe::App for QncApp {
 
         if self.auto_connect_once {
             self.auto_connect_once = false;
-            self.connect_and_load();
+            self.connect_and_load(Some(ctx.clone()));
         }
 
+        self.poll_component_backend(Some(ctx.clone()));
         self.apply_theme(ctx);
 
         if self.phase == Phase::Workspace && self.screen == Screen::Ingest {
             if let Some(p) = self.open_project.clone() {
-                self.ingest.maybe_poll(&self.host, &p.project_id);
+                if self.ingest.should_request_poll() {
+                    self.poll_ingest_state(&p.project_id, Some(ctx.clone()));
+                }
                 if self.ingest.needs_poll() {
                     ctx.request_repaint_after(std::time::Duration::from_millis(500));
                 }
@@ -976,30 +1893,73 @@ impl eframe::App for QncApp {
         let story_active = self.phase == Phase::Workspace && matches!(self.screen, Screen::Story);
         let media_assist_active =
             self.phase == Phase::Workspace && matches!(self.screen, Screen::MediaAssist);
+        let ingest_active = self.phase == Phase::Workspace && matches!(self.screen, Screen::Ingest);
+        let project_active = self.phase == Phase::ProjectOnly;
+        if story_active {
+            if let Some(p) = self.open_project.clone() {
+                self.request_editorial_state_if_needed(
+                    EDITORIAL_INSTANCE_STORY,
+                    &p.project_id,
+                    Some(ctx.clone()),
+                );
+                self.request_shortcuts_if_needed(EDITORIAL_INSTANCE_STORY, Some(ctx.clone()));
+            }
+        } else if media_assist_active {
+            if let Some(p) = self.open_project.clone() {
+                self.request_editorial_state_if_needed(
+                    EDITORIAL_INSTANCE_MEDIA_ASSIST,
+                    &p.project_id,
+                    Some(ctx.clone()),
+                );
+                self.request_shortcuts_if_needed(
+                    EDITORIAL_INSTANCE_MEDIA_ASSIST,
+                    Some(ctx.clone()),
+                );
+            }
+        } else if ingest_active {
+            self.request_shortcuts_if_needed(SHORTCUT_INSTANCE_INGEST, Some(ctx.clone()));
+        } else if project_active {
+            self.request_shortcuts_if_needed(SHORTCUT_INSTANCE_PROJECT, Some(ctx.clone()));
+        }
         let comp = self.composition();
 
-        // Pre-UI: keep decode clock + apply RX (no command drain — UI may queue seeks).
+        // Pre-UI: decode clock + RX. Transport commands are routed explicitly below.
         self.pump_active_player(ctx);
 
-        let ingest_active =
-            self.phase == Phase::Workspace && matches!(self.screen, Screen::Ingest);
-
-        if story_active {
-            self.story
-                .handle_shortcuts(ctx, &self.host, &mut self.playback);
+        if story_active && self.story.meta_ready() && self.story.shortcuts_ready() {
+            let intents = self.story.handle_shortcuts(ctx, &self.host, &self.playback);
+            self.playback_transport_intents(intents);
+            self.submit_editorial_backend_commands(EDITORIAL_INSTANCE_STORY, Some(ctx.clone()));
             // Apply catalog CueFrame before dock paint so playhead moves this frame.
-            self.tick_playback(ctx, true);
+            self.tick_playback(ctx);
             self.story.prepare_frame(&self.host, ctx);
             self.story.tick(&self.host, ctx);
-        } else if media_assist_active {
-            self.media_assist
-                .handle_shortcuts(ctx, &self.host, &mut self.playback);
-            self.tick_playback(ctx, true);
+        } else if media_assist_active
+            && self.media_assist.meta_ready()
+            && self.media_assist.shortcuts_ready()
+        {
+            let intents = self
+                .media_assist
+                .handle_shortcuts(ctx, &self.host, &self.playback);
+            self.playback_transport_intents(intents);
+            self.submit_editorial_backend_commands(
+                EDITORIAL_INSTANCE_MEDIA_ASSIST,
+                Some(ctx.clone()),
+            );
+            self.tick_playback(ctx);
             self.media_assist.prepare_frame(&self.host, ctx);
             self.media_assist.tick(&self.host, ctx);
         } else if ingest_active {
-            self.ingest.handle_shortcuts(ctx, &self.host);
-            self.tick_playback(ctx, true);
+            let actions = self.ingest.handle_shortcuts(ctx);
+            for action in actions {
+                self.dispatch_ingest("", action, ctx);
+            }
+            self.tick_playback(ctx);
+        } else if project_active && self.project_ui.shortcuts_ready() {
+            let action = self.project_ui.handle_shortcuts(ctx);
+            if matches!(action, ProjectAction::OpenSelected) && self.selected_index.is_some() {
+                self.dispatch_project(action, ctx);
+            }
         }
 
         // Host chrome only on HostGate. Project / editorial / ingest = empty shell (web).
@@ -1020,7 +1980,7 @@ impl eframe::App for QncApp {
                             .hint_text("http://127.0.0.1:8001"),
                     );
                     if ui.button("Connect / Refresh").clicked() {
-                        self.connect_and_load();
+                        self.connect_and_load(Some(ctx.clone()));
                     }
                     if self.health_ok {
                         ui.colored_label(Color32::from_rgb(80, 180, 100), "connected");
@@ -1031,7 +1991,7 @@ impl eframe::App for QncApp {
                         ui.label(RichText::new(&self.runtime_summary).weak());
                     }
                 });
-                if let Some(err) = &self.error {
+                if let Some(err) = self.global_error_message() {
                     ui.colored_label(Color32::from_rgb(220, 90, 90), err);
                 }
             });
@@ -1108,6 +2068,12 @@ impl eframe::App for QncApp {
                                 if qnc_theme::action_btn(ui, "Close project").clicked() {
                                     close = true;
                                 }
+                                if let Some(err) = self.global_error_message() {
+                                    ui.colored_label(
+                                        Color32::from_rgb(220, 90, 90),
+                                        Self::short_error_label(&err),
+                                    );
+                                }
                             },
                         );
                     });
@@ -1140,9 +2106,17 @@ impl eframe::App for QncApp {
                                 let _ = qnc_theme::link_tab(ui, "Project", true);
                             });
                         });
-                        cols[2].allocate_exact_size(
-                            egui::vec2(cols[2].available_width(), h),
-                            egui::Sense::hover(),
+                        cols[2].with_layout(
+                            egui::Layout::right_to_left(egui::Align::Center),
+                            |ui| {
+                                ui.set_min_height(h);
+                                if let Some(err) = self.global_error_message() {
+                                    ui.colored_label(
+                                        Color32::from_rgb(220, 90, 90),
+                                        Self::short_error_label(&err),
+                                    );
+                                }
+                            },
                         );
                     });
                 });
@@ -1156,7 +2130,12 @@ impl eframe::App for QncApp {
                 .exact_height(h)
                 .frame(egui::Frame::NONE.fill(panel_bg).inner_margin(0.0))
                 .show(ctx, |ui| {
-                    self.story.ui_source_dock(ui, &self.host, &mut self.playback);
+                    let intent = self.story.ui_source_dock(ui, &self.host, &self.playback);
+                    self.playback_transport_intent(intent);
+                    self.submit_editorial_backend_commands(
+                        EDITORIAL_INSTANCE_STORY,
+                        Some(ctx.clone()),
+                    );
                 });
         } else if comp.dock.show && media_assist_active {
             let h = self.media_assist.source_dock_height();
@@ -1164,8 +2143,14 @@ impl eframe::App for QncApp {
                 .exact_height(h)
                 .frame(egui::Frame::NONE.fill(panel_bg).inner_margin(0.0))
                 .show(ctx, |ui| {
-                    self.media_assist
-                        .ui_source_dock(ui, &self.host, &mut self.playback);
+                    let intent = self
+                        .media_assist
+                        .ui_source_dock(ui, &self.host, &self.playback);
+                    self.playback_transport_intent(intent);
+                    self.submit_editorial_backend_commands(
+                        EDITORIAL_INSTANCE_MEDIA_ASSIST,
+                        Some(ctx.clone()),
+                    );
                 });
         } else if comp.dock.show
             && self.phase == Phase::Workspace
@@ -1181,9 +2166,17 @@ impl eframe::App for QncApp {
                         .as_ref()
                         .map(|p| p.project_id.clone())
                         .unwrap_or_default();
-                    let action = self.ingest.ui_timeline_dock(ui, &mut self.playback);
+                    let action = self.ingest.ui_timeline_dock(ui, &self.playback);
                     if !pid.is_empty() {
-                        self.dispatch_ingest(&pid, action);
+                        match action {
+                            crate::ingest::IngestAction::CueFrame(frame) => {
+                                self.playback_transport_cue_frame(frame);
+                            }
+                            crate::ingest::IngestAction::TogglePlay => {
+                                self.playback_transport_toggle();
+                            }
+                            other => self.dispatch_ingest(&pid, other, ctx),
+                        }
                     }
                 });
         }
@@ -1201,7 +2194,7 @@ impl eframe::App for QncApp {
                         );
                         ui.add_space(12.0);
                         if ui.button("Retry connect").clicked() {
-                            self.connect_and_load();
+                            self.connect_and_load(Some(ctx.clone()));
                         }
                     });
                 }
@@ -1220,13 +2213,24 @@ impl eframe::App for QncApp {
                                 }
                                 let action =
                                     self.ingest.ui(ui, &name, &pid, &self.host, ctx, &self.playback);
-                                self.dispatch_ingest(&pid, action);
+                                self.dispatch_ingest(&pid, action, ctx);
                             }
                             Screen::MediaAssist => {
-                                self.media_assist.ui_main(ui, &self.host, ctx, &self.playback);
+                                let intents =
+                                    self.media_assist.ui_main(ui, &self.host, ctx, &self.playback);
+                                self.playback_transport_intents(intents);
+                                self.submit_editorial_backend_commands(
+                                    EDITORIAL_INSTANCE_MEDIA_ASSIST,
+                                    Some(ctx.clone()),
+                                );
                             }
                             Screen::Story => {
-                                self.story.ui_main(ui, &self.host, ctx, &self.playback);
+                                let intents = self.story.ui_main(ui, &self.host, ctx, &self.playback);
+                                self.playback_transport_intents(intents);
+                                self.submit_editorial_backend_commands(
+                                    EDITORIAL_INSTANCE_STORY,
+                                    Some(ctx.clone()),
+                                );
                             }
                             Screen::Unsupported(tab) => {
                                 ui.vertical_centered(|ui| {
@@ -1238,26 +2242,20 @@ impl eframe::App for QncApp {
                             Screen::Project => {}
                         }
                     } else {
-                        self.project_ui.ensure_loaded(&self.host);
+                        self.request_project_meta_if_needed(Some(ctx.clone()));
                         let action = self.project_ui.ui(
                             ui,
                             &self.projects,
                             &mut self.selected_index,
                             &self.active_project_id,
                         );
-                        self.dispatch_project(action);
-                        if ui.input(|i| i.key_pressed(egui::Key::Enter))
-                            && self.selected_index.is_some()
-                            && self.phase == Phase::ProjectOnly
-                        {
-                            self.open_selected();
-                        }
+                        self.dispatch_project(action, ctx);
                     }
                 }
             }
         });
 
-        // Post-UI: commands queued during paint → TX/RX.
+        // Post-UI: process app-routed transport commands emitted during paint.
         self.tick_active_player(ctx);
     }
 }

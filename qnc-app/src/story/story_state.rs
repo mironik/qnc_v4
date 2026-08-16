@@ -34,12 +34,7 @@ pub(super) fn parse_state(state: &Value, timeline: Option<&TimelineModel>) -> St
     let marker_slots: Vec<MarkerSlot> = array(state, "marker_slots");
 
     let selected_cover_id = string_field(state, "selected_cover_id");
-    let mut selected_slot_id = string_field(state, "selected_slot_id");
-    if selected_slot_id.is_empty() {
-        if let Some(slot) = marker_slots.first() {
-            selected_slot_id = slot.slot_id.clone();
-        }
-    }
+    let selected_slot_id = string_field(state, "selected_slot_id");
 
     let draft_status = if state
         .get("committed_at")
@@ -122,6 +117,26 @@ fn string_field(state: &Value, key: &str) -> String {
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn parse_state_does_not_invent_selected_slot() {
+        let state = json!({
+            "marker_slots": [
+                { "slot_id": "slot_a", "start_frame": 0, "end_frame": 25 }
+            ]
+        });
+
+        let parsed = parse_state(&state, None);
+
+        assert_eq!(parsed.selected_slot_id, "");
+        assert_eq!(parsed.marker_slots.len(), 1);
+    }
 }
 
 fn array<T>(state: &Value, key: &str) -> Vec<T>

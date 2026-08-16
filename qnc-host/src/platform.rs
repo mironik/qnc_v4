@@ -17,7 +17,7 @@ pub fn runtime_info(root: &Path, config: &AppConfig) -> Value {
     json!({
         "status": "ok",
         "shell_api_version": SHELL_API_VERSION,
-        "app_version": std::env::var("QNC_APP_VERSION").unwrap_or_else(|_| "0.3.0".into()),
+        "app_version": std::env::var("QNC_APP_VERSION").unwrap_or_else(|_| "0.4.6".into()),
         "deployment": deployment,
         "hardware_hints": hardware_hints(),
         "hardware_profile": crate::hardware_profile::get().map(|p| p.snapshot()),

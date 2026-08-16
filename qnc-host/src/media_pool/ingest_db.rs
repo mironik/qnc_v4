@@ -7,13 +7,14 @@ use serde_json::{json, Value};
 
 use crate::frame_time::normalize_fps;
 use crate::ingest::db::{ingest_asset_meta, open_ingest, IngestAssetMetaInput};
+use crate::ingest::proxy_source::{classify_tv_source, recipe_for_source};
 use crate::ingest::thumb::probe_media;
-use crate::project::db::{open_project, ProjectPaths};
+use crate::project::db::ProjectPaths;
 
 const VIDEO_EXT: &[&str] = &["mp4", "mov", "m4v", "mxf", "mts", "mkv", "avi", "webm"];
 
 fn open_ingest_readonly(paths: &ProjectPaths, project_id: &str) -> Result<Connection, String> {
-    open_project(paths, project_id).map_err(|e| e.to_string())
+    open_ingest(paths, project_id).map_err(|e| e.to_string())
 }
 
 fn is_video(path: &Path) -> bool {
@@ -37,7 +38,10 @@ pub fn read_imported_clips(paths: &ProjectPaths, project_id: &str) -> Result<Vec
             "SELECT clip_id, name, duration_sec, import_status, status,
                     project_proxy_path, proxy_path, thumb_path, source_path, original_path,
                     card_thumb_path, file_extension, read_from_card, card_locked, poster_source,
-                    fps, resolution, codec, virtual_name
+                    fps, resolution, codec, virtual_name,
+                    COALESCE(has_audio, 0), COALESCE(audio_channels, 0),
+                    COALESCE(field_order, ''), COALESCE(interlaced, 0),
+                    COALESCE(source_class, ''), COALESCE(proxy_recipe, '')
              FROM ingest_assets
              WHERE import_status = 'imported'
              ORDER BY clip_id",
@@ -60,6 +64,12 @@ pub fn read_imported_clips(paths: &ProjectPaths, project_id: &str) -> Result<Vec
             let resolution = row.get::<_, String>(16).unwrap_or_default();
             let codec = row.get::<_, String>(17).unwrap_or_default();
             let virtual_name = row.get::<_, String>(18).unwrap_or_default();
+            let has_audio = row.get::<_, i64>(19).unwrap_or(0) != 0;
+            let audio_channels = row.get::<_, i64>(20).unwrap_or(0).clamp(0, u8::MAX as i64) as u8;
+            let field_order = row.get::<_, String>(21).unwrap_or_default();
+            let interlaced = row.get::<_, i64>(22).unwrap_or(0) != 0;
+            let source_class = row.get::<_, String>(23).unwrap_or_default();
+            let proxy_recipe = row.get::<_, String>(24).unwrap_or_default();
             let meta = ingest_asset_meta(&IngestAssetMetaInput {
                 source_path: source_path.clone(),
                 original_path: original_path.clone(),
@@ -88,13 +98,22 @@ pub fn read_imported_clips(paths: &ProjectPaths, project_id: &str) -> Result<Vec
                 "resolution": resolution,
                 "codec": codec,
                 "import_status": row.get::<_, String>(3)?,
+                "status": row.get::<_, String>(4)?,
                 "proxy_status": row.get::<_, String>(4)?,
+                "project_proxy_path": empty_to_null(&project_proxy_path),
+                "ingest_proxy_path": empty_to_null(&ingest_proxy_path),
                 "metadata": meta,
                 "proxy_path": proxy_path.as_ref().map(|p| p.to_string_lossy().to_string()),
                 "thumb_path": empty_to_null(&thumb_path),
                 "source_path": empty_to_null(&source_path),
                 "original_path": empty_to_null(&original_path),
                 "card_thumb_path": empty_to_null(&card_thumb_path),
+                "has_audio": has_audio,
+                "audio_channels": audio_channels,
+                "field_order": field_order,
+                "interlaced": interlaced,
+                "source_class": source_class,
+                "proxy_recipe": proxy_recipe,
             }))
         })
         .map_err(|e| e.to_string())?
@@ -227,6 +246,10 @@ struct IngestClipProbeRow {
     _duration_sec: f64,
     project_proxy_path: String,
     proxy_path: String,
+    field_order: String,
+    interlaced: bool,
+    source_class: String,
+    proxy_recipe: String,
 }
 
 fn load_ingest_clip_row(
@@ -237,7 +260,9 @@ fn load_ingest_clip_row(
     let conn = open_ingest(paths, project_id).map_err(|e| e.to_string())?;
     conn.query_row(
         "SELECT source_id, fps, COALESCE(has_audio, 0), COALESCE(audio_channels, 0),
-                duration_sec, project_proxy_path, proxy_path
+                duration_sec, project_proxy_path, proxy_path,
+                COALESCE(field_order, ''), COALESCE(interlaced, 0),
+                COALESCE(source_class, ''), COALESCE(proxy_recipe, '')
          FROM ingest_assets
          WHERE clip_id = ?1 AND import_status = 'imported'
          ORDER BY CASE WHEN source_id = 'project_proxy_repair' THEN 1 ELSE 0 END
@@ -252,6 +277,10 @@ fn load_ingest_clip_row(
                 _duration_sec: row.get(4)?,
                 project_proxy_path: row.get(5)?,
                 proxy_path: row.get(6)?,
+                field_order: row.get(7)?,
+                interlaced: row.get::<_, i64>(8)? != 0,
+                source_class: row.get(9)?,
+                proxy_recipe: row.get(10)?,
             })
         },
     )
@@ -274,6 +303,8 @@ fn persist_clip_probe(
     source_id: &str,
     probe: &crate::ingest::thumb::MediaProbe,
 ) -> Result<(), String> {
+    let source_class = classify_tv_source(probe);
+    let proxy_recipe = recipe_for_source(source_class);
     let conn = open_ingest(paths, project_id).map_err(|e| e.to_string())?;
     conn.execute(
         "UPDATE ingest_assets SET
@@ -282,7 +313,11 @@ fn persist_clip_probe(
             resolution = CASE WHEN ?5 = '' THEN resolution ELSE ?5 END,
             codec = CASE WHEN ?6 = '' THEN codec ELSE ?6 END,
             has_audio = ?7,
-            audio_channels = ?8
+            audio_channels = ?8,
+            field_order = ?9,
+            interlaced = ?10,
+            source_class = ?11,
+            proxy_recipe = ?12
          WHERE source_id = ?1 AND clip_id = ?2",
         params![
             source_id,
@@ -293,6 +328,10 @@ fn persist_clip_probe(
             probe.codec,
             if probe.has_audio { 1 } else { 0 },
             probe.audio_channels,
+            probe.field_order,
+            if probe.interlaced { 1 } else { 0 },
+            source_class.label(),
+            proxy_recipe.id(),
         ],
     )
     .map_err(|e| e.to_string())?;
@@ -319,9 +358,19 @@ pub fn resolve_clip_fps(
                 } else {
                     0.0
                 };
+                let source_class = classify_tv_source(&probe);
+                let proxy_recipe = recipe_for_source(source_class);
                 let audio_changed =
                     row.has_audio != probe.has_audio || row.audio_channels != probe.audio_channels;
-                if stored <= 0.0 || (stored - probed).abs() > 0.01 || audio_changed {
+                let clip_type_changed = row.field_order != probe.field_order
+                    || row.interlaced != probe.interlaced
+                    || row.source_class != source_class.label()
+                    || row.proxy_recipe != proxy_recipe.id();
+                if stored <= 0.0
+                    || (stored - probed).abs() > 0.01
+                    || audio_changed
+                    || clip_type_changed
+                {
                     persist_clip_probe(paths, project_id, clip_id, &row.source_id, &probe)?;
                 }
                 return Ok(probed);

@@ -9,11 +9,14 @@ use serde_json::Value;
 use crate::api::{HostClient, TimelineModel};
 use crate::audio::AudioEngine;
 use crate::editorial::{
-    apply_mark_in_fit_duration, clip_id_from_state, cover_confirm_summary, create_cover_from_marks,
-    create_segment, first_empty_slot, kind_for_action, slot_duration_by_id, source_sec_at_part,
-    SourceMarks,
+    apply_mark_in_fit_frames, clip_id_from_state, cover_confirm_summary, create_cover_from_marks,
+    create_segment, first_empty_slot, kind_for_action, slot_duration_frames_by_id,
+    source_frame_at_part, SourceMarks,
 };
-use crate::focus::{focus_chain, fps_from_timeline, frame_sec, FocusTarget, TimelineFocus};
+use crate::focus::{
+    duration_frames_from_timeline, focus_chain, fps_from_timeline, frame_to_seconds,
+    seconds_to_frame, FocusTarget, TimelineFocus,
+};
 use crate::shortcuts::StoryBindings;
 use crate::timeline;
 
@@ -42,7 +45,7 @@ pub struct TransportApp {
     host: HostClient,
     session_id: String,
     project_id: String,
-    virtual_sec: f64,
+    virtual_frame: i64,
     playing: bool,
     layer: String,
     buses: String,
@@ -52,7 +55,7 @@ pub struct TransportApp {
     last_frame_at: Instant,
     last_tick: Instant,
     audio: Option<AudioEngine>,
-    audio_until: f64,
+    audio_until_frame: i64,
     stop_on_close: bool,
     timeline: Option<TimelineModel>,
     bindings: StoryBindings,
@@ -61,7 +64,7 @@ pub struct TransportApp {
     focus: TimelineFocus,
     view_mode: ViewMode,
     source_clip_id: Option<String>,
-    source_seek: f64,
+    source_seek_frame: i64,
     pending_cover: Option<PendingCover>,
     undo_stack: Vec<UndoEntry>,
     show_cheatsheet: bool,
@@ -92,9 +95,11 @@ impl TransportApp {
                 None
             }
         };
+        let initial_frame =
+            seconds_to_frame(initial_seek.max(0.0), fps_from_timeline(timeline.as_ref()));
         let start = host.playback_start(&project_id)?;
-        if initial_seek > 0.0 {
-            host.playback_seek(&start.session_id, initial_seek)?;
+        if initial_frame > 0 {
+            host.playback_seek_frame(&start.session_id, initial_frame)?;
         }
         let state = host.playback_state(&start.session_id)?;
         let buses = start
@@ -124,10 +129,10 @@ impl TransportApp {
             host,
             session_id: state.session_id.clone(),
             project_id,
-            virtual_sec: if initial_seek > 0.0 {
-                initial_seek
+            virtual_frame: if initial_frame > 0 {
+                initial_frame
             } else {
-                state.virtual_sec
+                state.virtual_frame
             },
             playing: false,
             layer: state.active.layer.clone(),
@@ -144,7 +149,7 @@ impl TransportApp {
             last_frame_at: Instant::now() - FRAME_INTERVAL,
             last_tick: Instant::now(),
             audio,
-            audio_until: -1.0,
+            audio_until_frame: -1,
             stop_on_close: true,
             timeline,
             bindings,
@@ -153,7 +158,7 @@ impl TransportApp {
             focus: TimelineFocus::default(),
             view_mode,
             source_clip_id: resolved_clip,
-            source_seek: initial_seek.max(0.0),
+            source_seek_frame: initial_frame,
             pending_cover: None,
             undo_stack: Vec::new(),
             show_cheatsheet: true,
@@ -170,16 +175,28 @@ impl TransportApp {
         fps_from_timeline(self.timeline.as_ref())
     }
 
-    fn step(&self) -> f64 {
-        frame_sec(self.fps())
+    fn duration_frames(&self) -> i64 {
+        duration_frames_from_timeline(self.timeline.as_ref())
+    }
+
+    fn virtual_sec(&self) -> f64 {
+        frame_to_seconds(self.virtual_frame, self.fps())
+    }
+
+    fn source_seek_sec(&self) -> f64 {
+        frame_to_seconds(self.source_seek_frame, self.fps())
+    }
+
+    fn audio_chunk_frames(&self) -> i64 {
+        seconds_to_frame(AUDIO_CHUNK_SEC, self.fps()).max(1)
     }
 
     fn fetch_frame(&mut self) -> Result<(), String> {
         self.host
-            .playback_seek(&self.session_id, self.virtual_sec)?;
+            .playback_seek_frame(&self.session_id, self.virtual_frame)?;
         let state = self.host.playback_state(&self.session_id)?;
         self.layer = state.active.layer.clone();
-        let url = self.host.frame_url(&state, self.virtual_sec);
+        let url = self.host.frame_url_for_frame(&state, self.virtual_frame);
         let bytes = self.host.download_bytes(&url)?;
         let img = image::load_from_memory(&bytes)
             .map_err(|e| e.to_string())?
@@ -197,7 +214,7 @@ impl TransportApp {
             .ok_or_else(|| "nema source clip".to_string())?;
         let url = self
             .host
-            .story_thumbnail_url(&self.project_id, clip, self.source_seek);
+            .story_thumbnail_url(&self.project_id, clip, self.source_seek_sec());
         let bytes = self.host.download_bytes(&url)?;
         let img = image::load_from_memory(&bytes)
             .map_err(|e| e.to_string())?
@@ -242,12 +259,10 @@ impl TransportApp {
                     .map(|b| b.role.as_str())
                     .collect::<Vec<_>>()
                     .join(",");
-                let max = self
-                    .timeline
-                    .as_ref()
-                    .map(|m| m.duration_sec)
-                    .unwrap_or(0.0);
-                self.virtual_sec = self.virtual_sec.clamp(0.0, max.max(0.0));
+                let max = self.duration_frames();
+                if max > 0 {
+                    self.virtual_frame = self.virtual_frame.clamp(0, max);
+                }
                 if let Err(e) = self.fetch_frame() {
                     self.status = format!("session restart frame: {e}");
                 }
@@ -263,19 +278,21 @@ impl TransportApp {
         if !self.playing {
             return;
         }
-        if self.virtual_sec + 0.25 < self.audio_until && !engine.empty() {
+        let margin = (self.fps() / 4.0).round() as i64;
+        if self.virtual_frame + margin < self.audio_until_frame && !engine.empty() {
             return;
         }
         let Ok(state) = self.host.playback_state(&self.session_id) else {
             return;
         };
-        let url = self.host.audio_url(&state, AUDIO_CHUNK_SEC);
+        let chunk_frames = self.audio_chunk_frames();
+        let url = self.host.audio_url_for_frames(&state, chunk_frames);
         match self.host.download_bytes(&url) {
             Ok(bytes) => {
                 if let Err(e) = engine.append_m4a(bytes) {
                     self.status = format!("audio decode: {e}");
                 } else {
-                    self.audio_until = self.virtual_sec + AUDIO_CHUNK_SEC;
+                    self.audio_until_frame = self.virtual_frame + chunk_frames;
                     engine.play();
                 }
             }
@@ -289,7 +306,7 @@ impl TransportApp {
         if let Some(engine) = self.audio.as_ref() {
             if playing {
                 engine.play();
-                self.audio_until = -1.0;
+                self.audio_until_frame = -1;
             } else {
                 engine.pause();
             }
@@ -302,13 +319,13 @@ impl TransportApp {
         };
     }
 
-    fn seek_to(&mut self, sec: f64) {
-        let max = self
-            .timeline
-            .as_ref()
-            .map(|m| m.duration_sec)
-            .unwrap_or(f64::MAX);
-        self.virtual_sec = sec.clamp(0.0, max.max(0.0));
+    fn seek_to_frame(&mut self, frame: i64) {
+        let max = self.duration_frames();
+        self.virtual_frame = if max > 0 {
+            frame.clamp(0, max)
+        } else {
+            frame.max(0)
+        };
         if let Some(engine) = self.audio.as_ref() {
             engine.clear();
             if self.playing {
@@ -317,22 +334,23 @@ impl TransportApp {
                 engine.pause();
             }
         }
-        self.audio_until = -1.0;
+        self.audio_until_frame = -1;
         if let Err(e) = self.fetch_frame() {
             self.status = format!("seek: {e}");
         } else {
             self.status = format!(
-                "Seek {:.3}s · fokus={}",
-                self.virtual_sec,
+                "Seek {}f ({:.3}s) · fokus={}",
+                self.virtual_frame,
+                self.virtual_sec(),
                 self.focus.target.label()
             );
         }
     }
 
-    fn source_at_playhead(&self) -> Option<(String, f64)> {
+    fn source_at_playhead(&self) -> Option<(String, i64)> {
         if self.view_mode == ViewMode::Source {
             if let Some(clip) = self.source_clip_id.clone() {
-                return Some((clip, self.source_seek.max(0.0)));
+                return Some((clip, self.source_seek_frame.max(0)));
             }
         }
         if let Some(clip) = self.source_clip_id.clone() {
@@ -340,14 +358,14 @@ impl TransportApp {
             if matches!(self.focus.target, FocusTarget::In | FocusTarget::Out)
                 || self.marks.clip_id.as_ref() == Some(&clip)
             {
-                return Some((clip, self.source_seek.max(0.0)));
+                return Some((clip, self.source_seek_frame.max(0)));
             }
         }
         if let Ok(state) = self.host.playback_state(&self.session_id) {
             let part_id = state.active.part_id.trim();
             if !part_id.is_empty() {
                 if let Some(pair) =
-                    source_sec_at_part(&self.story_state, part_id, state.active.source_sec)
+                    source_frame_at_part(&self.story_state, part_id, state.active.local_frame)
                 {
                     return Some(pair);
                 }
@@ -356,12 +374,12 @@ impl TransportApp {
         let clip = clip_id_from_state(&self.story_state)
             .or_else(|| self.marks.clip_id.clone())
             .or_else(|| self.source_clip_id.clone())?;
-        let sec = if self.source_clip_id.as_ref() == Some(&clip) {
-            self.source_seek
+        let frame = if self.source_clip_id.as_ref() == Some(&clip) {
+            self.source_seek_frame
         } else {
-            self.virtual_sec
+            self.virtual_frame
         };
-        Some((clip, sec.max(0.0)))
+        Some((clip, frame.max(0)))
     }
 
     fn sync_marks_from_io_pins(&mut self) {
@@ -369,12 +387,12 @@ impl TransportApp {
             for pin in &model.io_pins {
                 if pin.kind.eq_ignore_ascii_case("in") && self.marks.mark_in.is_none() {
                     if let Some((clip, _)) = self.source_at_playhead() {
-                        self.marks.set_in(&clip, pin.timeline_sec);
+                        self.marks.set_in(&clip, pin.timeline_frame);
                     }
                 }
                 if pin.kind.eq_ignore_ascii_case("out") && self.marks.mark_out.is_none() {
                     if let Some((clip, _)) = self.source_at_playhead() {
-                        self.marks.set_out(&clip, pin.timeline_sec);
+                        self.marks.set_out(&clip, pin.timeline_frame);
                     }
                 }
             }
@@ -405,8 +423,11 @@ impl TransportApp {
             match self.host.select_slot(&self.project_id, &id) {
                 Ok(s) => {
                     self.story_state = s;
-                    let dur = slot_duration_by_id(&self.story_state, &id).unwrap_or(0.0);
-                    self.status = format!("Fokus slot {id} · trajanje={dur:.3}s (bafer=DB)");
+                    let dur = slot_duration_frames_by_id(&self.story_state, &id).unwrap_or(0);
+                    self.status = format!(
+                        "Fokus slot {id} · trajanje={dur}f ({:.3}s) (bafer=DB)",
+                        frame_to_seconds(dur, self.fps())
+                    );
                 }
                 Err(e) => self.status = format!("slot select: {e}"),
             }
@@ -425,14 +446,14 @@ impl TransportApp {
             .unwrap_or("")
             .to_string();
         let dur = slot
-            .get("duration_sec")
-            .and_then(Value::as_f64)
-            .unwrap_or(0.0);
+            .get("duration_frames")
+            .and_then(Value::as_i64)
+            .unwrap_or(0);
         match self.host.select_slot(&self.project_id, &id) {
             Ok(s) => {
                 self.story_state = s;
                 self.focus.select_slot(id.clone());
-                self.status = format!("Prazni slot {id} · trajanje={dur:.3}s → Shift+I na source");
+                self.status = format!("Prazni slot {id} · trajanje={dur}f → Shift+I na source");
             }
             Err(e) => self.status = format!("focus_empty_slot: {e}"),
         }
@@ -441,14 +462,14 @@ impl TransportApp {
     fn apply_mark_in_fit(&mut self) {
         self.view_mode = ViewMode::Source;
         match self.source_at_playhead() {
-            Some((clip, sec)) => {
+            Some((clip, frame)) => {
                 self.source_clip_id = Some(clip.clone());
-                self.source_seek = sec;
-                match apply_mark_in_fit_duration(&mut self.marks, &clip, sec, &self.story_state) {
+                self.source_seek_frame = frame;
+                match apply_mark_in_fit_frames(&mut self.marks, &clip, frame, &self.story_state) {
                     Ok((inn, out)) => {
                         self.focus.select_out();
                         self.status = format!(
-                            "IN={inn:.3} OUT={out:.3} (slot dur) · {} · zatim {}",
+                            "IN={inn}f OUT={out}f (slot dur) · {} · zatim {}",
                             self.marks.summary(),
                             self.bindings.chord_hint("overwrite_cover")
                         );
@@ -595,10 +616,10 @@ impl TransportApp {
 
     fn apply_mark_in(&mut self) {
         match self.source_at_playhead() {
-            Some((clip, sec)) => {
-                self.marks.set_in(&clip, sec);
+            Some((clip, frame)) => {
+                self.marks.set_in(&clip, frame);
                 self.focus.select_in();
-                self.status = format!("Mark IN {:.3}s · {}", sec, self.marks.summary());
+                self.status = format!("Mark IN {frame}f · {}", self.marks.summary());
             }
             None => {
                 self.status = "Mark IN: nema clip konteksta (odaberi kadar / play-clip)".into();
@@ -608,10 +629,10 @@ impl TransportApp {
 
     fn apply_mark_out(&mut self) {
         match self.source_at_playhead() {
-            Some((clip, sec)) => {
-                self.marks.set_out(&clip, sec);
+            Some((clip, frame)) => {
+                self.marks.set_out(&clip, frame);
                 self.focus.select_out();
-                self.status = format!("Mark OUT {:.3}s · {}", sec, self.marks.summary());
+                self.status = format!("Mark OUT {frame}f · {}", self.marks.summary());
             }
             None => {
                 self.status = "Mark OUT: nema clip konteksta (odaberi kadar / play-clip)".into();
@@ -620,22 +641,21 @@ impl TransportApp {
     }
 
     fn apply_add_marker(&mut self) {
-        let at = self.virtual_sec;
-        match self.host.create_marker(&self.project_id, at, None) {
+        let at = self.virtual_frame;
+        match self.host.create_marker_frame(&self.project_id, at, None) {
             Ok(_) => {
                 self.reload_story_state();
                 self.reload_timeline();
                 if let Some(model) = self.timeline.as_ref() {
                     if let Some(nearest) = model.markers.iter().min_by(|a, b| {
-                        (a.timeline_sec - at)
+                        (a.timeline_frame - at)
                             .abs()
-                            .partial_cmp(&(b.timeline_sec - at).abs())
-                            .unwrap_or(std::cmp::Ordering::Equal)
+                            .cmp(&(b.timeline_frame - at).abs())
                     }) {
                         self.focus.select_marker(nearest.id.clone());
                     }
                 }
-                self.status = format!("M @ {at:.3}s");
+                self.status = format!("M @ {at}f");
             }
             Err(e) => self.status = format!("add_marker: {e}"),
         }
@@ -665,8 +685,8 @@ impl TransportApp {
     fn ensure_in_selected(&mut self) {
         self.sync_marks_from_io_pins();
         if self.marks.mark_in.is_none() {
-            if let Some((clip, sec)) = self.source_at_playhead() {
-                self.marks.set_in(&clip, sec);
+            if let Some((clip, frame)) = self.source_at_playhead() {
+                self.marks.set_in(&clip, frame);
             }
         }
         self.focus.select_in();
@@ -676,8 +696,8 @@ impl TransportApp {
     fn ensure_out_selected(&mut self) {
         self.sync_marks_from_io_pins();
         if self.marks.mark_out.is_none() {
-            if let Some((clip, sec)) = self.source_at_playhead() {
-                self.marks.set_out(&clip, sec);
+            if let Some((clip, frame)) = self.source_at_playhead() {
+                self.marks.set_out(&clip, frame);
             }
         }
         self.focus.select_out();
@@ -702,15 +722,14 @@ impl TransportApp {
                 return;
             }
         }
-        let t = self.virtual_sec;
+        let t = self.virtual_frame;
         let nearest = model
             .markers
             .iter()
             .min_by(|a, b| {
-                (a.timeline_sec - t)
+                (a.timeline_frame - t)
                     .abs()
-                    .partial_cmp(&(b.timeline_sec - t).abs())
-                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .cmp(&(b.timeline_frame - t).abs())
             })
             .map(|m| m.id.clone());
         if let Some(id) = nearest {
@@ -720,18 +739,22 @@ impl TransportApp {
     }
 
     fn step_focus(&mut self, forward: bool) {
-        let delta = if forward { self.step() } else { -self.step() };
+        let delta = if forward { 1 } else { -1 };
         match self.focus.target.clone() {
             FocusTarget::Playhead => {
                 if self.view_mode == ViewMode::Source {
-                    self.source_seek = (self.source_seek + delta).max(0.0);
+                    self.source_seek_frame = (self.source_seek_frame + delta).max(0);
                     if let Err(e) = self.refresh_preview() {
                         self.status = format!("source seek: {e}");
                     } else {
-                        self.status = format!("source t={:.3}s (1f)", self.source_seek);
+                        self.status = format!(
+                            "source {}f ({:.3}s)",
+                            self.source_seek_frame,
+                            self.source_seek_sec()
+                        );
                     }
                 } else {
-                    self.seek_to(self.virtual_sec + delta);
+                    self.seek_to_frame(self.virtual_frame + delta);
                 }
             }
             FocusTarget::In => {
@@ -744,10 +767,10 @@ impl TransportApp {
                     self.status = "IN nudge: nema clip".into();
                     return;
                 };
-                let cur = self.marks.mark_in.unwrap_or(self.virtual_sec);
-                let next = (cur + delta).max(0.0);
+                let cur = self.marks.mark_in.unwrap_or(self.virtual_frame);
+                let next = (cur + delta).max(0);
                 self.marks.set_in(&clip, next);
-                self.status = format!("IN → {:.3}s (1f)", next);
+                self.status = format!("IN → {next}f");
             }
             FocusTarget::Out => {
                 let Some(clip) = self
@@ -759,14 +782,14 @@ impl TransportApp {
                     self.status = "OUT nudge: nema clip".into();
                     return;
                 };
-                let cur = self.marks.mark_out.unwrap_or(self.virtual_sec);
-                let next = (cur + delta).max(0.0);
+                let cur = self.marks.mark_out.unwrap_or(self.virtual_frame);
+                let next = (cur + delta).max(0);
                 if self.marks.mark_in.is_some_and(|i| next <= i) {
                     self.status = "OUT ne smije prijeći ispred IN".into();
                     return;
                 }
                 self.marks.set_out(&clip, next);
-                self.status = format!("OUT → {:.3}s (1f)", next);
+                self.status = format!("OUT → {next}f");
             }
             FocusTarget::Marker { id } => {
                 let Some(model) = self.timeline.as_ref() else {
@@ -777,13 +800,13 @@ impl TransportApp {
                     self.focus.clear();
                     return;
                 };
-                let next = (pin.timeline_sec + delta).max(0.0);
-                match self.host.update_marker(&self.project_id, &id, next) {
+                let next = (pin.timeline_frame + delta).max(0);
+                match self.host.update_marker_frame(&self.project_id, &id, next) {
                     Ok(_) => {
                         self.reload_timeline();
                         self.reload_story_state();
                         self.focus.select_marker(id);
-                        self.status = format!("M → {:.3}s (1f)", next);
+                        self.status = format!("M → {next}f");
                     }
                     Err(e) => self.status = format!("marker nudge: {e}"),
                 }
@@ -791,8 +814,8 @@ impl TransportApp {
             FocusTarget::Slot { id } => {
                 // Slot bounds are derived from M markers — nudge start/end markers instead.
                 self.status = format!(
-                    "Slot {id}: pomakni M markere (←/→ na M) · trajanje={:.3}s",
-                    slot_duration_by_id(&self.story_state, &id).unwrap_or(0.0)
+                    "Slot {id}: pomakni M markere (←/→ na M) · trajanje={}f",
+                    slot_duration_frames_by_id(&self.story_state, &id).unwrap_or(0)
                 );
             }
         }
@@ -805,12 +828,11 @@ impl TransportApp {
                 .timeline
                 .as_ref()
                 .and_then(|m| {
-                    let t = self.virtual_sec;
+                    let t = self.virtual_frame;
                     m.markers.iter().min_by(|a, b| {
-                        (a.timeline_sec - t)
+                        (a.timeline_frame - t)
                             .abs()
-                            .partial_cmp(&(b.timeline_sec - t).abs())
-                            .unwrap_or(std::cmp::Ordering::Equal)
+                            .cmp(&(b.timeline_frame - t).abs())
                     })
                 })
                 .map(|m| m.id.clone()),
@@ -962,12 +984,13 @@ impl eframe::App for TransportApp {
         if self.playing && self.view_mode == ViewMode::Wrap {
             let dt = self.last_tick.elapsed().as_secs_f64();
             self.last_tick = Instant::now();
-            let max = self
-                .timeline
-                .as_ref()
-                .map(|m| m.duration_sec)
-                .unwrap_or(f64::MAX);
-            self.virtual_sec = (self.virtual_sec + dt).clamp(0.0, max.max(0.0));
+            let delta_frames = seconds_to_frame(dt, self.fps()).max(1);
+            let max = self.duration_frames();
+            self.virtual_frame = if max > 0 {
+                (self.virtual_frame + delta_frames).clamp(0, max)
+            } else {
+                (self.virtual_frame + delta_frames).max(0)
+            };
             if self.last_frame_at.elapsed() >= FRAME_INTERVAL {
                 if let Err(e) = self.fetch_frame() {
                     self.status = format!("frame: {e}");
@@ -1036,8 +1059,16 @@ impl eframe::App for TransportApp {
                     self.show_cheatsheet = !self.show_cheatsheet;
                 }
                 ui.separator();
-                ui.label(format!("wrap={:.3}s", self.virtual_sec));
-                ui.label(format!("src={:.3}s", self.source_seek));
+                ui.label(format!(
+                    "wrap={}f ({:.3}s)",
+                    self.virtual_frame,
+                    self.virtual_sec()
+                ));
+                ui.label(format!(
+                    "src={}f ({:.3}s)",
+                    self.source_seek_frame,
+                    self.source_seek_sec()
+                ));
                 ui.label(format!("fokus={}", self.focus.target.label()));
             });
             ui.label(format!(
@@ -1104,10 +1135,10 @@ impl eframe::App for TransportApp {
                     if let Some(t) = timeline::paint_timeline(
                         ui,
                         &model,
-                        self.virtual_sec,
+                        self.virtual_frame,
                         Some(&self.focus.target),
                     ) {
-                        self.seek_to(t);
+                        self.seek_to_frame(t);
                     }
                 } else {
                     ui.colored_label(

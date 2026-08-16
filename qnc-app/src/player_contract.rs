@@ -18,9 +18,9 @@ pub struct BroadcastHostSourceRef {
     pub project_id: String,
     pub virtual_shot_id: String,
     pub clip_id: String,
-    pub in_seconds: Option<f64>,
-    pub out_seconds: Option<f64>,
-    pub duration_sec: f64,
+    pub in_frame: Option<FrameNumber>,
+    pub out_frame: Option<FrameNumber>,
+    pub duration_frames: FrameNumber,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -45,14 +45,14 @@ impl std::fmt::Display for BroadcastHostSourceError {
 impl std::error::Error for BroadcastHostSourceError {}
 
 impl BroadcastHostSourceRef {
-    pub fn from_story_fields(
+    pub fn from_frame_fields(
         project_id: impl Into<String>,
         shot_id: impl Into<String>,
         root_shot_id: impl Into<String>,
         clip_id: impl Into<String>,
-        in_seconds: Option<f64>,
-        out_seconds: Option<f64>,
-        duration_sec: f64,
+        in_frame: Option<FrameNumber>,
+        out_frame: Option<FrameNumber>,
+        duration_frames: FrameNumber,
     ) -> Result<Self, BroadcastHostSourceError> {
         let project_id = project_id.into();
         let shot_id = shot_id.into();
@@ -63,19 +63,27 @@ impl BroadcastHostSourceRef {
                 .ok_or_else(|| BroadcastHostSourceError::new("source is missing id"))?;
 
         if project_id.trim().is_empty() {
-            return Err(BroadcastHostSourceError::new("source is missing project id"));
+            return Err(BroadcastHostSourceError::new(
+                "source is missing project id",
+            ));
         }
         if clip_id.trim().is_empty() {
             return Err(BroadcastHostSourceError::new("source is missing clip id"));
         }
+        if duration_frames.0 <= 0 {
+            return Err(BroadcastHostSourceError::new(
+                "source duration_frames must be greater than zero",
+            ));
+        }
+        let clamp = |frame: FrameNumber| FrameNumber(frame.0.clamp(0, duration_frames.0));
 
         Ok(Self {
             project_id,
             virtual_shot_id: virtual_shot_id.to_string(),
             clip_id,
-            in_seconds,
-            out_seconds,
-            duration_sec,
+            in_frame: in_frame.map(clamp),
+            out_frame: out_frame.map(clamp),
+            duration_frames,
         })
     }
 }

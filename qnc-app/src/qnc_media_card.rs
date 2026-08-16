@@ -7,7 +7,6 @@ use eframe::egui::{self, Color32, Rect, TextureHandle, Vec2};
 
 use crate::qnc_theme::{self, BORDER, MUTED, RAISED, SELECT_RED, SURFACE, TEXT};
 
-pub const STRIP_MARGIN_Y: f32 = 10.0;
 pub const GRID_GAP: f32 = 10.0;
 pub const CARD_TEXT_H: f32 = 34.0;
 pub const MIN_CARD_W: f32 = 160.0;
@@ -17,6 +16,7 @@ pub const MIN_CARD_H: f32 = MIN_CARD_W * 9.0 / 16.0 + CARD_TEXT_H;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StatusDotsMode {
     /// No dots (unused — prefer explicit presets).
+    #[allow(dead_code)]
     Off,
     /// Story / MA: proxy + original (ready/pending/error colours) once import started.
     Pipeline,

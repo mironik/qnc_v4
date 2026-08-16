@@ -5,7 +5,7 @@ Native egui client against `qnc-host` (**no WebView / WASM / browser UI**).
 ## Run
 
 ```powershell
-# terminal 1 — API server (also serves legacy web at /app — ignore that)
+# terminal 1 — API server only
 .\run_host.ps1
 
 # terminal 2 — native egui window titled "QNC App"

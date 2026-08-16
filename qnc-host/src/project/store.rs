@@ -71,6 +71,34 @@ pub fn list_projects(conn: &Connection) -> rusqlite::Result<Vec<Value>> {
     rows.collect()
 }
 
+pub fn project_row(conn: &Connection, project_id: &str) -> rusqlite::Result<Option<Value>> {
+    ensure_project_store(conn)?;
+    let pid = project_id.trim();
+    if pid.is_empty() {
+        return Ok(None);
+    }
+    let row = conn.query_row(
+        "SELECT project_id, name, project_dir, created_at, last_opened_at
+         FROM projects
+         WHERE project_id = ?1",
+        params![pid],
+        |r| {
+            Ok(json!({
+                "project_id": r.get::<_, String>(0)?,
+                "name": r.get::<_, String>(1)?,
+                "project_dir": r.get::<_, Option<String>>(2)?,
+                "created_at": r.get::<_, Option<String>>(3)?,
+                "last_opened_at": r.get::<_, Option<String>>(4)?,
+            }))
+        },
+    );
+    match row {
+        Ok(value) => Ok(Some(value)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
 pub fn list_project_ids(conn: &Connection) -> rusqlite::Result<Vec<String>> {
     ensure_project_store(conn)?;
     let mut stmt = conn.prepare("SELECT project_id FROM projects ORDER BY project_id")?;
@@ -150,12 +178,7 @@ pub fn create_project(
     ensure_project_dirs(paths, &project_id).ok();
     record_project_opened(conn, &project_id)?;
     set_active_project_id(conn, &project_id)?;
-    Ok(json!({
-        "project_id": project_id,
-        "name": label,
-        "created_at": created_at,
-        "last_opened_at": created_at,
-    }))
+    project_row(conn, &project_id)?.ok_or(rusqlite::Error::QueryReturnedNoRows)
 }
 
 pub fn open_project(
@@ -168,7 +191,7 @@ pub fn open_project(
         if p.get("project_id").and_then(|v| v.as_str()) == Some(pid) {
             set_active_project_id(conn, pid)?;
             record_project_opened(conn, pid)?;
-            return Ok(Some(p));
+            return project_row(conn, pid);
         }
     }
     Ok(None)

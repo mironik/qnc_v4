@@ -51,6 +51,10 @@ fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
             resolution TEXT NOT NULL DEFAULT '',
             codec TEXT NOT NULL DEFAULT '',
             fps REAL NOT NULL DEFAULT 0,
+            field_order TEXT NOT NULL DEFAULT '',
+            interlaced INTEGER NOT NULL DEFAULT 0,
+            source_class TEXT NOT NULL DEFAULT '',
+            proxy_recipe TEXT NOT NULL DEFAULT '',
             has_audio INTEGER NOT NULL DEFAULT 0,
             audio_channels INTEGER NOT NULL DEFAULT 0,
             status TEXT NOT NULL DEFAULT '',
@@ -327,6 +331,30 @@ fn migrate_ingest_metadata_columns(conn: &Connection) -> rusqlite::Result<()> {
     if !column_exists(conn, "ingest_assets", "audio_channels") {
         let _ = conn.execute(
             "ALTER TABLE ingest_assets ADD COLUMN audio_channels INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
+    }
+    if !column_exists(conn, "ingest_assets", "field_order") {
+        let _ = conn.execute(
+            "ALTER TABLE ingest_assets ADD COLUMN field_order TEXT NOT NULL DEFAULT ''",
+            [],
+        );
+    }
+    if !column_exists(conn, "ingest_assets", "interlaced") {
+        let _ = conn.execute(
+            "ALTER TABLE ingest_assets ADD COLUMN interlaced INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
+    }
+    if !column_exists(conn, "ingest_assets", "source_class") {
+        let _ = conn.execute(
+            "ALTER TABLE ingest_assets ADD COLUMN source_class TEXT NOT NULL DEFAULT ''",
+            [],
+        );
+    }
+    if !column_exists(conn, "ingest_assets", "proxy_recipe") {
+        let _ = conn.execute(
+            "ALTER TABLE ingest_assets ADD COLUMN proxy_recipe TEXT NOT NULL DEFAULT ''",
             [],
         );
     }

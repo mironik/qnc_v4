@@ -23,6 +23,7 @@ pub mod space {
     use crate::qnc_theme;
 
     /// Matches source-dock horizontal inset (timeline chrome).
+    #[allow(dead_code)]
     pub const SHELL_MARGIN_X: i8 = 8;
     /// Story left media column share.
     pub const LEFT_RATIO: f32 = 0.365;
@@ -31,6 +32,7 @@ pub mod space {
     pub const RIGHT_MIN_W: f32 = 200.0;
 
     pub const CHROME_H: f32 = qnc_theme::CHROME_ROW_H;
+    #[allow(dead_code)]
     pub const PAD_X: i8 = qnc_theme::CHROME_PAD_X;
     pub const BLOCK_PAD: i8 = 10;
     pub const GAP: f32 = 8.0;
@@ -38,6 +40,7 @@ pub mod space {
     /// Story: room under preview for chrome + strip.
     pub const PREVIEW_RESERVE_BELOW: f32 = 190.0;
     pub const PREVIEW_MIN_H: f32 = 160.0;
+    #[allow(dead_code)]
     pub const BODY_MIN_H: f32 = 96.0;
 
     pub fn block_margin() -> Margin {
@@ -60,6 +63,7 @@ pub struct ShellMetrics {
 }
 
 impl ShellMetrics {
+    #[allow(dead_code)]
     pub fn from_avail(avail: Vec2) -> Self {
         Self::from_avail_ratio(avail, LEFT_RATIO)
     }
@@ -82,6 +86,7 @@ impl ShellMetrics {
         (preview_w * 9.0 / 16.0).min(max_h).max(PREVIEW_MIN_H)
     }
 
+    #[allow(dead_code)]
     pub fn body_h(&self, preview_h: f32) -> f32 {
         // Never invent height above the column — overflow would paint over the dock.
         (self.height - preview_h - CHROME_H).max(0.0)
@@ -108,10 +113,14 @@ pub fn column_shell(
 }
 
 /// Web `workspace-split` / `.qnc-project-workspace`: ~32% list | settings, 1px seam.
+#[allow(dead_code)]
 pub const PROJECT_LEFT_RATIO: f32 = 0.32;
+#[allow(dead_code)]
 const PROJECT_LEFT_MIN: f32 = 260.0;
+#[allow(dead_code)]
 const PROJECT_RIGHT_MIN: f32 = 360.0;
 
+#[allow(dead_code)]
 pub fn project_workspace(
     ui: &mut egui::Ui,
     mut paint: impl FnMut(&mut egui::Ui, &ShellMetrics, ShellSide),
@@ -228,6 +237,7 @@ fn shell_split(
 /// remainder). Caller must tile chrome + body inside that budget with
 /// `item_spacing.y = 0` and size the body from `ui.available_height()` after chrome
 /// — never allocate chrome + precomputed body_h (that overflows into the dock).
+#[allow(dead_code)]
 pub fn media_column(
     ui: &mut egui::Ui,
     m: &ShellMetrics,
@@ -236,17 +246,22 @@ pub fn media_column(
     preview_sense: Sense,
     after_preview: impl FnMut(&mut egui::Ui, f32),
 ) {
-    media_column_monitor(ui, m, |ui, preview_h| {
-        preview(
-            ui,
-            PreviewInput {
-                height: preview_h,
-                texture,
-                empty_label,
-                sense: preview_sense,
-            },
-        );
-    }, after_preview);
+    media_column_monitor(
+        ui,
+        m,
+        |ui, preview_h| {
+            preview(
+                ui,
+                PreviewInput {
+                    height: preview_h,
+                    texture,
+                    empty_label,
+                    sense: preview_sense,
+                },
+            );
+        },
+        after_preview,
+    );
 }
 
 /// Left media column with an injected monitor paint (broadcast player monitor).

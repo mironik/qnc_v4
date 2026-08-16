@@ -599,13 +599,7 @@ impl FfmpegVideoSession {
         request: FfmpegVideoCacheRequest<'_>,
     ) -> Result<(), BroadcastEngineError> {
         let frame_byte_len = self.frame_byte_len()?;
-        self.ensure_stream_at(
-            path,
-            start_frame,
-            end_frame,
-            frame_byte_len,
-            request,
-        )?;
+        self.ensure_stream_at(path, start_frame, end_frame, frame_byte_len, request)?;
         let stream = self.stream.as_mut().ok_or_else(|| {
             BroadcastEngineError::new(
                 BroadcastEngineErrorKind::VideoDecode,
@@ -3202,7 +3196,9 @@ mod tests {
         // Progress-bar cue 180 → 3180 must not decode ~3000 RGB frames into RAM.
         assert!(should_drain_forward_gap(1));
         assert!(should_drain_forward_gap(MAX_INPIPE_FORWARD_SKIP_FRAMES));
-        assert!(!should_drain_forward_gap(MAX_INPIPE_FORWARD_SKIP_FRAMES + 1));
+        assert!(!should_drain_forward_gap(
+            MAX_INPIPE_FORWARD_SKIP_FRAMES + 1
+        ));
         assert!(!should_drain_forward_gap(3_000));
     }
 

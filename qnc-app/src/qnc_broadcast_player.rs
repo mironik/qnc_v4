@@ -39,6 +39,7 @@ pub mod css {
 
 /// Latest clock/transport peek (optional; prefer Rx for reactions).
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct PlayerSnapshot {
     pub source_frame: FrameNumber,
     pub source_sec: f64,
@@ -103,10 +104,12 @@ impl BroadcastPlayerTx {
         self.send(PlayerCommand::Open(request))
     }
 
+    #[allow(dead_code)]
     pub fn play(&self) -> Result<(), String> {
         self.send(PlayerCommand::Play)
     }
 
+    #[allow(dead_code)]
     pub fn pause(&self) -> Result<(), String> {
         self.send(PlayerCommand::Pause)
     }
@@ -115,6 +118,7 @@ impl BroadcastPlayerTx {
         self.send(PlayerCommand::TogglePlay)
     }
 
+    #[allow(dead_code)]
     pub fn seek_frame(
         &self,
         frame: FrameNumber,
@@ -128,6 +132,7 @@ impl BroadcastPlayerTx {
         })
     }
 
+    #[allow(dead_code)]
     pub fn goto_frame(&self, frame: FrameNumber) -> Result<(), String> {
         self.seek_frame(frame, true, false)
     }
@@ -144,6 +149,7 @@ pub struct BroadcastPlayerRx {
 
 impl BroadcastPlayerRx {
     /// Placeholder before [`QncBroadcastPlayer::subscribe`] — drops all events.
+    #[allow(dead_code)]
     pub fn disconnected() -> Self {
         let (_tx, rx) = mpsc::sync_channel(1);
         Self { rx }
@@ -162,6 +168,7 @@ impl BroadcastPlayerRx {
         out
     }
 
+    #[allow(dead_code)]
     pub fn try_recv(&self) -> Option<PlayerEvent> {
         self.rx.try_recv().ok()
     }
@@ -211,6 +218,7 @@ impl QncBroadcastPlayer {
         BroadcastPlayerRx { rx: event_rx }
     }
 
+    #[allow(dead_code)]
     pub fn texture(&self) -> Option<&TextureHandle> {
         self.texture.as_ref()
     }
@@ -264,6 +272,9 @@ impl QncBroadcastPlayer {
                         source_frame.0,
                         *source_sec,
                     );
+                }
+                PlayerEvent::BoundaryReached { source_frame } => {
+                    crate::player_log::log_state("player", "Boundary", false, source_frame.0, 0.0);
                 }
                 PlayerEvent::SourceReady { .. } => {}
             }

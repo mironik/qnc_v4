@@ -13,8 +13,11 @@ pub struct Health {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
 pub struct PlaybackState {
     pub session_id: String,
+    #[serde(default)]
+    pub virtual_frame: i64,
     pub virtual_sec: f64,
     #[serde(default)]
     pub playing: bool,
@@ -26,6 +29,7 @@ pub struct PlaybackState {
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
+#[allow(dead_code)]
 pub struct ActiveLayer {
     #[serde(default)]
     pub mixed_audio_url: String,
@@ -37,6 +41,10 @@ pub struct ActiveLayer {
     pub part_id: String,
     #[serde(default)]
     pub source_sec: f64,
+    #[serde(default)]
+    pub local_frame: i64,
+    #[serde(default)]
+    pub source_frame: i64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -68,6 +76,10 @@ pub struct TimelineCover {
     pub timeline_start_sec: f64,
     pub timeline_end_sec: f64,
     #[serde(default)]
+    pub timeline_start_frame: i64,
+    #[serde(default)]
+    pub timeline_end_frame: i64,
+    #[serde(default)]
     pub streamable: bool,
 }
 
@@ -79,6 +91,8 @@ pub struct TimelinePin {
     pub kind: String,
     pub timeline_sec: f64,
     #[serde(default)]
+    pub timeline_frame: i64,
+    #[serde(default)]
     pub label: String,
 }
 
@@ -89,7 +103,13 @@ pub struct TimelineMarkerSlot {
     pub start_sec: f64,
     pub end_sec: f64,
     #[serde(default)]
+    pub start_frame: i64,
+    #[serde(default)]
+    pub end_frame: i64,
+    #[serde(default)]
     pub duration_sec: f64,
+    #[serde(default)]
+    pub duration_frames: i64,
     #[serde(default)]
     pub slot_index: i64,
     #[serde(default)]
@@ -113,6 +133,12 @@ pub struct TimelineSegment {
     pub global_end_sec: f64,
     pub duration_sec: f64,
     #[serde(default)]
+    pub global_start_frame: i64,
+    #[serde(default)]
+    pub global_end_frame: i64,
+    #[serde(default)]
+    pub duration_frames: i64,
+    #[serde(default)]
     pub streamable: bool,
     #[serde(default)]
     pub covers: Vec<TimelineCover>,
@@ -127,6 +153,8 @@ pub struct TimelineModel {
     #[serde(default)]
     pub timeline_fps: f64,
     pub duration_sec: f64,
+    #[serde(default)]
+    pub duration_frames: i64,
     #[serde(default)]
     pub rows: Vec<String>,
     #[serde(default)]
@@ -190,6 +218,8 @@ impl HostClient {
         Ok(())
     }
 
+    #[deprecated(note = "playback seek je frame-only; use playback_seek_frame")]
+    #[allow(dead_code)]
     pub fn playback_seek(&self, session_id: &str, virtual_sec: f64) -> Result<(), String> {
         let _: Value = self
             .agent
@@ -197,6 +227,20 @@ impl HostClient {
             .send_json(ureq::json!({
                 "session_id": session_id,
                 "virtual_sec": virtual_sec.max(0.0)
+            }))
+            .map_err(|e| e.to_string())?
+            .into_json()
+            .unwrap_or(Value::Null);
+        Ok(())
+    }
+
+    pub fn playback_seek_frame(&self, session_id: &str, virtual_frame: i64) -> Result<(), String> {
+        let _: Value = self
+            .agent
+            .post(&format!("{}/api/story/playback/seek", self.base))
+            .send_json(ureq::json!({
+                "session_id": session_id,
+                "virtual_frame": virtual_frame.max(0)
             }))
             .map_err(|e| e.to_string())?
             .into_json()
@@ -241,23 +285,40 @@ impl HostClient {
             .map_err(|e| e.to_string())
     }
 
+    #[deprecated(
+        note = "source timeline model je frame-only; use source_timeline_model_for_frames"
+    )]
+    #[allow(dead_code)]
     pub fn source_timeline_model(
         &self,
         project_id: &str,
         clip_id: &str,
-        duration_sec: f64,
-        in_sec: f64,
-        out_sec: f64,
+        _duration_sec: f64,
+        _in_sec: f64,
+        _out_sec: f64,
+    ) -> Result<TimelineModel, String> {
+        let _ = (project_id, clip_id);
+        Err("source timeline model je frame-only; frameove izračunaj iz source FPS-a i pozovi source_timeline_model_for_frames".into())
+    }
+
+    #[allow(dead_code)]
+    pub fn source_timeline_model_for_frames(
+        &self,
+        project_id: &str,
+        clip_id: &str,
+        duration_frames: i64,
+        in_frame: i64,
+        out_frame: i64,
     ) -> Result<TimelineModel, String> {
         self.agent
             .get(&format!(
-                "{}/api/story/timeline-model/source?project_id={}&clip_id={}&duration_sec={}&in_sec={}&out_sec={}",
+                "{}/api/story/timeline-model/source?project_id={}&clip_id={}&duration_frames={}&in_frame={}&out_frame={}",
                 self.base,
                 urlencoding(project_id),
                 urlencoding(clip_id),
-                duration_sec,
-                in_sec,
-                out_sec
+                duration_frames.max(0),
+                in_frame.max(0),
+                out_frame.max(in_frame.max(0))
             ))
             .call()
             .map_err(|e| e.to_string())?
@@ -298,6 +359,8 @@ impl HostClient {
         std::fs::write(dest, bytes).map_err(|e| e.to_string())
     }
 
+    #[deprecated(note = "playback frame render je frame-only; use frame_url_for_frame")]
+    #[allow(dead_code)]
     pub fn frame_url(&self, state: &PlaybackState, virtual_sec: f64) -> String {
         let rel = if state.active.preview_frame_url.is_empty() {
             format!(
@@ -314,6 +377,17 @@ impl HostClient {
         self.absolute(&rel)
     }
 
+    pub fn frame_url_for_frame(&self, state: &PlaybackState, virtual_frame: i64) -> String {
+        let rel = format!(
+            "/api/story/playback/frame?session_id={}&virtual_frame={}",
+            urlencoding(&state.session_id),
+            virtual_frame.max(0)
+        );
+        self.absolute(&rel)
+    }
+
+    #[deprecated(note = "playback audio je frame-only; use audio_url_for_frames")]
+    #[allow(dead_code)]
     pub fn audio_url(&self, state: &PlaybackState, duration_sec: f64) -> String {
         let rel = format!(
             "/api/story/playback/audio?session_id={}&duration_sec={duration_sec:.3}",
@@ -323,9 +397,20 @@ impl HostClient {
         self.absolute(&rel)
     }
 
+    pub fn audio_url_for_frames(&self, state: &PlaybackState, duration_frames: i64) -> String {
+        let rel = format!(
+            "/api/story/playback/audio?session_id={}&duration_frames={}",
+            urlencoding(&state.session_id),
+            duration_frames.max(1)
+        );
+        let _ = &state.active.mixed_audio_url;
+        self.absolute(&rel)
+    }
+
     /// Story plugin media (proxy-first) — works on current host product path.
     /// Note: host may return a bounded byte chunk (no trailing moov); prefer
     /// `story_virtual_stream_url` for decodeable short windows.
+    #[allow(dead_code)]
     pub fn story_media_url(&self, project_id: &str, clip_id: &str) -> String {
         format!(
             "{}/api/story/media?project_id={}&clip_id={}",
@@ -412,12 +497,34 @@ impl HostClient {
         kind: &str,
         virtual_shot_id: Option<&str>,
     ) -> Result<Value, String> {
+        self.create_part_ex(project_id, kind, virtual_shot_id, None, None, None)
+    }
+
+    /// Virtual segment from source IN/OUT for the Segment tab.
+    pub fn create_part_ex(
+        &self,
+        project_id: &str,
+        kind: &str,
+        virtual_shot_id: Option<&str>,
+        clip_id: Option<&str>,
+        in_seconds: Option<f64>,
+        out_seconds: Option<f64>,
+    ) -> Result<Value, String> {
         let mut body = ureq::json!({
             "project_id": project_id,
             "kind": kind,
         });
         if let Some(id) = virtual_shot_id.filter(|s| !s.is_empty()) {
             body["virtual_shot_id"] = Value::String(id.to_string());
+        }
+        if let Some(id) = clip_id.filter(|s| !s.is_empty()) {
+            body["clip_id"] = Value::String(id.to_string());
+        }
+        if let Some(v) = in_seconds {
+            body["in_seconds"] = Value::from(v);
+        }
+        if let Some(v) = out_seconds {
+            body["out_seconds"] = Value::from(v);
         }
         self.agent
             .post(&format!("{}/api/story/part/create", self.base))
@@ -428,6 +535,7 @@ impl HostClient {
     }
 
     /// Derive a source trim as a virtual shot (IN/OUT in source seconds).
+    #[allow(dead_code)]
     pub fn create_virtual_shot(
         &self,
         project_id: &str,
@@ -448,6 +556,61 @@ impl HostClient {
             .map_err(|e| e.to_string())
     }
 
+    pub fn create_part_ex_frames(
+        &self,
+        project_id: &str,
+        kind: &str,
+        virtual_shot_id: Option<&str>,
+        clip_id: Option<&str>,
+        in_frame: Option<i64>,
+        out_frame: Option<i64>,
+    ) -> Result<Value, String> {
+        let mut body = ureq::json!({
+            "project_id": project_id,
+            "kind": kind,
+        });
+        if let Some(id) = virtual_shot_id.filter(|s| !s.is_empty()) {
+            body["virtual_shot_id"] = Value::String(id.to_string());
+        }
+        if let Some(id) = clip_id.filter(|s| !s.is_empty()) {
+            body["clip_id"] = Value::String(id.to_string());
+        }
+        let in_base = in_frame.unwrap_or(0).max(0);
+        if in_frame.is_some() {
+            body["in_frame"] = Value::from(in_base);
+        }
+        if let Some(v) = out_frame {
+            body["out_frame"] = Value::from(v.max(in_base + 1));
+        }
+        self.agent
+            .post(&format!("{}/api/story/part/create", self.base))
+            .send_json(body)
+            .map_err(|e| e.to_string())?
+            .into_json()
+            .map_err(|e| e.to_string())
+    }
+
+    pub fn create_virtual_shot_from_frames(
+        &self,
+        project_id: &str,
+        clip_id: &str,
+        in_frame: i64,
+        out_frame: i64,
+    ) -> Result<Value, String> {
+        self.agent
+            .post(&format!("{}/api/story/virtual-shot", self.base))
+            .send_json(ureq::json!({
+                "project_id": project_id,
+                "clip_id": clip_id,
+                "in_frame": in_frame.max(0),
+                "out_frame": out_frame.max(in_frame + 1),
+            }))
+            .map_err(|e| e.to_string())?
+            .into_json()
+            .map_err(|e| e.to_string())
+    }
+
+    #[allow(dead_code)]
     pub fn create_marker(
         &self,
         project_id: &str,
@@ -469,6 +632,28 @@ impl HostClient {
             .map_err(|e| e.to_string())
     }
 
+    pub fn create_marker_frame(
+        &self,
+        project_id: &str,
+        timeline_frame: i64,
+        part_id: Option<&str>,
+    ) -> Result<Value, String> {
+        let mut body = ureq::json!({
+            "project_id": project_id,
+            "timeline_frame": timeline_frame.max(0),
+        });
+        if let Some(id) = part_id.filter(|s| !s.is_empty()) {
+            body["part_id"] = Value::String(id.to_string());
+        }
+        self.agent
+            .post(&format!("{}/api/story/marker/create", self.base))
+            .send_json(body)
+            .map_err(|e| e.to_string())?
+            .into_json()
+            .map_err(|e| e.to_string())
+    }
+
+    #[allow(dead_code)]
     pub fn update_marker(
         &self,
         project_id: &str,
@@ -481,6 +666,24 @@ impl HostClient {
                 "project_id": project_id,
                 "marker_id": marker_id,
                 "timeline_sec": timeline_sec.max(0.0),
+            }))
+            .map_err(|e| e.to_string())?
+            .into_json()
+            .map_err(|e| e.to_string())
+    }
+
+    pub fn update_marker_frame(
+        &self,
+        project_id: &str,
+        marker_id: &str,
+        timeline_frame: i64,
+    ) -> Result<Value, String> {
+        self.agent
+            .post(&format!("{}/api/story/marker/update", self.base))
+            .send_json(ureq::json!({
+                "project_id": project_id,
+                "marker_id": marker_id,
+                "timeline_frame": timeline_frame.max(0),
             }))
             .map_err(|e| e.to_string())?
             .into_json()

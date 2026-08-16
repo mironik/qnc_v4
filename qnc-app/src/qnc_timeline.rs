@@ -1,10 +1,14 @@
 //! QNC-timeline — one native timeline component, symbolic layer paint.
 //!
+//! Form-agnostic: this component does not know Ingest, Story, Media Assist,
+//! Wrap, or any workflow screen. Owners pass [`LayerFlags`] + paint data.
+//!
 //! Layers (docs/qnc-timeline.md):
 //!   carrier = logical clock, not painted
 //!   → audio A1..A4 → base video → pokrivalice → IN/OUT + playhead
 //!
-//! Visibility is per-layer via [`LayerFlags`]. Named presets come later.
+//! Layers are visual UI only. They do not play media.
+//!
 //! Editorial segments/parts are owner data — not part of this component.
 //!
 //! # M markers — not owned here
@@ -36,6 +40,8 @@ pub mod css {
     pub const LINE: Color32 = Color32::from_rgb(55, 65, 81);
     pub const WAVE_A1: Color32 = Color32::from_rgb(16, 185, 129);
     pub const WAVE_A2: Color32 = Color32::from_rgb(107, 114, 128);
+    pub const WAVE_A3: Color32 = Color32::from_rgb(75, 85, 99);
+    pub const WAVE_A4: Color32 = Color32::from_rgb(55, 65, 81);
     pub const FOCUS: Color32 = Color32::from_rgb(255, 180, 60);
     pub const PLAYHEAD: Color32 = Color32::from_rgb(0x4e, 0xc9, 0xb0);
     pub const MUTED: Color32 = Color32::from_rgb(0x9c, 0xa3, 0xaf);
@@ -64,10 +70,12 @@ impl ExpandedAudio {
         }
     }
 
+    #[allow(dead_code)]
     pub fn a1_h(self) -> f32 {
         self.lane_h(Self::A1)
     }
 
+    #[allow(dead_code)]
     pub fn a2_h(self) -> f32 {
         self.lane_h(Self::A2)
     }
@@ -83,10 +91,10 @@ impl ExpandedAudio {
     }
 }
 
-/// Per-layer visibility. Owners compose presets from these later.
+/// Per-layer visibility. Owner (outside this component) sets which layers paint.
 ///
 /// `markers` / `marker_slots` are paint toggles that only apply when
-/// [`LayerFlags::covers`] is active (owner invokes broadcast M logic then).
+/// [`LayerFlags::covers`] is active (owner invokes M logic then).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LayerFlags {
     pub carrier: bool,
@@ -95,18 +103,21 @@ pub struct LayerFlags {
     pub audio_a3: bool,
     pub audio_a4: bool,
     pub base_video: bool,
+    /// Selected shot/source range — durable DB range, paint-only.
+    pub shot_range: bool,
     /// Pokrivalice layer — gate for M pin / slot paint.
     pub covers: bool,
     /// Paint M pins (only if `covers`).
     pub markers: bool,
     /// Paint slot bands (only if `covers`); data from broadcast/owner.
     pub marker_slots: bool,
+    /// Draft IN/OUT range for user marking; paint-only.
     pub in_out: bool,
     pub playhead: bool,
 }
 
 impl LayerFlags {
-    /// Complete QNC-timeline — every layer available.
+    /// Every layer defined and on — including A3/A4.
     pub const ALL: Self = Self {
         carrier: true,
         audio_a1: true,
@@ -114,6 +125,7 @@ impl LayerFlags {
         audio_a3: true,
         audio_a4: true,
         base_video: true,
+        shot_range: true,
         covers: true,
         markers: true,
         marker_slots: true,
@@ -123,8 +135,13 @@ impl LayerFlags {
 }
 
 impl Default for LayerFlags {
+    /// A1–A4 are defined; A3/A4 stay off until explicitly enabled.
     fn default() -> Self {
-        Self::ALL
+        Self {
+            audio_a3: false,
+            audio_a4: false,
+            ..Self::ALL
+        }
     }
 }
 
@@ -138,35 +155,39 @@ pub enum TimelineFocusPaint {
 
 #[derive(Debug, Clone, Copy)]
 pub struct TimelineCoverSpan<'a> {
+    #[allow(dead_code)]
     pub id: &'a str,
-    pub start_sec: f64,
-    pub end_sec: f64,
+    pub start_frame: i64,
+    pub end_frame: i64,
     pub selected: bool,
 }
 
 /// Slot band for paint — geometry from broadcast/owner, not derived here.
 #[derive(Debug, Clone, Copy)]
 pub struct TimelineSlotSpan<'a> {
+    #[allow(dead_code)]
     pub id: &'a str,
-    pub start_sec: f64,
-    pub end_sec: f64,
+    pub start_frame: i64,
+    pub end_frame: i64,
     pub has_cover: bool,
     pub selected: bool,
 }
 
-/// M pin for paint — position from owner projection to seconds.
+/// M pin for paint — position from owner projection to carrier frame.
 #[derive(Debug, Clone, Copy)]
 pub struct TimelineMarkerPin {
-    pub timeline_sec: f64,
+    pub timeline_frame: i64,
 }
 
 /// Full QNC-timeline paint input.
 pub struct QncTimeline<'a> {
     pub layers: LayerFlags,
-    pub duration_sec: f64,
-    pub playhead_sec: f64,
-    pub source_in: f64,
-    pub source_out: f64,
+    pub duration_frames: i64,
+    pub playhead_frame: i64,
+    pub shot_in_frame: i64,
+    pub shot_out_frame: i64,
+    pub draft_in_frame: i64,
+    pub draft_out_frame: i64,
     pub video_background: Option<&'a dyn Fn(&mut egui::Ui, egui::Rect)>,
     pub focus: TimelineFocusPaint,
     pub expanded_audio: ExpandedAudio,
@@ -184,13 +205,13 @@ pub struct QncTimeline<'a> {
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct TimelineInteract {
-    pub seek_sec: Option<f64>,
+    pub seek_frame: Option<i64>,
     pub expand_click: Option<ExpandedAudio>,
 }
 
 struct AudioRowInteract {
     expand_click: bool,
-    seek_sec: Option<f64>,
+    seek_frame: Option<i64>,
 }
 
 impl QncTimeline<'_> {
@@ -204,7 +225,7 @@ impl QncTimeline<'_> {
             h += row;
             gaps += 1;
         };
-        // Visual order: A1 → V → A2
+        // Visual order: A1 → V → A2 → A3 → A4 (A3/A4 only if enabled)
         if self.layers.audio_a1 {
             push(self.expanded_audio.lane_h(ExpandedAudio::A1));
         }
@@ -214,12 +235,19 @@ impl QncTimeline<'_> {
         if self.layers.audio_a2 {
             push(self.expanded_audio.lane_h(ExpandedAudio::A2));
         }
+        if self.layers.audio_a3 {
+            push(self.expanded_audio.lane_h(ExpandedAudio::A3));
+        }
+        if self.layers.audio_a4 {
+            push(self.expanded_audio.lane_h(ExpandedAudio::A4));
+        }
         h
     }
 
     fn video_stack_on(&self) -> bool {
         self.layers.carrier
             || self.layers.base_video
+            || self.layers.shot_range
             || self.layers.covers
             || self.layers.in_out
             || self.layers.playhead
@@ -233,7 +261,7 @@ impl QncTimeline<'_> {
         let mut out = TimelineInteract::default();
         let width = ui.available_width();
         let total_h = self.content_height();
-        let dur = self.duration_sec.max(0.04);
+        let duration_frames = self.duration_frames.max(1);
 
         egui::Frame::NONE
             .fill(css::BG)
@@ -243,7 +271,7 @@ impl QncTimeline<'_> {
                 ui.set_max_height(total_h);
                 ui.spacing_mut().item_spacing = Vec2::new(0.0, css::ROW_GAP);
 
-                // Visual order: A1 → V → A2
+                // Visual order: A1 → V → A2 → A3 → A4 (A3/A4 only if enabled)
                 if self.layers.audio_a1 {
                     merge_audio(
                         &mut out,
@@ -255,15 +283,15 @@ impl QncTimeline<'_> {
                             self.a1_peaks,
                             css::WAVE_A1,
                             css::AUDIO_PRIMARY_BG,
-                            dur,
+                            duration_frames,
                         ),
                     );
                 }
 
                 if self.video_stack_on() {
-                    if let Some(sec) = self.paint_video_stack(ui, dur) {
-                        if out.seek_sec.is_none() {
-                            out.seek_sec = Some(sec);
+                    if let Some(frame) = self.paint_video_stack(ui, duration_frames) {
+                        if out.seek_frame.is_none() {
+                            out.seek_frame = Some(frame);
                         }
                     }
                 }
@@ -279,7 +307,39 @@ impl QncTimeline<'_> {
                             self.a2_peaks,
                             css::WAVE_A2,
                             css::AUDIO_SECONDARY_BG,
-                            dur,
+                            duration_frames,
+                        ),
+                    );
+                }
+
+                if self.layers.audio_a3 {
+                    merge_audio(
+                        &mut out,
+                        ExpandedAudio::A3,
+                        self.paint_audio_row(
+                            ui,
+                            ExpandedAudio::A3,
+                            "A3",
+                            self.a3_peaks,
+                            css::WAVE_A3,
+                            css::AUDIO_SECONDARY_BG,
+                            duration_frames,
+                        ),
+                    );
+                }
+
+                if self.layers.audio_a4 {
+                    merge_audio(
+                        &mut out,
+                        ExpandedAudio::A4,
+                        self.paint_audio_row(
+                            ui,
+                            ExpandedAudio::A4,
+                            "A4",
+                            self.a4_peaks,
+                            css::WAVE_A4,
+                            css::AUDIO_SECONDARY_BG,
+                            duration_frames,
                         ),
                     );
                 }
@@ -322,7 +382,7 @@ impl QncTimeline<'_> {
         peaks: &[f32],
         wave_color: Color32,
         bg: Color32,
-        dur: f64,
+        duration_frames: i64,
     ) -> AudioRowInteract {
         let height = self.expanded_audio.lane_h(lane);
         let width = ui.available_width();
@@ -349,34 +409,55 @@ impl QncTimeline<'_> {
             egui::StrokeKind::Inside,
         );
         paint_peaks(painter, inner, peaks, wave_color);
+        if self.layers.shot_range {
+            paint_shot_range(
+                painter,
+                inner,
+                duration_frames,
+                self.shot_in_frame,
+                self.shot_out_frame,
+            );
+        }
         if self.layers.in_out {
-            paint_io_dim(painter, inner, dur, self.source_in, self.source_out);
+            paint_io_dim(
+                painter,
+                inner,
+                duration_frames,
+                self.draft_in_frame,
+                self.draft_out_frame,
+            );
             paint_io_handles(
                 painter,
                 inner,
-                dur,
-                self.source_in,
-                self.source_out,
+                duration_frames,
+                self.draft_in_frame,
+                self.draft_out_frame,
                 self.focus,
             );
         }
         if self.layers.playhead {
-            paint_playhead(painter, inner, dur, self.playhead_sec, self.focus);
+            paint_playhead(
+                painter,
+                inner,
+                duration_frames,
+                self.playhead_frame,
+                self.focus,
+            );
         }
         if label_resp.clicked() {
             return AudioRowInteract {
                 expand_click: true,
-                seek_sec: None,
+                seek_frame: None,
             };
         }
         AudioRowInteract {
             expand_click: false,
-            seek_sec: seek_from_pointer(&response, inner, dur),
+            seek_frame: seek_from_pointer(&response, inner, duration_frames),
         }
     }
 
     /// V: video/control row. Filmstrip thumbnails are a separate UI background component.
-    fn paint_video_stack(&self, ui: &mut egui::Ui, dur: f64) -> Option<f64> {
+    fn paint_video_stack(&self, ui: &mut egui::Ui, duration_frames: i64) -> Option<i64> {
         let width = ui.available_width();
         let (row, response) = ui.allocate_exact_size(
             Vec2::new(width, self.video_stack_h()),
@@ -409,7 +490,7 @@ impl QncTimeline<'_> {
             let painter = ui.painter();
 
             if covers_active && self.layers.marker_slots {
-                paint_marker_slots(painter, track_rect, dur, self.marker_slots);
+                paint_marker_slots(painter, track_rect, duration_frames, self.marker_slots);
             }
 
             if self.layers.base_video && !self.base_video_blank {
@@ -420,55 +501,82 @@ impl QncTimeline<'_> {
                 );
             }
 
+            if self.layers.shot_range {
+                paint_shot_range(
+                    painter,
+                    inner,
+                    duration_frames,
+                    self.shot_in_frame,
+                    self.shot_out_frame,
+                );
+            }
+
             if covers_active {
-                paint_covers(painter, track_rect, dur, self.covers);
+                paint_covers(painter, track_rect, duration_frames, self.covers);
                 if self.layers.markers {
-                    paint_markers(painter, track_rect, dur, self.markers);
+                    paint_markers(painter, track_rect, duration_frames, self.markers);
                 }
             }
             if self.layers.in_out {
-                paint_io_dim(painter, inner, dur, self.source_in, self.source_out);
+                paint_io_dim(
+                    painter,
+                    inner,
+                    duration_frames,
+                    self.draft_in_frame,
+                    self.draft_out_frame,
+                );
                 paint_io_handles(
                     painter,
                     inner,
-                    dur,
-                    self.source_in,
-                    self.source_out,
+                    duration_frames,
+                    self.draft_in_frame,
+                    self.draft_out_frame,
                     self.focus,
                 );
             }
             if self.layers.playhead {
-                paint_playhead(painter, inner, dur, self.playhead_sec, self.focus);
+                paint_playhead(
+                    painter,
+                    inner,
+                    duration_frames,
+                    self.playhead_frame,
+                    self.focus,
+                );
             }
         }
 
-        seek_from_pointer(&response, inner, dur)
+        seek_from_pointer(&response, inner, duration_frames)
     }
 }
 
 fn merge_audio(out: &mut TimelineInteract, lane: ExpandedAudio, a: AudioRowInteract) {
     if a.expand_click {
         out.expand_click = Some(lane);
-    } else if out.seek_sec.is_none() {
-        if let Some(sec) = a.seek_sec {
-            out.seek_sec = Some(sec);
+    } else if out.seek_frame.is_none() {
+        if let Some(frame) = a.seek_frame {
+            out.seek_frame = Some(frame);
         }
     }
+}
+
+fn x_for_frame(area: egui::Rect, duration_frames: i64, frame: i64) -> f32 {
+    let duration_frames = duration_frames.max(1);
+    let t = (frame.clamp(0, duration_frames) as f32) / (duration_frames as f32);
+    area.left() + t * area.width()
 }
 
 fn paint_covers(
     painter: &egui::Painter,
     area: egui::Rect,
-    dur: f64,
+    duration_frames: i64,
     covers: &[TimelineCoverSpan<'_>],
 ) {
-    let x_at = |sec: f64| area.left() + (sec / dur).clamp(0.0, 1.0) as f32 * area.width();
     for cover in covers {
-        if cover.end_sec <= cover.start_sec {
+        if cover.end_frame <= cover.start_frame {
             continue;
         }
-        let x0 = x_at(cover.start_sec);
-        let x1 = x_at(cover.end_sec);
+        let x0 = x_for_frame(area, duration_frames, cover.start_frame);
+        let x1 = x_for_frame(area, duration_frames, cover.end_frame);
         painter.rect_filled(
             egui::Rect::from_min_max(
                 egui::pos2(x0, area.top() + 2.0),
@@ -487,16 +595,15 @@ fn paint_covers(
 fn paint_marker_slots(
     painter: &egui::Painter,
     area: egui::Rect,
-    dur: f64,
+    duration_frames: i64,
     slots: &[TimelineSlotSpan<'_>],
 ) {
-    let x_at = |sec: f64| area.left() + (sec / dur).clamp(0.0, 1.0) as f32 * area.width();
     for slot in slots {
-        if slot.end_sec <= slot.start_sec {
+        if slot.end_frame <= slot.start_frame {
             continue;
         }
-        let x0 = x_at(slot.start_sec);
-        let x1 = x_at(slot.end_sec);
+        let x0 = x_for_frame(area, duration_frames, slot.start_frame);
+        let x1 = x_for_frame(area, duration_frames, slot.end_frame);
         let slot_rect = egui::Rect::from_min_max(
             egui::pos2(x0, area.top() + 2.0),
             egui::pos2(x1.max(x0 + 3.0), area.bottom() - 2.0),
@@ -521,13 +628,12 @@ fn paint_marker_slots(
 fn paint_markers(
     painter: &egui::Painter,
     area: egui::Rect,
-    dur: f64,
+    duration_frames: i64,
     markers: &[TimelineMarkerPin],
 ) {
-    let x_at = |sec: f64| area.left() + (sec / dur).clamp(0.0, 1.0) as f32 * area.width();
     let pink = Color32::from_rgb(244, 114, 182);
     for m in markers {
-        let x = x_at(m.timeline_sec);
+        let x = x_for_frame(area, duration_frames, m.timeline_frame);
         painter.line_segment(
             [egui::pos2(x, area.top()), egui::pos2(x, area.bottom())],
             egui::Stroke::new(1.0, pink),
@@ -542,15 +648,54 @@ fn paint_markers(
     }
 }
 
+fn paint_shot_range(
+    painter: &egui::Painter,
+    inner: egui::Rect,
+    duration_frames: i64,
+    shot_in_frame: i64,
+    shot_out_frame: i64,
+) {
+    if shot_out_frame <= shot_in_frame {
+        return;
+    }
+    let in_x = x_for_frame(inner, duration_frames, shot_in_frame);
+    let out_x = x_for_frame(inner, duration_frames, shot_out_frame);
+    let range = egui::Rect::from_min_max(
+        egui::pos2(in_x, inner.top() + 1.0),
+        egui::pos2(out_x.max(in_x + 3.0), inner.bottom() - 1.0),
+    );
+    let color = Color32::from_rgb(96, 165, 250);
+    painter.rect_stroke(
+        range,
+        1.0,
+        egui::Stroke::new(1.5, color.linear_multiply(0.85)),
+        egui::StrokeKind::Inside,
+    );
+    painter.line_segment(
+        [
+            egui::pos2(in_x, inner.top() + 1.0),
+            egui::pos2(in_x, inner.bottom() - 1.0),
+        ],
+        egui::Stroke::new(2.0, color),
+    );
+    painter.line_segment(
+        [
+            egui::pos2(out_x, inner.top() + 1.0),
+            egui::pos2(out_x, inner.bottom() - 1.0),
+        ],
+        egui::Stroke::new(2.0, color),
+    );
+}
+
 fn paint_io_dim(
     painter: &egui::Painter,
     inner: egui::Rect,
-    dur: f64,
-    source_in: f64,
-    source_out: f64,
+    duration_frames: i64,
+    draft_in_frame: i64,
+    draft_out_frame: i64,
 ) {
-    let in_x = inner.left() + (source_in / dur).clamp(0.0, 1.0) as f32 * inner.width();
-    let out_x = inner.left() + (source_out / dur).clamp(0.0, 1.0) as f32 * inner.width();
+    let in_x = x_for_frame(inner, duration_frames, draft_in_frame);
+    let out_x = x_for_frame(inner, duration_frames, draft_out_frame);
     if in_x > inner.left() + 0.5 {
         painter.rect_filled(
             egui::Rect::from_min_max(inner.min, egui::pos2(in_x, inner.bottom())),
@@ -570,13 +715,13 @@ fn paint_io_dim(
 fn paint_io_handles(
     painter: &egui::Painter,
     inner: egui::Rect,
-    dur: f64,
-    source_in: f64,
-    source_out: f64,
+    duration_frames: i64,
+    draft_in_frame: i64,
+    draft_out_frame: i64,
     focus: TimelineFocusPaint,
 ) {
-    let in_x = inner.left() + (source_in / dur).clamp(0.0, 1.0) as f32 * inner.width();
-    let out_x = inner.left() + (source_out / dur).clamp(0.0, 1.0) as f32 * inner.width();
+    let in_x = x_for_frame(inner, duration_frames, draft_in_frame);
+    let out_x = x_for_frame(inner, duration_frames, draft_out_frame);
     let in_stroke = if focus == TimelineFocusPaint::In {
         egui::Stroke::new(3.0, css::FOCUS)
     } else {
@@ -606,11 +751,11 @@ fn paint_io_handles(
 fn paint_playhead(
     painter: &egui::Painter,
     inner: egui::Rect,
-    dur: f64,
-    playhead_sec: f64,
+    duration_frames: i64,
+    playhead_frame: i64,
     focus: TimelineFocusPaint,
 ) {
-    let x = inner.left() + (playhead_sec / dur).clamp(0.0, 1.0) as f32 * inner.width();
+    let x = x_for_frame(inner, duration_frames, playhead_frame);
     let stroke = if focus == TimelineFocusPaint::Playhead {
         egui::Stroke::new(2.5, css::FOCUS)
     } else {
@@ -622,7 +767,11 @@ fn paint_playhead(
     );
 }
 
-fn seek_from_pointer(response: &egui::Response, inner: egui::Rect, duration: f64) -> Option<f64> {
+fn seek_from_pointer(
+    response: &egui::Response,
+    inner: egui::Rect,
+    duration_frames: i64,
+) -> Option<i64> {
     if !(response.clicked() || response.dragged()) {
         return None;
     }
@@ -630,8 +779,12 @@ fn seek_from_pointer(response: &egui::Response, inner: egui::Rect, duration: f64
     if !inner.expand(2.0).contains(pos) {
         return None;
     }
+    if inner.width() <= 0.0 {
+        return None;
+    }
     let t = ((pos.x - inner.left()) / inner.width()).clamp(0.0, 1.0) as f64;
-    Some(t * duration.max(0.04))
+    let duration_frames = duration_frames.max(1);
+    Some(((t * duration_frames as f64).round() as i64).clamp(0, duration_frames))
 }
 
 fn paint_peaks(painter: &egui::Painter, rect: egui::Rect, peaks: &[f32], color: Color32) {
@@ -655,5 +808,23 @@ fn paint_peaks(painter: &egui::Painter, rect: egui::Rect, peaks: &[f32], color: 
             [egui::pos2(x, mid - amp), egui::pos2(x, mid + amp)],
             egui::Stroke::new(1.0, color),
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_defines_a3_a4_but_leaves_them_off() {
+        let d = LayerFlags::default();
+        assert!(d.audio_a1);
+        assert!(d.audio_a2);
+        assert!(d.shot_range);
+        assert!(d.in_out);
+        assert!(!d.audio_a3);
+        assert!(!d.audio_a4);
+        assert!(LayerFlags::ALL.audio_a3);
+        assert!(LayerFlags::ALL.audio_a4);
     }
 }

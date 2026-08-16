@@ -9,7 +9,9 @@ use super::db::{
     project_dir_in_root, project_root_from_settings, slug_id, ProjectPaths,
 };
 use super::kv::{load_object, load_string_list, replace_object, replace_string_list};
-use super::store::{record_project_opened, set_active_project_id, upsert_project_meta};
+use super::store::{
+    project_row, record_project_opened, set_active_project_id, upsert_project_meta,
+};
 
 #[derive(serde::Deserialize)]
 struct SeedFile {
@@ -229,7 +231,11 @@ pub fn get_project_template(
 pub fn get_project_settings(paths: &ProjectPaths, project_id: &str) -> rusqlite::Result<Value> {
     let pid = project_id.trim();
     let conn = open_project(paths, pid)?;
-    migrate_legacy_ingest_workflow(&conn, pid)?;
+    project_settings_from_conn(&conn, pid)
+}
+
+fn project_settings_from_conn(conn: &Connection, project_id: &str) -> rusqlite::Result<Value> {
+    let pid = project_id.trim();
     let row: Option<String> = conn
         .query_row(
             "SELECT template_id FROM project_settings WHERE project_id = ?1",
@@ -248,20 +254,21 @@ pub fn get_project_settings(paths: &ProjectPaths, project_id: &str) -> rusqlite:
     }))
 }
 
-pub fn get_project_workspace(
+pub fn prepare_project_workspace(
     global: &Connection,
     paths: &ProjectPaths,
     project_id: &str,
 ) -> rusqlite::Result<Value> {
     let pid = project_id.trim();
-    let item = get_project_settings(paths, pid)?;
+    let conn = open_project(paths, pid)?;
+    migrate_legacy_ingest_workflow(&conn, pid)?;
+    let item = project_settings_from_conn(&conn, pid)?;
     let template_id = item
         .get("template_id")
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
     let settings_raw = item.get("settings").cloned().unwrap_or_else(|| json!({}));
-    let conn = open_project(paths, pid)?;
     let settings = normalize_settings_workspace(&hydrate_project_settings(
         global,
         &conn,
@@ -270,13 +277,56 @@ pub fn get_project_workspace(
         settings_raw.clone(),
     )?);
     let settings = materialize_workspace_tabs(&settings);
+    let mut snapshot_template_id = item.get("template_id").cloned().unwrap_or(Value::Null);
     if settings != settings_raw && settings_have_workflow_tabs(&settings) {
         let tid = resolve_persist_template_id(global, &conn, pid, &template_id)?;
         let _ = persist_project_settings_kv(&conn, pid, &tid, &settings);
+        if !tid.trim().is_empty() {
+            snapshot_template_id = Value::String(tid);
+        }
     }
     ensure_project_workflow(&conn, pid, &settings)?;
-    let steps = list_workflow_steps(&conn, project_id)?;
-    let state = workflow_state(&conn, project_id)?;
+    workspace_snapshot_from_db(&conn, pid, snapshot_template_id)
+}
+
+pub fn get_project_workspace(
+    _global: &Connection,
+    paths: &ProjectPaths,
+    project_id: &str,
+) -> rusqlite::Result<Value> {
+    let pid = project_id.trim();
+    let conn = open_project(paths, pid)?;
+    let item = project_settings_from_conn(&conn, pid)?;
+    let steps = list_workflow_steps(&conn, pid)?;
+    if steps.is_empty() {
+        return Err(rusqlite::Error::InvalidParameterName(format!(
+            "Projekt '{pid}' nema DB workspace workflow; otvori projekt kroz Project Registry repair/open tok."
+        )));
+    }
+    workspace_snapshot_from_parts(
+        pid,
+        item.get("template_id").cloned().unwrap_or(Value::Null),
+        steps,
+        workflow_state(&conn, pid)?,
+    )
+}
+
+fn workspace_snapshot_from_db(
+    conn: &Connection,
+    project_id: &str,
+    template_id: Value,
+) -> rusqlite::Result<Value> {
+    let steps = list_workflow_steps(conn, project_id)?;
+    let state = workflow_state(conn, project_id)?;
+    workspace_snapshot_from_parts(project_id, template_id, steps, state)
+}
+
+fn workspace_snapshot_from_parts(
+    project_id: &str,
+    template_id: Value,
+    steps: Vec<Value>,
+    state: Value,
+) -> rusqlite::Result<Value> {
     let tabs: Vec<String> = steps
         .iter()
         .filter_map(|s| {
@@ -295,8 +345,8 @@ pub fn get_project_workspace(
         }
     }
     Ok(json!({
-        "project_id": pid,
-        "template_id": item.get("template_id").cloned().unwrap_or(Value::Null),
+        "project_id": project_id,
+        "template_id": template_id,
         "tabs": tabs,
         "tab_labels": Value::Object(labels),
         "steps": steps,
@@ -314,6 +364,7 @@ pub fn save_project_settings(
     user_id: &str,
 ) -> rusqlite::Result<Value> {
     let pid = project_id.trim();
+    validate_project_export_settings(settings).map_err(rusqlite::Error::InvalidParameterName)?;
     let conn = open_project(paths, pid)?;
     let now = now_str();
     let existing: Option<(Option<String>, Option<String>)> = conn
@@ -348,6 +399,7 @@ pub fn save_project_settings(
         ],
     )?;
     replace_object(&conn, "project_settings_kv", "project_id", pid, settings)?;
+    write_project_workflow(&conn, pid, settings)?;
     get_project_settings(paths, pid)
 }
 
@@ -371,6 +423,7 @@ pub fn create_user_template(
         (None, Some(b)) => b.get("settings").cloned().unwrap_or_else(|| json!({})),
         (None, None) => json!({}),
     };
+    validate_project_export_settings(&payload).map_err(rusqlite::Error::InvalidParameterName)?;
     let source_ids = source_template_ids
         .cloned()
         .or_else(|| {
@@ -473,6 +526,7 @@ pub fn create_project_from_template(
         settings = deep_merge(&settings, ov);
     }
     settings = materialize_workspace_tabs(&settings);
+    validate_project_export_settings(&settings).map_err(rusqlite::Error::InvalidParameterName)?;
     if let Value::Object(ref mut map) = settings {
         map.insert(
             "template".into(),
@@ -510,15 +564,59 @@ pub fn create_project_from_template(
     write_project_workflow(&project_conn, &project_id, &settings)?;
     set_active_project_id(global, &project_id)?;
     record_project_opened(global, &project_id)?;
+    let project = project_row(global, &project_id)?.ok_or(rusqlite::Error::QueryReturnedNoRows)?;
     Ok(json!({
-        "project": {
-            "project_id": project_id,
-            "name": label,
-            "created_at": now_str(),
-            "template_id": tpl_id,
-        },
+        "project": project,
         "settings": saved,
     }))
+}
+
+pub(crate) fn validate_project_export_settings(settings: &Value) -> Result<(), String> {
+    let Some(export) = settings.get("export") else {
+        return Ok(());
+    };
+    if export_is_progressive_25(export) && !export_allows_progressive_25(export) {
+        return Err(
+            "25p export je dozvoljen samo kao telekino PsF profil; za news koristi p50 ili i50."
+                .into(),
+        );
+    }
+    Ok(())
+}
+
+fn export_str<'a>(export: &'a Value, key: &str) -> &'a str {
+    export.get(key).and_then(Value::as_str).unwrap_or("")
+}
+
+fn export_fps(export: &Value) -> f64 {
+    export
+        .get("fps")
+        .and_then(Value::as_f64)
+        .or_else(|| {
+            export
+                .get("fps")
+                .and_then(Value::as_i64)
+                .map(|value| value as f64)
+        })
+        .or_else(|| export.get("fps").and_then(Value::as_str)?.parse().ok())
+        .unwrap_or(0.0)
+}
+
+fn export_allows_progressive_25(export: &Value) -> bool {
+    ["purpose", "preset", "format", "name"].iter().any(|key| {
+        let value = export_str(export, key).to_ascii_lowercase();
+        value.contains("telekino") || value.contains("psf")
+    })
+}
+
+fn export_is_progressive_25(export: &Value) -> bool {
+    let fps = export_fps(export);
+    let field_order = export_str(export, "field_order").to_ascii_lowercase();
+    let format = export_str(export, "format").to_ascii_lowercase();
+    let looks_25 = (fps - 25.0).abs() < 0.01;
+    let explicit_p25 = format.contains("p25");
+    let explicit_i50 = format.contains("i50") || field_order.contains("upper");
+    explicit_p25 || (looks_25 && field_order == "progressive" && !explicit_i50)
 }
 
 /// Legacy v1 workspace tab id → registered plugin tab id.
@@ -1320,6 +1418,64 @@ mod legacy_ingest_tests {
     }
 
     #[test]
+    fn workspace_get_reads_existing_db_workflow_and_prepare_owns_repair() {
+        let base = std::env::temp_dir().join(format!(
+            "qnc_workspace_db_first_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::create_dir_all(&base);
+        let paths = test_paths(&base);
+        let project_id = "qa_workspace_db_first";
+        let global = open_global(&paths).unwrap();
+        let project_dir = project_dir_in_root(&paths.projects_root, project_id);
+        upsert_project_meta(&global, project_id, project_id, None, Some(&project_dir)).unwrap();
+        ensure_project_dirs_at(&project_dir).unwrap();
+        let conn = open_project(&paths, project_id).unwrap();
+        let settings = breaking_news_settings();
+        conn.execute(
+            "INSERT INTO project_settings (project_id, template_id, settings_json)
+             VALUES (?1, 'tpl_breaking_news', '{}')",
+            params![project_id],
+        )
+        .unwrap();
+        replace_object(
+            &conn,
+            "project_settings_kv",
+            "project_id",
+            project_id,
+            &settings,
+        )
+        .unwrap();
+
+        assert!(
+            get_project_workspace(&global, &paths, project_id).is_err(),
+            "workspace GET must not derive workflow from settings/template on read"
+        );
+
+        let repaired = prepare_project_workspace(&global, &paths, project_id).unwrap();
+        assert_eq!(
+            repaired
+                .get("entry_step_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or(""),
+            "step_ingest"
+        );
+        let readonly = get_project_workspace(&global, &paths, project_id).unwrap();
+        assert_eq!(
+            readonly
+                .get("entry_step_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or(""),
+            "step_ingest"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
     fn legacy_ingest_renames_proxy_step_and_settings() {
         let base = std::env::temp_dir().join(format!(
             "qnc_legacy_ingest_{}",
@@ -1492,5 +1648,43 @@ mod legacy_ingest_tests {
             .unwrap_or_default();
         assert!(stored.iter().any(|v| v.as_str() == Some("ingest")));
         assert!(stored.iter().any(|v| v.as_str() == Some("qstoryboard")));
+    }
+
+    #[test]
+    fn export_settings_reject_generic_progressive_25_for_news() {
+        let settings = json!({
+            "export": {
+                "preset": "h264_1080p25",
+                "format": "HD 1080p25",
+                "fps": 25,
+                "field_order": "progressive"
+            }
+        });
+
+        assert!(validate_project_export_settings(&settings).is_err());
+    }
+
+    #[test]
+    fn export_settings_allow_i50_and_telekino_psf25() {
+        let i50 = json!({
+            "export": {
+                "preset": "xdcam_hd422_50i",
+                "format": "HD 1080i50",
+                "fps": 25,
+                "field_order": "upper_first"
+            }
+        });
+        let telekino_psf = json!({
+            "export": {
+                "preset": "telekino_psf25",
+                "purpose": "telekino_psf",
+                "format": "HD 1080PsF25",
+                "fps": 25,
+                "field_order": "upper_first"
+            }
+        });
+
+        assert!(validate_project_export_settings(&i50).is_ok());
+        assert!(validate_project_export_settings(&telekino_psf).is_ok());
     }
 }

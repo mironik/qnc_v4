@@ -5,12 +5,11 @@
 //! 2. User overrides from SQLite: `GET /api/settings/keyboard-shortcuts`
 
 use std::collections::HashMap;
-use std::fs;
-use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
-use crate::api::HostClient;
+pub(crate) const STORYBOARD_SHORTCUT_SCOPE: &str = "storyboard";
+pub(crate) const PROJECT_SHORTCUT_SCOPE: &str = "project";
 
 #[derive(Debug, Clone)]
 pub struct KeyChord {
@@ -50,6 +49,7 @@ pub struct StoryBindings {
     pub by_action: HashMap<String, Vec<KeyChord>>,
     #[allow(dead_code)]
     pub labels: HashMap<String, String>,
+    #[allow(dead_code)]
     pub source: String,
 }
 
@@ -80,12 +80,7 @@ impl StoryBindings {
         }
 
         let mut by_action = HashMap::new();
-        if let Some(scope_map) = catalog
-            .get("presets")
-            .and_then(|p| p.get(preset_id))
-            .and_then(|p| p.get(scope))
-            .and_then(|v| v.as_object())
-        {
+        if let Some(scope_map) = catalog_scope_map(catalog, preset_id, scope) {
             for (action_id, bindings) in scope_map {
                 let chords: Vec<KeyChord> = bindings
                     .as_array()
@@ -159,57 +154,22 @@ impl StoryBindings {
     }
 }
 
-/// Load bindings from host catalog + SQLite user overrides only (no Rust hardcoded chords).
-pub fn load_story_bindings(host: &HostClient, scope: &str) -> StoryBindings {
-    let user = host.keyboard_user().unwrap_or_else(|_| Value::Null);
-    match host.keyboard_catalog() {
-        Ok(catalog) => {
-            let bindings = StoryBindings::from_catalog(&catalog, &user, scope);
-            if bindings.by_action.is_empty() {
-                eprintln!("qnc-app: keyboard catalog loaded but scope `{scope}` is empty");
-            }
-            bindings
-        }
-        Err(err) => {
-            eprintln!("qnc-app: keyboard catalog from host failed: {err}");
-            // Last resort: same manifest the host would serve (not hardcoded chords).
-            if let Some(catalog) = load_catalog_from_disk() {
-                let mut bindings = StoryBindings::from_catalog(&catalog, &user, scope);
-                bindings.source = format!("file+{}", bindings.source);
-                return bindings;
-            }
-            StoryBindings::empty()
-        }
-    }
-}
-
-fn load_catalog_from_disk() -> Option<Value> {
-    for path in catalog_candidate_paths() {
-        if let Ok(raw) = fs::read_to_string(&path) {
-            if let Ok(v) = serde_json::from_str::<Value>(&raw) {
-                return Some(v);
-            }
-        }
-    }
-    None
-}
-
-fn catalog_candidate_paths() -> Vec<PathBuf> {
-    let mut out = Vec::new();
-    out.push(PathBuf::from("seed/keyboard-shortcuts.json"));
-    if let Ok(cwd) = std::env::current_dir() {
-        out.push(cwd.join("seed/keyboard-shortcuts.json"));
-        out.push(cwd.join("../seed/keyboard-shortcuts.json"));
-        out.push(cwd.join("../../seed/keyboard-shortcuts.json"));
-    }
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            out.push(dir.join("keyboard-shortcuts.json"));
-            out.push(dir.join("seed/keyboard-shortcuts.json"));
-            out.push(dir.join("../../../seed/keyboard-shortcuts.json"));
-        }
-    }
-    out.into_iter().filter(|p| Path::new(p).is_file()).collect()
+fn catalog_scope_map<'a>(
+    catalog: &'a Value,
+    preset_id: &str,
+    scope: &str,
+) -> Option<&'a serde_json::Map<String, Value>> {
+    let presets = catalog.get("presets")?;
+    presets
+        .get(preset_id)
+        .and_then(|preset| preset.get(scope))
+        .and_then(|v| v.as_object())
+        .or_else(|| {
+            presets
+                .get("default")
+                .and_then(|preset| preset.get(scope))
+                .and_then(|v| v.as_object())
+        })
 }
 
 fn parse_chord(v: &Value) -> Option<KeyChord> {
@@ -487,6 +447,31 @@ mod tests {
         assert!(bindings
             .matching_actions(egui::Key::I, egui::Modifiers::NONE)
             .is_empty());
+    }
+
+    #[test]
+    fn missing_scope_uses_default_preset_scope_from_catalog() {
+        let catalog = json!({
+            "active_preset": "edius",
+            "presets": {
+                "default": {
+                    "project": {
+                        "project_open_selected": [{ "key": "Enter" }]
+                    }
+                },
+                "edius": {
+                    "storyboard": {
+                        "mark_in": [{ "code": "KeyI" }]
+                    }
+                }
+            }
+        });
+        let bindings = StoryBindings::from_catalog(&catalog, &Value::Null, PROJECT_SHORTCUT_SCOPE);
+
+        assert_eq!(
+            bindings.matching_actions(egui::Key::Enter, egui::Modifiers::NONE),
+            vec!["project_open_selected"]
+        );
     }
 
     #[test]

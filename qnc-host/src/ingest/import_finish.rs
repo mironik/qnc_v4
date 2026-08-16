@@ -5,6 +5,7 @@ use std::path::Path;
 use rusqlite::params;
 
 use crate::ingest::db::{mark_ingest_job_done, open_ingest, thumbnail_path};
+use crate::ingest::proxy_source::{classify_tv_source, recipe_for_source};
 use crate::ingest::thumb::probe_media;
 use crate::project::db::{bump_project_data_revision, ProjectPaths};
 
@@ -37,18 +38,47 @@ pub fn complete_imported_clip(
     } else {
         None
     };
-    let (duration_sec, fps, resolution, codec, has_audio, audio_channels) = probe
+    let (
+        duration_sec,
+        fps,
+        resolution,
+        codec,
+        has_audio,
+        audio_channels,
+        field_order,
+        interlaced,
+        source_class,
+        proxy_recipe,
+    ) = probe
+        .as_ref()
         .map(|p| {
+            let source_class = classify_tv_source(p);
+            let proxy_recipe = recipe_for_source(source_class);
             (
                 p.duration_sec,
                 p.fps,
-                p.resolution,
-                p.codec,
+                p.resolution.clone(),
+                p.codec.clone(),
                 p.has_audio,
                 p.audio_channels,
+                p.field_order.clone(),
+                p.interlaced,
+                source_class.label().to_string(),
+                proxy_recipe.id().to_string(),
             )
         })
-        .unwrap_or((0.0, 0.0, String::new(), String::new(), false, 0));
+        .unwrap_or((
+            0.0,
+            0.0,
+            String::new(),
+            String::new(),
+            false,
+            0,
+            String::new(),
+            false,
+            String::new(),
+            String::new(),
+        ));
     conn.execute(
         "UPDATE ingest_assets SET
             import_status = 'imported',
@@ -66,6 +96,10 @@ pub fn complete_imported_clip(
             codec = ?12,
             has_audio = ?14,
             audio_channels = ?15,
+            field_order = ?16,
+            interlaced = ?17,
+            source_class = ?18,
+            proxy_recipe = ?19,
             metadata_json = '{}'
          WHERE source_id = ?1 AND clip_id = ?2",
         params![
@@ -84,6 +118,10 @@ pub fn complete_imported_clip(
             original_path,
             if has_audio { 1 } else { 0 },
             audio_channels,
+            field_order,
+            if interlaced { 1 } else { 0 },
+            source_class,
+            proxy_recipe,
         ],
     )
     .map_err(|e| e.to_string())?;

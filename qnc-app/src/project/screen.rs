@@ -6,9 +6,10 @@
 use eframe::egui;
 use serde_json::Value;
 
-use crate::api::{FsEntry, HostClient, KeyboardPresetRow, ModuleRow, ProjectRow, TemplateRow};
-use crate::project_pts;
+use crate::api::{FsEntry, KeyboardPresetRow, ModuleRow, ProjectRow, TemplateRow};
+use crate::components::ProjectCatalogData;
 use crate::qnc_location_browser::{clean_location_path, LocationSourceKind};
+use crate::shortcuts::{StoryBindings, PROJECT_SHORTCUT_SCOPE};
 
 use super::empty_story_layout;
 use super::project_list;
@@ -40,6 +41,7 @@ pub struct ProjectScreen {
     pub projects_root_browser_parent: Option<String>,
     pub projects_root_browser_entries: Vec<FsEntry>,
     pub projects_root_browser_error: Option<String>,
+    pub projects_root_browser_busy: bool,
     pub export_dir_draft: String,
     pub export_dir_browser_open: bool,
     pub export_dir_browser_kind: LocationSourceKind,
@@ -48,8 +50,17 @@ pub struct ProjectScreen {
     pub export_dir_browser_parent: Option<String>,
     pub export_dir_browser_entries: Vec<FsEntry>,
     pub export_dir_browser_error: Option<String>,
+    pub export_dir_browser_busy: bool,
     pub export_preset_draft_name: String,
     loaded: bool,
+    meta_loading: bool,
+    meta_pending: usize,
+    bindings: StoryBindings,
+    shortcuts_loading: bool,
+    shortcuts_pending: usize,
+    shortcuts_loaded: bool,
+    shortcut_catalog: Option<Value>,
+    shortcut_user: Option<Value>,
 }
 
 impl Default for ProjectScreen {
@@ -78,6 +89,7 @@ impl Default for ProjectScreen {
             projects_root_browser_parent: None,
             projects_root_browser_entries: Vec::new(),
             projects_root_browser_error: None,
+            projects_root_browser_busy: false,
             export_dir_draft: String::new(),
             export_dir_browser_open: false,
             export_dir_browser_kind: LocationSourceKind::Local,
@@ -86,8 +98,17 @@ impl Default for ProjectScreen {
             export_dir_browser_parent: None,
             export_dir_browser_entries: Vec::new(),
             export_dir_browser_error: None,
+            export_dir_browser_busy: false,
             export_preset_draft_name: String::new(),
             loaded: false,
+            meta_loading: false,
+            meta_pending: 0,
+            bindings: StoryBindings::empty(),
+            shortcuts_loading: false,
+            shortcuts_pending: 0,
+            shortcuts_loaded: false,
+            shortcut_catalog: None,
+            shortcut_user: None,
         }
     }
 }
@@ -95,6 +116,7 @@ impl Default for ProjectScreen {
 #[derive(Debug, Clone)]
 pub enum ProjectAction {
     None,
+    #[allow(dead_code)]
     Reload,
     OpenSelected,
     Create,
@@ -122,70 +144,178 @@ pub enum ProjectAction {
 }
 
 impl ProjectScreen {
-    pub fn ensure_loaded(&mut self, host: &HostClient) {
-        if self.loaded && self.ui_state.is_some() && !self.templates.is_empty() {
-            return;
+    pub fn handle_shortcuts(&mut self, ctx: &egui::Context) -> ProjectAction {
+        if !self.shortcuts_ready() {
+            return ProjectAction::None;
         }
-        self.reload_meta(host);
+        ctx.input(|input| {
+            for event in &input.events {
+                let egui::Event::Key {
+                    key,
+                    pressed: true,
+                    repeat: false,
+                    modifiers,
+                    ..
+                } = event
+                else {
+                    continue;
+                };
+                let matches = self.bindings.matching_actions(*key, *modifiers);
+                if matches!(
+                    project_action_from_shortcut_matches(&matches),
+                    ProjectAction::OpenSelected
+                ) {
+                    return ProjectAction::OpenSelected;
+                }
+            }
+            ProjectAction::None
+        })
     }
 
-    pub fn reload_meta(&mut self, host: &HostClient) {
-        match host.list_templates() {
-            Ok(t) => {
-                self.templates = t;
+    pub fn needs_shortcuts_load(&self) -> bool {
+        !self.shortcuts_loaded && !self.shortcuts_loading
+    }
+
+    pub fn begin_shortcuts_load(&mut self, expected_results: usize) {
+        self.shortcuts_loading = expected_results > 0;
+        self.shortcuts_pending = expected_results;
+        self.shortcut_catalog = None;
+        self.shortcut_user = None;
+    }
+
+    pub fn apply_shortcut_catalog(&mut self, scope: &str, catalog: Value) {
+        if scope != PROJECT_SHORTCUT_SCOPE {
+            return;
+        }
+        self.shortcut_catalog = Some(catalog);
+        self.finish_shortcut_result();
+    }
+
+    pub fn apply_shortcut_user(&mut self, scope: &str, user: Value) {
+        if scope != PROJECT_SHORTCUT_SCOPE {
+            return;
+        }
+        self.shortcut_user = Some(user);
+        self.finish_shortcut_result();
+    }
+
+    pub fn set_shortcuts_error(&mut self, scope: &str, port_id: &str, error: impl Into<String>) {
+        if scope != PROJECT_SHORTCUT_SCOPE {
+            return;
+        }
+        if port_id == "user" {
+            self.shortcut_user = Some(Value::Null);
+            self.finish_shortcut_result();
+            return;
+        }
+        self.shortcuts_loading = false;
+        self.shortcuts_pending = 0;
+        self.shortcuts_loaded = true;
+        self.message = Some(format!("shortcut catalog: {}", error.into()));
+    }
+
+    pub fn shortcuts_ready(&self) -> bool {
+        self.shortcuts_loaded
+    }
+
+    fn finish_shortcut_result(&mut self) {
+        self.shortcuts_pending = self.shortcuts_pending.saturating_sub(1);
+        if self.shortcuts_pending == 0 {
+            self.shortcuts_loading = false;
+        }
+        self.apply_shortcuts_if_ready();
+    }
+
+    fn apply_shortcuts_if_ready(&mut self) {
+        if self.shortcuts_loaded {
+            return;
+        }
+        let Some(catalog) = self.shortcut_catalog.as_ref() else {
+            return;
+        };
+        let Some(user) = self.shortcut_user.as_ref() else {
+            return;
+        };
+        self.bindings = StoryBindings::from_catalog(catalog, user, PROJECT_SHORTCUT_SCOPE);
+        self.shortcuts_loaded = true;
+        self.shortcuts_loading = false;
+        self.shortcuts_pending = 0;
+    }
+
+    pub fn needs_meta_load(&self) -> bool {
+        !self.meta_loading && !(self.loaded && self.ui_state.is_some())
+    }
+
+    pub fn begin_meta_load(&mut self, expected_results: usize) {
+        self.meta_loading = expected_results > 0;
+        self.meta_pending = expected_results;
+        self.message = None;
+    }
+
+    pub fn apply_catalog_data(&mut self, data: ProjectCatalogData) {
+        match data {
+            ProjectCatalogData::Templates(templates) => {
+                self.templates = templates;
                 if self.selected_template_id.is_empty() {
                     if let Some(first) = self.templates.first() {
                         self.selected_template_id = first.template_id.clone();
                     }
                 }
             }
-            Err(e) => self.message = Some(e),
-        }
-        match host.list_modules() {
-            Ok(mut m) => {
-                m.sort_by_key(|row| project_pts::module_sort_key(row));
-                self.modules = m;
+            ProjectCatalogData::Modules(modules) => {
+                self.modules = modules;
             }
-            Err(e) => {
-                if self.message.is_none() {
-                    self.message = Some(e);
-                }
+            ProjectCatalogData::KeyboardPresets(presets) => {
+                self.keyboard_presets = presets;
             }
-        }
-        match host.keyboard_presets() {
-            Ok(p) => self.keyboard_presets = p,
-            Err(_) => {}
-        }
-        if let Ok(root) = host.default_projects_root() {
-            self.default_projects_root = root;
-        }
-        match host.ui_state() {
-            Ok(ui) => {
-                if let Some(sel) = ui.get("selected_template_id").and_then(|v| v.as_str()) {
-                    if !sel.is_empty() {
-                        self.selected_template_id = sel.to_string();
-                    }
-                }
-                if let Some(name) = ui.get("project_name").and_then(|v| v.as_str()) {
-                    if self.new_name.is_empty() {
-                        self.new_name = name.to_string();
-                    }
-                }
-                if let Some(open) = ui.get("template_create_open").and_then(|v| v.as_bool()) {
-                    self.template_create_open = open;
-                }
-                if let Some(n) = ui.get("template_draft_name").and_then(|v| v.as_str()) {
-                    if self.template_draft_name.is_empty() && !n.is_empty() {
-                        self.template_draft_name = n.to_string();
-                    }
-                }
-                self.ui_state = Some(ui);
+            ProjectCatalogData::DefaultProjectsRoot(root) => {
+                self.default_projects_root = root;
                 self.sync_path_drafts();
-                self.message = None;
             }
-            Err(e) => self.message = Some(e),
+            ProjectCatalogData::UiState(ui) => self.apply_project_ui_state(ui),
         }
-        self.loaded = true;
+        self.finish_meta_result();
+    }
+
+    pub fn set_meta_error(&mut self, error: impl Into<String>) {
+        if self.message.is_none() {
+            self.message = Some(error.into());
+        }
+        self.finish_meta_result();
+    }
+
+    fn finish_meta_result(&mut self) {
+        if self.meta_pending > 0 {
+            self.meta_pending -= 1;
+        }
+        if self.meta_pending == 0 {
+            self.meta_loading = false;
+            self.loaded = true;
+        }
+    }
+
+    fn apply_project_ui_state(&mut self, ui: Value) {
+        if let Some(sel) = ui.get("selected_template_id").and_then(|v| v.as_str()) {
+            if !sel.is_empty() {
+                self.selected_template_id = sel.to_string();
+            }
+        }
+        if let Some(name) = ui.get("project_name").and_then(|v| v.as_str()) {
+            if self.new_name.is_empty() {
+                self.new_name = name.to_string();
+            }
+        }
+        if let Some(open) = ui.get("template_create_open").and_then(|v| v.as_bool()) {
+            self.template_create_open = open;
+        }
+        if let Some(n) = ui.get("template_draft_name").and_then(|v| v.as_str()) {
+            if self.template_draft_name.is_empty() && !n.is_empty() {
+                self.template_draft_name = n.to_string();
+            }
+        }
+        self.ui_state = Some(ui);
+        self.sync_path_drafts();
+        self.message = None;
     }
 
     pub fn apply_ui_state(&mut self, ui: Value) {
@@ -269,6 +399,7 @@ impl ProjectScreen {
         self.projects_root_browser_parent = parent;
         self.projects_root_browser_entries = entries;
         self.projects_root_browser_error = None;
+        self.projects_root_browser_busy = false;
         if !self.projects_root_browser_path.trim().is_empty() {
             self.projects_root_draft = self.projects_root_browser_path.clone();
         }
@@ -277,6 +408,7 @@ impl ProjectScreen {
     pub fn set_projects_root_browser_error(&mut self, error: impl Into<String>) {
         self.projects_root_browser_error = Some(error.into());
         self.projects_root_browser_entries.clear();
+        self.projects_root_browser_busy = false;
     }
 
     pub fn apply_export_dir_listing(
@@ -301,6 +433,7 @@ impl ProjectScreen {
         self.export_dir_browser_parent = parent;
         self.export_dir_browser_entries = entries;
         self.export_dir_browser_error = None;
+        self.export_dir_browser_busy = false;
         if !self.export_dir_browser_path.trim().is_empty() {
             self.export_dir_draft = self.export_dir_browser_path.clone();
         }
@@ -309,6 +442,7 @@ impl ProjectScreen {
     pub fn set_export_dir_browser_error(&mut self, error: impl Into<String>) {
         self.export_dir_browser_error = Some(error.into());
         self.export_dir_browser_entries.clear();
+        self.export_dir_browser_busy = false;
     }
 
     pub fn ui(
@@ -369,5 +503,33 @@ impl ProjectScreen {
         });
 
         action
+    }
+}
+
+fn project_action_from_shortcut_matches(matches: &[&str]) -> ProjectAction {
+    if matches
+        .iter()
+        .any(|action| *action == "project_open_selected")
+    {
+        ProjectAction::OpenSelected
+    } else {
+        ProjectAction::None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn project_open_selected_comes_from_shortcut_action_id() {
+        assert!(matches!(
+            project_action_from_shortcut_matches(&["project_open_selected"]),
+            ProjectAction::OpenSelected
+        ));
+        assert!(matches!(
+            project_action_from_shortcut_matches(&["mark_in"]),
+            ProjectAction::None
+        ));
     }
 }

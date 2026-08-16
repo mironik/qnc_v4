@@ -118,6 +118,13 @@ fn run_editorial_oneshot(
 ) -> Result<(), String> {
     let _ = host.health()?;
     let start = host.playback_start(project_id)?;
+    let timeline = host.timeline_model(project_id).ok();
+    let timeline_fps = timeline
+        .as_ref()
+        .map(|model| model.timeline_fps)
+        .filter(|fps| fps.is_finite() && *fps > 0.0)
+        .unwrap_or(25.0);
+    let seek_frame = (seek.max(0.0) * timeline_fps).round() as i64;
     println!(
         "session={} buses={}",
         start.session_id,
@@ -128,22 +135,29 @@ fn run_editorial_oneshot(
             .collect::<Vec<_>>()
             .join(",")
     );
-    if seek > 0.0 {
-        host.playback_seek(&start.session_id, seek)?;
+    if seek_frame > 0 {
+        host.playback_seek_frame(&start.session_id, seek_frame)?;
     }
     let state = host.playback_state(&start.session_id)?;
     println!(
-        "layer={} virtual_sec={:.3}",
-        state.active.layer, state.virtual_sec
+        "layer={} virtual_frame={} virtual_sec={:.3}",
+        state.active.layer, state.virtual_frame, state.virtual_sec
     );
     let tmp = std::env::temp_dir().join("qnc-client");
     std::fs::create_dir_all(&tmp).map_err(|e| e.to_string())?;
     let frame_path = tmp.join(format!("frame_{}.jpg", state.session_id));
-    let frame_url = host.frame_url(&state, if seek > 0.0 { seek } else { state.virtual_sec });
+    let frame_url = host.frame_url_for_frame(
+        &state,
+        if seek_frame > 0 {
+            seek_frame
+        } else {
+            state.virtual_frame
+        },
+    );
     host.download_file(&frame_url, &frame_path)?;
     println!("frame={}", frame_path.display());
     if with_audio {
-        let audio_url = host.audio_url(&state, 4.0);
+        let audio_url = host.audio_url_for_frames(&state, (4.0 * timeline_fps).round() as i64);
         let audio_path = tmp.join(format!("mix_{}.m4a", state.session_id));
         host.download_file(&audio_url, &audio_path)?;
         println!("audio={}", audio_path.display());

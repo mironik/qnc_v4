@@ -20,6 +20,10 @@ pub struct PlayMedia {
     pub path: PathBuf,
     pub kind: PlayMediaKind,
     pub clip_id: String,
+    pub field_order: String,
+    pub interlaced: bool,
+    pub source_class: String,
+    pub proxy_recipe: String,
 }
 
 /// Resolve media for timeline playback. MVP: **proxy only**.
@@ -41,10 +45,15 @@ pub fn resolve_play_media(
     let path = proxy_path_for_clip(paths, pid, clip)
         .filter(|p| p.is_file())
         .ok_or_else(|| format!("proxy_missing: Proxy za klip '{clip}' nije pronađen."))?;
+    let meta = playback_probe_meta(paths, pid, clip);
     Ok(PlayMedia {
         path,
         kind: PlayMediaKind::Proxy,
         clip_id: clip.to_string(),
+        field_order: meta.field_order,
+        interlaced: meta.interlaced,
+        source_class: meta.source_class,
+        proxy_recipe: meta.proxy_recipe,
     })
 }
 
@@ -84,11 +93,50 @@ pub fn resolve_original_media(
     };
     let path = first_existing_path(&[original, source])
         .ok_or_else(|| format!("original_missing: Original za klip '{clip}' nije pronađen."))?;
+    let meta = playback_probe_meta(paths, pid, clip);
     Ok(PlayMedia {
         path,
         kind: PlayMediaKind::Original,
         clip_id: clip.to_string(),
+        field_order: meta.field_order,
+        interlaced: meta.interlaced,
+        source_class: meta.source_class,
+        proxy_recipe: meta.proxy_recipe,
     })
+}
+
+#[derive(Default)]
+struct PlaybackProbeMeta {
+    field_order: String,
+    interlaced: bool,
+    source_class: String,
+    proxy_recipe: String,
+}
+
+fn playback_probe_meta(paths: &ProjectPaths, project_id: &str, clip_id: &str) -> PlaybackProbeMeta {
+    let Ok(conn) = crate::ingest::db::open_ingest(paths, project_id) else {
+        return PlaybackProbeMeta::default();
+    };
+    conn.query_row(
+        "SELECT COALESCE(field_order, ''), COALESCE(interlaced, 0),
+                COALESCE(source_class, ''), COALESCE(proxy_recipe, '')
+         FROM ingest_assets
+         WHERE clip_id = ?1
+         ORDER BY CASE import_status WHEN 'imported' THEN 0 WHEN 'done' THEN 1 ELSE 2 END,
+                  CASE WHEN TRIM(COALESCE(project_proxy_path, '')) != '' THEN 0 ELSE 1 END,
+                  source_id
+         LIMIT 1",
+        rusqlite::params![clip_id],
+        |row| {
+            Ok(PlaybackProbeMeta {
+                field_order: row.get(0)?,
+                interlaced: row.get::<_, i64>(1)? != 0,
+                source_class: row.get(2)?,
+                proxy_recipe: row.get(3)?,
+            })
+        },
+    )
+    .unwrap_or_default()
 }
 
 #[cfg(test)]

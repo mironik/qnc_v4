@@ -3,11 +3,8 @@
 //! UI blocks (`qnc_ui`, `editorial::*`, `qnc_source_dock`, cards) are shared
 //! components. This form only chooses composition via `EditorialRole`.
 
-mod async_media;
 mod focus;
 pub(crate) mod playback_controls;
-mod playback_runtime;
-mod preview_monitor;
 mod source_editor;
 mod story_edit;
 mod story_selection;
@@ -24,20 +21,24 @@ use std::time::{Duration, Instant};
 use eframe::egui::{self, ColorImage, TextureHandle, TextureOptions, Vec2};
 use serde_json::Value;
 
-use crate::api::{HostClient, TimelineModel};
+use crate::api::{EditorialPlaylist, EditorialPlaylistSegment, HostClient, TimelineModel};
+use crate::component_runtime::ComponentBackendCommand;
+use crate::components::{EditorialEditComponent, EditorialEditData, EditorialEditKind};
 use crate::composition::EditorialRole;
 use crate::editorial::common::{shot_id, truncate};
+use crate::editorial::segment_program::{SegmentBoundaryTransition, SegmentProgramModel};
 use crate::editorial::{marker_cover_panel, media_pool, segment_panel};
-use crate::frame_time::{
-    frame_to_seconds, normalize_fps, seconds_to_frame, seconds_to_timecode,
-    snap_seconds_to_frame, DEFAULT_FPS,
+use crate::frame_time::{frame_to_seconds, normalize_fps, seconds_to_frame, seconds_to_timecode};
+use crate::media_assets::{
+    self, AsyncImageAssetLoader, AsyncSourceMediaAssetLoader, ImageAssetKey,
 };
-use crate::player_contract::FrameNumber;
+use crate::playback_routing::PlaybackTransportIntent;
 use crate::playback_stack::PlaybackStack;
 use crate::player_contract::BroadcastHostSourceRef;
+use crate::player_contract::FrameNumber;
 use crate::qnc_filmstrip_background::FilmFrame;
 use crate::qnc_timeline::{ExpandedAudio, TimelineFocusPaint};
-use crate::shortcuts::{load_story_bindings, StoryBindings};
+use crate::shortcuts::{StoryBindings, STORYBOARD_SHORTCUT_SCOPE as STORY_SHORTCUT_SCOPE};
 
 use self::focus::{FocusTarget, TimelineFocus};
 
@@ -47,15 +48,21 @@ enum ViewMode {
     Source,
 }
 
-pub use crate::player_bridge::PlaybackCommand as StoryPlaybackCommand;
-
 /// Shared Story / Media Assist form — configure with [`EditorialRole`].
 pub struct StoryScreen {
     /// Composition attributes (head tabs, card facets, …) — not a code fork.
     role: EditorialRole,
     project_id: String,
     loaded_project_id: String,
+    meta_loading: bool,
+    meta_pending: usize,
+    state_loaded: bool,
+    timeline_loaded: bool,
+    playlist_loaded: bool,
+    initial_selection_done: bool,
     timeline: Option<TimelineModel>,
+    playlist: Option<EditorialPlaylist>,
+    story_state_snapshot: Option<Value>,
     parts: Vec<StoryPart>,
     all_clips: Vec<StoryShot>,
     virtual_shots: Vec<StoryShot>,
@@ -67,10 +74,15 @@ pub struct StoryScreen {
     selected_clip_id: String,
     selected_cover_id: String,
     selected_slot_id: String,
+    selected_marker_id: String,
     library_tab: LibraryTab,
     view_mode: ViewMode,
-    source_in: f64,
-    source_out: f64,
+    source_in_frame: i64,
+    source_out_frame: i64,
+    source_playhead_frame: i64,
+    wrap_playhead_frame: i64,
+    selected_shot_in_frame: i64,
+    selected_shot_out_frame: i64,
     /// True after user pressed Mark IN on this clip — required for select_mark_in focus.
     mark_in_set: bool,
     /// True after user pressed Mark OUT on this clip — required for select_mark_out focus.
@@ -81,13 +93,18 @@ pub struct StoryScreen {
     selected_source_ref: Option<BroadcastHostSourceRef>,
     /// Absolute local proxy path for broadcast player (from host play-media).
     selected_play_path: String,
+    wrap_source_fps: f64,
+    wrap_source_has_audio: bool,
+    wrap_source_audio_channels: u8,
+    wrap_source_ref: Option<BroadcastHostSourceRef>,
+    wrap_play_path: String,
     story_summary: String,
     draft_status: String,
-    virtual_sec: f64,
+    pending_wrap_scrub_part_id: Option<String>,
+    virtual_frame: i64,
     /// Frame playhead — synced from player / carrier (timeline authority).
     playhead_frame: i64,
     playing: bool,
-    layer: String,
     status: String,
     /// True while broadcast PlayerRemote owns the monitor.
     broadcast_preview_active: bool,
@@ -97,15 +114,21 @@ pub struct StoryScreen {
     a2_peaks: Vec<f32>,
     film_frames: Vec<FilmFrame>,
     waveform_clip_id: String,
-    image_loader: async_media::AsyncImageLoader,
-    source_media_loader: async_media::AsyncSourceMediaLoader,
+    image_loader: AsyncImageAssetLoader,
+    source_media_loader: AsyncSourceMediaAssetLoader,
     repaint_ctx: Option<egui::Context>,
     source_media_retry_at: Option<Instant>,
     /// Pending frame target while the player cue catches up.
     source_timebase_ready: bool,
-    pending_playback_commands: Vec<StoryPlaybackCommand>,
     /// Keyboard chords from host catalog + DB (or local file / builtin).
     bindings: StoryBindings,
+    shortcuts_loading: bool,
+    shortcuts_pending: usize,
+    shortcuts_loaded: bool,
+    shortcut_catalog: Option<Value>,
+    shortcut_user: Option<Value>,
+    pending_backend_commands: Vec<ComponentBackendCommand>,
+    next_backend_request_id: u64,
     focus: TimelineFocus,
     /// Web kodak: click A1/A2 label expands that wave lane.
     expanded_audio: ExpandedAudio,
@@ -126,16 +149,20 @@ impl StoryScreen {
         Self::with_role(EditorialRole::MediaAssist)
     }
 
-    pub fn role(&self) -> EditorialRole {
-        self.role
-    }
-
     fn with_role(role: EditorialRole) -> Self {
         Self {
             role,
             project_id: String::new(),
             loaded_project_id: String::new(),
+            meta_loading: false,
+            meta_pending: 0,
+            state_loaded: false,
+            timeline_loaded: false,
+            playlist_loaded: false,
+            initial_selection_done: false,
             timeline: None,
+            playlist: None,
+            story_state_snapshot: None,
             parts: Vec::new(),
             all_clips: Vec::new(),
             virtual_shots: Vec::new(),
@@ -147,10 +174,15 @@ impl StoryScreen {
             selected_clip_id: String::new(),
             selected_cover_id: String::new(),
             selected_slot_id: String::new(),
+            selected_marker_id: String::new(),
             library_tab: LibraryTab::All,
             view_mode: ViewMode::Source,
-            source_in: 0.0,
-            source_out: 0.0,
+            source_in_frame: 0,
+            source_out_frame: 0,
+            source_playhead_frame: 0,
+            wrap_playhead_frame: 0,
+            selected_shot_in_frame: 0,
+            selected_shot_out_frame: 0,
             mark_in_set: false,
             mark_out_set: false,
             selected_source_fps: 0.0,
@@ -158,12 +190,17 @@ impl StoryScreen {
             selected_source_audio_channels: 0,
             selected_source_ref: None,
             selected_play_path: String::new(),
+            wrap_source_fps: 0.0,
+            wrap_source_has_audio: false,
+            wrap_source_audio_channels: 0,
+            wrap_source_ref: None,
+            wrap_play_path: String::new(),
             story_summary: String::new(),
             draft_status: "draft".into(),
-            virtual_sec: 0.0,
+            pending_wrap_scrub_part_id: None,
+            virtual_frame: 0,
             playhead_frame: 0,
             playing: false,
-            layer: String::new(),
             status: role.idle_status().into(),
             broadcast_preview_active: false,
             thumb_textures: HashMap::new(),
@@ -172,24 +209,35 @@ impl StoryScreen {
             a2_peaks: Vec::new(),
             film_frames: Vec::new(),
             waveform_clip_id: String::new(),
-            image_loader: async_media::AsyncImageLoader::new(),
-            source_media_loader: async_media::AsyncSourceMediaLoader::new(),
+            image_loader: AsyncImageAssetLoader::new(),
+            source_media_loader: AsyncSourceMediaAssetLoader::new(),
             repaint_ctx: None,
             source_media_retry_at: None,
             source_timebase_ready: false,
-            pending_playback_commands: Vec::new(),
             bindings: StoryBindings::empty(),
+            shortcuts_loading: false,
+            shortcuts_pending: 0,
+            shortcuts_loaded: false,
+            shortcut_catalog: None,
+            shortcut_user: None,
+            pending_backend_commands: Vec::new(),
+            next_backend_request_id: 1,
             focus: TimelineFocus::default(),
             expanded_audio: ExpandedAudio::None,
         }
     }
 
-    fn timeline_fps(&self) -> f64 {
-        self.timeline
+    fn timeline_fps(&self) -> Option<f64> {
+        self.playlist
             .as_ref()
-            .map(|t| t.timeline_fps)
+            .map(|p| p.timeline_fps)
             .filter(|fps| fps.is_finite() && *fps > 0.0)
-            .unwrap_or(DEFAULT_FPS)
+            .or_else(|| {
+                self.timeline
+                    .as_ref()
+                    .map(|t| t.timeline_fps)
+                    .filter(|fps| fps.is_finite() && *fps > 0.0)
+            })
     }
 
     fn source_timebase_fps(&self) -> Option<f64> {
@@ -203,44 +251,508 @@ impl StoryScreen {
         }
     }
 
-    fn source_tc(&self, sec: f64) -> String {
+    fn active_playback_source_ref(&self) -> Option<&BroadcastHostSourceRef> {
+        match self.view_mode {
+            ViewMode::Source => self.selected_source_ref.as_ref(),
+            ViewMode::Wrap => self.wrap_source_ref.as_ref(),
+        }
+    }
+
+    fn active_playback_media_path(&self) -> Option<&str> {
+        let path = match self.view_mode {
+            ViewMode::Source => self.selected_play_path.trim(),
+            ViewMode::Wrap => self.wrap_play_path.trim(),
+        };
+        (!path.is_empty()).then_some(path)
+    }
+
+    fn active_playback_fps(&self) -> f64 {
+        match self.view_mode {
+            ViewMode::Source => self.selected_source_fps,
+            ViewMode::Wrap => self.wrap_source_fps,
+        }
+    }
+
+    fn active_playback_has_audio(&self) -> bool {
+        match self.view_mode {
+            ViewMode::Source => self.selected_source_has_audio,
+            ViewMode::Wrap => self.wrap_source_has_audio,
+        }
+    }
+
+    fn active_playback_audio_channels(&self) -> u8 {
+        match self.view_mode {
+            ViewMode::Source => self.selected_source_audio_channels,
+            ViewMode::Wrap => self.wrap_source_audio_channels,
+        }
+    }
+
+    fn source_sec_from_frame(&self, frame: i64) -> Option<f64> {
         self.source_timebase_fps()
+            .map(|fps| frame_to_seconds(frame.max(0), fps))
+    }
+
+    fn timeline_sec_from_frame(&self, frame: i64) -> Option<f64> {
+        let frame = frame.max(0);
+        if let Some(playlist) = self.playlist.as_ref() {
+            if let Some(segment) = playlist.segments.iter().find(|segment| {
+                let start = segment.global_start_frame.max(0);
+                let end = segment
+                    .global_end_frame
+                    .max(start + segment.duration_frames.max(0))
+                    .max(start + 1);
+                frame >= start && frame < end
+            }) {
+                let start = segment.global_start_frame.max(0);
+                let end = segment
+                    .global_end_frame
+                    .max(start + segment.duration_frames.max(0))
+                    .max(start + 1);
+                let local = (frame - start).clamp(0, end - start);
+                let start_sec = segment.global_start_sec.max(0.0);
+                let end_sec = segment.global_end_sec.max(start_sec);
+                if end_sec > start_sec {
+                    return Some(
+                        start_sec + (end_sec - start_sec) * local as f64 / (end - start) as f64,
+                    );
+                }
+                let fps = if segment.source_fps.is_finite() && segment.source_fps > 0.0 {
+                    segment.source_fps
+                } else {
+                    playlist.timeline_fps
+                };
+                if fps.is_finite() && fps > 0.0 {
+                    return Some(start_sec + frame_to_seconds(local, normalize_fps(fps)));
+                }
+            }
+            if playlist.duration_frames > 0 && frame >= playlist.duration_frames {
+                return Some(playlist.duration_sec.max(0.0));
+            }
+            if frame == 0 {
+                return Some(0.0);
+            }
+        }
+        if let Some(timeline) = self.timeline.as_ref() {
+            if let Some(segment) = story_timeline::active_segment_frame(Some(timeline), frame) {
+                let start = segment.global_start_frame.max(0);
+                let end = segment.global_end_frame.max(start + 1);
+                let local = (frame - start).clamp(0, end - start);
+                let span_sec = (segment.global_end_sec - segment.global_start_sec).max(0.0);
+                return Some(
+                    segment.global_start_sec + span_sec * local as f64 / (end - start) as f64,
+                );
+            }
+            if timeline.duration_frames > 0 && frame >= timeline.duration_frames {
+                return Some(timeline.duration_sec.max(0.0));
+            }
+            if frame == 0 {
+                return Some(0.0);
+            }
+        }
+        self.timeline_fps()
+            .map(|fps| frame_to_seconds(frame.max(0), fps))
+    }
+
+    fn virtual_sec(&self) -> f64 {
+        match self.view_mode {
+            ViewMode::Source => self
+                .source_sec_from_frame(self.source_playhead_frame)
+                .unwrap_or(0.0),
+            ViewMode::Wrap => self
+                .timeline_sec_from_frame(self.wrap_playhead_frame)
+                .unwrap_or(0.0),
+        }
+    }
+
+    fn part_source_fps(&self, part: &StoryPart) -> Option<f64> {
+        if part.fps.is_finite() && part.fps > 0.0 {
+            Some(normalize_fps(part.fps))
+        } else {
+            self.clip_source_meta(&part.clip_id)
+                .map(|(fps, _, _, _, _)| fps)
+                .filter(|fps| fps.is_finite() && *fps > 0.0)
+                .map(normalize_fps)
+        }
+    }
+
+    fn part_local_tc(&self, part_id: &str, local_frame: i64) -> String {
+        self.parts
+            .iter()
+            .find(|part| part.part_id == part_id)
+            .and_then(|part| self.part_source_fps(part))
+            .map(|fps| seconds_to_timecode(frame_to_seconds(local_frame.max(0), fps), fps))
+            .unwrap_or_else(|| "--:--:--:--".into())
+    }
+
+    fn set_source_playhead_frame(&mut self, frame: i64) {
+        let frame = frame.max(0);
+        self.source_playhead_frame = frame;
+        if self.view_mode == ViewMode::Source {
+            self.virtual_frame = frame;
+            self.playhead_frame = frame;
+        }
+    }
+
+    fn set_wrap_playhead_frame(&mut self, frame: i64) {
+        let frame = frame.max(0);
+        self.wrap_playhead_frame = frame;
+        if self.view_mode == ViewMode::Wrap {
+            self.virtual_frame = frame;
+            self.playhead_frame = frame;
+        }
+    }
+
+    fn source_dock_uses_live_carrier(&self, playback: &PlaybackStack) -> bool {
+        if self.view_mode != ViewMode::Source || !playback.carrier().is_active() {
+            return false;
+        }
+        self.selected_source_ref
+            .as_ref()
+            .is_some_and(|source_ref| playback.active_source_matches(source_ref))
+    }
+
+    fn source_dock_playhead_frame(
+        &self,
+        playback: &PlaybackStack,
+        clip_duration_frames: i64,
+    ) -> i64 {
+        let frame = if self.source_dock_uses_live_carrier(playback) {
+            playback.carrier().display_frame().0
+        } else {
+            self.source_playhead_frame
+        };
+        frame.clamp(0, clip_duration_frames.max(1))
+    }
+
+    fn source_dock_timeline_model(
+        &self,
+        playback: &PlaybackStack,
+        fps: f64,
+        clip_duration_frames: i64,
+        shot_in_frame: i64,
+        shot_out_frame: i64,
+        draft_in_frame: i64,
+        draft_out_frame: i64,
+    ) -> crate::qnc_timeline_progress::TimelineProgressModel {
+        let fallback_frame = self.source_dock_playhead_frame(playback, clip_duration_frames);
+        let live_source_ref = if self.view_mode == ViewMode::Source {
+            self.selected_source_ref.as_ref()
+        } else {
+            None
+        };
+        playback.timeline_model_for_source_ref(
+            live_source_ref,
+            fps,
+            clip_duration_frames,
+            shot_in_frame,
+            shot_out_frame,
+            draft_in_frame,
+            draft_out_frame,
+            fallback_frame,
+        )
+    }
+
+    fn clip_source_meta(&self, clip_id: &str) -> Option<(f64, bool, u8, i64, String)> {
+        let clip_id = clip_id.trim();
+        if clip_id.is_empty() {
+            return None;
+        }
+        self.all_clips
+            .iter()
+            .chain(self.virtual_shots.iter())
+            .find(|shot| shot.clip_id == clip_id)
+            .map(|shot| {
+                (
+                    shot.fps,
+                    shot.has_audio,
+                    shot.audio_channels,
+                    shot.duration_frames,
+                    shot.play_path.trim().to_string(),
+                )
+            })
+    }
+
+    fn playlist_segment_by_id(&self, part_id: &str) -> Option<&EditorialPlaylistSegment> {
+        let part_id = part_id.trim();
+        if part_id.is_empty() {
+            return None;
+        }
+        self.playlist
+            .as_ref()?
+            .segments
+            .iter()
+            .find(|segment| segment.part_id == part_id)
+    }
+
+    fn playlist_segment_at_frame(&self, frame: i64) -> Option<&EditorialPlaylistSegment> {
+        let frame = frame.max(0);
+        self.playlist.as_ref()?.segments.iter().find(|segment| {
+            let start = segment.global_start_frame.max(0);
+            let end = segment
+                .global_end_frame
+                .max(start + segment.duration_frames.max(0))
+                .max(start + 1);
+            frame >= start && frame < end
+        })
+    }
+
+    fn segment_program_model(&self) -> SegmentProgramModel {
+        SegmentProgramModel::from_playlist(
+            self.playlist.as_ref(),
+            &self.marker_slots,
+            &self.covers,
+            &self.markers,
+        )
+    }
+
+    fn source_frame_for_wrap_frame(&self, frame: i64) -> Option<i64> {
+        self.segment_program_model()
+            .source_frame_for_program_frame(frame)
+    }
+
+    fn wrap_frame_for_source_frame(&self, source_frame: i64) -> Option<(String, i64)> {
+        let source_clip_id = self
+            .wrap_source_ref
+            .as_ref()
+            .map(|source| source.clip_id.trim())
+            .unwrap_or("");
+        self.segment_program_model()
+            .program_frame_for_source_frame(&self.selected_part_id, source_clip_id, source_frame)
+            .map(|projection| (projection.part_id, projection.program_frame))
+    }
+
+    fn segment_boundary_transition(
+        &self,
+        source_frame: FrameNumber,
+    ) -> Option<SegmentBoundaryTransition> {
+        let source_clip_id = self
+            .wrap_source_ref
+            .as_ref()
+            .map(|source| source.clip_id.trim())
+            .unwrap_or("");
+        self.segment_program_model()
+            .boundary_transition_after_source_frame(
+                &self.selected_part_id,
+                source_clip_id,
+                source_frame.0,
+            )
+    }
+
+    fn prepare_wrap_source_from_snapshot(
+        &mut self,
+        selected_part_id: Option<String>,
+    ) -> Result<(), String> {
+        let segment = if let Some(part_id) = selected_part_id.filter(|id| !id.trim().is_empty()) {
+            self.playlist_segment_by_id(&part_id)
+                .cloned()
+                .ok_or_else(|| format!("Segment nije u snapshotu · {part_id}"))?
+        } else {
+            self.playlist_segment_at_frame(self.wrap_playhead_frame)
+                .cloned()
+                .ok_or_else(|| "Odaberi segment za Wrap playback".to_string())?
+        };
+        let clip_id = segment.clip_id.trim();
+        if clip_id.is_empty() {
+            return Err("Segment nema clip_id".into());
+        }
+        if segment.source_out_frame <= segment.source_in_frame {
+            return Err("Segment nema valjan frame IN/OUT".into());
+        }
+        let (meta_fps, has_audio, audio_channels, meta_duration_frames, path_hint) = self
+            .clip_source_meta(clip_id)
+            .unwrap_or((0.0, false, 2, 0, String::new()));
+        let fps = if segment.source_fps.is_finite() && segment.source_fps > 0.0 {
+            normalize_fps(segment.source_fps)
+        } else if meta_fps.is_finite() && meta_fps > 0.0 {
+            normalize_fps(meta_fps)
+        } else {
+            return Err(format!(
+                "Segment '{}' nema valjan source FPS",
+                segment.part_id
+            ));
+        };
+        if path_hint.is_empty() {
+            return Err(format!("Proxy path prazan · {clip_id}"));
+        }
+
+        self.selected_part_id = segment.part_id.clone();
+        let start = segment.global_start_frame.max(0);
+        let end = segment
+            .global_end_frame
+            .max(start + segment.duration_frames.max(0))
+            .max(start + 1);
+        if self.wrap_playhead_frame < start || self.wrap_playhead_frame > end {
+            self.set_wrap_playhead_frame(start);
+        }
+        self.wrap_source_fps = fps;
+        self.wrap_source_has_audio = has_audio;
+        self.wrap_source_audio_channels = audio_channels;
+        self.wrap_play_path = path_hint;
+        let duration_frames = meta_duration_frames
+            .max(segment.source_out_frame)
+            .max(segment.duration_frames)
+            .max(1);
+        let source_identity = format!(
+            "{}:{}-{}",
+            segment.part_id,
+            segment.source_in_frame.max(0),
+            segment.source_out_frame.max(segment.source_in_frame + 1)
+        );
+        let source_ref = BroadcastHostSourceRef::from_frame_fields(
+            &self.project_id,
+            source_identity,
+            "",
+            clip_id,
+            Some(FrameNumber(segment.source_in_frame.max(0))),
+            Some(FrameNumber(
+                segment.source_out_frame.max(segment.source_in_frame + 1),
+            )),
+            FrameNumber(duration_frames),
+        )
+        .map_err(|err| err.message)?;
+        self.wrap_source_ref = Some(source_ref);
+        Ok(())
+    }
+
+    fn source_tc_frame(&self, frame: i64) -> String {
+        self.source_timebase_fps()
+            .map(|fps| seconds_to_timecode(frame_to_seconds(frame.max(0), fps), fps))
+            .unwrap_or_else(|| "--:--:--:--".into())
+    }
+
+    fn tc(&self, sec: f64) -> String {
+        self.timeline_fps()
             .map(|fps| seconds_to_timecode(sec, fps))
             .unwrap_or_else(|| "--:--:--:--".into())
     }
 
-    fn snap_source_sec(&self, sec: f64) -> f64 {
-        self.source_timebase_fps()
-            .map(|fps| snap_seconds_to_frame(sec, fps))
-            .unwrap_or_else(|| sec.max(0.0))
+    pub fn needs_meta_load(&self, project_id: &str) -> bool {
+        let project_id = project_id.trim();
+        !project_id.is_empty() && self.loaded_project_id != project_id && !self.meta_loading
     }
 
-    fn snap_sec(&self, sec: f64) -> f64 {
-        snap_seconds_to_frame(sec, self.timeline_fps())
-    }
-
-    fn tc(&self, sec: f64) -> String {
-        seconds_to_timecode(sec, self.timeline_fps())
-    }
-
-    fn frame_step(&self) -> f64 {
-        1.0 / self.timeline_fps().max(1.0)
-    }
-
-    pub fn ensure_loaded(&mut self, host: &HostClient, project_id: &str) {
-        if self.loaded_project_id == project_id {
-            return;
-        }
-        self.reset_session(host);
+    pub fn begin_meta_load(&mut self, project_id: &str, expected_results: usize) {
+        let role = self.role;
+        *self = Self::with_role(role);
         self.project_id = project_id.to_string();
         self.loaded_project_id = project_id.to_string();
-        self.reload_shortcuts(host);
-        self.reload_meta(host);
+        self.meta_loading = expected_results > 0;
+        self.meta_pending = expected_results;
+        if self.meta_loading {
+            self.status = "Učitavam editorial snapshot...".into();
+        }
+    }
+
+    pub fn apply_editorial_story_state(&mut self, project_id: &str, state: Value) {
+        if self.loaded_project_id != project_id {
+            return;
+        }
+        self.story_state_snapshot = Some(state.clone());
+        self.apply_story_state(&state);
+        self.state_loaded = true;
+        self.finish_meta_result();
+    }
+
+    pub fn apply_editorial_timeline_model(
+        &mut self,
+        project_id: &str,
+        timeline: TimelineModel,
+    ) -> PlaybackTransportIntent {
+        if self.loaded_project_id != project_id {
+            return PlaybackTransportIntent::None;
+        }
+        let was_wrap = self.view_mode == ViewMode::Wrap;
+        self.timeline = Some(timeline);
+        self.timeline_loaded = true;
+        if let Some(state) = self.story_state_snapshot.clone() {
+            self.apply_story_state(&state);
+        } else {
+            self.refresh_story_summary();
+        }
+        self.finish_meta_result();
+        self.wrap_projection_after_program_refresh(was_wrap)
+    }
+
+    pub fn apply_editorial_playlist(
+        &mut self,
+        project_id: &str,
+        playlist: EditorialPlaylist,
+    ) -> PlaybackTransportIntent {
+        if self.loaded_project_id != project_id {
+            return PlaybackTransportIntent::None;
+        }
+        let was_wrap = self.view_mode == ViewMode::Wrap;
+        self.playlist = Some(playlist);
+        self.playlist_loaded = true;
+        self.finish_meta_result();
+        self.wrap_projection_after_program_refresh(was_wrap)
+    }
+
+    fn wrap_projection_after_program_refresh(&mut self, was_wrap: bool) -> PlaybackTransportIntent {
+        if !self.meta_ready() {
+            return PlaybackTransportIntent::None;
+        }
+        if let Some(part_id) = self.pending_wrap_scrub_part_id.clone() {
+            match self.start_wrap_session_from_snapshot(Some(part_id)) {
+                PlaybackTransportIntent::None => PlaybackTransportIntent::None,
+                intent => {
+                    self.pending_wrap_scrub_part_id = None;
+                    intent
+                }
+            }
+        } else if was_wrap && self.initial_selection_done {
+            let active_at_head = self
+                .playlist_segment_at_frame(self.wrap_playhead_frame)
+                .map(|segment| segment.part_id.clone());
+            let selected = active_at_head.or_else(|| {
+                (!self.selected_part_id.trim().is_empty()).then(|| self.selected_part_id.clone())
+            });
+            if self.prepare_wrap_source_from_snapshot(selected).is_ok() {
+                return self.scrub_current_playhead_intent();
+            }
+            PlaybackTransportIntent::None
+        } else {
+            PlaybackTransportIntent::None
+        }
+    }
+
+    pub fn set_editorial_meta_error(&mut self, project_id: &str, error: impl Into<String>) {
+        if self.loaded_project_id != project_id {
+            return;
+        }
+        self.meta_loading = false;
+        self.meta_pending = 0;
+        self.pending_wrap_scrub_part_id = None;
+        self.status = format!("editorial snapshot: {}", error.into());
+    }
+
+    pub fn meta_ready(&self) -> bool {
+        !self.project_id.is_empty()
+            && self.state_loaded
+            && self.timeline_loaded
+            && self.playlist_loaded
+    }
+
+    fn finish_meta_result(&mut self) {
+        self.meta_pending = self.meta_pending.saturating_sub(1);
+        if self.meta_pending == 0 {
+            self.meta_loading = false;
+        }
+        self.apply_initial_projection_if_ready();
+    }
+
+    fn apply_initial_projection_if_ready(&mut self) {
+        if !self.meta_ready() || self.initial_selection_done {
+            return;
+        }
+        self.initial_selection_done = true;
         // Classic Story opens on source/All — not empty wrap.
         if let Some(first) = self.all_clips.first().cloned() {
-            self.select_shot(host, &first);
+            self.select_shot_from_snapshot(&first);
         } else {
-            self.start_wrap_session(host);
+            self.view_mode = ViewMode::Wrap;
+            self.playing = false;
+            self.status = "Wrap · broadcast".into();
         }
     }
 
@@ -248,94 +760,181 @@ impl StoryScreen {
         *self = Self::with_role(self.role);
     }
 
-    fn reload_shortcuts(&mut self, host: &HostClient) {
-        self.bindings = load_story_bindings(host, "storyboard");
+    pub fn drain_backend_commands(&mut self) -> Vec<ComponentBackendCommand> {
+        std::mem::take(&mut self.pending_backend_commands)
     }
 
-    fn start_wrap_session(&mut self, host: &HostClient) {
-        self.start_wrap_session_for_part(host, None);
+    fn edit_instance_id(&self) -> &'static str {
+        match self.role {
+            EditorialRole::Story => "story",
+            EditorialRole::MediaAssist => "media_assist",
+        }
+    }
+
+    fn next_backend_request_id(&mut self) -> u64 {
+        let request_id = self.next_backend_request_id;
+        self.next_backend_request_id = self.next_backend_request_id.saturating_add(1);
+        request_id
+    }
+
+    fn enqueue_backend_command(&mut self, command: ComponentBackendCommand) {
+        self.pending_backend_commands.push(command);
+    }
+
+    fn enqueue_edit_command<F>(&mut self, build: F)
+    where
+        F: FnOnce(&str, u64, &str) -> ComponentBackendCommand,
+    {
+        if self.project_id.trim().is_empty() {
+            self.status = "Nema otvorenog projekta".into();
+            return;
+        }
+        let instance_id = self.edit_instance_id();
+        let request_id = self.next_backend_request_id();
+        let project_id = self.project_id.clone();
+        self.enqueue_backend_command(build(instance_id, request_id, &project_id));
+    }
+
+    pub fn needs_shortcuts_load(&self) -> bool {
+        !self.shortcuts_loaded && !self.shortcuts_loading
+    }
+
+    pub fn begin_shortcuts_load(&mut self, expected_results: usize) {
+        self.shortcuts_loading = expected_results > 0;
+        self.shortcuts_pending = expected_results;
+        self.shortcut_catalog = None;
+        self.shortcut_user = None;
+    }
+
+    pub fn apply_shortcut_catalog(&mut self, scope: &str, catalog: Value) {
+        if scope != STORY_SHORTCUT_SCOPE {
+            return;
+        }
+        self.shortcut_catalog = Some(catalog);
+        self.finish_shortcut_result();
+    }
+
+    pub fn apply_shortcut_user(&mut self, scope: &str, user: Value) {
+        if scope != STORY_SHORTCUT_SCOPE {
+            return;
+        }
+        self.shortcut_user = Some(user);
+        self.finish_shortcut_result();
+    }
+
+    pub fn set_shortcuts_error(&mut self, scope: &str, port_id: &str, error: impl Into<String>) {
+        if scope != STORY_SHORTCUT_SCOPE {
+            return;
+        }
+        if port_id == "user" {
+            self.shortcut_user = Some(Value::Null);
+            self.finish_shortcut_result();
+            return;
+        }
+        self.shortcuts_loading = false;
+        self.shortcuts_pending = 0;
+        self.shortcuts_loaded = true;
+        self.status = format!("shortcut catalog: {}", error.into());
+    }
+
+    pub fn shortcuts_ready(&self) -> bool {
+        self.shortcuts_loaded
+    }
+
+    fn finish_shortcut_result(&mut self) {
+        self.shortcuts_pending = self.shortcuts_pending.saturating_sub(1);
+        if self.shortcuts_pending == 0 {
+            self.shortcuts_loading = false;
+        }
+        self.apply_shortcuts_if_ready();
+    }
+
+    fn apply_shortcuts_if_ready(&mut self) {
+        if self.shortcuts_loaded {
+            return;
+        }
+        let Some(catalog) = self.shortcut_catalog.as_ref() else {
+            return;
+        };
+        let Some(user) = self.shortcut_user.as_ref() else {
+            return;
+        };
+        self.bindings = StoryBindings::from_catalog(catalog, user, STORY_SHORTCUT_SCOPE);
+        self.shortcuts_loaded = true;
+        self.shortcuts_loading = false;
+        self.shortcuts_pending = 0;
+    }
+
+    fn start_wrap_session(&mut self, _host: &HostClient) -> PlaybackTransportIntent {
+        self.start_wrap_session_from_snapshot(None)
+    }
+
+    fn start_wrap_session_from_snapshot(
+        &mut self,
+        selected_part_id: Option<String>,
+    ) -> PlaybackTransportIntent {
+        self.view_mode = ViewMode::Wrap;
+        self.virtual_frame = self.wrap_playhead_frame;
+        self.playhead_frame = self.wrap_playhead_frame;
+        self.playing = false;
+        self.status = "Wrap · broadcast".into();
+        match self.prepare_wrap_source_from_snapshot(selected_part_id) {
+            Ok(()) => self.scrub_current_playhead_intent(),
+            Err(e) => {
+                self.status = e;
+                PlaybackTransportIntent::None
+            }
+        }
     }
 
     /// Enter Wrap UI — editorial only. Preview stays on broadcast PlayerRemote.
-    fn start_wrap_session_for_part(&mut self, host: &HostClient, selected_part_id: Option<String>) {
-        self.view_mode = ViewMode::Wrap;
-        self.playing = false;
-        if let Some(part_id) = selected_part_id.filter(|id| !id.trim().is_empty()) {
-            match host.story_part_select(&self.project_id, &part_id) {
-                Ok(state) => self.apply_story_state(&state),
-                Err(e) => {
-                    self.status = e;
-                    return;
-                }
-            }
-        }
-        self.status = "Wrap · broadcast".into();
-        if self.selected_source_ref.is_some() && !self.selected_play_path.trim().is_empty() {
-            self.queue_pause_and_seek();
-        }
-    }
-
-    fn activate_source_ui(&mut self, host: &HostClient, clip_id: &str) {
-        self.activate_source_ui_for_shot(host, clip_id, None, None);
-    }
-
-    fn activate_source_ui_for_shot(
+    fn start_wrap_session_for_part(
         &mut self,
-        host: &HostClient,
-        clip_id: &str,
-        selected_shot_id: Option<String>,
-        play_path_hint: Option<&str>,
-    ) {
-        if clip_id.trim().is_empty() {
-            self.status = "Nema clip_id".into();
-            return;
-        }
-        self.view_mode = ViewMode::Source;
-        self.selected_clip_id = clip_id.to_string();
-        if let Some(shot_id) = selected_shot_id {
-            self.selected_shot_id = shot_id;
-        }
-        self.playing = false;
+        _host: &HostClient,
+        selected_part_id: Option<String>,
+    ) -> PlaybackTransportIntent {
+        self.start_wrap_session_from_snapshot(selected_part_id)
+    }
 
-        // Prefer path from Story snapshot (no extra round-trip); refresh via play-media.
-        let hint = play_path_hint.unwrap_or("").trim();
-        if !hint.is_empty() {
-            self.selected_play_path = hint.to_string();
-        } else if let Some(path) = self
-            .all_clips
-            .iter()
-            .chain(self.virtual_shots.iter())
-            .find(|c| c.clip_id == clip_id)
-            .map(|c| c.play_path.trim().to_string())
-            .filter(|p| !p.is_empty())
-        {
-            self.selected_play_path = path;
+    fn defer_wrap_scrub_after_timeline(&mut self, preferred_part_id: Option<String>) {
+        let preferred = preferred_part_id
+            .filter(|id| !id.trim().is_empty())
+            .filter(|id| self.parts.iter().any(|part| part.part_id == *id));
+        let selected = (!self.selected_part_id.trim().is_empty())
+            .then(|| self.selected_part_id.clone())
+            .filter(|id| self.parts.iter().any(|part| part.part_id == *id));
+        let fallback = self.parts.first().map(|part| part.part_id.clone());
+        self.pending_wrap_scrub_part_id = preferred.or(selected).or(fallback);
+    }
+
+    fn cue_current_playhead_intent(&self) -> PlaybackTransportIntent {
+        let frame = match self.view_mode {
+            ViewMode::Source => self.source_playhead_frame.max(0),
+            ViewMode::Wrap => match self.source_frame_for_wrap_frame(self.wrap_playhead_frame) {
+                Some(frame) => frame,
+                None => return PlaybackTransportIntent::None,
+            },
+        };
+        if self.active_playback_source_ref().is_some() {
+            PlaybackTransportIntent::CueFrame(frame)
         } else {
-            self.selected_play_path.clear();
+            PlaybackTransportIntent::None
         }
-        match host.story_play_media(&self.project_id, clip_id) {
-            Ok(media) if !media.path.trim().is_empty() => {
-                self.selected_play_path = media.path;
-                self.status = format!("Source · {} ({})", clip_id, media.kind);
-            }
-            Ok(_) if !self.selected_play_path.is_empty() => {
-                self.status = format!("Source · {clip_id} (snapshot path)");
-            }
-            Ok(_) => {
-                self.selected_play_path.clear();
-                self.status = format!("Proxy path prazan · {clip_id}");
-            }
-            Err(err) if !self.selected_play_path.is_empty() => {
-                self.status = format!("Source · {clip_id}");
-                let _ = err;
-            }
-            Err(err) => {
-                self.selected_play_path.clear();
-                self.status = err;
-            }
+    }
+
+    fn scrub_current_playhead_intent(&self) -> PlaybackTransportIntent {
+        let frame = match self.view_mode {
+            ViewMode::Source => self.source_playhead_frame.max(0),
+            ViewMode::Wrap => match self.source_frame_for_wrap_frame(self.wrap_playhead_frame) {
+                Some(frame) => frame,
+                None => return PlaybackTransportIntent::None,
+            },
+        };
+        if self.active_playback_source_ref().is_some() {
+            PlaybackTransportIntent::ScrubFrame(frame)
+        } else {
+            PlaybackTransportIntent::None
         }
-        self.source_timebase_ready =
-            self.selected_source_fps.is_finite() && self.selected_source_fps > 0.0;
     }
 
     fn apply_story_state(&mut self, state: &Value) {
@@ -372,41 +971,123 @@ impl StoryScreen {
         );
     }
 
-    fn reload_meta(&mut self, host: &HostClient) {
-        match host.timeline_model(&self.project_id) {
-            Ok(m) => self.timeline = Some(m),
-            Err(e) => {
-                self.timeline = None;
-                self.status = format!("timeline: {e}");
-            }
+    pub fn apply_editorial_edit_data(
+        &mut self,
+        data: EditorialEditData,
+    ) -> PlaybackTransportIntent {
+        if self.loaded_project_id != data.project_id {
+            return PlaybackTransportIntent::None;
         }
-        match host.story_state(&self.project_id) {
-            Ok(state) => self.apply_story_state(&state),
-            Err(e) => self.status = format!("story state: {e}"),
+        self.story_state_snapshot = Some(data.state.clone());
+        self.apply_story_state(&data.state);
+        self.pending_wrap_scrub_part_id = None;
+        self.timeline_loaded = false;
+        self.playlist_loaded = false;
+        match data.kind {
+            EditorialEditKind::SaveVirtualShot => {
+                self.library_tab = LibraryTab::Virtual;
+                self.status = "Virtual clip spremljen u Virtual tab".into();
+                PlaybackTransportIntent::None
+            }
+            EditorialEditKind::CreatePartFromMarks => {
+                self.library_tab = LibraryTab::Segment;
+                self.status = format!("Dodan {}", data.detail);
+                self.defer_wrap_scrub_after_timeline(None);
+                PlaybackTransportIntent::None
+            }
+            EditorialEditKind::Commit => {
+                self.status = "Commit OK — Export XML datoteka čeka host API (isto kao web)".into();
+                PlaybackTransportIntent::None
+            }
+            EditorialEditKind::DeletePart => {
+                self.status = format!("Segment obrisan {}", truncate(&data.detail, 24));
+                self.defer_wrap_scrub_after_timeline(None);
+                PlaybackTransportIntent::None
+            }
+            EditorialEditKind::ReorderPart => {
+                self.selected_part_id = data.detail.clone();
+                self.status = format!("Segment {}", truncate(&data.detail, 24));
+                self.defer_wrap_scrub_after_timeline(Some(data.detail));
+                PlaybackTransportIntent::None
+            }
+            EditorialEditKind::MarkPartIn => {
+                self.focus.clear();
+                self.status = "Mark IN spremljen".into();
+                self.defer_wrap_scrub_after_timeline(Some(data.detail));
+                PlaybackTransportIntent::None
+            }
+            EditorialEditKind::MarkPartOut => {
+                self.focus.clear();
+                self.status = "Mark OUT spremljen".into();
+                self.defer_wrap_scrub_after_timeline(Some(data.detail));
+                PlaybackTransportIntent::None
+            }
+            EditorialEditKind::CreateMarker => {
+                self.status = format!("Marker @ {}", self.tc(self.virtual_sec()));
+                PlaybackTransportIntent::None
+            }
+            EditorialEditKind::DeleteMarker => {
+                self.status = format!("Marker obrisan {}", truncate(&data.detail, 24));
+                PlaybackTransportIntent::None
+            }
+            EditorialEditKind::MoveMarker => {
+                self.status = format!("Marker {}", truncate(&data.detail, 24));
+                PlaybackTransportIntent::None
+            }
+            EditorialEditKind::SelectMarkerSlot => {
+                self.selected_slot_id = data.detail.clone();
+                self.status = format!("Slot {}", truncate(&data.detail, 24));
+                PlaybackTransportIntent::None
+            }
+            EditorialEditKind::SelectCover => {
+                self.selected_cover_id = data.detail.clone();
+                self.status = format!("Cover {}", truncate(&data.detail, 24));
+                PlaybackTransportIntent::None
+            }
+            EditorialEditKind::CreateCover => {
+                self.status = "Cover kreiran".into();
+                PlaybackTransportIntent::None
+            }
+            EditorialEditKind::DeleteCover => {
+                self.status = format!("Cover obrisan {}", truncate(&data.detail, 24));
+                PlaybackTransportIntent::None
+            }
         }
     }
 
-    fn after_edit(&mut self, host: &HostClient, state: Value) {
-        self.apply_story_state(&state);
-        if let Ok(m) = host.timeline_model(&self.project_id) {
-            self.timeline = Some(m);
-            self.refresh_story_summary();
+    pub fn set_editorial_edit_error(
+        &mut self,
+        project_id: &str,
+        _kind: EditorialEditKind,
+        error: impl Into<String>,
+    ) {
+        if self.loaded_project_id != project_id {
+            return;
         }
+        self.status = error.into();
     }
 
-    fn select_shot(&mut self, host: &HostClient, shot: &StoryShot) {
-        let selection = match story_selection::shot_selection(&self.project_id, shot) {
-            Ok(selection) => selection,
-            Err(err) => {
-                self.status = err.message;
-                return;
-            }
-        };
+    fn select_shot_from_snapshot(&mut self, shot: &StoryShot) {
+        let source_duration_frames = self
+            .all_clips
+            .iter()
+            .find(|clip| clip.clip_id == shot.clip_id && clip.duration_frames > 0)
+            .map(|clip| clip.duration_frames);
+        let selection =
+            match story_selection::shot_selection(&self.project_id, shot, source_duration_frames) {
+                Ok(selection) => selection,
+                Err(err) => {
+                    self.status = err.message;
+                    return;
+                }
+            };
+        self.view_mode = ViewMode::Source;
         self.selected_shot_id = selection.shot_id.clone();
         self.selected_clip_id = selection.clip_id.clone();
-        self.source_in = selection.source_in;
-        self.source_out = selection.source_out;
-        // Loaded shot range is not an explicit Mark I/O — require I/O keys first.
+        self.source_in_frame = selection.shot_in_frame;
+        self.source_out_frame = selection.shot_out_frame;
+        self.selected_shot_in_frame = selection.shot_in_frame;
+        self.selected_shot_out_frame = selection.shot_out_frame;
         self.mark_in_set = false;
         self.mark_out_set = false;
         self.focus.clear();
@@ -415,60 +1096,41 @@ impl StoryScreen {
         self.selected_source_has_audio = shot.has_audio;
         self.selected_source_audio_channels = shot.audio_channels;
         self.source_timebase_ready = shot.fps.is_finite() && shot.fps > 0.0;
-        self.virtual_sec = self.snap_source_sec(selection.source_in);
+        self.set_source_playhead_frame(selection.shot_in_frame);
         if self.waveform_clip_id != selection.clip_id {
             self.a1_peaks.clear();
             self.a2_peaks.clear();
             self.film_frames.clear();
             self.waveform_clip_id.clear();
+            self.image_loader.cancel_pending();
         }
-        if !selection.clip_id.is_empty() {
-            let play_hint = shot.play_path.as_str();
-            self.activate_source_ui_for_shot(
-                host,
-                &selection.clip_id,
-                Some(selection.shot_id),
-                Some(play_hint),
-            );
+
+        let mut play_path = shot.play_path.trim().to_string();
+        if play_path.is_empty() {
+            play_path = self
+                .all_clips
+                .iter()
+                .chain(self.virtual_shots.iter())
+                .find(|candidate| candidate.clip_id == selection.clip_id)
+                .map(|candidate| candidate.play_path.trim().to_string())
+                .unwrap_or_default();
+        }
+        if play_path.is_empty() {
+            self.selected_play_path.clear();
+            self.status = format!("Proxy path nije spreman · {}", selection.clip_id);
+        } else {
+            self.selected_play_path = play_path;
+            self.status = format!("Source · {} (snapshot path)", selection.clip_id);
+        }
+    }
+
+    fn select_shot(&mut self, host: &HostClient, shot: &StoryShot) -> PlaybackTransportIntent {
+        self.select_shot_from_snapshot(shot);
+        if !self.selected_clip_id.trim().is_empty() {
             self.request_source_media(host);
-            self.queue_seek_to_playhead();
+            return self.cue_current_playhead_intent();
         }
-    }
-
-    fn queue_seek_to_playhead(&mut self) {
-        if self.selected_source_ref.is_some() {
-            let frame = FrameNumber(seconds_to_frame(
-                self.virtual_sec,
-                self.source_timebase_fps().unwrap_or(DEFAULT_FPS),
-            ));
-            self.pending_playback_commands
-                .push(StoryPlaybackCommand::CueFrame(frame));
-        }
-    }
-
-    fn queue_pause_and_seek(&mut self) {
-        if self.selected_source_ref.is_some() {
-            let frame = FrameNumber(seconds_to_frame(
-                self.virtual_sec,
-                self.source_timebase_fps().unwrap_or(DEFAULT_FPS),
-            ));
-            self.pending_playback_commands
-                .push(StoryPlaybackCommand::ScrubFrame(frame));
-        }
-    }
-
-    fn schedule_native_seek(&mut self) {
-        self.queue_pause_and_seek();
-    }
-
-    fn schedule_native_seek_io(&mut self) {
-        self.queue_seek_to_playhead();
-    }
-
-    fn frame_eps_sec(&self) -> f64 {
-        self.source_timebase_fps()
-            .map(|fps| 0.5 / fps.max(1.0))
-            .unwrap_or(0.02)
+        PlaybackTransportIntent::None
     }
 
     fn request_source_media(&mut self, host: &HostClient) {
@@ -495,10 +1157,11 @@ impl StoryScreen {
         }
     }
 
-    fn poll_async_media(&mut self, _host: &HostClient, ctx: &egui::Context) {
+    fn poll_media_assets(&mut self, _host: &HostClient, ctx: &egui::Context) {
         for result in self.image_loader.poll() {
-            match result.key {
-                async_media::ImageKey::Thumb { clip_id } => {
+            match result.key.scope.as_str() {
+                "editorial.thumb" => {
+                    let clip_id = result.key.item_id;
                     if let Ok(color) = result.image {
                         let tex = ctx.load_texture(
                             format!("thumb_{clip_id}"),
@@ -508,10 +1171,12 @@ impl StoryScreen {
                         self.thumb_textures.insert(clip_id, tex);
                     }
                 }
-                async_media::ImageKey::Film { clip_id, index } => {
+                "editorial.film" => {
+                    let clip_id = result.key.item_id;
                     if clip_id != self.selected_clip_id {
                         continue;
                     }
+                    let index = result.key.variant.parse::<i64>().unwrap_or(0);
                     if let Ok(color) = result.image {
                         if let Some(frame) = self
                             .film_frames
@@ -526,6 +1191,7 @@ impl StoryScreen {
                         }
                     }
                 }
+                _ => {}
             }
         }
 
@@ -538,16 +1204,13 @@ impl StoryScreen {
                     self.waveform_clip_id = media.clip_id;
                     self.a1_peaks = media.a1_peaks;
                     self.a2_peaks = media.a2_peaks;
-                    self.film_frames = media
-                        .film_frames
-                        .into_iter()
-                        .map(|(index, seek_sec, url)| FilmFrame {
-                            index,
-                            seek_sec,
-                            url,
-                            texture: None,
-                        })
-                        .collect();
+                    let frames = media.film_frames.into_iter().map(|frame| FilmFrame {
+                        index: frame.index,
+                        seek_sec: frame.seek_sec,
+                        url: frame.url,
+                        texture: None,
+                    });
+                    crate::qnc_filmstrip_background::merge_frames(&mut self.film_frames, frames);
                     if self.a1_peaks.is_empty() && self.a2_peaks.is_empty() {
                         self.source_media_retry_at = Some(Instant::now() + Duration::from_secs(1));
                         self.status = format!("Waveform se gradi · {}", self.selected_clip_id);
@@ -568,10 +1231,11 @@ impl StoryScreen {
                 continue;
             }
             let _ = self.image_loader.request(
-                async_media::ImageKey::Film {
-                    clip_id: self.selected_clip_id.clone(),
-                    index: frame.index,
-                },
+                ImageAssetKey::new(
+                    "editorial.film",
+                    self.selected_clip_id.clone(),
+                    frame.index.to_string(),
+                ),
                 frame.url.clone(),
                 Some(ctx.clone()),
             );
@@ -586,9 +1250,9 @@ impl StoryScreen {
         if self.thumb_textures.contains_key(&clip_id) {
             return;
         }
-        let url = host.story_thumbnail_url(&self.project_id, &clip_id, 0.0);
+        let url = media_assets::story_thumbnail_url(host, &self.project_id, &clip_id, 0.0);
         let _ = self.image_loader.request(
-            async_media::ImageKey::Thumb { clip_id },
+            ImageAssetKey::new("editorial.thumb", clip_id, "poster"),
             url,
             Some(ctx.clone()),
         );
@@ -617,90 +1281,134 @@ impl StoryScreen {
         &mut self,
         ctx: &egui::Context,
         host: &HostClient,
-        playback: &mut crate::playback_stack::PlaybackStack,
-    ) {
-        if self.bindings.by_action.is_empty() {
-            self.reload_shortcuts(host);
+        playback: &crate::playback_stack::PlaybackStack,
+    ) -> Vec<PlaybackTransportIntent> {
+        if !self.shortcuts_ready() {
+            return Vec::new();
         }
+        let mut intents = Vec::new();
         // Keys come only from seed/DB keyboard-shortcuts (storyboard scope).
         for action in playback_controls::shortcut_actions(ctx, &self.bindings) {
-            match action {
+            let intent = match action {
                 playback_controls::PlaybackAction::SeekFrames(frames) => {
-                    self.step_focus(host, playback, frames);
+                    self.step_focus(host, playback, frames)
                 }
                 other => self.dispatch_playback_action(host, other),
+            };
+            if intent != PlaybackTransportIntent::None {
+                intents.push(intent);
             }
         }
+        intents
     }
 
-    pub fn drain_playback_commands(&mut self) -> Vec<StoryPlaybackCommand> {
-        <Self as crate::player_bridge::PlayerClient>::drain_playback_commands(self)
-    }
-
-    /// Drop UI playhead lock so play is not fighting a scrub target.
-    pub fn clear_pending_seeks(&mut self) {
-        <Self as crate::player_bridge::PlayerClient>::clear_pending_seeks(self)
-    }
-
+    #[allow(dead_code)]
     pub fn playback_is_playing(&self) -> bool {
         self.playing
     }
 
     pub fn playback_source_ref(&self) -> Option<&BroadcastHostSourceRef> {
-        <Self as crate::player_bridge::PlayerClient>::playback_source_ref(self)
+        self.active_playback_source_ref()
     }
 
+    #[allow(dead_code)]
     pub fn playback_source_fps(&self) -> f64 {
         <Self as crate::player_bridge::PlayerClient>::playback_source_fps(self)
     }
 
+    #[allow(dead_code)]
     pub fn playback_source_has_audio(&self) -> bool {
         <Self as crate::player_bridge::PlayerClient>::playback_source_has_audio(self)
     }
 
+    #[allow(dead_code)]
     pub fn playback_source_audio_channels(&self) -> u8 {
         <Self as crate::player_bridge::PlayerClient>::playback_source_audio_channels(self)
     }
 
+    #[allow(dead_code)]
     pub fn playback_source_sec(&self) -> f64 {
-        self.virtual_sec
+        // Player clock only — timelines never map to each other.
+        self.virtual_sec().max(0.0)
+    }
+
+    /// Project broadcast-player clock onto the active UI playhead.
+    /// Timelines do not talk to each other; they only mirror the player.
+    fn sync_playhead_from_player_frame(&mut self, source_frame: FrameNumber) {
+        let frame = source_frame.0.max(0);
+        match self.view_mode {
+            ViewMode::Source => self.set_source_playhead_frame(frame),
+            ViewMode::Wrap => {
+                if let Some((part_id, mapped)) = self.wrap_frame_for_source_frame(frame) {
+                    self.selected_part_id = part_id;
+                    self.set_wrap_playhead_frame(mapped);
+                }
+            }
+        }
+    }
+
+    pub(crate) fn playback_boundary_intents(
+        &mut self,
+        source_frame: FrameNumber,
+    ) -> Vec<PlaybackTransportIntent> {
+        if self.view_mode != ViewMode::Wrap {
+            return Vec::new();
+        }
+        if let Some(transition) = self.segment_boundary_transition(source_frame) {
+            self.set_wrap_playhead_frame(transition.program_frame);
+            let scrub = self.start_wrap_session_from_snapshot(Some(transition.part_id));
+            if scrub == PlaybackTransportIntent::None {
+                return Vec::new();
+            }
+            return match scrub {
+                PlaybackTransportIntent::ScrubFrame(frame) => {
+                    vec![PlaybackTransportIntent::ScrubFrameAndPlay(frame)]
+                }
+                other => vec![other],
+            };
+        }
+        self.sync_playhead_from_player_frame(source_frame);
+        Vec::new()
     }
 
     /// Local disk path for native ffmpeg (never an HTTP virtual-stream URL).
+    #[allow(dead_code)]
     pub fn playback_media_path(&self) -> Option<String> {
         <Self as crate::player_bridge::PlayerClient>::playback_media_path(self)
     }
 
-    pub fn playback_source_range_sec(&self) -> (f64, f64) {
-        <Self as crate::player_bridge::PlayerClient>::playback_source_range_sec(self)
-    }
-
-    /// Marked IN/OUT for save / virtual shot (not the decode window).
-    pub fn marked_range_sec(&self) -> (f64, f64) {
-        (
-            self.source_in.max(0.0),
-            self.source_out.max(self.source_in + 0.04),
-        )
-    }
-
+    #[allow(dead_code)]
     pub fn set_player_preview_active(&mut self, active: bool) {
         <Self as crate::player_bridge::PlayerClient>::set_player_preview_active(self, active)
     }
 
-    pub fn apply_player_frame(&mut self, image: ColorImage, source_sec: f64, playing: bool) {
+    #[allow(dead_code)]
+    pub fn apply_player_frame(
+        &mut self,
+        image: ColorImage,
+        source_frame: FrameNumber,
+        playing: bool,
+    ) {
         <Self as crate::player_bridge::PlayerClient>::apply_player_frame(
-            self, image, source_sec, playing,
+            self,
+            image,
+            source_frame,
+            playing,
         )
     }
 
+    #[allow(dead_code)]
     pub fn apply_player_state(
         &mut self,
-        source_sec: f64,
+        source_frame: FrameNumber,
         playing: bool,
         status: impl Into<String>,
     ) {
         <Self as crate::player_bridge::PlayerClient>::apply_player_state(
-            self, source_sec, playing, status,
+            self,
+            source_frame,
+            playing,
+            status,
         )
     }
 
@@ -708,6 +1416,7 @@ impl StoryScreen {
         <Self as crate::player_bridge::PlayerClient>::apply_player_error(self, status)
     }
 
+    #[allow(dead_code)]
     pub fn apply_playback_command_state(&mut self, playing: bool, status: impl Into<String>) {
         <Self as crate::player_bridge::PlayerClient>::apply_playback_command_state(
             self, playing, status,
@@ -716,7 +1425,7 @@ impl StoryScreen {
 
     pub fn prepare_frame(&mut self, host: &HostClient, ctx: &egui::Context) {
         self.repaint_ctx = Some(ctx.clone());
-        self.poll_async_media(host, ctx);
+        self.poll_media_assets(host, ctx);
         if let Some(retry_at) = self.source_media_retry_at {
             let now = Instant::now();
             if now >= retry_at {
@@ -733,17 +1442,35 @@ impl StoryScreen {
 
     /// Docked bottom bar — web `story-source-editor-col` + `qnc-timeline` source.
     pub fn source_dock_height(&self) -> f32 {
-        let dur = self.selected_clip_duration().max(0.04);
-        source_editor::dock_height(self.expanded_audio, dur)
+        source_editor::dock_height(self.expanded_audio)
     }
 
     pub fn ui_source_dock(
         &mut self,
         ui: &mut egui::Ui,
         host: &HostClient,
-        playback: &mut PlaybackStack,
-    ) {
-        self.ui_source_editor(ui, host, self.source_dock_height(), playback);
+        playback: &PlaybackStack,
+    ) -> PlaybackTransportIntent {
+        match self.ui_source_editor(ui, host, self.source_dock_height(), playback) {
+            source_editor::SourceEditorAction::None => PlaybackTransportIntent::None,
+            source_editor::SourceEditorAction::CueFrame(frame) => {
+                if self.view_mode != ViewMode::Source {
+                    self.view_mode = ViewMode::Source;
+                }
+                self.set_source_playhead_frame(frame);
+                PlaybackTransportIntent::CueFrame(frame)
+            }
+            source_editor::SourceEditorAction::SaveVirtualShot => {
+                self.save_virtual_shot(host);
+                PlaybackTransportIntent::None
+            }
+            source_editor::SourceEditorAction::CreatePart(kind) => self.create_part(host, kind),
+            source_editor::SourceEditorAction::CreateCover => self.quick_cover(host),
+            source_editor::SourceEditorAction::ToggleAudioExpand(lane) => {
+                self.expanded_audio = self.expanded_audio.toggle(lane);
+                PlaybackTransportIntent::None
+            }
+        }
     }
 
     /// Central workspace — composed from `qnc_ui` (Story is the reference form).
@@ -753,7 +1480,8 @@ impl StoryScreen {
         host: &HostClient,
         _ctx: &egui::Context,
         playback: &PlaybackStack,
-    ) {
+    ) -> Vec<PlaybackTransportIntent> {
+        let mut intents = Vec::new();
         crate::qnc_ui::editorial_shell(ui, |ui, m, side| match side {
             crate::qnc_ui::ShellSide::Left => {
                 crate::qnc_ui::media_column_monitor(
@@ -765,22 +1493,32 @@ impl StoryScreen {
                     |ui, _rest| {
                         ui.spacing_mut().item_spacing.y = 0.0;
                         ui.allocate_ui(Vec2::new(m.left_w, crate::qnc_ui::space::CHROME_H), |ui| {
-                            self.ui_pool_head(ui, host);
+                            let intent = self.ui_pool_head(ui, host);
+                            if intent != PlaybackTransportIntent::None {
+                                intents.push(intent);
+                            }
                         });
                         let body = ui.available_height().max(0.0);
-                        self.ui_filmstrip_web(ui, host, body);
+                        let intent = self.ui_filmstrip_web(ui, host, body);
+                        if intent != PlaybackTransportIntent::None {
+                            intents.push(intent);
+                        }
                     },
                 );
             }
             crate::qnc_ui::ShellSide::Right => match self.role.composition().right {
                 crate::composition::RightPanelKind::SegmentPanel => {
-                    self.ui_segmenti_panel(ui, host, m.height);
+                    let intent = self.ui_segmenti_panel(ui, host, m.height);
+                    if intent != PlaybackTransportIntent::None {
+                        intents.push(intent);
+                    }
                 }
                 crate::composition::RightPanelKind::None
                 | crate::composition::RightPanelKind::ClipGrid
                 | crate::composition::RightPanelKind::TemplateSettings => {}
             },
         });
+        intents
     }
 
     fn selected_clip_label(&self) -> String {
@@ -800,9 +1538,13 @@ impl StoryScreen {
             .unwrap_or_else(|| "Odaberi klip".into())
     }
 
-    fn dispatch_media_pool(&mut self, host: &HostClient, action: media_pool::MediaPoolAction) {
+    fn dispatch_media_pool(
+        &mut self,
+        host: &HostClient,
+        action: media_pool::MediaPoolAction,
+    ) -> PlaybackTransportIntent {
         match action {
-            media_pool::MediaPoolAction::None => {}
+            media_pool::MediaPoolAction::None => PlaybackTransportIntent::None,
             media_pool::MediaPoolAction::SwitchTab(tab) => {
                 // Honor composition: no Segment tab → clamp away.
                 let tab = if tab == LibraryTab::Segment && !self.role.head().show_segment_tab {
@@ -812,50 +1554,64 @@ impl StoryScreen {
                 };
                 self.library_tab = tab;
                 if tab == LibraryTab::Segment {
-                    self.start_wrap_session(host);
+                    self.start_wrap_session(host)
+                } else {
+                    PlaybackTransportIntent::None
                 }
             }
             media_pool::MediaPoolAction::SelectShot(shot) => self.select_shot(host, &shot),
             media_pool::MediaPoolAction::SelectPart(part_id) => {
                 self.selected_part_id = part_id.clone();
-                self.start_wrap_session_for_part(host, Some(part_id));
+                self.start_wrap_session_for_part(host, Some(part_id))
             }
             media_pool::MediaPoolAction::DeletePart(part_id) => {
-                if let Ok(st) = host.story_part_delete(&self.project_id, &part_id) {
-                    self.after_edit(host, st);
-                    self.start_wrap_session(host);
-                }
+                self.delete_part(host, &part_id);
+                PlaybackTransportIntent::None
             }
-            media_pool::MediaPoolAction::TogglePlay => {
-                self.dispatch_playback_action(host, playback_controls::PlaybackAction::TogglePlay);
+            media_pool::MediaPoolAction::ReorderPart { part_id, direction } => {
+                self.reorder_part(host, &part_id, &direction);
+                PlaybackTransportIntent::None
             }
+            media_pool::MediaPoolAction::TogglePlay => self.toggle_play_intent(host),
             media_pool::MediaPoolAction::MarkIn => {
-                self.dispatch_playback_action(host, playback_controls::PlaybackAction::MarkIn);
+                self.dispatch_playback_action(host, playback_controls::PlaybackAction::MarkIn)
             }
             media_pool::MediaPoolAction::MarkOut => {
-                self.dispatch_playback_action(host, playback_controls::PlaybackAction::MarkOut);
+                self.dispatch_playback_action(host, playback_controls::PlaybackAction::MarkOut)
             }
             media_pool::MediaPoolAction::QuickCover => {
-                self.dispatch_playback_action(host, playback_controls::PlaybackAction::QuickCover);
+                self.dispatch_playback_action(host, playback_controls::PlaybackAction::QuickCover)
             }
-            media_pool::MediaPoolAction::ExportCommit => self.export_commit(host),
-            media_pool::MediaPoolAction::SelectClipId(_) => {}
+            media_pool::MediaPoolAction::ExportCommit => {
+                self.export_commit(host);
+                PlaybackTransportIntent::None
+            }
+            media_pool::MediaPoolAction::SelectClipId(_) => PlaybackTransportIntent::None,
         }
     }
 
-    fn ui_pool_head(&mut self, ui: &mut egui::Ui, host: &HostClient) {
+    fn ui_pool_head(&mut self, ui: &mut egui::Ui, host: &HostClient) -> PlaybackTransportIntent {
         let action = media_pool::show_head(
             ui,
             self.role
                 .head()
                 .to_pool_head(self.library_tab, self.playing),
         );
-        self.dispatch_media_pool(host, action);
+        self.dispatch_media_pool(host, action)
     }
 
-    fn ui_filmstrip_web(&mut self, ui: &mut egui::Ui, host: &HostClient, height: f32) {
+    fn ui_filmstrip_web(
+        &mut self,
+        ui: &mut egui::Ui,
+        host: &HostClient,
+        height: f32,
+    ) -> PlaybackTransportIntent {
         let timeline_fps = self.timeline_fps();
-        let tc = move |sec| seconds_to_timecode(sec, timeline_fps);
+        let tc = move |sec| {
+            timeline_fps
+                .map(|fps| seconds_to_timecode(sec, fps))
+                .unwrap_or_else(|| format!("{sec:.2}s"))
+        };
         let action = media_pool::show_strip(
             ui,
             media_pool::MediaPoolStripInput {
@@ -872,62 +1628,84 @@ impl StoryScreen {
                 card_features: self.role.card_features(),
             },
         );
-        self.dispatch_media_pool(host, action);
+        self.dispatch_media_pool(host, action)
     }
 
-    fn ui_segmenti_panel(&mut self, ui: &mut egui::Ui, host: &HostClient, height: f32) {
-        let segs = self
-            .timeline
-            .as_ref()
-            .map(|t| t.segments.clone())
-            .unwrap_or_default();
-        let duration = self
-            .timeline
-            .as_ref()
-            .map(|t| t.duration_sec.max(0.1))
-            .unwrap_or(0.1);
-        let active_part_id =
-            story_timeline::active_segment(self.timeline.as_ref(), self.virtual_sec)
-                .map(|segment| segment.part_id.as_str());
+    fn ui_segmenti_panel(
+        &mut self,
+        ui: &mut egui::Ui,
+        host: &HostClient,
+        height: f32,
+    ) -> PlaybackTransportIntent {
+        let program = self.segment_program_model();
         let tc = |sec| self.tc(sec);
+        let tc_frame = |frame| {
+            self.timeline_sec_from_frame(frame)
+                .map(|sec| self.tc(sec))
+                .unwrap_or_else(|| "--:--:--:--".into())
+        };
+        let playhead_sec = self
+            .timeline_sec_from_frame(self.wrap_playhead_frame)
+            .unwrap_or(0.0);
         let action = segment_panel::show(
             ui,
             segment_panel::SegmentPanelInput {
                 height,
-                duration_sec: duration,
-                fps: self.timeline_fps(),
-                virtual_sec: self.virtual_sec,
-                segments: &segs,
-                active_part_id,
+                virtual_frame: self.wrap_playhead_frame,
+                playhead_sec,
+                program: &program,
                 marker_slots: &self.marker_slots,
                 covers: &self.covers,
                 markers: &self.markers,
                 selected_slot_id: &self.selected_slot_id,
                 selected_cover_id: &self.selected_cover_id,
                 tc: &tc,
+                tc_frame: &tc_frame,
             },
         );
-        self.dispatch_segment_panel(host, action);
+        self.dispatch_segment_panel(host, action)
     }
 
     fn dispatch_marker_cover_action(
         &mut self,
         host: &HostClient,
         action: marker_cover_panel::MarkerCoverAction,
-    ) {
+    ) -> PlaybackTransportIntent {
         match action {
-            marker_cover_panel::MarkerCoverAction::None => {}
-            marker_cover_panel::MarkerCoverAction::AddMarker => self.marker_at_head(host),
+            marker_cover_panel::MarkerCoverAction::None => PlaybackTransportIntent::None,
+            marker_cover_panel::MarkerCoverAction::AddMarker => {
+                self.marker_at_head(host);
+                PlaybackTransportIntent::None
+            }
             marker_cover_panel::MarkerCoverAction::CreateCover => self.quick_cover(host),
+            marker_cover_panel::MarkerCoverAction::OverwriteCover => self.overwrite_cover(host),
             marker_cover_panel::MarkerCoverAction::SelectSlot(id) => {
                 self.select_marker_slot(host, &id);
+                PlaybackTransportIntent::None
             }
             marker_cover_panel::MarkerCoverAction::SelectCover(id) => {
                 self.select_cover(host, &id);
+                PlaybackTransportIntent::None
             }
-            marker_cover_panel::MarkerCoverAction::SeekMarker(sec) => {
-                self.virtual_sec = self.snap_sec(sec);
-                self.ensure_wrap_or_scrub(host);
+            marker_cover_panel::MarkerCoverAction::DeleteCover(id) => {
+                self.delete_cover(host, &id);
+                PlaybackTransportIntent::None
+            }
+            marker_cover_panel::MarkerCoverAction::SeekMarkerFrame(frame) => {
+                self.selected_marker_id.clear();
+                self.set_wrap_playhead_frame(frame);
+                self.ensure_wrap_or_scrub(host)
+            }
+            marker_cover_panel::MarkerCoverAction::MoveMarker {
+                marker_id,
+                direction,
+            } => {
+                self.move_marker(host, &marker_id, &direction);
+                PlaybackTransportIntent::None
+            }
+            marker_cover_panel::MarkerCoverAction::DeleteMarker(id) => {
+                self.delete_marker(host, &id);
+                PlaybackTransportIntent::None
             }
         }
     }
@@ -936,33 +1714,66 @@ impl StoryScreen {
         &mut self,
         host: &HostClient,
         action: segment_panel::SegmentPanelAction,
-    ) {
+    ) -> PlaybackTransportIntent {
         match action {
-            segment_panel::SegmentPanelAction::None => {}
-            segment_panel::SegmentPanelAction::SeekTimeline(sec) => {
-                self.virtual_sec = self.snap_sec(sec);
-                self.ensure_wrap_or_scrub(host);
+            segment_panel::SegmentPanelAction::None => PlaybackTransportIntent::None,
+            segment_panel::SegmentPanelAction::SeekTimelineFrame(frame) => {
+                self.set_wrap_playhead_frame(frame);
+                self.ensure_wrap_or_scrub(host)
             }
             segment_panel::SegmentPanelAction::MarkerCover(action) => {
-                self.dispatch_marker_cover_action(host, action);
+                self.dispatch_marker_cover_action(host, action)
             }
-            segment_panel::SegmentPanelAction::SelectSegment { part_id, start_sec } => {
-                self.virtual_sec = start_sec;
+            segment_panel::SegmentPanelAction::SelectMarkerSlot(id) => {
+                self.select_marker_slot(host, &id);
+                PlaybackTransportIntent::None
+            }
+            segment_panel::SegmentPanelAction::SelectCover(id) => {
+                self.select_cover(host, &id);
+                PlaybackTransportIntent::None
+            }
+            segment_panel::SegmentPanelAction::SelectMarker { marker_id, frame } => {
+                self.select_marker(host, &marker_id, frame)
+            }
+            segment_panel::SegmentPanelAction::SelectSegment {
+                part_id,
+                start_frame,
+            } => {
+                self.set_wrap_playhead_frame(start_frame);
                 self.selected_part_id = part_id.clone();
                 if self.view_mode != ViewMode::Wrap {
-                    self.start_wrap_session_for_part(host, Some(part_id));
+                    self.start_wrap_session_for_part(host, Some(part_id))
                 } else {
-                    self.scrub_soft(host);
+                    self.scrub_soft(host)
                 }
             }
         }
     }
 
-    fn ensure_wrap_or_scrub(&mut self, host: &HostClient) {
+    fn ensure_wrap_or_scrub(&mut self, host: &HostClient) -> PlaybackTransportIntent {
         if self.view_mode != ViewMode::Wrap {
-            self.start_wrap_session(host);
+            self.start_wrap_session(host)
         } else {
-            self.scrub_soft(host);
+            self.scrub_soft(host)
+        }
+    }
+
+    fn toggle_play_intent(&mut self, _host: &HostClient) -> PlaybackTransportIntent {
+        if self.view_mode != ViewMode::Wrap || self.playing {
+            return PlaybackTransportIntent::TogglePlay;
+        }
+        if let Err(e) = self.prepare_wrap_source_from_snapshot(None) {
+            self.status = e;
+            return PlaybackTransportIntent::None;
+        }
+        match self.scrub_current_playhead_intent() {
+            PlaybackTransportIntent::CueFrame(frame)
+            | PlaybackTransportIntent::ScrubFrame(frame)
+            | PlaybackTransportIntent::ScrubFrameAndPlay(frame) => {
+                PlaybackTransportIntent::ScrubFrameAndPlay(frame)
+            }
+            PlaybackTransportIntent::None => PlaybackTransportIntent::None,
+            PlaybackTransportIntent::TogglePlay => PlaybackTransportIntent::TogglePlay,
         }
     }
 
@@ -971,73 +1782,68 @@ impl StoryScreen {
         ui: &mut egui::Ui,
         host: &HostClient,
         _height: f32,
-        playback: &mut PlaybackStack,
-    ) {
+        playback: &PlaybackStack,
+    ) -> source_editor::SourceEditorAction {
+        let _ = host;
         let clip_label = self.selected_clip_label();
-        let clip_dur = self
+        let Some(timebase_fps) = self.source_timebase_fps() else {
+            self.status = "Source FPS još nije potvrđen — source timeline nije spreman".into();
+            return source_editor::SourceEditorAction::None;
+        };
+        let clip = self
             .all_clips
             .iter()
-            .find(|c| c.clip_id == self.selected_clip_id)
-            .map(|c| c.duration_sec)
-            .unwrap_or(0.0)
-            .max((self.source_out).max(1.0));
-        let timebase_fps = self.source_timebase_fps().unwrap_or(DEFAULT_FPS);
-        // Editorial mirror from carrier projection (marks), not a local clock.
-        if playback.carrier().is_active() {
+            .find(|c| c.clip_id == self.selected_clip_id);
+        let clip_duration_frames = clip
+            .and_then(|c| (c.duration_frames > 0).then_some(c.duration_frames))
+            .unwrap_or_else(|| {
+                let duration_sec = clip.map(|c| c.duration_sec).unwrap_or(0.0).max(0.0);
+                seconds_to_frame(duration_sec, timebase_fps)
+            })
+            .max(self.source_out_frame.max(1));
+        if self.source_dock_uses_live_carrier(playback) {
             let frame = playback.carrier().display_frame().0;
-            self.playhead_frame = frame;
-            self.virtual_sec = self.snap_source_sec(frame_to_seconds(frame, timebase_fps));
+            self.sync_playhead_from_player_frame(FrameNumber(frame));
         }
-        let tc = |sec| self.source_tc(sec);
+        let tc_frame = |frame: i64| {
+            seconds_to_timecode(frame_to_seconds(frame.max(0), timebase_fps), timebase_fps)
+        };
         let focus_paint = match self.focus.target {
             FocusTarget::Playhead => TimelineFocusPaint::Playhead,
             FocusTarget::In => TimelineFocusPaint::In,
             FocusTarget::Out => TimelineFocusPaint::Out,
         };
-        let in_frame = seconds_to_frame(self.source_in.max(0.0), timebase_fps);
-        let out_frame = seconds_to_frame(self.source_out.max(self.source_in), timebase_fps);
-        let fallback_frame =
-            seconds_to_frame(self.virtual_sec.clamp(0.0, clip_dur), timebase_fps);
-        let timeline_model = playback.timeline_model_for_clip(
+        let shot_in_frame = self.selected_shot_in_frame.clamp(0, clip_duration_frames);
+        let shot_out_frame = self
+            .selected_shot_out_frame
+            .max(shot_in_frame + 1)
+            .clamp(0, clip_duration_frames);
+        let draft_in_frame = self.source_in_frame.max(0);
+        let draft_out_frame = self.source_out_frame.max(self.source_in_frame + 1);
+        let timeline_model = self.source_dock_timeline_model(
+            playback,
             timebase_fps,
-            clip_dur,
-            in_frame,
-            out_frame,
-            fallback_frame,
+            clip_duration_frames,
+            shot_in_frame,
+            shot_out_frame,
+            draft_in_frame,
+            draft_out_frame,
         );
-        let action = source_editor::show(
+        source_editor::show(
             ui,
             source_editor::SourceEditorInput {
                 clip_label: &clip_label,
-                source_in: self.source_in,
-                source_out: self.source_out,
+                source_in_frame: self.source_in_frame,
+                source_out_frame: self.source_out_frame,
                 timeline_model,
                 focus: focus_paint,
                 a1_peaks: &self.a1_peaks,
                 a2_peaks: &self.a2_peaks,
                 frames: &self.film_frames,
-                tc: &tc,
+                tc_frame: &tc_frame,
                 expanded_audio: self.expanded_audio,
             },
-        );
-
-        match action {
-            source_editor::SourceEditorAction::None => {}
-            source_editor::SourceEditorAction::SaveVirtualShot => self.save_virtual_shot(host),
-            source_editor::SourceEditorAction::CreatePart(kind) => self.create_part(host, kind),
-            source_editor::SourceEditorAction::ToggleAudioExpand(lane) => {
-                self.expanded_audio = self.expanded_audio.toggle(lane);
-            }
-            source_editor::SourceEditorAction::CueFrame(frame) => {
-                // Progress bar → CueFrame; Space plays from this position.
-                match crate::player_bridge::build_open_request(self)
-                    .and_then(|request| playback.cue_timeline_click(request, frame))
-                {
-                    Ok(()) => {}
-                    Err(err) => self.status = err,
-                }
-            }
-        }
+        )
     }
 }
 
@@ -1046,11 +1852,9 @@ impl StoryScreen {
         &mut self,
         host: &HostClient,
         action: playback_controls::PlaybackAction,
-    ) {
+    ) -> PlaybackTransportIntent {
         match action {
-            playback_controls::PlaybackAction::TogglePlay => self
-                .pending_playback_commands
-                .push(StoryPlaybackCommand::TogglePlay),
+            playback_controls::PlaybackAction::TogglePlay => self.toggle_play_intent(host),
             playback_controls::PlaybackAction::MarkIn => self.mark_in_action(host),
             playback_controls::PlaybackAction::MarkOut => self.mark_out_action(host),
             playback_controls::PlaybackAction::SelectMarkIn => self.select_mark_in(host),
@@ -1058,22 +1862,44 @@ impl StoryScreen {
             playback_controls::PlaybackAction::FocusNext => {
                 let chain = self.edit_focus_chain();
                 self.focus.focus_next(&chain);
-                self.after_focus_changed();
+                self.after_focus_changed()
             }
             playback_controls::PlaybackAction::FocusPrev => {
                 let chain = self.edit_focus_chain();
                 self.focus.focus_prev(&chain);
-                self.after_focus_changed();
+                self.after_focus_changed()
             }
             playback_controls::PlaybackAction::ClearFocus => {
                 if !self.focus.is_playhead() {
                     self.focus.clear();
                     self.status = "Fokus → playhead".into();
                 }
+                PlaybackTransportIntent::None
             }
             playback_controls::PlaybackAction::QuickCover => self.quick_cover(host),
-            // SeekFrames is handled in handle_shortcuts (needs PlaybackStack).
-            playback_controls::PlaybackAction::SeekFrames(_) => {}
+            playback_controls::PlaybackAction::OverwriteCover => self.overwrite_cover(host),
+            playback_controls::PlaybackAction::StepPrevPart => self.select_adjacent_part(host, -1),
+            playback_controls::PlaybackAction::StepNextPart => self.select_adjacent_part(host, 1),
+            playback_controls::PlaybackAction::StepPrevMarkerSlot => {
+                self.select_adjacent_marker_slot(host, -1)
+            }
+            playback_controls::PlaybackAction::StepNextMarkerSlot => {
+                self.select_adjacent_marker_slot(host, 1)
+            }
+            playback_controls::PlaybackAction::FocusEmptySlot => self.focus_empty_marker_slot(host),
+            playback_controls::PlaybackAction::MarkInFitDuration => self.mark_in_fit_duration(host),
+            playback_controls::PlaybackAction::DeleteSelection => {
+                self.delete_selected_timeline_item(host);
+                PlaybackTransportIntent::None
+            }
+            playback_controls::PlaybackAction::AddMarker => {
+                self.marker_at_head(host);
+                PlaybackTransportIntent::None
+            }
+            playback_controls::PlaybackAction::AddTonSegment => self.create_part(host, "tonovi"),
+            playback_controls::PlaybackAction::AddOffSegment => self.create_part(host, "offovi"),
+            // SeekFrames is handled in handle_shortcuts.
+            playback_controls::PlaybackAction::SeekFrames(_) => PlaybackTransportIntent::None,
         }
     }
 
@@ -1088,31 +1914,31 @@ impl StoryScreen {
         chain
     }
 
-    fn select_mark_in(&mut self, host: &HostClient) {
+    fn select_mark_in(&mut self, host: &HostClient) -> PlaybackTransportIntent {
         let _ = host;
         if self.view_mode != ViewMode::Source {
             self.status = format!(
                 "{}: source mode",
                 self.chord_or("select_mark_in", "select_mark_in")
             );
-            return;
+            return PlaybackTransportIntent::None;
         }
         if !self.mark_in_set {
             self.status = format!("Prvo stavi IN ({})", self.chord_or("mark_in", "mark_in"));
-            return;
+            return PlaybackTransportIntent::None;
         }
         self.focus.select_in();
-        self.virtual_sec = self.snap_source_sec(self.source_in);
-        self.schedule_native_seek_io();
+        self.set_source_playhead_frame(self.source_in_frame);
         self.status = format!(
             "Fokus IN · {} · {} pomak 1 frame · {} playhead",
-            self.source_tc(self.source_in),
+            self.source_tc_frame(self.source_in_frame),
             self.chord_or("step_forward_frame", "←/→"),
             self.chord_or("clear_focus", "Esc")
         );
+        self.cue_current_playhead_intent()
     }
 
-    fn after_focus_changed(&mut self) {
+    fn after_focus_changed(&mut self) -> PlaybackTransportIntent {
         match self.focus.target {
             FocusTarget::In => {
                 if !self.mark_in_set {
@@ -1121,15 +1947,15 @@ impl StoryScreen {
                         "IN još nije označen ({})",
                         self.chord_or("mark_in", "mark_in")
                     );
-                    return;
+                    return PlaybackTransportIntent::None;
                 }
-                self.virtual_sec = self.snap_source_sec(self.source_in);
-                self.schedule_native_seek_io();
+                self.set_source_playhead_frame(self.source_in_frame);
                 self.status = format!(
                     "Fokus IN · {} · {} 1f",
-                    self.source_tc(self.source_in),
+                    self.source_tc_frame(self.source_in_frame),
                     self.chord_or("step_forward_frame", "step")
                 );
+                self.cue_current_playhead_intent()
             }
             FocusTarget::Out => {
                 if !self.mark_out_set {
@@ -1138,44 +1964,45 @@ impl StoryScreen {
                         "OUT još nije označen ({})",
                         self.chord_or("mark_out", "mark_out")
                     );
-                    return;
+                    return PlaybackTransportIntent::None;
                 }
-                self.virtual_sec = self.snap_source_sec(self.source_out);
-                self.schedule_native_seek_io();
+                self.set_source_playhead_frame(self.source_out_frame);
                 self.status = format!(
                     "Fokus OUT · {} · {} 1f",
-                    self.source_tc(self.source_out),
+                    self.source_tc_frame(self.source_out_frame),
                     self.chord_or("step_forward_frame", "step")
                 );
+                self.cue_current_playhead_intent()
             }
             FocusTarget::Playhead => {
                 self.status = "Fokus → playhead".into();
+                PlaybackTransportIntent::None
             }
         }
     }
 
-    fn select_mark_out(&mut self, host: &HostClient) {
+    fn select_mark_out(&mut self, host: &HostClient) -> PlaybackTransportIntent {
         let _ = host;
         if self.view_mode != ViewMode::Source {
             self.status = format!(
                 "{}: source mode",
                 self.chord_or("select_mark_out", "select_mark_out")
             );
-            return;
+            return PlaybackTransportIntent::None;
         }
         if !self.mark_out_set {
             self.status = format!("Prvo stavi OUT ({})", self.chord_or("mark_out", "mark_out"));
-            return;
+            return PlaybackTransportIntent::None;
         }
         self.focus.select_out();
-        self.virtual_sec = self.snap_source_sec(self.source_out);
-        self.schedule_native_seek_io();
+        self.set_source_playhead_frame(self.source_out_frame);
         self.status = format!(
             "Fokus OUT · {} · {} pomak 1 frame · {} playhead",
-            self.source_tc(self.source_out),
+            self.source_tc_frame(self.source_out_frame),
             self.chord_or("step_forward_frame", "←/→"),
             self.chord_or("clear_focus", "Esc")
         );
+        self.cue_current_playhead_intent()
     }
 
     fn chord_or(&self, action_id: &str, fallback: &str) -> String {
@@ -1187,223 +2014,530 @@ impl StoryScreen {
         }
     }
 
-    fn selected_clip_duration(&self) -> f64 {
+    fn selected_clip_duration_frames(&self) -> i64 {
         self.all_clips
             .iter()
             .find(|c| c.clip_id == self.selected_clip_id)
-            .map(|c| c.duration_sec)
-            .unwrap_or(0.0)
-            .max(self.source_out)
-            .max(self.virtual_sec + 0.04)
-            .max(1.0)
+            .map(|c| c.duration_frames)
+            .unwrap_or(0)
+            .max(self.selected_shot_out_frame)
+            .max(self.source_out_frame)
+            .max(self.source_playhead_frame + 1)
+            .max(1)
     }
 
-    fn mark_in_action(&mut self, host: &HostClient) {
+    fn mark_in_action(&mut self, _host: &HostClient) -> PlaybackTransportIntent {
         match self.view_mode {
             ViewMode::Source => {
                 if self.source_timebase_fps().is_none() {
                     self.status = "Source FPS još nije potvrđen — IN nije upisan".into();
-                    return;
+                    return PlaybackTransportIntent::None;
                 }
-                self.source_in = self.snap_source_sec(self.virtual_sec.max(0.0));
+                self.source_in_frame = self.source_playhead_frame.max(0);
                 // Do not collapse OUT to IN+1s — that traps playhead/player in a 1s window.
-                if !self.mark_out_set || self.source_out <= self.source_in {
-                    let clip_end = self.snap_source_sec(self.selected_clip_duration());
-                    self.source_out = clip_end.max(self.source_in + 0.04);
+                if !self.mark_out_set || self.source_out_frame <= self.source_in_frame {
+                    let clip_end = self.selected_clip_duration_frames();
+                    self.source_out_frame = clip_end.max(self.source_in_frame + 1);
                 }
                 self.mark_in_set = true;
                 // Stay on playhead — select_mark_in later for frame edit focus.
                 self.focus.clear();
                 self.status = format!(
                     "IN {} · {} za fokus / korekcija",
-                    self.source_tc(self.source_in),
+                    self.source_tc_frame(self.source_in_frame),
                     self.chord_or("select_mark_in", "select_mark_in")
                 );
+                PlaybackTransportIntent::None
             }
             ViewMode::Wrap => {
-                if let Some(local) = story_timeline::local_sec_in_part(
+                if let Some(local_frame) = story_timeline::local_frame_in_part(
                     self.timeline.as_ref(),
                     &self.selected_part_id,
-                    self.virtual_sec,
+                    self.wrap_playhead_frame,
                 ) {
                     let part = self.selected_part_id.clone();
-                    match story_edit::mark_part_in(host, &self.project_id, &part, local) {
-                        Ok(st) => {
-                            self.after_edit(host, st);
-                            self.focus.clear();
-                            self.status = format!("Mark IN @ {local:.2}s");
-                            self.start_wrap_session(host);
-                        }
-                        Err(e) => self.status = e,
-                    }
+                    self.enqueue_edit_command(|instance, request, project| {
+                        EditorialEditComponent::mark_part_in(
+                            instance,
+                            request,
+                            project,
+                            &part,
+                            local_frame,
+                        )
+                    });
+                    self.status = format!(
+                        "Spremam Mark IN @ {}",
+                        self.part_local_tc(&part, local_frame)
+                    );
+                    PlaybackTransportIntent::None
                 } else {
                     self.status = "Odaberi part za Mark IN".into();
+                    PlaybackTransportIntent::None
                 }
             }
         }
     }
 
-    fn mark_out_action(&mut self, host: &HostClient) {
+    fn mark_out_action(&mut self, _host: &HostClient) -> PlaybackTransportIntent {
         match self.view_mode {
             ViewMode::Source => {
                 if self.source_timebase_fps().is_none() {
                     self.status = "Source FPS još nije potvrđen — OUT nije upisan".into();
-                    return;
+                    return PlaybackTransportIntent::None;
                 }
-                self.source_out = self.snap_source_sec(self.virtual_sec.max(self.source_in + 0.04));
+                self.source_out_frame = self.source_playhead_frame.max(self.source_in_frame + 1);
                 self.mark_out_set = true;
                 self.focus.clear();
                 self.status = format!(
                     "OUT {} · {} za fokus / korekcija",
-                    self.source_tc(self.source_out),
+                    self.source_tc_frame(self.source_out_frame),
                     self.chord_or("select_mark_out", "select_mark_out")
                 );
+                PlaybackTransportIntent::None
             }
             ViewMode::Wrap => {
-                if let Some(local) = story_timeline::local_sec_in_part(
+                if let Some(local_frame) = story_timeline::local_frame_in_part(
                     self.timeline.as_ref(),
                     &self.selected_part_id,
-                    self.virtual_sec,
+                    self.wrap_playhead_frame,
                 ) {
                     let part = self.selected_part_id.clone();
-                    match story_edit::mark_part_out(host, &self.project_id, &part, local) {
-                        Ok(st) => {
-                            self.after_edit(host, st);
-                            self.focus.clear();
-                            self.status = format!("Mark OUT @ {local:.2}s");
-                            self.start_wrap_session(host);
-                        }
-                        Err(e) => self.status = e,
-                    }
+                    self.enqueue_edit_command(|instance, request, project| {
+                        EditorialEditComponent::mark_part_out(
+                            instance,
+                            request,
+                            project,
+                            &part,
+                            local_frame,
+                        )
+                    });
+                    self.status = format!(
+                        "Spremam Mark OUT @ {}",
+                        self.part_local_tc(&part, local_frame)
+                    );
+                    PlaybackTransportIntent::None
                 } else {
                     self.status = "Odaberi part za Mark OUT".into();
+                    PlaybackTransportIntent::None
                 }
             }
         }
     }
 
-    fn save_virtual_shot(&mut self, host: &HostClient) {
+    fn save_virtual_shot(&mut self, _host: &HostClient) {
         if self.view_mode == ViewMode::Source && self.source_timebase_fps().is_none() {
             self.status = "Source FPS još nije potvrđen — virtualni kadar nije spremljen".into();
             return;
         }
         let clip = self.selected_clip_id.clone();
-        match story_edit::save_virtual_shot(
-            host,
-            &self.project_id,
-            &clip,
-            self.source_in,
-            self.source_out,
-        ) {
-            Ok(_) => {
-                self.status = "Virtualni kadar spremljen".into();
-                self.reload_meta(host);
-                self.library_tab = LibraryTab::Virtual;
+        if clip.trim().is_empty() {
+            self.status = "Odaberi klip u All".into();
+            return;
+        }
+        if self.source_out_frame <= self.source_in_frame {
+            self.status = "OUT mora biti nakon IN".into();
+            return;
+        }
+        let in_frame = self.source_in_frame;
+        let out_frame = self.source_out_frame;
+        self.enqueue_edit_command(|instance, request, project| {
+            EditorialEditComponent::save_virtual_shot(
+                instance, request, project, &clip, in_frame, out_frame,
+            )
+        });
+        self.status = "Spremam virtual clip...".into();
+    }
+
+    fn create_part(&mut self, _host: &HostClient, kind: &str) -> PlaybackTransportIntent {
+        // TON/OFF from Source IN/OUT creates a virtual segment in story_parts.
+        // Add virtual clip is a separate action that writes virtual_shots.
+        match self.source_range_for_segment() {
+            Ok((clip_id, in_frame, out_frame)) => {
+                let kind = kind.to_string();
+                self.enqueue_edit_command(|instance, request, project| {
+                    EditorialEditComponent::create_part_from_marks(
+                        instance, request, project, &kind, &clip_id, in_frame, out_frame,
+                    )
+                });
+                self.status = format!("Spremam {kind} segment...");
+                PlaybackTransportIntent::None
             }
-            Err(e) => self.status = e,
+            Err(e) => {
+                self.status = e;
+                PlaybackTransportIntent::None
+            }
         }
     }
 
-    fn create_part(&mut self, host: &HostClient, kind: &str) {
-        match story_edit::create_part(
-            host,
-            &self.project_id,
-            kind,
-            &self.selected_shot_id,
-            &self.virtual_shots,
-        ) {
-            Ok(st) => {
-                self.status = format!("Dodan {kind}");
-                self.after_edit(host, st);
-                self.library_tab = LibraryTab::Segment;
-                self.start_wrap_session(host);
-            }
-            Err(e) => self.status = e,
+    /// Mark range from Source dock — copied into `story_parts` at create time only.
+    fn source_range_for_segment(&self) -> Result<(String, i64, i64), String> {
+        let clip_id = self.selected_clip_id.trim();
+        if clip_id.is_empty() {
+            return Err("Odaberi source klip".into());
+        }
+        let _ = self
+            .source_timebase_fps()
+            .ok_or_else(|| "Source FPS još nije potvrđen".to_string())?;
+        if !self.mark_in_set || !self.mark_out_set {
+            return Err("Označi IN i OUT na source klipu".into());
+        }
+        let in_frame = self.source_in_frame.max(0);
+        let out_frame = self.source_out_frame.max(self.source_in_frame + 1);
+        if out_frame <= in_frame {
+            return Err("OUT mora biti poslije IN".into());
+        }
+        Ok((clip_id.to_string(), in_frame, out_frame))
+    }
+
+    fn export_commit(&mut self, _host: &HostClient) {
+        self.enqueue_edit_command(EditorialEditComponent::commit);
+        self.status = "Commit u tijeku...".into();
+    }
+
+    fn delete_part(&mut self, _host: &HostClient, part_id: &str) {
+        if part_id.trim().is_empty() {
+            return;
+        }
+        let part_id = part_id.to_string();
+        self.enqueue_edit_command(|instance, request, project| {
+            EditorialEditComponent::delete_part(instance, request, project, &part_id)
+        });
+        self.status = format!("Brišem segment {}", truncate(&part_id, 24));
+    }
+
+    fn reorder_part(&mut self, _host: &HostClient, part_id: &str, direction: &str) {
+        if part_id.trim().is_empty() {
+            return;
+        }
+        let part_id = part_id.to_string();
+        let direction = direction.to_string();
+        self.enqueue_edit_command(|instance, request, project| {
+            EditorialEditComponent::reorder_part(instance, request, project, &part_id, &direction)
+        });
+        self.status = format!("Pomičem segment {}", truncate(&part_id, 24));
+    }
+
+    fn select_adjacent_part(
+        &mut self,
+        host: &HostClient,
+        direction: i32,
+    ) -> PlaybackTransportIntent {
+        let program = self.segment_program_model();
+        let Some(part) =
+            program.adjacent_part(&self.selected_part_id, self.wrap_playhead_frame, direction)
+        else {
+            self.status = if direction < 0 {
+                "Nema prethodnog segmenta".into()
+            } else {
+                "Nema sljedećeg segmenta".into()
+            };
+            return PlaybackTransportIntent::None;
+        };
+        let part_id = part.part_id.clone();
+        let start_frame = part.global_start_frame;
+        drop(program);
+
+        self.selected_part_id = part_id.clone();
+        self.set_wrap_playhead_frame(start_frame);
+        if self.view_mode == ViewMode::Wrap {
+            self.scrub_soft(host)
+        } else {
+            self.start_wrap_session_for_part(host, Some(part_id))
         }
     }
 
-    fn export_commit(&mut self, host: &HostClient) {
-        match story_edit::commit(host, &self.project_id) {
-            Ok(st) => {
-                self.after_edit(host, st);
-                self.status = "Commit OK — Export XML datoteka čeka host API (isto kao web)".into();
-            }
-            Err(e) => self.status = e,
+    fn delete_selected_timeline_item(&mut self, host: &HostClient) {
+        if !self.selected_marker_id.trim().is_empty() {
+            let marker_id = self.selected_marker_id.clone();
+            self.delete_marker(host, &marker_id);
+            return;
         }
+        let program = self.segment_program_model();
+        let part_id = if !self.selected_part_id.trim().is_empty() {
+            self.selected_part_id.clone()
+        } else {
+            program
+                .active_part_at_program_frame(self.wrap_playhead_frame)
+                .map(|part| part.part_id.clone())
+                .unwrap_or_default()
+        };
+        drop(program);
+        if part_id.trim().is_empty() {
+            self.status = "Nema odabranog segmenta za brisanje".into();
+            return;
+        }
+        self.delete_part(host, &part_id);
     }
 
-    fn marker_at_head(&mut self, host: &HostClient) {
+    fn marker_at_head(&mut self, _host: &HostClient) {
         let part = self.selected_part_id.clone();
-        match story_edit::create_marker(host, &self.project_id, self.virtual_sec, &part) {
-            Ok(st) => {
-                self.after_edit(host, st);
-                self.status = format!("Marker @ {}", self.tc(self.virtual_sec));
-            }
-            Err(e) => self.status = e,
-        }
+        let timeline_frame = self.wrap_playhead_frame;
+        self.enqueue_edit_command(|instance, request, project| {
+            EditorialEditComponent::create_marker(instance, request, project, timeline_frame, &part)
+        });
+        self.status = format!("Spremam marker @ {}", self.tc(self.virtual_sec()));
     }
 
-    fn select_marker_slot(&mut self, host: &HostClient, slot_id: &str) {
+    fn delete_marker(&mut self, _host: &HostClient, marker_id: &str) {
+        if marker_id.trim().is_empty() {
+            return;
+        }
+        if self.selected_marker_id == marker_id {
+            self.selected_marker_id.clear();
+        }
+        let marker_id = marker_id.to_string();
+        self.enqueue_edit_command(|instance, request, project| {
+            EditorialEditComponent::delete_marker(instance, request, project, &marker_id)
+        });
+        self.status = format!("Brišem marker {}", truncate(&marker_id, 24));
+    }
+
+    fn move_marker(&mut self, _host: &HostClient, marker_id: &str, direction: &str) {
+        if marker_id.trim().is_empty() {
+            return;
+        }
+        let marker_id = marker_id.to_string();
+        let direction = direction.to_string();
+        self.enqueue_edit_command(|instance, request, project| {
+            EditorialEditComponent::move_marker(instance, request, project, &marker_id, &direction)
+        });
+        self.status = format!("Pomičem marker {}", truncate(&marker_id, 24));
+    }
+
+    fn select_marker_slot(&mut self, _host: &HostClient, slot_id: &str) {
         if slot_id.trim().is_empty() {
             return;
         }
-        match story_edit::select_marker_slot(host, &self.project_id, slot_id) {
-            Ok(st) => {
-                self.after_edit(host, st);
-                self.selected_slot_id = slot_id.to_string();
-                self.status = format!("Slot {}", truncate(slot_id, 24));
-            }
-            Err(e) => self.status = e,
+        self.selected_marker_id.clear();
+        self.selected_slot_id = slot_id.to_string();
+        let slot_id = slot_id.to_string();
+        self.enqueue_edit_command(|instance, request, project| {
+            EditorialEditComponent::select_marker_slot(instance, request, project, &slot_id)
+        });
+        self.status = format!("Biranje slota {}", truncate(&slot_id, 24));
+    }
+
+    fn select_adjacent_marker_slot(
+        &mut self,
+        host: &HostClient,
+        direction: i32,
+    ) -> PlaybackTransportIntent {
+        let program = self.segment_program_model();
+        let Some(slot) = program.adjacent_marker_slot(
+            &self.selected_slot_id,
+            self.wrap_playhead_frame,
+            direction,
+        ) else {
+            self.status = if direction < 0 {
+                "Nema prethodnog M-M slota".into()
+            } else {
+                "Nema sljedećeg M-M slota".into()
+            };
+            return PlaybackTransportIntent::None;
+        };
+        let slot_id = slot.slot_id.clone();
+        let start_frame = slot.start_frame;
+        drop(program);
+
+        self.set_wrap_playhead_frame(start_frame);
+        self.select_marker_slot(host, &slot_id);
+        if self.view_mode == ViewMode::Wrap {
+            self.scrub_soft(host)
+        } else {
+            PlaybackTransportIntent::None
         }
     }
 
-    fn select_cover(&mut self, host: &HostClient, cover_id: &str) {
+    fn focus_empty_marker_slot(&mut self, host: &HostClient) -> PlaybackTransportIntent {
+        let program = self.segment_program_model();
+        let Some(slot) = program.first_empty_marker_slot() else {
+            self.status = "Nema praznog M-M slota".into();
+            return PlaybackTransportIntent::None;
+        };
+        let slot_id = slot.slot_id.clone();
+        let start_frame = slot.start_frame;
+        drop(program);
+
+        self.set_wrap_playhead_frame(start_frame);
+        self.select_marker_slot(host, &slot_id);
+        if self.view_mode == ViewMode::Wrap {
+            self.scrub_soft(host)
+        } else {
+            PlaybackTransportIntent::None
+        }
+    }
+
+    fn select_cover(&mut self, _host: &HostClient, cover_id: &str) {
         if cover_id.trim().is_empty() {
             return;
         }
-        match story_edit::select_cover(host, &self.project_id, cover_id) {
-            Ok(st) => {
-                self.after_edit(host, st);
-                self.selected_cover_id = cover_id.to_string();
-                self.status = format!("Cover {}", truncate(cover_id, 24));
-            }
-            Err(e) => self.status = e,
-        }
+        self.selected_marker_id.clear();
+        let cover_id = cover_id.to_string();
+        self.enqueue_edit_command(|instance, request, project| {
+            EditorialEditComponent::select_cover(instance, request, project, &cover_id)
+        });
+        self.status = format!("Biranje covera {}", truncate(&cover_id, 24));
     }
 
-    fn quick_cover(&mut self, host: &HostClient) {
+    fn delete_cover(&mut self, _host: &HostClient, cover_id: &str) {
+        if cover_id.trim().is_empty() {
+            return;
+        }
+        let cover_id = cover_id.to_string();
+        self.enqueue_edit_command(|instance, request, project| {
+            EditorialEditComponent::delete_cover(instance, request, project, &cover_id)
+        });
+        self.status = format!("Brišem cover {}", truncate(&cover_id, 24));
+    }
+
+    fn select_marker(
+        &mut self,
+        host: &HostClient,
+        marker_id: &str,
+        frame: i64,
+    ) -> PlaybackTransportIntent {
+        let marker_id = marker_id.trim();
+        if marker_id.is_empty() {
+            return PlaybackTransportIntent::None;
+        }
+        let frame = self
+            .markers
+            .iter()
+            .find(|marker| marker.marker_id == marker_id)
+            .map(|marker| marker.timeline_frame.max(0))
+            .unwrap_or(frame.max(0));
+        self.set_wrap_playhead_frame(frame);
+        if frame == 0 {
+            self.selected_marker_id.clear();
+            self.status = "Početni M marker je zaključan.".into();
+        } else {
+            self.selected_marker_id = marker_id.to_string();
+            self.status = format!("M marker odabran @ {}", self.tc(self.virtual_sec()));
+        }
+        self.ensure_wrap_or_scrub(host)
+    }
+
+    fn quick_cover(&mut self, _host: &HostClient) -> PlaybackTransportIntent {
         let target = match story_edit::quick_cover_target(
-            &self.selected_slot_id,
             &self.marker_slots,
-            &self.selected_clip_id,
             &self.selected_shot_id,
+            &self.virtual_shots,
         ) {
             Ok(target) => target,
             Err(e) => {
                 self.status = e;
-                return;
+                return PlaybackTransportIntent::None;
             }
         };
-        match story_edit::create_cover(host, &self.project_id, &target) {
-            Ok(st) => {
-                self.after_edit(host, st);
-                self.status = "Cover kreiran".into();
-            }
-            Err(e) => self.status = e,
-        }
+        let slot_id = target.slot_id;
+        let clip_id = target.clip_id;
+        let virtual_shot_id = target.virtual_shot_id;
+        self.enqueue_edit_command(|instance, request, project| {
+            EditorialEditComponent::create_cover(
+                instance,
+                request,
+                project,
+                &slot_id,
+                clip_id.as_deref(),
+                virtual_shot_id.as_deref(),
+            )
+        });
+        self.status = "Spremam cover...".into();
+        PlaybackTransportIntent::None
     }
 
-    fn scrub_soft(&mut self, _host: &HostClient) {
-        self.schedule_native_seek();
+    fn overwrite_cover(&mut self, _host: &HostClient) -> PlaybackTransportIntent {
+        let target = match story_edit::overwrite_cover_target(
+            &self.selected_slot_id,
+            &self.selected_cover_id,
+            &self.marker_slots,
+            &self.covers,
+            &self.selected_shot_id,
+            &self.virtual_shots,
+        ) {
+            Ok(target) => target,
+            Err(e) => {
+                self.status = e;
+                return PlaybackTransportIntent::None;
+            }
+        };
+        let slot_id = target.slot_id;
+        let clip_id = target.clip_id;
+        let virtual_shot_id = target.virtual_shot_id;
+        self.enqueue_edit_command(|instance, request, project| {
+            EditorialEditComponent::create_cover(
+                instance,
+                request,
+                project,
+                &slot_id,
+                clip_id.as_deref(),
+                virtual_shot_id.as_deref(),
+            )
+        });
+        self.status = "Overwrite cover...".into();
+        PlaybackTransportIntent::None
+    }
+
+    fn mark_in_fit_duration(&mut self, _host: &HostClient) -> PlaybackTransportIntent {
+        if self.view_mode != ViewMode::Source {
+            self.status = "Mark IN + trajanje slota radi na source timelineu".into();
+            return PlaybackTransportIntent::None;
+        }
+        let Some(source_fps) = self.source_timebase_fps() else {
+            self.status = "Source FPS još nije potvrđen — slot fit nije moguć".into();
+            return PlaybackTransportIntent::None;
+        };
+        let program = self.segment_program_model();
+        let slot = program
+            .marker_slot_by_id(&self.selected_slot_id)
+            .or_else(|| program.first_empty_marker_slot());
+        let Some(slot) = slot else {
+            self.status = "Nema M-M slota za trajanje".into();
+            return PlaybackTransportIntent::None;
+        };
+        let slot_id = slot.slot_id.clone();
+        let slot_duration_frames = (slot.end_frame - slot.start_frame).max(1);
+        let program_fps = program.timeline_fps().unwrap_or(source_fps);
+        drop(program);
+
+        let source_duration_frames =
+            convert_duration_frames(slot_duration_frames, program_fps, source_fps);
+        let clip_end = self.selected_clip_duration_frames().max(1);
+        let in_frame = self
+            .source_playhead_frame
+            .clamp(0, clip_end.saturating_sub(1));
+        let out_frame = (in_frame + source_duration_frames).clamp(in_frame + 1, clip_end);
+        self.source_in_frame = in_frame;
+        self.source_out_frame = out_frame;
+        self.mark_in_set = true;
+        self.mark_out_set = true;
+        self.select_marker_slot(_host, &slot_id);
+        self.status = format!(
+            "IN/OUT prema slotu {} · {}–{}",
+            truncate(&slot_id, 18),
+            self.source_tc_frame(in_frame),
+            self.source_tc_frame(out_frame)
+        );
+        self.cue_current_playhead_intent()
+    }
+
+    fn scrub_soft(&mut self, _host: &HostClient) -> PlaybackTransportIntent {
+        if self.view_mode == ViewMode::Wrap {
+            if let Err(e) = self.prepare_wrap_source_from_snapshot(None) {
+                self.status = e;
+                return PlaybackTransportIntent::None;
+            }
+        }
+        self.scrub_current_playhead_intent()
     }
 
     /// ←/→: nudge focused IN/OUT, otherwise seek playhead by frames.
     fn step_focus(
         &mut self,
         host: &HostClient,
-        playback: &mut crate::playback_stack::PlaybackStack,
+        playback: &crate::playback_stack::PlaybackStack,
         frames: i64,
-    ) {
+    ) -> PlaybackTransportIntent {
         match self.focus.target {
             FocusTarget::In => self.nudge_in(host, frames),
             FocusTarget::Out => self.nudge_out(host, frames),
@@ -1415,62 +2549,40 @@ impl StoryScreen {
     fn seek_playhead(
         &mut self,
         host: &HostClient,
-        playback: &mut crate::playback_stack::PlaybackStack,
+        playback: &crate::playback_stack::PlaybackStack,
         frames: i64,
-    ) {
+    ) -> PlaybackTransportIntent {
         if self.view_mode != ViewMode::Source {
-            self.seek_by_frames(host, frames);
-            return;
+            return self.seek_by_frames(host, frames);
         }
-        let Some(fps) = self.source_timebase_fps() else {
+        if self.source_timebase_fps().is_none() {
             self.status = "Source FPS još nije potvrđen — frame seek nije moguć".into();
-            return;
-        };
-        let clip_end = seconds_to_frame(self.selected_clip_duration(), fps);
+            return PlaybackTransportIntent::None;
+        }
+        let clip_end = self.selected_clip_duration_frames();
         let current = if playback.carrier().is_active() {
             playback.carrier().display_frame().0
         } else {
-            seconds_to_frame(self.virtual_sec, fps)
+            self.source_playhead_frame
         };
         let next = (current + frames).clamp(0, clip_end);
-        self.playhead_frame = next;
-        self.virtual_sec = self.snap_source_sec(frame_to_seconds(next, fps));
-        match crate::player_bridge::build_open_request(self)
-            .and_then(|request| playback.cue_timeline_click(request, next))
-        {
-            Ok(()) => {
-                self.status = format!("Playhead → {} (1f)", self.source_tc(self.virtual_sec));
-            }
-            Err(err) => self.status = err,
-        }
+        self.set_source_playhead_frame(next);
+        self.status = format!("Playhead → {} (1f)", self.source_tc_frame(next));
+        self.cue_current_playhead_intent()
     }
 
-    fn frame_delta_sec(&self) -> Option<f64> {
-        if self.view_mode == ViewMode::Source {
-            let fps = self.source_timebase_fps()?;
-            Some(1.0 / fps.max(1.0))
-        } else {
-            Some(self.frame_step())
-        }
-    }
-
-    fn nudge_in(&mut self, host: &HostClient, frames: i64) {
-        let Some(step) = self.frame_delta_sec() else {
-            self.status = "Source FPS još nije potvrđen — IN nudge nije moguć".into();
-            return;
-        };
-        let delta = step * frames as f64;
+    fn nudge_in(&mut self, _host: &HostClient, frames: i64) -> PlaybackTransportIntent {
         match self.view_mode {
             ViewMode::Source => {
-                let next = self.snap_source_sec((self.source_in + delta).max(0.0));
-                if next >= self.source_out {
+                let next = (self.source_in_frame + frames).max(0);
+                if next >= self.source_out_frame {
                     self.status = "IN ne smije prijeći OUT".into();
-                    return;
+                    return PlaybackTransportIntent::None;
                 }
-                self.source_in = next;
-                self.virtual_sec = next;
-                self.schedule_native_seek_io();
-                self.status = format!("IN → {} (1f)", self.source_tc(self.source_in));
+                self.source_in_frame = next;
+                self.set_source_playhead_frame(next);
+                self.status = format!("IN → {} (1f)", self.source_tc_frame(self.source_in_frame));
+                self.cue_current_playhead_intent()
             }
             ViewMode::Wrap => {
                 let Some(part) = self
@@ -1479,44 +2591,43 @@ impl StoryScreen {
                     .find(|p| p.part_id == self.selected_part_id)
                 else {
                     self.status = "IN nudge: odaberi part".into();
-                    return;
+                    return PlaybackTransportIntent::None;
                 };
-                let cur = part.in_seconds.unwrap_or(0.0).max(0.0);
-                let next = (cur + delta).max(0.0);
-                if part.out_seconds.is_some_and(|o| next >= o) {
+                let cur = part.in_frame.max(0);
+                let next = (cur + frames).max(0);
+                if next >= part.out_frame.max(cur + 1) {
                     self.status = "IN ne smije prijeći OUT".into();
-                    return;
+                    return PlaybackTransportIntent::None;
                 }
                 let part_id = part.part_id.clone();
-                match story_edit::mark_part_in(host, &self.project_id, &part_id, next) {
-                    Ok(st) => {
-                        self.after_edit(host, st);
-                        self.status = format!("IN → {next:.3}s (1f)");
-                        self.start_wrap_session(host);
-                    }
-                    Err(e) => self.status = e,
-                }
+                let local_frame = (next - cur).max(0);
+                self.enqueue_edit_command(|instance, request, project| {
+                    EditorialEditComponent::mark_part_in(
+                        instance,
+                        request,
+                        project,
+                        &part_id,
+                        local_frame,
+                    )
+                });
+                self.status = format!("Spremam IN → {} (1f)", self.source_tc_frame(next));
+                PlaybackTransportIntent::None
             }
         }
     }
 
-    fn nudge_out(&mut self, host: &HostClient, frames: i64) {
-        let Some(step) = self.frame_delta_sec() else {
-            self.status = "Source FPS još nije potvrđen — OUT nudge nije moguć".into();
-            return;
-        };
-        let delta = step * frames as f64;
+    fn nudge_out(&mut self, _host: &HostClient, frames: i64) -> PlaybackTransportIntent {
         match self.view_mode {
             ViewMode::Source => {
-                let next = self.snap_source_sec((self.source_out + delta).max(0.0));
-                if next <= self.source_in {
+                let next = (self.source_out_frame + frames).max(0);
+                if next <= self.source_in_frame {
                     self.status = "OUT ne smije prijeći ispred IN".into();
-                    return;
+                    return PlaybackTransportIntent::None;
                 }
-                self.source_out = next;
-                self.virtual_sec = next;
-                self.schedule_native_seek_io();
-                self.status = format!("OUT → {} (1f)", self.source_tc(self.source_out));
+                self.source_out_frame = next;
+                self.set_source_playhead_frame(next);
+                self.status = format!("OUT → {} (1f)", self.source_tc_frame(self.source_out_frame));
+                self.cue_current_playhead_intent()
             }
             ViewMode::Wrap => {
                 let Some(part) = self
@@ -1525,114 +2636,86 @@ impl StoryScreen {
                     .find(|p| p.part_id == self.selected_part_id)
                 else {
                     self.status = "OUT nudge: odaberi part".into();
-                    return;
+                    return PlaybackTransportIntent::None;
                 };
-                let inn = part.in_seconds.unwrap_or(0.0).max(0.0);
-                let cur = part.out_seconds.unwrap_or(inn + 1.0);
-                let next = (cur + delta).max(0.0);
+                let inn = part.in_frame.max(0);
+                let cur = part.out_frame.max(inn + 1);
+                let next = (cur + frames).max(0);
                 if next <= inn {
                     self.status = "OUT ne smije prijeći ispred IN".into();
-                    return;
+                    return PlaybackTransportIntent::None;
                 }
                 let part_id = part.part_id.clone();
-                match story_edit::mark_part_out(host, &self.project_id, &part_id, next) {
-                    Ok(st) => {
-                        self.after_edit(host, st);
-                        self.status = format!("OUT → {next:.3}s (1f)");
-                        self.start_wrap_session(host);
-                    }
-                    Err(e) => self.status = e,
-                }
+                let local_frame = (next - inn).max(0);
+                self.enqueue_edit_command(|instance, request, project| {
+                    EditorialEditComponent::mark_part_out(
+                        instance,
+                        request,
+                        project,
+                        &part_id,
+                        local_frame,
+                    )
+                });
+                self.status = format!("Spremam OUT → {} (1f)", self.source_tc_frame(next));
+                PlaybackTransportIntent::None
             }
         }
     }
 
-    fn seek_by_frames(&mut self, host: &HostClient, frames: i64) {
+    fn seek_by_frames(&mut self, host: &HostClient, frames: i64) -> PlaybackTransportIntent {
         if self.view_mode == ViewMode::Source {
-            let Some(fps) = self.source_timebase_fps() else {
+            if self.source_timebase_fps().is_none() {
                 self.status = "Source FPS još nije potvrđen — frame seek nije moguć".into();
-                return;
-            };
-            let delta = (1.0 / fps.max(1.0)) * frames as f64;
-            let clip_end = self.selected_clip_duration();
-            self.virtual_sec = self.snap_source_sec((self.virtual_sec + delta).max(0.0));
-            self.virtual_sec = self.virtual_sec.clamp(0.0, clip_end);
-            self.schedule_native_seek_io();
-            return;
+                return PlaybackTransportIntent::None;
+            }
+            let clip_end = self.selected_clip_duration_frames();
+            self.set_source_playhead_frame(
+                (self.source_playhead_frame + frames).clamp(0, clip_end),
+            );
+            return self.cue_current_playhead_intent();
         }
-        let delta = self.frame_step() * frames as f64;
-        self.virtual_sec = self.snap_sec((self.virtual_sec + delta).max(0.0));
-        let dur = story_timeline::duration(
-            self.view_mode,
-            self.timeline.as_ref(),
-            self.source_in,
-            self.source_out,
-        );
-        if dur > 0.0 {
-            self.virtual_sec = self.virtual_sec.min(dur);
+        self.set_wrap_playhead_frame((self.wrap_playhead_frame + frames).max(0));
+        let dur = self.segment_program_model().duration_frames();
+        if dur > 0 {
+            self.set_wrap_playhead_frame(self.wrap_playhead_frame.min(dur));
         }
-        self.scrub_soft(host);
+        self.scrub_soft(host)
     }
 }
 
-impl crate::player_bridge::PlayerClient for StoryScreen {
-    fn drain_playback_commands(&mut self) -> Vec<crate::player_bridge::PlaybackCommand> {
-        let raw = std::mem::take(&mut self.pending_playback_commands);
-        crate::player_bridge::compact_playback_commands(raw, self.playing)
+fn convert_duration_frames(frames: i64, from_fps: f64, to_fps: f64) -> i64 {
+    let frames = frames.max(1);
+    if !(from_fps.is_finite() && from_fps > 0.0 && to_fps.is_finite() && to_fps > 0.0) {
+        return frames;
     }
+    ((frames as f64) * normalize_fps(to_fps) / normalize_fps(from_fps))
+        .round()
+        .max(1.0) as i64
+}
 
-    fn clear_pending_seeks(&mut self) {}
-
-    fn playback_source_ref(&self) -> Option<&BroadcastHostSourceRef> {
-        self.selected_source_ref.as_ref()
+impl crate::player_bridge::PlayerClient for StoryScreen {
+    fn playback_source_ref(&self) -> Option<BroadcastHostSourceRef> {
+        self.active_playback_source_ref().cloned()
     }
 
     fn playback_media_path(&self) -> Option<String> {
-        let path = self.selected_play_path.trim();
-        if path.is_empty() {
-            None
-        } else {
-            Some(path.to_string())
-        }
-    }
-
-    fn playback_source_range_sec(&self) -> (f64, f64) {
-        if self.view_mode == ViewMode::Wrap {
-            if let Some(part) = self
-                .parts
-                .iter()
-                .find(|p| p.part_id == self.selected_part_id)
-            {
-                let in_sec = part.in_seconds.unwrap_or(0.0).max(0.0);
-                let out_sec = part
-                    .out_seconds
-                    .filter(|o| *o > in_sec)
-                    .unwrap_or(in_sec + 1.0);
-                return (in_sec, out_sec);
-            }
-        }
-        let end = self.selected_clip_duration();
-        (0.0, end.max(0.04))
+        self.active_playback_media_path().map(str::to_string)
     }
 
     fn playback_source_fps(&self) -> f64 {
-        self.selected_source_fps
+        self.active_playback_fps()
     }
 
     fn playback_source_has_audio(&self) -> bool {
-        self.selected_source_has_audio
+        self.active_playback_has_audio()
     }
 
     fn playback_source_audio_channels(&self) -> u8 {
-        if self.selected_source_has_audio {
-            self.selected_source_audio_channels.max(2).min(4)
+        if self.active_playback_has_audio() {
+            self.active_playback_audio_channels().max(2).min(4)
         } else {
             2
         }
-    }
-
-    fn playback_is_playing(&self) -> bool {
-        self.playing
     }
 
     fn missing_source_message(&self) -> String {
@@ -1652,30 +2735,818 @@ impl crate::player_bridge::PlayerClient for StoryScreen {
         self.status = status.into();
     }
 
-    fn apply_player_frame(&mut self, _image: ColorImage, source_sec: f64, playing: bool) {
+    fn apply_player_frame(&mut self, _image: ColorImage, source_frame: FrameNumber, playing: bool) {
         self.playing = playing;
         self.status = "Broadcast player".into();
-        // Editorial mirror of player clock (Source view). Timeline paint uses carrier.
-        if self.view_mode == ViewMode::Source {
-            let fps = self.source_timebase_fps().unwrap_or(DEFAULT_FPS);
-            self.playhead_frame = seconds_to_frame(source_sec.max(0.0), fps);
-            self.virtual_sec = self.snap_source_sec(source_sec.max(0.0));
-        }
+        self.sync_playhead_from_player_frame(source_frame);
     }
 
-    fn apply_player_state(&mut self, source_sec: f64, playing: bool, status: impl Into<String>) {
+    fn apply_player_state(
+        &mut self,
+        source_frame: FrameNumber,
+        playing: bool,
+        status: impl Into<String>,
+    ) {
         self.playing = playing;
         self.status = status.into();
-        if self.view_mode == ViewMode::Source {
-            let fps = self.source_timebase_fps().unwrap_or(DEFAULT_FPS);
-            self.playhead_frame = seconds_to_frame(source_sec.max(0.0), fps);
-            self.virtual_sec = self.snap_source_sec(source_sec.max(0.0));
-        }
+        self.sync_playhead_from_player_frame(source_frame);
     }
 
     fn apply_player_error(&mut self, status: impl Into<String>) {
         self.broadcast_preview_active = false;
         self.playing = false;
         self.status = status.into();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::api::TimelineSegment;
+    use crate::player_remote::PlayerEvent;
+    use qnc_player_core::FieldMode;
+    use serde_json::json;
+
+    fn story_state_with_selected_part(part_id: &str) -> Value {
+        json!({
+            "selected_part_id": part_id,
+            "parts": [{
+                "part_id": part_id,
+                "kind": "tonovi",
+                "clip_id": "clip_a",
+                "in_frame": 100,
+                "out_frame": 150,
+                "fps": 25.0,
+                "duration_frames": 50
+            }],
+            "all_clips": [{
+                "shot_id": "clip_a",
+                "root_shot_id": "clip_a",
+                "clip_id": "clip_a",
+                "fps": 25.0,
+                "duration_frames": 250,
+                "play_path": "C:/qnc/proxy/clip_a.mp4",
+                "has_audio": true,
+                "audio_channels": 2
+            }],
+            "virtual_shots": [],
+            "covers": [],
+            "markers": [],
+            "marker_slots": []
+        })
+    }
+
+    fn timeline_with_part(part_id: &str) -> TimelineModel {
+        TimelineModel {
+            project_id: "p".into(),
+            application: "wrap".into(),
+            timeline_fps: 25.0,
+            duration_frames: 50,
+            duration_sec: 2.0,
+            rows: Vec::new(),
+            segments: vec![TimelineSegment {
+                part_id: part_id.into(),
+                clip_id: "clip_a".into(),
+                global_start_frame: 10,
+                global_end_frame: 60,
+                duration_frames: 50,
+                streamable: true,
+                ..TimelineSegment::default()
+            }],
+        }
+    }
+
+    fn two_part_timeline() -> TimelineModel {
+        TimelineModel {
+            project_id: "p".into(),
+            application: "wrap".into(),
+            timeline_fps: 25.0,
+            duration_frames: 100,
+            duration_sec: 4.0,
+            rows: Vec::new(),
+            segments: vec![
+                TimelineSegment {
+                    part_id: "part_a".into(),
+                    clip_id: "clip_a".into(),
+                    global_start_frame: 0,
+                    global_end_frame: 50,
+                    duration_frames: 50,
+                    streamable: true,
+                    ..TimelineSegment::default()
+                },
+                TimelineSegment {
+                    part_id: "part_b".into(),
+                    clip_id: "clip_a".into(),
+                    global_start_frame: 50,
+                    global_end_frame: 100,
+                    duration_frames: 50,
+                    streamable: true,
+                    ..TimelineSegment::default()
+                },
+            ],
+        }
+    }
+
+    fn playlist_with_part(part_id: &str) -> EditorialPlaylist {
+        EditorialPlaylist {
+            project_id: "p".into(),
+            timeline_fps: 25.0,
+            duration_frames: 50,
+            duration_sec: 2.0,
+            segments: vec![EditorialPlaylistSegment {
+                part_id: part_id.into(),
+                kind: "tonovi".into(),
+                clip_id: "clip_a".into(),
+                global_start_frame: 10,
+                global_end_frame: 60,
+                duration_frames: 50,
+                source_in_frame: 100,
+                source_out_frame: 150,
+                source_fps: 25.0,
+                streamable: true,
+                ..EditorialPlaylistSegment::default()
+            }],
+        }
+    }
+
+    fn two_part_playlist() -> EditorialPlaylist {
+        EditorialPlaylist {
+            project_id: "p".into(),
+            timeline_fps: 25.0,
+            duration_frames: 100,
+            duration_sec: 4.0,
+            segments: vec![
+                EditorialPlaylistSegment {
+                    part_id: "part_a".into(),
+                    kind: "tonovi".into(),
+                    clip_id: "clip_a".into(),
+                    global_start_frame: 0,
+                    global_end_frame: 50,
+                    duration_frames: 50,
+                    source_in_frame: 100,
+                    source_out_frame: 150,
+                    source_fps: 25.0,
+                    streamable: true,
+                    ..EditorialPlaylistSegment::default()
+                },
+                EditorialPlaylistSegment {
+                    part_id: "part_b".into(),
+                    kind: "tonovi".into(),
+                    clip_id: "clip_a".into(),
+                    global_start_frame: 50,
+                    global_end_frame: 100,
+                    duration_frames: 50,
+                    source_in_frame: 200,
+                    source_out_frame: 250,
+                    source_fps: 25.0,
+                    streamable: true,
+                    ..EditorialPlaylistSegment::default()
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn wrap_frame_maps_directly_to_source_frame_without_project_fps_remap() {
+        let mut screen = StoryScreen::story();
+        screen.timeline = Some(TimelineModel {
+            project_id: "p".into(),
+            application: "wrap".into(),
+            timeline_fps: 25.0,
+            duration_frames: 50,
+            duration_sec: 2.0,
+            rows: Vec::new(),
+            segments: vec![TimelineSegment {
+                part_id: "part_a".into(),
+                clip_id: "clip_a".into(),
+                global_start_frame: 10,
+                global_end_frame: 35,
+                duration_frames: 25,
+                streamable: true,
+                ..TimelineSegment::default()
+            }],
+        });
+        screen.playlist = Some(EditorialPlaylist {
+            project_id: "p".into(),
+            timeline_fps: 25.0,
+            duration_frames: 25,
+            duration_sec: 0.5,
+            segments: vec![EditorialPlaylistSegment {
+                part_id: "part_a".into(),
+                kind: "tonovi".into(),
+                clip_id: "clip_a".into(),
+                global_start_frame: 10,
+                global_end_frame: 35,
+                duration_frames: 25,
+                source_in_frame: 100,
+                source_out_frame: 150,
+                source_fps: 50.0,
+                streamable: true,
+                ..EditorialPlaylistSegment::default()
+            }],
+        });
+        screen.parts = vec![StoryPart {
+            part_id: "part_a".into(),
+            clip_id: "clip_a".into(),
+            in_frame: 100,
+            out_frame: 150,
+            fps: 50.0,
+            duration_frames: 50,
+            ..StoryPart::default()
+        }];
+
+        assert_eq!(screen.source_frame_for_wrap_frame(15), Some(105));
+    }
+
+    #[test]
+    fn source_dock_ignores_segment_carrier_when_wrap_is_active() {
+        let mut playback = PlaybackStack::new();
+        let source_ref = BroadcastHostSourceRef::from_frame_fields(
+            "p",
+            "clip_a",
+            "",
+            "clip_a",
+            Some(FrameNumber(0)),
+            Some(FrameNumber(300)),
+            FrameNumber(300),
+        )
+        .unwrap();
+        playback
+            .ensure_open(crate::player_remote::BroadcastPlayerOpenRequest {
+                source_ref: source_ref.clone(),
+                media_input: "C:/qnc/proxy/clip_a.mp4".into(),
+                source_fps: 25.0,
+                has_audio: true,
+                audio_channels: 2,
+                start_source_frame: FrameNumber(0),
+            })
+            .unwrap();
+        playback.ingest_events(&[
+            PlayerEvent::SourceReady {
+                fps: 25.0,
+                duration_frames: 300,
+                in_frame: 100,
+                out_frame: 150,
+                field_mode: FieldMode::Progressive,
+            },
+            PlayerEvent::State {
+                source_frame: FrameNumber(130),
+                source_sec: 5.2,
+                playing: true,
+                status: "playing".into(),
+            },
+        ]);
+
+        let mut screen = StoryScreen::story();
+        screen.selected_source_ref = Some(source_ref);
+        screen.view_mode = ViewMode::Wrap;
+        screen.source_playhead_frame = 12;
+        screen.wrap_playhead_frame = 70;
+
+        let wrap_source_model =
+            screen.source_dock_timeline_model(&playback, 25.0, 300, 0, 300, 10, 40);
+        assert_eq!(wrap_source_model.playhead_frame(), 12);
+
+        screen.view_mode = ViewMode::Source;
+        let live_source_model =
+            screen.source_dock_timeline_model(&playback, 25.0, 300, 0, 300, 10, 40);
+        assert_eq!(live_source_model.playhead_frame(), 130);
+    }
+
+    #[test]
+    fn segment_playback_prepare_does_not_replace_source_dock_selection() {
+        let mut screen = StoryScreen::story();
+        screen.project_id = "p".into();
+        screen.loaded_project_id = "p".into();
+        let source_shot = StoryShot {
+            shot_id: "source_a".into(),
+            root_shot_id: "source_a".into(),
+            clip_id: "clip_source".into(),
+            fps: 25.0,
+            in_frame: 0,
+            out_frame: 250,
+            duration_frames: 250,
+            play_path: "C:/qnc/proxy/source.mp4".into(),
+            has_audio: true,
+            audio_channels: 2,
+            ..StoryShot::default()
+        };
+        screen.all_clips = vec![
+            source_shot.clone(),
+            StoryShot {
+                shot_id: "segment_src".into(),
+                root_shot_id: "segment_src".into(),
+                clip_id: "clip_segment".into(),
+                fps: 25.0,
+                in_frame: 0,
+                out_frame: 300,
+                duration_frames: 300,
+                play_path: "C:/qnc/proxy/segment.mp4".into(),
+                has_audio: true,
+                audio_channels: 2,
+                ..StoryShot::default()
+            },
+        ];
+        screen.select_shot_from_snapshot(&source_shot);
+        let source_clip_id = screen.selected_clip_id.clone();
+        let source_ref = screen.selected_source_ref.clone();
+        let source_path = screen.selected_play_path.clone();
+
+        screen.view_mode = ViewMode::Wrap;
+        screen.timeline = Some(TimelineModel {
+            project_id: "p".into(),
+            application: "wrap".into(),
+            timeline_fps: 25.0,
+            duration_frames: 50,
+            duration_sec: 2.0,
+            rows: Vec::new(),
+            segments: vec![TimelineSegment {
+                part_id: "part_segment".into(),
+                clip_id: "clip_segment".into(),
+                global_start_frame: 0,
+                global_end_frame: 50,
+                duration_frames: 50,
+                streamable: true,
+                ..TimelineSegment::default()
+            }],
+        });
+        screen.playlist = Some(EditorialPlaylist {
+            project_id: "p".into(),
+            timeline_fps: 25.0,
+            duration_frames: 50,
+            duration_sec: 2.0,
+            segments: vec![EditorialPlaylistSegment {
+                part_id: "part_segment".into(),
+                kind: "tonovi".into(),
+                clip_id: "clip_segment".into(),
+                global_start_frame: 0,
+                global_end_frame: 50,
+                duration_frames: 50,
+                source_in_frame: 100,
+                source_out_frame: 150,
+                source_fps: 25.0,
+                streamable: true,
+                ..EditorialPlaylistSegment::default()
+            }],
+        });
+        screen.parts = vec![StoryPart {
+            part_id: "part_segment".into(),
+            clip_id: "clip_segment".into(),
+            in_frame: 100,
+            out_frame: 150,
+            fps: 25.0,
+            duration_frames: 50,
+            ..StoryPart::default()
+        }];
+
+        screen
+            .prepare_wrap_source_from_snapshot(Some("part_segment".into()))
+            .unwrap();
+
+        assert_eq!(screen.selected_clip_id, source_clip_id);
+        assert_eq!(screen.selected_source_ref, source_ref);
+        assert_eq!(screen.selected_play_path, source_path);
+        assert_eq!(
+            screen
+                .wrap_source_ref
+                .as_ref()
+                .map(|source| source.clip_id.as_str()),
+            Some("clip_segment")
+        );
+    }
+
+    #[test]
+    fn source_player_frame_does_not_advance_segment_playhead() {
+        let mut screen = StoryScreen::story();
+        screen.view_mode = ViewMode::Source;
+        screen.source_playhead_frame = 12;
+        screen.wrap_playhead_frame = 80;
+
+        screen.sync_playhead_from_player_frame(FrameNumber(140));
+
+        assert_eq!(screen.source_playhead_frame, 140);
+        assert_eq!(screen.wrap_playhead_frame, 80);
+    }
+
+    #[test]
+    fn wrap_timeline_refresh_scrubs_current_playhead_when_already_in_wrap() {
+        let mut screen = StoryScreen::story();
+        screen.project_id = "p".into();
+        screen.loaded_project_id = "p".into();
+        screen.view_mode = ViewMode::Wrap;
+        screen.state_loaded = true;
+        screen.initial_selection_done = true;
+        screen.selected_part_id = "part_new".into();
+        screen.wrap_playhead_frame = 10;
+        screen.apply_story_state(&story_state_with_selected_part("part_new"));
+        screen.playlist = Some(playlist_with_part("part_new"));
+        screen.playlist_loaded = true;
+
+        let timeline_intent =
+            screen.apply_editorial_timeline_model("p", timeline_with_part("part_new"));
+
+        assert_eq!(timeline_intent, PlaybackTransportIntent::ScrubFrame(100));
+        assert_eq!(screen.selected_part_id, "part_new");
+        assert!(screen.wrap_source_ref.is_some());
+    }
+
+    #[test]
+    fn wrap_timeline_refresh_prefers_part_under_playhead_over_selected_part() {
+        let mut screen = StoryScreen::story();
+        screen.project_id = "p".into();
+        screen.loaded_project_id = "p".into();
+        screen.view_mode = ViewMode::Wrap;
+        screen.state_loaded = true;
+        screen.initial_selection_done = true;
+        screen.selected_part_id = "part_b".into();
+        screen.wrap_playhead_frame = 10;
+        screen.parts = vec![
+            StoryPart {
+                part_id: "part_a".into(),
+                clip_id: "clip_a".into(),
+                in_frame: 100,
+                out_frame: 150,
+                fps: 25.0,
+                duration_frames: 50,
+                ..StoryPart::default()
+            },
+            StoryPart {
+                part_id: "part_b".into(),
+                clip_id: "clip_a".into(),
+                in_frame: 200,
+                out_frame: 250,
+                fps: 25.0,
+                duration_frames: 50,
+                ..StoryPart::default()
+            },
+        ];
+        screen.all_clips = vec![StoryShot {
+            clip_id: "clip_a".into(),
+            fps: 25.0,
+            duration_frames: 300,
+            play_path: "C:/qnc/proxy/clip_a.mp4".into(),
+            has_audio: true,
+            audio_channels: 2,
+            ..StoryShot::default()
+        }];
+        screen.playlist = Some(two_part_playlist());
+        screen.playlist_loaded = true;
+
+        let timeline_intent = screen.apply_editorial_timeline_model("p", two_part_timeline());
+
+        assert_eq!(timeline_intent, PlaybackTransportIntent::ScrubFrame(110));
+        assert_eq!(screen.selected_part_id, "part_a");
+        assert_eq!(
+            screen.wrap_source_ref.as_ref().and_then(|s| s.in_frame),
+            Some(FrameNumber(100))
+        );
+    }
+
+    #[test]
+    fn wrap_player_frame_sync_uses_source_frame_active_part() {
+        let mut screen = StoryScreen::story();
+        screen.project_id = "p".into();
+        screen.loaded_project_id = "p".into();
+        screen.view_mode = ViewMode::Wrap;
+        screen.timeline = Some(two_part_timeline());
+        screen.playlist = Some(two_part_playlist());
+        screen.selected_part_id = "part_a".into();
+        screen.parts = vec![
+            StoryPart {
+                part_id: "part_a".into(),
+                clip_id: "clip_a".into(),
+                in_frame: 100,
+                out_frame: 150,
+                fps: 25.0,
+                duration_frames: 50,
+                ..StoryPart::default()
+            },
+            StoryPart {
+                part_id: "part_b".into(),
+                clip_id: "clip_a".into(),
+                in_frame: 200,
+                out_frame: 250,
+                fps: 25.0,
+                duration_frames: 50,
+                ..StoryPart::default()
+            },
+        ];
+        screen.all_clips = vec![StoryShot {
+            clip_id: "clip_a".into(),
+            fps: 25.0,
+            duration_frames: 300,
+            play_path: "C:/qnc/proxy/clip_a.mp4".into(),
+            has_audio: true,
+            audio_channels: 2,
+            ..StoryShot::default()
+        }];
+        screen
+            .prepare_wrap_source_from_snapshot(Some("part_a".into()))
+            .unwrap();
+
+        screen.sync_playhead_from_player_frame(FrameNumber(210));
+
+        assert_eq!(screen.selected_part_id, "part_b");
+        assert_eq!(screen.wrap_playhead_frame, 60);
+    }
+
+    #[test]
+    fn wrap_boundary_advances_to_next_segment_with_transport_intents() {
+        let mut screen = StoryScreen::story();
+        screen.project_id = "p".into();
+        screen.loaded_project_id = "p".into();
+        screen.view_mode = ViewMode::Wrap;
+        screen.timeline = Some(two_part_timeline());
+        screen.playlist = Some(two_part_playlist());
+        screen.selected_part_id = "part_a".into();
+        screen.parts = vec![
+            StoryPart {
+                part_id: "part_a".into(),
+                clip_id: "clip_a".into(),
+                in_frame: 100,
+                out_frame: 150,
+                fps: 25.0,
+                duration_frames: 50,
+                ..StoryPart::default()
+            },
+            StoryPart {
+                part_id: "part_b".into(),
+                clip_id: "clip_a".into(),
+                in_frame: 200,
+                out_frame: 250,
+                fps: 25.0,
+                duration_frames: 50,
+                ..StoryPart::default()
+            },
+        ];
+        screen.all_clips = vec![StoryShot {
+            clip_id: "clip_a".into(),
+            fps: 25.0,
+            duration_frames: 300,
+            play_path: "C:/qnc/proxy/clip_a.mp4".into(),
+            has_audio: true,
+            audio_channels: 2,
+            ..StoryShot::default()
+        }];
+        screen
+            .prepare_wrap_source_from_snapshot(Some("part_a".into()))
+            .unwrap();
+
+        let intents = screen.playback_boundary_intents(FrameNumber(150));
+
+        assert_eq!(
+            intents,
+            vec![PlaybackTransportIntent::ScrubFrameAndPlay(200)]
+        );
+        assert_eq!(screen.selected_part_id, "part_b");
+        assert_eq!(screen.wrap_playhead_frame, 50);
+        assert_eq!(
+            screen.wrap_source_ref.as_ref().and_then(|s| s.in_frame),
+            Some(FrameNumber(200))
+        );
+    }
+
+    #[test]
+    fn wrap_boundary_overrun_still_advances_to_next_segment() {
+        let mut screen = StoryScreen::story();
+        screen.project_id = "p".into();
+        screen.loaded_project_id = "p".into();
+        screen.view_mode = ViewMode::Wrap;
+        screen.timeline = Some(two_part_timeline());
+        screen.playlist = Some(two_part_playlist());
+        screen.selected_part_id = "part_a".into();
+        screen.parts = vec![
+            StoryPart {
+                part_id: "part_a".into(),
+                clip_id: "clip_a".into(),
+                in_frame: 100,
+                out_frame: 150,
+                fps: 25.0,
+                duration_frames: 50,
+                ..StoryPart::default()
+            },
+            StoryPart {
+                part_id: "part_b".into(),
+                clip_id: "clip_a".into(),
+                in_frame: 200,
+                out_frame: 250,
+                fps: 25.0,
+                duration_frames: 50,
+                ..StoryPart::default()
+            },
+        ];
+        screen.all_clips = vec![StoryShot {
+            clip_id: "clip_a".into(),
+            fps: 25.0,
+            duration_frames: 300,
+            play_path: "C:/qnc/proxy/clip_a.mp4".into(),
+            has_audio: true,
+            audio_channels: 2,
+            ..StoryShot::default()
+        }];
+        screen
+            .prepare_wrap_source_from_snapshot(Some("part_a".into()))
+            .unwrap();
+
+        let intents = screen.playback_boundary_intents(FrameNumber(151));
+
+        assert_eq!(
+            intents,
+            vec![PlaybackTransportIntent::ScrubFrameAndPlay(200)]
+        );
+        assert_eq!(screen.selected_part_id, "part_b");
+        assert_eq!(screen.wrap_playhead_frame, 50);
+        assert_eq!(
+            screen.wrap_source_ref.as_ref().and_then(|s| s.in_frame),
+            Some(FrameNumber(200))
+        );
+    }
+
+    #[test]
+    fn segment_play_start_reads_playlist_program_position() {
+        let mut screen = StoryScreen::story();
+        screen.project_id = "p".into();
+        screen.loaded_project_id = "p".into();
+        screen.view_mode = ViewMode::Wrap;
+        screen.timeline = Some(two_part_timeline());
+        screen.playlist = Some(two_part_playlist());
+        screen.wrap_playhead_frame = 60;
+        screen.parts = vec![
+            StoryPart {
+                part_id: "part_a".into(),
+                clip_id: "clip_a".into(),
+                in_frame: 100,
+                out_frame: 150,
+                fps: 25.0,
+                duration_frames: 50,
+                ..StoryPart::default()
+            },
+            StoryPart {
+                part_id: "part_b".into(),
+                clip_id: "clip_a".into(),
+                in_frame: 200,
+                out_frame: 250,
+                fps: 25.0,
+                duration_frames: 50,
+                ..StoryPart::default()
+            },
+        ];
+        screen.all_clips = vec![StoryShot {
+            clip_id: "clip_a".into(),
+            fps: 25.0,
+            duration_frames: 300,
+            play_path: "C:/qnc/proxy/clip_a.mp4".into(),
+            has_audio: true,
+            audio_channels: 2,
+            ..StoryShot::default()
+        }];
+
+        let intent = screen.toggle_play_intent(&HostClient::new("http://127.0.0.1:1"));
+
+        assert_eq!(intent, PlaybackTransportIntent::ScrubFrameAndPlay(210));
+        assert_eq!(screen.selected_part_id, "part_b");
+        assert_eq!(
+            screen
+                .wrap_source_ref
+                .as_ref()
+                .and_then(|source| source.in_frame),
+            Some(FrameNumber(200))
+        );
+    }
+
+    #[test]
+    fn segment_playback_prepare_requires_playlist_not_ui_timeline() {
+        let mut screen = StoryScreen::story();
+        screen.timeline = Some(two_part_timeline());
+        screen.selected_part_id = "part_a".into();
+        screen.parts = vec![StoryPart {
+            part_id: "part_a".into(),
+            clip_id: "clip_a".into(),
+            in_frame: 100,
+            out_frame: 150,
+            fps: 25.0,
+            duration_frames: 50,
+            ..StoryPart::default()
+        }];
+
+        assert!(screen.prepare_wrap_source_from_snapshot(None).is_err());
+    }
+
+    #[test]
+    fn create_part_waits_for_timeline_refresh_before_wrap_scrub() {
+        let mut screen = StoryScreen::story();
+        screen.project_id = "p".into();
+        screen.loaded_project_id = "p".into();
+        screen.state_loaded = true;
+        screen.initial_selection_done = true;
+        screen.wrap_playhead_frame = 10;
+
+        let edit_intent = screen.apply_editorial_edit_data(EditorialEditData {
+            instance_id: "story".into(),
+            project_id: "p".into(),
+            kind: EditorialEditKind::CreatePartFromMarks,
+            detail: "tonovi".into(),
+            state: story_state_with_selected_part("part_new"),
+        });
+
+        assert_eq!(edit_intent, PlaybackTransportIntent::None);
+        assert!(screen.selected_source_ref.is_none());
+
+        let timeline_intent =
+            screen.apply_editorial_timeline_model("p", timeline_with_part("part_new"));
+        assert_eq!(timeline_intent, PlaybackTransportIntent::None);
+
+        let playlist_intent = screen.apply_editorial_playlist("p", playlist_with_part("part_new"));
+
+        assert_eq!(playlist_intent, PlaybackTransportIntent::ScrubFrame(100));
+        assert_eq!(screen.selected_part_id, "part_new");
+        assert!(screen.wrap_source_ref.is_some());
+    }
+
+    #[test]
+    fn delete_part_waits_for_timeline_refresh_and_uses_remaining_selection() {
+        let mut screen = StoryScreen::story();
+        screen.project_id = "p".into();
+        screen.loaded_project_id = "p".into();
+        screen.state_loaded = true;
+        screen.initial_selection_done = true;
+        screen.wrap_playhead_frame = 10;
+        screen.selected_part_id = "part_deleted".into();
+
+        let edit_intent = screen.apply_editorial_edit_data(EditorialEditData {
+            instance_id: "story".into(),
+            project_id: "p".into(),
+            kind: EditorialEditKind::DeletePart,
+            detail: "part_deleted".into(),
+            state: story_state_with_selected_part("part_remaining"),
+        });
+
+        assert_eq!(edit_intent, PlaybackTransportIntent::None);
+        assert_eq!(screen.selected_part_id, "part_remaining");
+
+        let timeline_intent =
+            screen.apply_editorial_timeline_model("p", timeline_with_part("part_remaining"));
+        assert_eq!(timeline_intent, PlaybackTransportIntent::None);
+
+        let playlist_intent =
+            screen.apply_editorial_playlist("p", playlist_with_part("part_remaining"));
+
+        assert_eq!(playlist_intent, PlaybackTransportIntent::ScrubFrame(100));
+        assert_eq!(screen.selected_part_id, "part_remaining");
+        assert!(screen.wrap_source_ref.is_some());
+    }
+
+    #[test]
+    fn marker_edit_clears_stale_pending_wrap_scrub() {
+        let mut screen = StoryScreen::story();
+        screen.project_id = "p".into();
+        screen.loaded_project_id = "p".into();
+        screen.wrap_playhead_frame = 10;
+
+        let edit_intent = screen.apply_editorial_edit_data(EditorialEditData {
+            instance_id: "story".into(),
+            project_id: "p".into(),
+            kind: EditorialEditKind::CreatePartFromMarks,
+            detail: "tonovi".into(),
+            state: story_state_with_selected_part("part_new"),
+        });
+        assert_eq!(edit_intent, PlaybackTransportIntent::None);
+
+        let marker_intent = screen.apply_editorial_edit_data(EditorialEditData {
+            instance_id: "story".into(),
+            project_id: "p".into(),
+            kind: EditorialEditKind::CreateMarker,
+            detail: "marker_a".into(),
+            state: story_state_with_selected_part("part_new"),
+        });
+        assert_eq!(marker_intent, PlaybackTransportIntent::None);
+
+        let timeline_intent =
+            screen.apply_editorial_timeline_model("p", timeline_with_part("part_new"));
+
+        assert_eq!(timeline_intent, PlaybackTransportIntent::None);
+    }
+
+    #[test]
+    fn timeline_error_clears_pending_wrap_scrub() {
+        let mut screen = StoryScreen::story();
+        screen.project_id = "p".into();
+        screen.loaded_project_id = "p".into();
+        screen.wrap_playhead_frame = 10;
+
+        let edit_intent = screen.apply_editorial_edit_data(EditorialEditData {
+            instance_id: "story".into(),
+            project_id: "p".into(),
+            kind: EditorialEditKind::CreatePartFromMarks,
+            detail: "tonovi".into(),
+            state: story_state_with_selected_part("part_new"),
+        });
+        assert_eq!(edit_intent, PlaybackTransportIntent::None);
+
+        screen.set_editorial_meta_error("p", "timeline failed");
+        let timeline_intent =
+            screen.apply_editorial_timeline_model("p", timeline_with_part("part_new"));
+
+        assert_eq!(timeline_intent, PlaybackTransportIntent::None);
     }
 }

@@ -17,6 +17,8 @@ pub(crate) struct StoryPart {
     #[serde(default)]
     pub title: String,
     #[serde(default)]
+    pub text: String,
+    #[serde(default)]
     pub clip_id: String,
     #[serde(default)]
     pub virtual_shot_id: String,
@@ -24,6 +26,14 @@ pub(crate) struct StoryPart {
     pub in_seconds: Option<f64>,
     #[serde(default)]
     pub out_seconds: Option<f64>,
+    #[serde(default)]
+    pub in_frame: i64,
+    #[serde(default)]
+    pub out_frame: i64,
+    #[serde(default)]
+    pub fps: f64,
+    #[serde(default)]
+    pub duration_frames: i64,
     #[serde(default)]
     pub duration_label: String,
 }
@@ -46,9 +56,23 @@ pub(crate) struct StoryShot {
     #[serde(default)]
     pub fps: f64,
     #[serde(default)]
+    pub in_frame: i64,
+    #[serde(default)]
+    pub out_frame: i64,
+    #[serde(default)]
+    pub duration_frames: i64,
+    #[serde(default)]
     pub has_audio: bool,
     #[serde(default)]
     pub audio_channels: u8,
+    #[serde(default)]
+    pub field_order: String,
+    #[serde(default)]
+    pub interlaced: bool,
+    #[serde(default)]
+    pub source_class: String,
+    #[serde(default)]
+    pub proxy_recipe: String,
     #[serde(default)]
     pub duration_label: String,
     #[serde(default)]
@@ -88,9 +112,15 @@ pub(crate) struct StoryCover {
     #[serde(default)]
     pub title: String,
     #[serde(default)]
+    pub note: String,
+    #[serde(default)]
     pub timeline_start_sec: f64,
     #[serde(default)]
     pub timeline_end_sec: f64,
+    #[serde(default)]
+    pub timeline_start_frame: i64,
+    #[serde(default)]
+    pub timeline_end_frame: i64,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -105,6 +135,10 @@ pub(crate) struct MarkerSlot {
     #[serde(default)]
     pub end_sec: f64,
     #[serde(default)]
+    pub start_frame: i64,
+    #[serde(default)]
+    pub end_frame: i64,
+    #[serde(default)]
     pub has_cover: bool,
 }
 
@@ -115,6 +149,8 @@ pub(crate) struct StoryMarker {
     pub marker_id: String,
     #[serde(default)]
     pub timeline_sec: f64,
+    #[serde(default)]
+    pub timeline_frame: i64,
     #[serde(default)]
     pub part_id: String,
     #[serde(default)]

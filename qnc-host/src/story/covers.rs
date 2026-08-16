@@ -7,6 +7,8 @@ use super::markers::{get_slot_by_id, TIMELINE_EPS};
 #[derive(Clone)]
 pub struct StoryCoverRow {
     pub cover_id: String,
+    pub timeline_start_frame: i64,
+    pub timeline_end_frame: i64,
     pub timeline_start_sec: f64,
     pub timeline_end_sec: f64,
     pub slot_signature: String,
@@ -28,6 +30,8 @@ pub fn ensure_cover_schema(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS story_covers (
             cover_id TEXT PRIMARY KEY,
+            timeline_start_frame INTEGER NOT NULL DEFAULT 0,
+            timeline_end_frame INTEGER NOT NULL DEFAULT 0,
             timeline_start_sec REAL NOT NULL DEFAULT 0,
             timeline_end_sec REAL NOT NULL DEFAULT 0,
             slot_signature TEXT NOT NULL DEFAULT '',
@@ -50,6 +54,30 @@ pub fn ensure_cover_schema(conn: &Connection) -> rusqlite::Result<()> {
         "ALTER TABLE story_state ADD COLUMN selected_cover_id TEXT NOT NULL DEFAULT ''",
         [],
     );
+    migrate_cover_frame_columns(conn)?;
+    Ok(())
+}
+
+fn column_exists(conn: &Connection, table: &str, column: &str) -> rusqlite::Result<bool> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+    for name in rows {
+        if name? == column {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn migrate_cover_frame_columns(conn: &Connection) -> rusqlite::Result<()> {
+    for column in ["timeline_start_frame", "timeline_end_frame"] {
+        if !column_exists(conn, "story_covers", column)? {
+            conn.execute(
+                &format!("ALTER TABLE story_covers ADD COLUMN {column} INTEGER NOT NULL DEFAULT 0"),
+                [],
+            )?;
+        }
+    }
     Ok(())
 }
 
@@ -79,30 +107,33 @@ fn cover_exists(conn: &Connection, cover_id: &str) -> Result<bool, String> {
 pub fn list_covers(conn: &Connection) -> rusqlite::Result<Vec<StoryCoverRow>> {
     ensure_cover_schema(conn)?;
     let mut stmt = conn.prepare(
-        "SELECT cover_id, timeline_start_sec, timeline_end_sec, slot_signature, slot_index,
+        "SELECT cover_id, timeline_start_frame, timeline_end_frame,
+                timeline_start_sec, timeline_end_sec, slot_signature, slot_index,
                 clip_id, virtual_shot_id, title, note,
                 in_tc, out_tc, in_seconds, out_seconds, sort_index, created_at, updated_at
          FROM story_covers
-         ORDER BY timeline_start_sec ASC, sort_index ASC, cover_id ASC",
+         ORDER BY timeline_start_frame ASC, sort_index ASC, cover_id ASC",
     )?;
     let rows = stmt.query_map([], |r| {
         Ok(StoryCoverRow {
             cover_id: r.get(0)?,
-            timeline_start_sec: r.get(1)?,
-            timeline_end_sec: r.get(2)?,
-            slot_signature: r.get(3)?,
-            slot_index: r.get(4)?,
-            clip_id: r.get(5)?,
-            virtual_shot_id: r.get(6)?,
-            title: r.get(7)?,
-            note: r.get(8)?,
-            in_tc: r.get(9)?,
-            out_tc: r.get(10)?,
-            in_seconds: r.get(11)?,
-            out_seconds: r.get(12)?,
-            sort_index: r.get(13)?,
-            created_at: r.get(14)?,
-            updated_at: r.get(15)?,
+            timeline_start_frame: r.get(1)?,
+            timeline_end_frame: r.get(2)?,
+            timeline_start_sec: r.get(3)?,
+            timeline_end_sec: r.get(4)?,
+            slot_signature: r.get(5)?,
+            slot_index: r.get(6)?,
+            clip_id: r.get(7)?,
+            virtual_shot_id: r.get(8)?,
+            title: r.get(9)?,
+            note: r.get(10)?,
+            in_tc: r.get(11)?,
+            out_tc: r.get(12)?,
+            in_seconds: r.get(13)?,
+            out_seconds: r.get(14)?,
+            sort_index: r.get(15)?,
+            created_at: r.get(16)?,
+            updated_at: r.get(17)?,
         })
     })?;
     rows.collect()
@@ -118,6 +149,8 @@ fn optional_f64(value: Option<f64>) -> Value {
 pub fn cover_json(row: &StoryCoverRow) -> Value {
     json!({
         "cover_id": row.cover_id,
+        "timeline_start_frame": row.timeline_start_frame,
+        "timeline_end_frame": row.timeline_end_frame,
         "timeline_start_sec": row.timeline_start_sec,
         "timeline_end_sec": row.timeline_end_sec,
         "slot_signature": row.slot_signature,
@@ -168,8 +201,18 @@ fn set_selected_cover_id(conn: &Connection, cover_id: &str) -> rusqlite::Result<
     Ok(())
 }
 
-fn cover_matches_slot(cover: &StoryCoverRow, start: f64, end: f64, sig: &str) -> bool {
+fn cover_matches_slot(
+    cover: &StoryCoverRow,
+    start_frame: i64,
+    end_frame: i64,
+    start: f64,
+    end: f64,
+    sig: &str,
+) -> bool {
     if cover.slot_signature == sig {
+        return true;
+    }
+    if cover.timeline_start_frame == start_frame && cover.timeline_end_frame == end_frame {
         return true;
     }
     (cover.timeline_start_sec - start).abs() < TIMELINE_EPS
@@ -179,15 +222,27 @@ fn cover_matches_slot(cover: &StoryCoverRow, start: f64, end: f64, sig: &str) ->
 /// Drop covers whose timeline interval no longer matches any materialized slot.
 pub fn normalize_covers_for_slots(
     conn: &Connection,
-    new_slots: &[(f64, f64, String)],
+    new_slots: &[(i64, i64, f64, f64, String)],
 ) -> rusqlite::Result<()> {
     ensure_cover_schema(conn)?;
     let covers = list_covers(conn)?;
     for cover in covers {
-        let keep = new_slots
+        let matched = new_slots
             .iter()
-            .any(|(start, end, sig)| cover_matches_slot(&cover, *start, *end, sig));
-        if !keep {
+            .find(|(start_frame, end_frame, start, end, sig)| {
+                cover_matches_slot(&cover, *start_frame, *end_frame, *start, *end, sig)
+            });
+        if let Some((start_frame, end_frame, _, _, _)) = matched {
+            if cover.timeline_start_frame != *start_frame || cover.timeline_end_frame != *end_frame
+            {
+                conn.execute(
+                    "UPDATE story_covers
+                     SET timeline_start_frame = ?1, timeline_end_frame = ?2
+                     WHERE cover_id = ?3",
+                    params![start_frame, end_frame, cover.cover_id],
+                )?;
+            }
+        } else {
             conn.execute(
                 "DELETE FROM story_covers WHERE cover_id = ?1",
                 params![cover.cover_id],
@@ -247,12 +302,15 @@ pub fn create_cover(
     let sort_index = 0;
     conn.execute(
         "INSERT INTO story_covers
-            (cover_id, timeline_start_sec, timeline_end_sec, slot_signature, slot_index,
+            (cover_id, timeline_start_frame, timeline_end_frame,
+             timeline_start_sec, timeline_end_sec, slot_signature, slot_index,
              clip_id, virtual_shot_id, title, note,
              in_tc, out_tc, in_seconds, out_seconds, sort_index, created_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?15)",
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?17)",
         params![
             cover_id,
+            slot.start_frame,
+            slot.end_frame,
             slot.start_sec,
             slot.end_sec,
             sig,

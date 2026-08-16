@@ -63,6 +63,7 @@ pub struct BroadcastPlayerOpenRequest {
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub enum PlayerCommand {
     Open(BroadcastPlayerOpenRequest),
     Play,
@@ -77,6 +78,7 @@ pub enum PlayerCommand {
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub enum PlayerEvent {
     /// Program loaded — timeline paint bounds (once per open).
     SourceReady {
@@ -98,6 +100,9 @@ pub enum PlayerEvent {
         source_sec: f64,
         playing: bool,
         status: String,
+    },
+    BoundaryReached {
+        source_frame: FrameNumber,
     },
     Error(String),
     Stopped,
@@ -330,32 +335,38 @@ impl PlayerRemote {
         }
     }
 
+    #[allow(dead_code)]
     pub fn source_kind(&self) -> Option<BroadcastSourceKind> {
         self.identity.as_ref().map(|identity| identity.source_kind)
     }
 
+    #[allow(dead_code)]
     pub fn source_sec(&self) -> f64 {
         self.source_sec
     }
 
+    #[allow(dead_code)]
     pub fn source_frame(&self) -> FrameNumber {
         self.source_frame
     }
 
+    #[allow(dead_code)]
     pub fn playing(&self) -> bool {
         self.playing
     }
 
+    #[allow(dead_code)]
     pub fn has_source(&self) -> bool {
         self.runtime.is_some()
     }
 
     pub fn matches_source(&self, request: &BroadcastPlayerOpenRequest) -> bool {
         self.last_request.as_ref().is_some_and(|prev| {
-            prev.source_ref.project_id == request.source_ref.project_id
-                && prev.source_ref.clip_id == request.source_ref.clip_id
-                && prev.source_ref.virtual_shot_id == request.source_ref.virtual_shot_id
+            prev.source_ref == request.source_ref
                 && prev.media_input == request.media_input
+                && approx(prev.source_fps, request.source_fps)
+                && prev.has_audio == request.has_audio
+                && prev.audio_channels == request.audio_channels
         })
     }
 
@@ -363,11 +374,7 @@ impl PlayerRemote {
         self.decode_policy = PlayerDecodePolicy::from_runtime(runtime);
     }
 
-    pub fn set_display_sec(&mut self, source_sec: f64) {
-        let frame = self.frame_at_seconds(source_sec.max(0.0));
-        self.set_display_core_frame(frame);
-    }
-
+    #[allow(dead_code)]
     pub fn set_display_frame(&mut self, frame: FrameNumber) {
         self.set_display_core_frame(old_to_core_frame(frame));
     }
@@ -385,8 +392,13 @@ impl PlayerRemote {
                 }
             }
             PlayerCommand::SeekFrame {
-                frame, coalesce, ..
-            } => self.seek_core_frame(old_to_core_frame(frame), coalesce, ctx),
+                frame,
+                still,
+                coalesce,
+            } => {
+                let _ = still;
+                self.seek_core_frame(old_to_core_frame(frame), coalesce, ctx)
+            }
             PlayerCommand::Stop => self.stop(),
         }
     }
@@ -709,6 +721,9 @@ impl PlayerRemote {
                     self.set_display_core_frame(frame);
                     self.playing = false;
                     self.status = "Paused".into();
+                    out.push(PlayerEvent::BoundaryReached {
+                        source_frame: core_to_old_frame(frame),
+                    });
                 }
                 BroadcastPlayerProtocolEvent::SourceFailed { reason, .. }
                 | BroadcastPlayerProtocolEvent::PlaybackError { message: reason }
@@ -771,23 +786,6 @@ impl PlayerRemote {
         };
         let carrier = runtime.runtime.transport().state().carrier_frame;
         self.set_display_core_frame(carrier);
-    }
-
-    fn frame_at_seconds(&self, seconds: f64) -> CoreFrameNumber {
-        let timebase = self
-            .runtime
-            .as_ref()
-            .map(|runtime| runtime.source.timebase)
-            .or_else(|| {
-                self.last_request
-                    .as_ref()
-                    .and_then(|request| core_timebase_from_fps(request.source_fps).ok())
-            })
-            .unwrap_or(CoreTimebase {
-                frame_rate_num: 25,
-                frame_rate_den: 1,
-            });
-        frame_at_seconds(seconds, timebase)
     }
 
     fn set_display_core_frame(&mut self, frame: CoreFrameNumber) {
@@ -1060,8 +1058,7 @@ fn fallback_source_runtime(
     source_id: String,
 ) -> Result<qnc_media_ffmpeg::FfmpegProbeReport, String> {
     let timebase = core_timebase_from_fps(request.source_fps)?;
-    let duration_frames =
-        frame_at_seconds(request.source_ref.duration_sec.max(1.0), timebase).max(1);
+    let duration_frames = old_to_core_frame(request.source_ref.duration_frames).max(1);
     let mut source = SourceRuntime::new(source_id, duration_frames, timebase)?;
     source = source.with_video_format(
         VideoFormat::new(1920, 1080, FieldMode::Progressive, ColorSpace::Rec709)
@@ -1102,15 +1099,15 @@ fn range_from_request(
     request: &BroadcastPlayerOpenRequest,
     source: &SourceRuntime,
 ) -> Result<CoreFrameRange, String> {
-    let in_sec = request.source_ref.in_seconds.unwrap_or(0.0).max(0.0);
-    let out_sec = request
-        .source_ref
-        .out_seconds
-        .filter(|value| *value > in_sec)
-        .unwrap_or_else(|| request.source_ref.duration_sec.max(in_sec + 0.04));
-    let start =
-        frame_at_seconds(in_sec, source.timebase).min(source.duration_frames.saturating_sub(1));
-    let mut end = frame_at_seconds(out_sec, source.timebase).min(source.duration_frames);
+    let start = old_to_core_frame(request.source_ref.in_frame.unwrap_or(FrameNumber(0)))
+        .min(source.duration_frames.saturating_sub(1));
+    let mut end = old_to_core_frame(
+        request
+            .source_ref
+            .out_frame
+            .unwrap_or(request.source_ref.duration_frames),
+    )
+    .min(source.duration_frames);
     if end <= start {
         end = start.saturating_add(1).min(source.duration_frames);
     }
@@ -1177,12 +1174,6 @@ fn core_timebase_from_fps(fps: f64) -> Result<CoreTimebase, String> {
     }
 }
 
-fn frame_at_seconds(seconds: f64, timebase: CoreTimebase) -> CoreFrameNumber {
-    let frames =
-        seconds.max(0.0) * f64::from(timebase.frame_rate_num) / f64::from(timebase.frame_rate_den);
-    frames.round().max(0.0) as CoreFrameNumber
-}
-
 fn seconds_at_frame(frame: CoreFrameNumber, timebase: CoreTimebase) -> f64 {
     frame as f64 * f64::from(timebase.frame_rate_den) / f64::from(timebase.frame_rate_num)
 }
@@ -1217,12 +1208,62 @@ fn approx(left: f64, right: f64) -> bool {
 mod tests {
     use super::*;
 
-    #[test]
-    fn app_adapter_converts_seconds_to_core_frames() {
-        let tb = CoreTimebase::new(25, 1).unwrap();
+    fn open_request(in_frame: i64, out_frame: i64) -> BroadcastPlayerOpenRequest {
+        BroadcastPlayerOpenRequest {
+            source_ref: BroadcastHostSourceRef::from_frame_fields(
+                "project",
+                "part_a",
+                "",
+                "clip_a",
+                Some(FrameNumber(in_frame)),
+                Some(FrameNumber(out_frame)),
+                FrameNumber(250),
+            )
+            .unwrap(),
+            media_input: "media.mov".into(),
+            source_fps: 25.0,
+            has_audio: true,
+            audio_channels: 2,
+            start_source_frame: FrameNumber(in_frame),
+        }
+    }
 
-        assert_eq!(frame_at_seconds(0.04, tb), 1);
-        assert_eq!(frame_at_seconds(1.0, tb), 25);
+    #[test]
+    fn app_adapter_uses_contract_frames_for_runtime_range() {
+        let source = SourceRuntime::new("src", 100, CoreTimebase::new(25, 1).unwrap()).unwrap();
+        let source_ref = BroadcastHostSourceRef::from_frame_fields(
+            "project",
+            "shot",
+            "root",
+            "clip",
+            Some(FrameNumber(10)),
+            Some(FrameNumber(40)),
+            FrameNumber(100),
+        )
+        .unwrap();
+        let request = BroadcastPlayerOpenRequest {
+            source_ref,
+            media_input: "media.mov".into(),
+            source_fps: 25.0,
+            has_audio: false,
+            audio_channels: 0,
+            start_source_frame: FrameNumber(0),
+        };
+
+        let range = range_from_request(&request, &source).unwrap();
+
+        assert_eq!(range.start_frame, 10);
+        assert_eq!(range.end_frame, 40);
+    }
+
+    #[test]
+    fn matches_source_includes_source_range() {
+        let mut remote = PlayerRemote::new();
+        remote.last_request = Some(open_request(10, 40));
+
+        assert!(remote.matches_source(&open_request(10, 40)));
+        assert!(!remote.matches_source(&open_request(11, 40)));
+        assert!(!remote.matches_source(&open_request(10, 41)));
     }
 
     #[test]
@@ -1382,8 +1423,7 @@ mod tests {
 
     #[test]
     fn source_ready_bounds_maps_timebase_and_range() {
-        let source =
-            SourceRuntime::new("src", 250, CoreTimebase::new(25, 1).unwrap()).unwrap();
+        let source = SourceRuntime::new("src", 250, CoreTimebase::new(25, 1).unwrap()).unwrap();
         let range = CoreFrameRange::new(10, 200).unwrap();
         let timebase = source.timebase;
         let fps = f64::from(timebase.frame_rate_num) / f64::from(timebase.frame_rate_den);

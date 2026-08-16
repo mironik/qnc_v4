@@ -19,6 +19,20 @@ pub struct FilmFrame {
     pub texture: Option<TextureHandle>,
 }
 
+pub fn merge_frames(existing: &mut Vec<FilmFrame>, frames: impl IntoIterator<Item = FilmFrame>) {
+    let old = std::mem::take(existing);
+    *existing = frames
+        .into_iter()
+        .map(|mut frame| {
+            frame.texture = old
+                .iter()
+                .find(|existing| existing.index == frame.index && existing.url == frame.url)
+                .and_then(|existing| existing.texture.clone());
+            frame
+        })
+        .collect();
+}
+
 pub fn paint(ui: &mut egui::Ui, area: egui::Rect, frames: &[FilmFrame]) {
     paint_slots(ui.painter(), area, frames);
     put_images(ui, area, frames);
@@ -40,11 +54,7 @@ fn paint_slots(painter: &egui::Painter, area: egui::Rect, frames: &[FilmFrame]) 
         if frame.texture.is_none() {
             painter.rect_filled(slot.shrink(2.0), 0.0, SEAM);
         }
-        painter.vline(
-            slot.right(),
-            slot.y_range(),
-            egui::Stroke::new(1.0, SEAM),
-        );
+        painter.vline(slot.right(), slot.y_range(), egui::Stroke::new(1.0, SEAM));
     }
 }
 
@@ -70,5 +80,44 @@ fn put_images(ui: &mut egui::Ui, area: egui::Rect, frames: &[FilmFrame]) {
             egui::Rect::from_center_size(slot.center(), img_size),
             egui::Image::new((tex.id(), img_size)),
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn merge_frames_keeps_manifest_order_and_replaces_urls() {
+        let mut existing = vec![FilmFrame {
+            index: 0,
+            seek_sec: 0.0,
+            url: "/old.jpg".into(),
+            texture: None,
+        }];
+
+        merge_frames(
+            &mut existing,
+            vec![
+                FilmFrame {
+                    index: 1,
+                    seek_sec: 1.0,
+                    url: "/b.jpg".into(),
+                    texture: None,
+                },
+                FilmFrame {
+                    index: 0,
+                    seek_sec: 0.0,
+                    url: "/a.jpg".into(),
+                    texture: None,
+                },
+            ],
+        );
+
+        assert_eq!(
+            existing.iter().map(|frame| frame.index).collect::<Vec<_>>(),
+            vec![1, 0]
+        );
+        assert_eq!(existing[1].url, "/a.jpg");
     }
 }

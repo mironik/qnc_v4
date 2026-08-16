@@ -109,12 +109,22 @@
     },
     "toggle_source_wrap": {
       "label": "Prebaci Source ↔ Wrap pregled"
+    },
+    "project_open_selected": {
+      "label": "Otvori odabrani projekt"
     }
   },
   "presets": {
     "default": {
       "name": "QNC",
       "description": "QNC: I/O mark, T Talking Head, V Voice over",
+      "project": {
+        "project_open_selected": [
+          {
+            "key": "Enter"
+          }
+        ]
+      },
       "storyboard": {
         "play_pause": [
           {
@@ -154,6 +164,13 @@
           },
           {
             "key": "M"
+          }
+        ],
+        "quick_overwrite_cover": [
+          {
+            "code": "KeyB",
+            "shift": false,
+            "ctrl": false
           }
         ],
         "overwrite_cover": [
@@ -344,6 +361,13 @@
           },
           {
             "key": "M"
+          }
+        ],
+        "quick_overwrite_cover": [
+          {
+            "code": "KeyB",
+            "shift": false,
+            "ctrl": false
           }
         ],
         "overwrite_cover": [
@@ -555,6 +579,13 @@
             "ctrl": false
           }
         ],
+        "quick_overwrite_cover": [
+          {
+            "code": "KeyB",
+            "shift": false,
+            "ctrl": false
+          }
+        ],
         "overwrite_cover": [
           {
             "code": "KeyB",
@@ -752,6 +783,13 @@
           {
             "code": "KeyM",
             "shift": true,
+            "ctrl": false
+          }
+        ],
+        "quick_overwrite_cover": [
+          {
+            "code": "KeyB",
+            "shift": false,
             "ctrl": false
           }
         ],
@@ -957,6 +995,13 @@
             "key": "M"
           }
         ],
+        "quick_overwrite_cover": [
+          {
+            "code": "KeyB",
+            "shift": false,
+            "ctrl": false
+          }
+        ],
         "overwrite_cover": [
           {
             "code": "KeyB",
@@ -1145,6 +1190,13 @@
           },
           {
             "key": "M"
+          }
+        ],
+        "quick_overwrite_cover": [
+          {
+            "code": "KeyB",
+            "shift": false,
+            "ctrl": false
           }
         ],
         "overwrite_cover": [
@@ -1349,6 +1401,13 @@
             "key": "M"
           }
         ],
+        "quick_overwrite_cover": [
+          {
+            "code": "KeyB",
+            "shift": false,
+            "ctrl": false
+          }
+        ],
         "overwrite_cover": [
           {
             "code": "KeyB",
@@ -1537,6 +1596,13 @@
           },
           {
             "key": "M"
+          }
+        ],
+        "quick_overwrite_cover": [
+          {
+            "code": "KeyB",
+            "shift": false,
+            "ctrl": false
           }
         ],
         "overwrite_cover": [
@@ -1748,6 +1814,13 @@
             "ctrl": false
           }
         ],
+        "quick_overwrite_cover": [
+          {
+            "code": "KeyB",
+            "shift": false,
+            "ctrl": false
+          }
+        ],
         "overwrite_cover": [
           {
             "code": "KeyB",
@@ -1945,6 +2018,13 @@
           {
             "code": "KeyM",
             "shift": true,
+            "ctrl": false
+          }
+        ],
+        "quick_overwrite_cover": [
+          {
+            "code": "KeyB",
+            "shift": false,
             "ctrl": false
           }
         ],
@@ -2154,6 +2234,13 @@
             "ctrl": false
           }
         ],
+        "quick_overwrite_cover": [
+          {
+            "code": "KeyB",
+            "shift": false,
+            "ctrl": false
+          }
+        ],
         "overwrite_cover": [
           {
             "code": "KeyB",
@@ -2332,6 +2419,13 @@
         "add_marker": [
           {
             "key": "'"
+          }
+        ],
+        "quick_overwrite_cover": [
+          {
+            "code": "KeyB",
+            "shift": false,
+            "ctrl": false
           }
         ],
         "overwrite_cover": [

@@ -12,21 +12,19 @@ use crate::frame_time::{
 use crate::ingest::db::{open_ingest, resolve_ingest_poster_path, thumbnail_url};
 use crate::ingest::store::ingest_archive_original_enabled;
 use crate::media::root_shot_id as root_shot_id_for_clip;
-use crate::project::db::{
-    now_str, open_project, project_settings_snapshot, project_timeline_fps, ProjectPaths,
-};
+use crate::project::db::{now_str, open_project, project_settings_snapshot, ProjectPaths};
 
 use super::covers::{
     covers_snapshot, create_cover as create_cover_row, delete_cover as delete_cover_row,
     ensure_cover_schema, select_cover as select_cover_row, update_cover as update_cover_row,
 };
 use super::markers::{
-    create_marker as create_marker_row, delete_marker as delete_marker_row,
-    delete_markers_for_part, ensure_marker_schema, ensure_materialized_slots,
-    finalize_story_mutation, marker_slots_snapshot, markers_snapshot,
-    move_marker as move_marker_row, resolve_marker_timeline_sec,
+    create_marker as create_marker_row, create_marker_frame as create_marker_row_frame,
+    delete_marker as delete_marker_row, delete_markers_for_part, ensure_marker_schema,
+    ensure_materialized_slots, finalize_story_mutation, marker_slots_snapshot, markers_snapshot,
+    move_marker as move_marker_row, resolve_marker_timeline_frame, resolve_marker_timeline_sec,
     select_marker_slot as select_marker_slot_row, timeline_duration_from_parts,
-    update_marker as update_marker_row, TIMELINE_EPS,
+    update_marker as update_marker_row, update_marker_frame as update_marker_frame_row,
 };
 
 #[derive(Default)]
@@ -54,9 +52,9 @@ pub(crate) struct StoryPartRow {
     pub(crate) in_seconds: Option<f64>,
     pub(crate) out_seconds: Option<f64>,
     pub(crate) fps: f64,
-    in_frame: i64,
-    out_frame: i64,
-    duration_frames: i64,
+    pub(crate) in_frame: i64,
+    pub(crate) out_frame: i64,
+    pub(crate) duration_frames: i64,
     duration_label: String,
     duration_color_key: String,
     created_at: String,
@@ -89,7 +87,7 @@ pub(crate) fn ensure_schema(conn: &Connection) -> rusqlite::Result<()> {
             out_tc TEXT NOT NULL DEFAULT '',
             in_seconds REAL,
             out_seconds REAL,
-            fps REAL NOT NULL DEFAULT 25,
+            fps REAL NOT NULL DEFAULT 0,
             in_frame INTEGER NOT NULL DEFAULT 0,
             out_frame INTEGER NOT NULL DEFAULT 0,
             duration_frames INTEGER NOT NULL DEFAULT 0,
@@ -119,7 +117,7 @@ fn column_exists(conn: &Connection, table: &str, column: &str) -> rusqlite::Resu
 
 fn migrate_story_part_frame_columns(conn: &Connection) -> rusqlite::Result<()> {
     for (column, sql_type) in [
-        ("fps", "REAL NOT NULL DEFAULT 25"),
+        ("fps", "REAL NOT NULL DEFAULT 0"),
         ("in_frame", "INTEGER NOT NULL DEFAULT 0"),
         ("out_frame", "INTEGER NOT NULL DEFAULT 0"),
         ("duration_frames", "INTEGER NOT NULL DEFAULT 0"),
@@ -155,6 +153,9 @@ fn backfill_story_part_duration_colors(conn: &Connection) -> rusqlite::Result<()
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     for (part_id, in_seconds, out_seconds, fps, stored_frames) in rows {
+        if !is_valid_fps(fps) {
+            continue;
+        }
         let frames = if stored_frames > 0 {
             stored_frames
         } else {
@@ -167,6 +168,23 @@ fn backfill_story_part_duration_colors(conn: &Connection) -> rusqlite::Result<()
         )?;
     }
     Ok(())
+}
+
+fn story_program_source_fps(parts: &[StoryPartRow]) -> Option<f64> {
+    parts
+        .iter()
+        .map(|part| part.fps)
+        .find(|fps| is_valid_fps(*fps))
+}
+
+fn require_story_program_source_fps(parts: &[StoryPartRow]) -> Result<f64, String> {
+    story_program_source_fps(parts)
+        .ok_or_else(|| "story program nema valjan source FPS iz probe/DB".to_string())
+}
+
+fn require_current_story_program_source_fps(conn: &Connection) -> Result<f64, String> {
+    let parts = list_parts(conn).map_err(|e| e.to_string())?;
+    require_story_program_source_fps(&parts)
 }
 
 fn ensure_row(conn: &Connection) -> rusqlite::Result<()> {
@@ -294,58 +312,16 @@ fn part_json(row: &StoryPartRow) -> Value {
     })
 }
 
-fn selected_virtual_ingest_rows(
-    paths: &ProjectPaths,
-    project_id: &str,
-) -> rusqlite::Result<
-    Vec<(
-        String,
-        String,
-        String,
-        f64,
-        f64,
-        String,
-        String,
-        String,
-        String,
-        bool,
-        u8,
-    )>,
-> {
-    let conn = open_ingest(paths, project_id)?;
-    let mut stmt = conn.prepare(
-        "SELECT clip_id, name, virtual_name, duration_sec, fps, import_status,
-                COALESCE(original_path, ''), COALESCE(project_proxy_path, ''),
-                COALESCE(proxy_path, ''), COALESCE(has_audio, 0),
-                COALESCE(audio_channels, 0)
-         FROM ingest_assets
-         WHERE selected != 0 AND TRIM(COALESCE(virtual_name, '')) != ''
-         ORDER BY clip_id",
-    )?;
-    let rows = stmt.query_map([], |row| {
-        Ok((
-            row.get::<_, String>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, String>(2)?,
-            row.get::<_, f64>(3)?,
-            row.get::<_, f64>(4)?,
-            row.get::<_, String>(5)?,
-            row.get::<_, String>(6)?,
-            row.get::<_, String>(7)?,
-            row.get::<_, String>(8)?,
-            row.get::<_, i64>(9)? != 0,
-            row.get::<_, i64>(10)?.clamp(0, u8::MAX as i64) as u8,
-        ))
-    })?;
-    rows.collect()
-}
-
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct ClipMediaMeta {
     duration_sec: f64,
     fps: f64,
     has_audio: bool,
     audio_channels: u8,
+    field_order: String,
+    interlaced: bool,
+    source_class: String,
+    proxy_recipe: String,
 }
 
 fn import_status_dots(
@@ -353,7 +329,6 @@ fn import_status_dots(
     project_id: &str,
     import_status: &str,
     original_path: &str,
-    project_proxy_path: &str,
     archive_original: bool,
 ) -> (String, String, bool) {
     let original_in_project = {
@@ -367,8 +342,6 @@ fn import_status_dots(
                     .zip(original_dir.canonicalize().ok())
                     .is_some_and(|(a, b)| a.starts_with(b)))
     };
-    let proxy_in_project = !project_proxy_path.trim().is_empty()
-        && std::path::PathBuf::from(project_proxy_path.trim()).is_file();
     let status_original = match import_status {
         "error" => "error",
         "original_ready" | "generating_proxy" => "ready",
@@ -380,7 +353,6 @@ fn import_status_dots(
         "error" => "error",
         "imported" | "done" => "ready",
         "queued" | "processing" | "original_ready" | "generating_proxy" => "pending",
-        _ if proxy_in_project => "ready",
         _ => "idle",
     };
     (
@@ -411,9 +383,14 @@ fn ingest_clip_media_meta_map(
     let conn = open_ingest(paths, project_id)?;
     let mut stmt = conn.prepare(
         "SELECT clip_id, duration_sec, fps, COALESCE(has_audio, 0),
-                COALESCE(audio_channels, 0)
+                COALESCE(audio_channels, 0), COALESCE(field_order, ''),
+                COALESCE(interlaced, 0), COALESCE(source_class, ''),
+                COALESCE(proxy_recipe, '')
          FROM ingest_assets
-         WHERE selected != 0 AND TRIM(COALESCE(virtual_name, '')) != ''",
+         WHERE import_status = 'imported'
+         ORDER BY CASE WHEN TRIM(COALESCE(project_proxy_path, '')) != '' THEN 0 ELSE 1 END,
+                  CASE WHEN source_id = 'project_proxy_repair' THEN 1 ELSE 0 END,
+                  clip_id",
     )?;
     let rows = stmt.query_map([], |row| {
         Ok((
@@ -422,13 +399,27 @@ fn ingest_clip_media_meta_map(
             row.get::<_, f64>(2)?,
             row.get::<_, i64>(3)? != 0,
             row.get::<_, i64>(4)?.clamp(0, u8::MAX as i64) as u8,
+            row.get::<_, String>(5)?,
+            row.get::<_, i64>(6)? != 0,
+            row.get::<_, String>(7)?,
+            row.get::<_, String>(8)?,
         ))
     })?;
     let mut map = HashMap::new();
     for row in rows {
-        let (clip_id, duration_sec, fps, has_audio, audio_channels) = row?;
+        let (
+            clip_id,
+            duration_sec,
+            fps,
+            has_audio,
+            audio_channels,
+            field_order,
+            interlaced,
+            source_class,
+            proxy_recipe,
+        ) = row?;
         let clip_id = clip_id.trim().to_string();
-        if !clip_id.is_empty() {
+        if !clip_id.is_empty() && !map.contains_key(&clip_id) {
             map.insert(
                 clip_id,
                 ClipMediaMeta {
@@ -436,6 +427,10 @@ fn ingest_clip_media_meta_map(
                     fps,
                     has_audio,
                     audio_channels,
+                    field_order,
+                    interlaced,
+                    source_class,
+                    proxy_recipe,
                 },
             );
         }
@@ -451,7 +446,138 @@ fn duration_label_from_sec(duration_sec: f64, fps: f64) -> String {
     seconds_frames_label_from_frames(frames, fps)
 }
 
-/// All tab: selektirani ingest klipovi — trajanje iz ingest_assets.duration_sec (probe).
+fn json_text(row: &Value, key: &str) -> String {
+    row.get(key)
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_string()
+}
+
+fn json_f64(row: &Value, key: &str) -> f64 {
+    row.get(key).and_then(Value::as_f64).unwrap_or(0.0)
+}
+
+fn json_u8(row: &Value, key: &str) -> u8 {
+    row.get(key)
+        .and_then(Value::as_u64)
+        .unwrap_or(0)
+        .min(u8::MAX as u64) as u8
+}
+
+fn existing_project_proxy_path(path: &str) -> Option<String> {
+    let path = path.trim();
+    if path.is_empty() {
+        return None;
+    }
+    std::path::Path::new(path)
+        .is_file()
+        .then(|| path.to_string())
+}
+
+fn source_catalog_play_path(
+    paths: &ProjectPaths,
+    project_id: &str,
+    clip_id: &str,
+    import_complete: bool,
+    project_proxy_path: &str,
+) -> Option<String> {
+    let direct = project_proxy_path.trim();
+    if !direct.is_empty() && (import_complete || std::path::Path::new(direct).is_file()) {
+        return Some(direct.to_string());
+    }
+    crate::media_pool::proxy_path_for_clip(paths, project_id, clip_id)
+        .map(|path| path.to_string_lossy().to_string())
+        .or_else(|| existing_project_proxy_path(project_proxy_path))
+}
+
+fn source_catalog_ingest_rows(
+    paths: &ProjectPaths,
+    project_id: &str,
+) -> rusqlite::Result<Vec<Value>> {
+    let conn = open_ingest(paths, project_id)?;
+    let mut stmt = conn.prepare(
+        "SELECT clip_id, name, duration_sec, import_status, status,
+                COALESCE(project_proxy_path, ''), COALESCE(proxy_path, ''),
+                COALESCE(thumb_path, ''), COALESCE(source_path, ''),
+                COALESCE(original_path, ''), COALESCE(card_thumb_path, ''),
+                COALESCE(file_extension, ''), COALESCE(read_from_card, 0),
+                COALESCE(card_locked, 0), COALESCE(poster_source, ''),
+                fps, COALESCE(resolution, ''), COALESCE(codec, ''),
+                COALESCE(virtual_name, ''), COALESCE(has_audio, 0),
+                COALESCE(audio_channels, 0), COALESCE(field_order, ''),
+                COALESCE(interlaced, 0), COALESCE(source_class, ''),
+                COALESCE(proxy_recipe, ''), COALESCE(selected, 0)
+         FROM ingest_assets
+         WHERE selected != 0
+            OR import_status IN ('queued', 'processing', 'original_ready',
+                                 'generating_proxy', 'imported', 'done')
+         ORDER BY clip_id,
+                  CASE
+                    WHEN import_status IN ('queued', 'processing', 'original_ready',
+                                           'generating_proxy') THEN 0
+                    WHEN selected != 0 THEN 1
+                    WHEN import_status IN ('imported', 'done') THEN 2
+                    ELSE 2
+                  END,
+                  CASE WHEN TRIM(COALESCE(project_proxy_path, '')) != '' THEN 0 ELSE 1 END,
+                  source_id",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        let project_proxy_path = row.get::<_, String>(5).unwrap_or_default();
+        let proxy_path = row.get::<_, String>(6).unwrap_or_default();
+        let thumb_path = row.get::<_, String>(7).unwrap_or_default();
+        let source_path = row.get::<_, String>(8).unwrap_or_default();
+        let original_path = row.get::<_, String>(9).unwrap_or_default();
+        let card_thumb_path = row.get::<_, String>(10).unwrap_or_default();
+        let file_extension = row.get::<_, String>(11).unwrap_or_default();
+        let read_from_card = row.get::<_, i64>(12).unwrap_or(0) != 0;
+        let card_locked = row.get::<_, i64>(13).unwrap_or(0) != 0;
+        let poster_source = row.get::<_, String>(14).unwrap_or_default();
+        let metadata =
+            crate::ingest::db::ingest_asset_meta(&crate::ingest::db::IngestAssetMetaInput {
+                source_path: source_path.clone(),
+                original_path: original_path.clone(),
+                proxy_path: proxy_path.clone(),
+                project_proxy_path: project_proxy_path.clone(),
+                card_thumb_path: card_thumb_path.clone(),
+                file_extension: file_extension.clone(),
+                read_from_card,
+                card_locked,
+                poster_source: poster_source.clone(),
+            });
+        Ok(json!({
+            "clip_id": row.get::<_, String>(0)?,
+            "name": row.get::<_, String>(1)?,
+            "duration_sec": row.get::<_, f64>(2)?,
+            "import_status": row.get::<_, String>(3)?,
+            "status": row.get::<_, String>(4)?,
+            "project_proxy_path": optional_text(&project_proxy_path),
+            "proxy_path": optional_text(&proxy_path),
+            "ingest_proxy_path": optional_text(&proxy_path),
+            "thumb_path": optional_text(&thumb_path),
+            "source_path": optional_text(&source_path),
+            "original_path": optional_text(&original_path),
+            "card_thumb_path": optional_text(&card_thumb_path),
+            "file_extension": file_extension,
+            "metadata": metadata,
+            "fps": row.get::<_, f64>(15)?,
+            "resolution": row.get::<_, String>(16)?,
+            "codec": row.get::<_, String>(17)?,
+            "virtual_name": row.get::<_, String>(18)?,
+            "has_audio": row.get::<_, i64>(19)? != 0,
+            "audio_channels": row.get::<_, i64>(20)?.clamp(0, u8::MAX as i64) as u8,
+            "field_order": row.get::<_, String>(21)?,
+            "interlaced": row.get::<_, i64>(22)? != 0,
+            "source_class": row.get::<_, String>(23)?,
+            "proxy_recipe": row.get::<_, String>(24)?,
+            "selected": row.get::<_, i64>(25)? != 0,
+        }))
+    })?;
+    rows.collect()
+}
+
+/// All/source catalog: imported media plus selected/pending source rows for immediate thumbs.
 fn build_all_clips_snapshot(
     paths: &ProjectPaths,
     project_id: &str,
@@ -460,26 +586,36 @@ fn build_all_clips_snapshot(
 ) -> rusqlite::Result<Vec<Value>> {
     let roots = root_shot_by_clip(virtual_shots);
     let mut out = Vec::new();
-    for (
-        clip_id,
-        name,
-        virtual_name,
-        duration_sec,
-        fps,
-        import_status,
-        original_path,
-        project_proxy_path,
-        _proxy_path,
-        has_audio,
-        audio_channels,
-    ) in selected_virtual_ingest_rows(paths, project_id)?
-    {
-        let clip_id = clip_id.trim().to_string();
-        if clip_id.is_empty() {
+    let mut seen = BTreeSet::new();
+    for row in source_catalog_ingest_rows(paths, project_id)? {
+        let clip_id = json_text(&row, "clip_id");
+        if clip_id.is_empty() || !seen.insert(clip_id.clone()) {
             continue;
         }
+        let name = json_text(&row, "name");
+        let duration_sec = json_f64(&row, "duration_sec");
+        let fps = json_f64(&row, "fps");
+        let import_status = json_text(&row, "import_status");
+        let original_path = json_text(&row, "original_path");
+        let project_proxy_path = json_text(&row, "project_proxy_path");
+        let proxy_path = json_text(&row, "proxy_path");
+        let thumb_path = json_text(&row, "thumb_path");
+        let source_path = json_text(&row, "source_path");
+        let card_thumb_path = json_text(&row, "card_thumb_path");
+        let has_audio = row
+            .get("has_audio")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let audio_channels = json_u8(&row, "audio_channels");
+        let field_order = json_text(&row, "field_order");
+        let interlaced = row
+            .get("interlaced")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let source_class = json_text(&row, "source_class");
+        let proxy_recipe = json_text(&row, "proxy_recipe");
         let root_shot = roots.get(&clip_id);
-        let has_poster = resolve_ingest_poster_path(paths, project_id, &clip_id).is_some();
+        let has_poster = !thumb_path.trim().is_empty() || !card_thumb_path.trim().is_empty();
         let thumb_url = if has_poster {
             thumbnail_url(project_id, &clip_id)
         } else {
@@ -489,14 +625,44 @@ fn build_all_clips_snapshot(
             .and_then(|s| s.get("shot_id").and_then(Value::as_str))
             .map(str::to_string)
             .unwrap_or_else(|| root_shot_id_for_clip(&clip_id));
-        let (status_proxy, status_original, original_in_project) = import_status_dots(
+        let virtual_name = root_shot
+            .and_then(|s| s.get("virtual_name").and_then(Value::as_str))
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| json_text(&row, "virtual_name"));
+        let import_complete = matches!(import_status.as_str(), "imported" | "done");
+        let play_path = source_catalog_play_path(
+            paths,
+            project_id,
+            &clip_id,
+            import_complete,
+            &project_proxy_path,
+        )
+        .unwrap_or_default();
+        let materialized = !play_path.is_empty();
+        let selected = row
+            .get("selected")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let (mut status_proxy, status_original, original_in_project) = import_status_dots(
             paths,
             project_id,
             &import_status,
             &original_path,
-            &project_proxy_path,
             archive_original,
         );
+        if materialized {
+            status_proxy = "ready".to_string();
+        } else if !import_complete
+            && (selected
+                || matches!(
+                    import_status.as_str(),
+                    "queued" | "processing" | "original_ready" | "generating_proxy"
+                ))
+        {
+            status_proxy = "pending".to_string();
+        }
         // Trajanje: isključivo iz ingest_assets (probe). Label iz baze ili izračun u Rustu.
         let root_label = root_shot
             .and_then(|s| s.get("duration_label").and_then(Value::as_str))
@@ -507,20 +673,27 @@ fn build_all_clips_snapshot(
         } else {
             duration_label_from_sec(duration_sec, fps)
         };
+        let duration_frames = if duration_sec > 0.0 && is_valid_fps(fps) {
+            seconds_to_frame(duration_sec, fps).max(1)
+        } else {
+            root_shot
+                .and_then(|s| s.get("duration_frames").and_then(Value::as_i64))
+                .unwrap_or(0)
+        };
         let duration_color_key = if duration_sec > 0.0 && is_valid_fps(fps) {
             let use_fps = fps;
-            duration_color_key_from_frames(seconds_to_frame(duration_sec, use_fps), use_fps)
-                .to_string()
+            duration_color_key_from_frames(duration_frames, use_fps).to_string()
         } else {
             root_shot
                 .and_then(|s| s.get("duration_color_key").and_then(Value::as_str))
                 .unwrap_or("")
                 .to_string()
         };
-        let play_path = crate::media::resolve_play_media(paths, project_id, &clip_id)
-            .ok()
-            .map(|m| m.path.to_string_lossy().into_owned())
-            .unwrap_or_default();
+        let effective_import_status = if materialized && !import_complete {
+            "imported".to_string()
+        } else {
+            import_status.clone()
+        };
         out.push(json!({
             "clip_id": clip_id,
             "root_shot_id": root_shot_id,
@@ -528,18 +701,37 @@ fn build_all_clips_snapshot(
             "virtual_name": virtual_name,
             "duration_sec": duration_sec,
             "duration_seconds": duration_sec,
+            "duration_frames": duration_frames,
+            "in_frame": 0,
+            "out_frame": duration_frames,
             "duration_label": duration_label,
             "duration_color_key": duration_color_key,
             "fps": fps,
             "has_audio": has_audio,
             "audio_channels": audio_channels,
-            "import_status": import_status,
+            "field_order": field_order,
+            "interlaced": interlaced,
+            "source_class": source_class,
+            "proxy_recipe": proxy_recipe,
+            "import_status": effective_import_status,
             "status_proxy": status_proxy,
             "status_original": status_original,
             "original_in_project": original_in_project,
             "has_poster": has_poster,
             "thumb_url": thumb_url,
             "play_path": play_path,
+            "selected": selected,
+            "materialized": materialized,
+            "proxy_path": optional_text(&proxy_path),
+            "project_proxy_path": optional_text(if project_proxy_path.trim().is_empty() {
+                &play_path
+            } else {
+                &project_proxy_path
+            }),
+            "thumb_path": optional_text(&thumb_path),
+            "source_path": optional_text(&source_path),
+            "original_path": optional_text(&original_path),
+            "card_thumb_path": optional_text(&card_thumb_path),
         }));
     }
     Ok(out)
@@ -605,6 +797,10 @@ fn enrich_virtual_shots_from_ingest(
             obj.insert("source_fps".into(), json!(use_fps));
             obj.insert("has_audio".into(), json!(meta.has_audio));
             obj.insert("audio_channels".into(), json!(meta.audio_channels));
+            obj.insert("field_order".into(), json!(meta.field_order));
+            obj.insert("interlaced".into(), json!(meta.interlaced));
+            obj.insert("source_class".into(), json!(meta.source_class));
+            obj.insert("proxy_recipe".into(), json!(meta.proxy_recipe));
 
             let in_seconds = obj
                 .get("in_seconds")
@@ -656,15 +852,23 @@ fn snapshot_json(
 ) -> rusqlite::Result<Value> {
     let part_values: Vec<Value> = parts.iter().map(part_json).collect();
     let part_count = parts.len();
-    let markers = markers_snapshot(conn, timeline_fps)?;
-    let marker_slots = marker_slots_snapshot(conn)?;
+    let markers = if parts.is_empty() || !is_valid_fps(timeline_fps) {
+        Vec::new()
+    } else {
+        markers_snapshot(conn, timeline_fps)?
+    };
+    let marker_slots = if parts.is_empty() {
+        Vec::new()
+    } else {
+        marker_slots_snapshot(conn)?
+    };
     let covers = covers_snapshot(conn)?;
     let mut all_virtual_shots = list_virtual_shots(conn)?;
     enrich_virtual_shots_from_ingest(paths, project_id, &mut all_virtual_shots)?;
     let project = project_settings_snapshot(paths, project_id).unwrap_or_else(|_| json!({}));
     let ingest_conn = open_ingest(paths, project_id)?;
     let archive_original = ingest_archive_original_enabled(&ingest_conn, &project)?;
-    // All tab = source virtual (import_root / selektirani ingest).
+    // All/source catalog = imported project media enriched with import_root identity.
     let all_clips =
         build_all_clips_snapshot(paths, project_id, &all_virtual_shots, archive_original)?;
     // Virtual tab = samo derived (kreirani iz source virtual).
@@ -897,6 +1101,14 @@ struct StoryShotForPart {
     duration_color_key: String,
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SegmentRangeInput {
+    pub in_frame: Option<i64>,
+    pub out_frame: Option<i64>,
+    pub in_seconds: Option<f64>,
+    pub out_seconds: Option<f64>,
+}
+
 fn get_virtual_shot_for_part(
     conn: &Connection,
     virtual_shot_id: Option<&str>,
@@ -1008,16 +1220,18 @@ fn load_snapshot(
     conn: &Connection,
     project_id: &str,
 ) -> rusqlite::Result<Value> {
-    let timeline_fps = project_timeline_fps(paths, project_id);
-    ensure_materialized_slots(conn, timeline_fps)?;
     let row = read_row(conn)?;
     let parts = list_parts(conn)?;
+    let timeline_fps = story_program_source_fps(&parts).unwrap_or(0.0);
+    if !parts.is_empty() && is_valid_fps(timeline_fps) {
+        ensure_materialized_slots(conn, timeline_fps)?;
+    }
     snapshot_json(paths, conn, project_id, timeline_fps, &row, &parts)
 }
 
 pub fn load_state(paths: &ProjectPaths, project_id: &str) -> Result<Value, String> {
     let pid = project_id.trim();
-    // Sinkroniziraj import_root za selektirane ingest klipove prije snimke.
+    // Back-compat: pending selected source rows may have reserved import_root identity.
     let _ = crate::virtual_shots::ensure_reserved_root_shots_for_project(paths, pid);
     let conn = open_project(paths, pid).map_err(|e| e.to_string())?;
     load_snapshot(paths, &conn, pid).map_err(|e| e.to_string())
@@ -1071,18 +1285,47 @@ fn resolve_selection_after_delete(
     Ok(neighbor.unwrap_or_default())
 }
 
+/// Create a Segment-tab virtual segment (`story_parts`).
+///
+/// - `virtual_shot_id`: copy range from an existing Virtual-tab shot (no new Virtual row).
+/// - or `clip_id` + IN/OUT: write segment directly from source marks (Talking Head /
+///   Voice over) — **never** inserts into `virtual_shots` / Virtual tab.
 pub fn create_part(
     paths: &ProjectPaths,
     project_id: &str,
     kind: &str,
     virtual_shot_id: Option<&str>,
+    clip_id: Option<&str>,
+    in_seconds: Option<f64>,
+    out_seconds: Option<f64>,
+) -> Result<Value, String> {
+    create_part_with_range(
+        paths,
+        project_id,
+        kind,
+        virtual_shot_id,
+        clip_id,
+        SegmentRangeInput {
+            in_seconds,
+            out_seconds,
+            ..SegmentRangeInput::default()
+        },
+    )
+}
+
+pub fn create_part_with_range(
+    paths: &ProjectPaths,
+    project_id: &str,
+    kind: &str,
+    virtual_shot_id: Option<&str>,
+    clip_id: Option<&str>,
+    range: SegmentRangeInput,
 ) -> Result<Value, String> {
     let pid = project_id.trim();
     let kind = validate_kind(kind)?;
     let conn = open_project(paths, pid).map_err(|e| e.to_string())?;
     ensure_row(&conn).map_err(|e| e.to_string())?;
-    let timeline_fps = project_timeline_fps(paths, pid);
-    let shot = get_virtual_shot_for_part(&conn, virtual_shot_id)?;
+    let shot = resolve_segment_source(paths, pid, &conn, virtual_shot_id, clip_id, range)?;
     let part_id = new_part_id();
     let now = now_str();
     let sort_index = next_sort_index(&conn).map_err(|e| e.to_string())?;
@@ -1134,8 +1377,106 @@ pub fn create_part(
     )
     .map_err(|e| e.to_string())?;
     set_selected_part_id(&conn, &part_id).map_err(|e| e.to_string())?;
+    let timeline_fps = require_current_story_program_source_fps(&conn)?;
     finalize_story_mutation(&conn, timeline_fps).map_err(|e| e.to_string())?;
     load_snapshot(paths, &conn, pid).map_err(|e| e.to_string())
+}
+
+fn resolve_segment_source(
+    paths: &ProjectPaths,
+    project_id: &str,
+    conn: &Connection,
+    virtual_shot_id: Option<&str>,
+    clip_id: Option<&str>,
+    range: SegmentRangeInput,
+) -> Result<Option<StoryShotForPart>, String> {
+    if virtual_shot_id
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .is_some()
+    {
+        return get_virtual_shot_for_part(conn, virtual_shot_id);
+    }
+    if let Some(clip_id) = clip_id.map(str::trim).filter(|s| !s.is_empty()) {
+        if range.in_frame.is_some() || range.out_frame.is_some() {
+            let inn = range
+                .in_frame
+                .ok_or_else(|| "Segment frame IN nedostaje".to_string())?;
+            let out = range
+                .out_frame
+                .ok_or_else(|| "Segment frame OUT nedostaje".to_string())?;
+            // Segment-only path: story_parts trim, no virtual_shots insert.
+            return Ok(Some(segment_source_from_clip_frames(
+                paths, project_id, clip_id, inn, out,
+            )?));
+        }
+        if range.in_seconds.is_some() || range.out_seconds.is_some() {
+            let inn = range
+                .in_seconds
+                .ok_or_else(|| "Segment legacy seconds IN nedostaje".to_string())?;
+            let out = range
+                .out_seconds
+                .ok_or_else(|| "Segment legacy seconds OUT nedostaje".to_string())?;
+            // Compatibility fallback for older clients. New callers must send frames.
+            return Ok(Some(segment_source_from_clip_seconds(
+                paths, project_id, clip_id, inn, out,
+            )?));
+        }
+        return Err("Segment source range nedostaje".into());
+    }
+    get_virtual_shot_for_part(conn, None)
+}
+
+/// Build part trim from source-file frame IN/OUT. Does not write `virtual_shots`.
+fn segment_source_from_clip_frames(
+    paths: &ProjectPaths,
+    project_id: &str,
+    clip_id: &str,
+    in_frame: i64,
+    out_frame: i64,
+) -> Result<StoryShotForPart, String> {
+    let fps = crate::media_pool::resolve_clip_fps(paths, project_id, clip_id)?;
+    if !is_valid_fps(fps) {
+        return Err(format!("clip '{clip_id}' nema valjan source FPS"));
+    }
+    let in_frame = in_frame.max(0);
+    if out_frame <= in_frame {
+        return Err("OUT mora biti poslije IN".into());
+    }
+    let out_frame = out_frame.max(in_frame + 1);
+    let duration_frames = (out_frame - in_frame).max(0);
+    let in_sec = frame_to_seconds(in_frame, fps);
+    let out_sec = frame_to_seconds(out_frame, fps);
+    Ok(StoryShotForPart {
+        shot_id: String::new(),
+        clip_id: clip_id.to_string(),
+        in_tc: seconds_to_timecode(in_sec, fps),
+        out_tc: seconds_to_timecode(out_sec, fps),
+        in_seconds: in_sec,
+        out_seconds: out_sec,
+        fps,
+        in_frame,
+        out_frame,
+        duration_frames,
+        duration_label: seconds_frames_label_from_frames(duration_frames, fps),
+        duration_color_key: duration_color_key_from_frames(duration_frames, fps).to_string(),
+    })
+}
+
+fn segment_source_from_clip_seconds(
+    paths: &ProjectPaths,
+    project_id: &str,
+    clip_id: &str,
+    in_seconds: f64,
+    out_seconds: f64,
+) -> Result<StoryShotForPart, String> {
+    let fps = crate::media_pool::resolve_clip_fps(paths, project_id, clip_id)?;
+    if !is_valid_fps(fps) {
+        return Err(format!("clip '{clip_id}' nema valjan source FPS"));
+    }
+    let in_frame = seconds_to_frame(snap_seconds_to_frame(in_seconds.max(0.0), fps), fps);
+    let out_frame = seconds_to_frame(snap_seconds_to_frame(out_seconds.max(0.0), fps), fps);
+    segment_source_from_clip_frames(paths, project_id, clip_id, in_frame, out_frame)
 }
 
 pub fn update_part(
@@ -1152,7 +1493,7 @@ pub fn update_part(
         return Err("part_id required".into());
     }
     let conn = open_project(paths, pid).map_err(|e| e.to_string())?;
-    let timeline_fps = project_timeline_fps(paths, pid);
+    let timeline_fps = require_current_story_program_source_fps(&conn)?;
     if !part_exists(&conn, part_id).map_err(|e| e.to_string())? {
         return Err(format!("part not found: {part_id}"));
     }
@@ -1186,22 +1527,22 @@ fn get_part_row(conn: &Connection, part_id: &str) -> Result<StoryPartRow, String
         .ok_or_else(|| format!("part not found: {part_id}"))
 }
 
-fn apply_part_source_trim(
+fn apply_part_source_trim_frames(
     conn: &Connection,
     part_id: &str,
-    in_seconds: f64,
-    out_seconds: f64,
+    in_frame: i64,
+    out_frame: i64,
 ) -> Result<(), String> {
     let part = get_part_row(conn, part_id)?;
     let fps = crate::frame_time::require_fps(part.fps, "story part source trim")?;
-    let in_sec = snap_seconds_to_frame(in_seconds.max(0.0), fps);
-    let out_sec = snap_seconds_to_frame(out_seconds.max(0.0), fps);
-    if out_sec <= in_sec {
+    let in_frame = in_frame.max(0);
+    if out_frame <= in_frame {
         return Err("OUT mora biti poslije IN".into());
     }
-    let in_frame = seconds_to_frame(in_sec, fps);
-    let out_frame = seconds_to_frame(out_sec, fps);
+    let out_frame = out_frame.max(in_frame + 1);
     let duration_frames = (out_frame - in_frame).max(0);
+    let in_sec = frame_to_seconds(in_frame, fps);
+    let out_sec = frame_to_seconds(out_frame, fps);
     let in_tc = seconds_to_timecode(in_sec, fps);
     let out_tc = seconds_to_timecode(out_sec, fps);
     let duration_label = seconds_frames_label_from_frames(duration_frames, fps);
@@ -1237,22 +1578,38 @@ pub fn set_part_mark_in(
 ) -> Result<Value, String> {
     let pid = project_id.trim();
     let part_id = part_id.trim();
+    let conn = open_project(paths, pid).map_err(|e| e.to_string())?;
+    let part = get_part_row(&conn, part_id)?;
+    let fps = crate::frame_time::require_fps(part.fps, "story part mark in")?;
+    let local_frame = seconds_to_frame(snap_seconds_to_frame(local_sec.max(0.0), fps), fps);
+    drop(conn);
+    set_part_mark_in_frame(paths, pid, part_id, local_frame)
+}
+
+pub fn set_part_mark_in_frame(
+    paths: &ProjectPaths,
+    project_id: &str,
+    part_id: &str,
+    local_frame: i64,
+) -> Result<Value, String> {
+    let pid = project_id.trim();
+    let part_id = part_id.trim();
     if part_id.is_empty() {
         return Err("part_id required".into());
     }
     let conn = open_project(paths, pid).map_err(|e| e.to_string())?;
-    let timeline_fps = project_timeline_fps(paths, pid);
+    let timeline_fps = require_current_story_program_source_fps(&conn)?;
     let part = get_part_row(&conn, part_id)?;
-    let current_in = part.in_seconds.unwrap_or(0.0);
-    let current_out = part.out_seconds.unwrap_or(current_in + 3.0);
-    let span = (current_out - current_in).max(0.0);
-    let local = if span > TIMELINE_EPS {
-        local_sec.max(0.0).min(span)
+    let current_in = part.in_frame.max(0);
+    let current_out = part.out_frame.max(current_in + 1);
+    let span = (current_out - current_in).max(0);
+    let local = if span > 0 {
+        local_frame.max(0).min(span)
     } else {
-        0.0
+        0
     };
     let new_in = current_in + local;
-    apply_part_source_trim(&conn, part_id, new_in, current_out)?;
+    apply_part_source_trim_frames(&conn, part_id, new_in, current_out)?;
     finalize_story_mutation(&conn, timeline_fps).map_err(|e| e.to_string())?;
     load_snapshot(paths, &conn, pid).map_err(|e| e.to_string())
 }
@@ -1265,22 +1622,38 @@ pub fn set_part_mark_out(
 ) -> Result<Value, String> {
     let pid = project_id.trim();
     let part_id = part_id.trim();
+    let conn = open_project(paths, pid).map_err(|e| e.to_string())?;
+    let part = get_part_row(&conn, part_id)?;
+    let fps = crate::frame_time::require_fps(part.fps, "story part mark out")?;
+    let local_frame = seconds_to_frame(snap_seconds_to_frame(local_sec.max(0.0), fps), fps);
+    drop(conn);
+    set_part_mark_out_frame(paths, pid, part_id, local_frame)
+}
+
+pub fn set_part_mark_out_frame(
+    paths: &ProjectPaths,
+    project_id: &str,
+    part_id: &str,
+    local_frame: i64,
+) -> Result<Value, String> {
+    let pid = project_id.trim();
+    let part_id = part_id.trim();
     if part_id.is_empty() {
         return Err("part_id required".into());
     }
     let conn = open_project(paths, pid).map_err(|e| e.to_string())?;
-    let timeline_fps = project_timeline_fps(paths, pid);
+    let timeline_fps = require_current_story_program_source_fps(&conn)?;
     let part = get_part_row(&conn, part_id)?;
-    let current_in = part.in_seconds.unwrap_or(0.0);
-    let current_out = part.out_seconds.unwrap_or(current_in + 3.0);
-    let span = (current_out - current_in).max(0.0);
-    let local = if span > TIMELINE_EPS {
-        local_sec.max(0.0).min(span)
+    let current_in = part.in_frame.max(0);
+    let current_out = part.out_frame.max(current_in + 1);
+    let span = (current_out - current_in).max(0);
+    let local = if span > 0 {
+        local_frame.max(0).min(span)
     } else {
-        0.0
+        0
     };
     let new_out = current_in + local;
-    apply_part_source_trim(&conn, part_id, current_in, new_out)?;
+    apply_part_source_trim_frames(&conn, part_id, current_in, new_out)?;
     finalize_story_mutation(&conn, timeline_fps).map_err(|e| e.to_string())?;
     load_snapshot(paths, &conn, pid).map_err(|e| e.to_string())
 }
@@ -1292,7 +1665,7 @@ pub fn delete_part(paths: &ProjectPaths, project_id: &str, part_id: &str) -> Res
         return Err("part_id required".into());
     }
     let conn = open_project(paths, pid).map_err(|e| e.to_string())?;
-    let timeline_fps = project_timeline_fps(paths, pid);
+    let timeline_fps = require_current_story_program_source_fps(&conn)?;
     let deleted_sort: i64 = conn
         .query_row(
             "SELECT sort_index FROM story_parts WHERE part_id = ?1",
@@ -1300,12 +1673,14 @@ pub fn delete_part(paths: &ProjectPaths, project_id: &str, part_id: &str) -> Res
             |r| r.get(0),
         )
         .map_err(|_| format!("part not found: {part_id}"))?;
+    let parts_before_delete = list_parts(&conn).map_err(|e| e.to_string())?;
     conn.execute(
         "DELETE FROM story_parts WHERE part_id = ?1",
         params![part_id],
     )
     .map_err(|e| e.to_string())?;
-    delete_markers_for_part(&conn, part_id).map_err(|e| e.to_string())?;
+    delete_markers_for_part(&conn, part_id, timeline_fps, &parts_before_delete)
+        .map_err(|e| e.to_string())?;
     let next_selected =
         resolve_selection_after_delete(&conn, part_id, deleted_sort).map_err(|e| e.to_string())?;
     set_selected_part_id(&conn, &next_selected).map_err(|e| e.to_string())?;
@@ -1337,7 +1712,7 @@ pub fn reorder_part(
         return Err(format!("invalid direction: {direction}"));
     }
     let conn = open_project(paths, pid).map_err(|e| e.to_string())?;
-    let timeline_fps = project_timeline_fps(paths, pid);
+    let timeline_fps = require_current_story_program_source_fps(&conn)?;
     let mut parts = list_parts(&conn).map_err(|e| e.to_string())?;
     let idx = parts
         .iter()
@@ -1419,7 +1794,7 @@ pub fn create_marker(
 ) -> Result<Value, String> {
     let pid = project_id.trim();
     let conn = open_project(paths, pid).map_err(|e| e.to_string())?;
-    let timeline_fps = project_timeline_fps(paths, pid);
+    let timeline_fps = require_current_story_program_source_fps(&conn)?;
     let parts = list_parts(&conn).map_err(|e| e.to_string())?;
     let (resolved_sec, origin_part_id, origin_local_sec) =
         resolve_marker_timeline_sec(&parts, timeline_sec, part_id, local_sec)?;
@@ -1439,6 +1814,75 @@ pub fn create_marker(
     load_snapshot(paths, &conn, pid).map_err(|e| e.to_string())
 }
 
+pub fn create_marker_from_frame(
+    paths: &ProjectPaths,
+    project_id: &str,
+    timeline_frame: i64,
+    part_id: Option<&str>,
+    label: Option<&str>,
+    local_frame: Option<i64>,
+) -> Result<Value, String> {
+    let pid = project_id.trim();
+    let conn = open_project(paths, pid).map_err(|e| e.to_string())?;
+    let timeline_fps = require_current_story_program_source_fps(&conn)?;
+    let parts = list_parts(&conn).map_err(|e| e.to_string())?;
+    let (resolved_frame, origin_part_id, origin_local_frame) = resolve_marker_timeline_frame(
+        &parts,
+        Some(timeline_frame),
+        part_id,
+        local_frame,
+        timeline_fps,
+    )?;
+    let origin_part = if origin_part_id.is_empty() {
+        None
+    } else {
+        Some(origin_part_id.as_str())
+    };
+    create_marker_row_frame(
+        &conn,
+        resolved_frame,
+        label,
+        origin_part,
+        origin_local_frame,
+        timeline_fps,
+    )?;
+    load_snapshot(paths, &conn, pid).map_err(|e| e.to_string())
+}
+
+pub fn create_marker_from_part_frame(
+    paths: &ProjectPaths,
+    project_id: &str,
+    part_id: &str,
+    label: Option<&str>,
+    local_frame: i64,
+) -> Result<Value, String> {
+    let pid = project_id.trim();
+    let conn = open_project(paths, pid).map_err(|e| e.to_string())?;
+    let timeline_fps = require_current_story_program_source_fps(&conn)?;
+    let parts = list_parts(&conn).map_err(|e| e.to_string())?;
+    let (resolved_frame, origin_part_id, origin_local_frame) = resolve_marker_timeline_frame(
+        &parts,
+        None,
+        Some(part_id),
+        Some(local_frame),
+        timeline_fps,
+    )?;
+    let origin_part = if origin_part_id.is_empty() {
+        None
+    } else {
+        Some(origin_part_id.as_str())
+    };
+    create_marker_row_frame(
+        &conn,
+        resolved_frame,
+        label,
+        origin_part,
+        origin_local_frame,
+        timeline_fps,
+    )?;
+    load_snapshot(paths, &conn, pid).map_err(|e| e.to_string())
+}
+
 pub fn delete_marker(
     paths: &ProjectPaths,
     project_id: &str,
@@ -1446,7 +1890,7 @@ pub fn delete_marker(
 ) -> Result<Value, String> {
     let pid = project_id.trim();
     let conn = open_project(paths, pid).map_err(|e| e.to_string())?;
-    let timeline_fps = project_timeline_fps(paths, pid);
+    let timeline_fps = require_current_story_program_source_fps(&conn)?;
     delete_marker_row(&conn, marker_id, timeline_fps)?;
     load_snapshot(paths, &conn, pid).map_err(|e| e.to_string())
 }
@@ -1459,7 +1903,7 @@ pub fn move_marker(
 ) -> Result<Value, String> {
     let pid = project_id.trim();
     let conn = open_project(paths, pid).map_err(|e| e.to_string())?;
-    let timeline_fps = project_timeline_fps(paths, pid);
+    let timeline_fps = require_current_story_program_source_fps(&conn)?;
     move_marker_row(&conn, marker_id, direction, timeline_fps)?;
     load_snapshot(paths, &conn, pid).map_err(|e| e.to_string())
 }
@@ -1473,8 +1917,22 @@ pub fn update_marker(
 ) -> Result<Value, String> {
     let pid = project_id.trim();
     let conn = open_project(paths, pid).map_err(|error| error.to_string())?;
-    let timeline_fps = project_timeline_fps(paths, pid);
+    let timeline_fps = require_current_story_program_source_fps(&conn)?;
     update_marker_row(&conn, marker_id, timeline_sec, label, timeline_fps)?;
+    load_snapshot(paths, &conn, pid).map_err(|error| error.to_string())
+}
+
+pub fn update_marker_frame(
+    paths: &ProjectPaths,
+    project_id: &str,
+    marker_id: &str,
+    timeline_frame: i64,
+    label: Option<&str>,
+) -> Result<Value, String> {
+    let pid = project_id.trim();
+    let conn = open_project(paths, pid).map_err(|error| error.to_string())?;
+    let timeline_fps = require_current_story_program_source_fps(&conn)?;
+    update_marker_frame_row(&conn, marker_id, timeline_frame, label, timeline_fps)?;
     load_snapshot(paths, &conn, pid).map_err(|error| error.to_string())
 }
 
@@ -1500,7 +1958,7 @@ pub fn create_cover(
 ) -> Result<Value, String> {
     let pid = project_id.trim();
     let conn = open_project(paths, pid).map_err(|e| e.to_string())?;
-    let timeline_fps = project_timeline_fps(paths, pid);
+    let timeline_fps = require_current_story_program_source_fps(&conn)?;
     ensure_materialized_slots(&conn, timeline_fps).map_err(|e| e.to_string())?;
     let shot = get_virtual_shot_for_cover(&conn, virtual_shot_id)?;
     let slot = super::markers::get_slot_by_id(&conn, slot_id)?;
@@ -1706,6 +2164,358 @@ mod tests {
         }
     }
 
+    fn seed_imported_clip(paths: &ProjectPaths, project_id: &str, clip_id: &str, fps: f64) {
+        let conn = crate::ingest::db::open_ingest(paths, project_id).unwrap();
+        conn.execute(
+            "INSERT INTO ingest_assets
+                (source_id, clip_id, name, duration_sec, fps, import_status)
+             VALUES ('src_a', ?1, ?1, 10.0, ?2, 'imported')",
+            params![clip_id, fps],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn story_all_catalog_keeps_selected_thumbs_and_imported_ready_status() {
+        let base =
+            std::env::temp_dir().join(format!("qnc_story_all_catalog_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let paths = test_paths(&base);
+        let project_id = "story_all_catalog";
+        let conn = open_project(&paths, project_id).unwrap();
+        ensure_schema(&conn).unwrap();
+        drop(conn);
+
+        let proxy_path = paths
+            .project_dir(project_id)
+            .join("proxy")
+            .join("imported_clip.mp4")
+            .to_string_lossy()
+            .to_string();
+        let thumb_path = paths
+            .project_dir(project_id)
+            .join("ingest")
+            .join("thumbnails")
+            .join("imported_clip")
+            .join("poster.jpg")
+            .to_string_lossy()
+            .to_string();
+        let selected_thumb_path = paths
+            .project_dir(project_id)
+            .join("ingest")
+            .join("thumbnails")
+            .join("selected_clip")
+            .join("poster.jpg")
+            .to_string_lossy()
+            .to_string();
+        let conn = crate::ingest::db::open_ingest(&paths, project_id).unwrap();
+        conn.execute(
+            "INSERT INTO ingest_assets
+                (source_id, clip_id, name, duration_sec, fps, status, import_status, selected)
+             VALUES ('card_a', 'card_only_clip', 'Card only', 8.0, 50.0,
+                     'on_source', 'detected', 0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO ingest_assets
+                (source_id, clip_id, name, duration_sec, fps, status, import_status, selected,
+                 source_path, proxy_path, thumb_path, virtual_name)
+             VALUES ('card_a', 'selected_clip', 'Selected clip', 9.0, 50.0,
+                     'on_source', 'detected', 1, 'G:/DCIM/selected_clip.MP4',
+                     'G:/SUB/selected_clip_proxy.MP4', ?1, 'selected_clip_root.mp4')",
+            params![selected_thumb_path],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO ingest_assets
+                (source_id, clip_id, name, duration_sec, fps, has_audio, audio_channels,
+                 status, import_status, selected, source_path, project_proxy_path, thumb_path,
+                 virtual_name)
+             VALUES ('card_a', 'imported_clip', 'Imported clip', 10.0, 50.0, 1, 2,
+                     'active', 'imported', 0, 'G:/DCIM/imported_clip.MP4', ?1, ?2, '')",
+            params![proxy_path, thumb_path],
+        )
+        .unwrap();
+        drop(conn);
+
+        let state = load_state(&paths, project_id).unwrap();
+        let clips = state.get("all_clips").and_then(Value::as_array).unwrap();
+        assert_eq!(
+            clips
+                .iter()
+                .map(|clip| clip.get("clip_id").and_then(Value::as_str).unwrap_or(""))
+                .collect::<Vec<_>>(),
+            vec!["imported_clip", "selected_clip"],
+            "source catalog projects selected thumbnails immediately and imported media as ready"
+        );
+        let imported = clips
+            .iter()
+            .find(|clip| clip.get("clip_id").and_then(Value::as_str) == Some("imported_clip"))
+            .unwrap();
+        assert_eq!(imported.get("fps").and_then(Value::as_f64), Some(50.0));
+        assert_eq!(
+            imported.get("has_audio").and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            imported.get("audio_channels").and_then(Value::as_u64),
+            Some(2)
+        );
+        assert_eq!(
+            imported.get("status_proxy").and_then(Value::as_str),
+            Some("ready")
+        );
+        assert_eq!(
+            imported.get("project_proxy_path").and_then(Value::as_str),
+            Some(proxy_path.as_str())
+        );
+        assert_eq!(
+            imported.get("play_path").and_then(Value::as_str),
+            Some(proxy_path.as_str())
+        );
+        assert_eq!(
+            imported.get("materialized").and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            imported.get("has_poster").and_then(Value::as_bool),
+            Some(true)
+        );
+        assert!(
+            imported
+                .get("thumb_url")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .contains("/api/ingest/thumbnail"),
+            "thumbnail URL must be projected from DB thumbnail metadata"
+        );
+
+        let selected = clips
+            .iter()
+            .find(|clip| clip.get("clip_id").and_then(Value::as_str) == Some("selected_clip"))
+            .unwrap();
+        assert_eq!(
+            selected.get("status_proxy").and_then(Value::as_str),
+            Some("pending"),
+            "selected source row keeps the yellow/pending proxy status until project proxy exists"
+        );
+        assert_eq!(
+            selected.get("selected").and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            selected.get("materialized").and_then(Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(selected.get("play_path").and_then(Value::as_str), Some(""));
+        assert_eq!(
+            selected.get("has_poster").and_then(Value::as_bool),
+            Some(true),
+            "selected clip thumbnail must be visible immediately while import is pending"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn story_all_catalog_prioritizes_pending_selected_row_over_stale_ready_path() {
+        let base = std::env::temp_dir().join(format!(
+            "qnc_story_pending_status_test_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let paths = test_paths(&base);
+        let project_id = "story_pending_status";
+        let conn = open_project(&paths, project_id).unwrap();
+        ensure_schema(&conn).unwrap();
+        drop(conn);
+
+        let stale_proxy_path = paths
+            .project_dir(project_id)
+            .join("proxy")
+            .join("clip_a.mp4")
+            .to_string_lossy()
+            .to_string();
+        let selected_thumb_path = paths
+            .project_dir(project_id)
+            .join("ingest")
+            .join("thumbnails")
+            .join("clip_a")
+            .join("poster.jpg")
+            .to_string_lossy()
+            .to_string();
+
+        let conn = crate::ingest::db::open_ingest(&paths, project_id).unwrap();
+        conn.execute(
+            "INSERT INTO ingest_assets
+                (source_id, clip_id, name, duration_sec, fps, status, import_status, selected,
+                 source_path, project_proxy_path, thumb_path)
+             VALUES ('card_a', 'clip_a', 'Clip A', 10.0, 50.0,
+                     'on_source', 'queued', 1, 'G:/DCIM/clip_a.MP4', ?1, ?2)",
+            params![stale_proxy_path, selected_thumb_path],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO ingest_assets
+                (source_id, clip_id, name, duration_sec, fps, status, import_status, selected,
+                 project_proxy_path)
+             VALUES ('project_proxy_repair', 'clip_a', 'Clip A stale', 10.0, 50.0,
+                     'active', 'imported', 0, ?1)",
+            params![stale_proxy_path],
+        )
+        .unwrap();
+        drop(conn);
+
+        let state = load_state(&paths, project_id).unwrap();
+        let clips = state.get("all_clips").and_then(Value::as_array).unwrap();
+        assert_eq!(clips.len(), 1);
+        let clip = &clips[0];
+        assert_eq!(clip.get("clip_id").and_then(Value::as_str), Some("clip_a"));
+        assert_eq!(
+            clip.get("import_status").and_then(Value::as_str),
+            Some("queued"),
+            "pending selected source row is the active DB state for this clip"
+        );
+        assert_eq!(
+            clip.get("status_proxy").and_then(Value::as_str),
+            Some("pending"),
+            "queued clip must keep the yellow dot even if a stale proxy path exists"
+        );
+        assert_eq!(
+            clip.get("materialized").and_then(Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(clip.get("play_path").and_then(Value::as_str), Some(""));
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn story_all_catalog_refreshes_materialized_pending_proxy_for_play() {
+        let base = std::env::temp_dir().join(format!(
+            "qnc_story_materialized_pending_test_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let paths = test_paths(&base);
+        let project_id = "story_materialized_pending";
+        let conn = open_project(&paths, project_id).unwrap();
+        ensure_schema(&conn).unwrap();
+        drop(conn);
+
+        let proxy_path = paths
+            .project_dir(project_id)
+            .join("proxy")
+            .join("clip_ready.mp4");
+        std::fs::create_dir_all(proxy_path.parent().unwrap()).unwrap();
+        std::fs::write(&proxy_path, b"proxy").unwrap();
+        let proxy_path = proxy_path.to_string_lossy().to_string();
+        let selected_thumb_path = paths
+            .project_dir(project_id)
+            .join("ingest")
+            .join("thumbnails")
+            .join("clip_ready")
+            .join("poster.jpg")
+            .to_string_lossy()
+            .to_string();
+
+        let conn = crate::ingest::db::open_ingest(&paths, project_id).unwrap();
+        conn.execute(
+            "INSERT INTO ingest_assets
+                (source_id, clip_id, name, duration_sec, fps, status, import_status, selected,
+                 source_path, project_proxy_path, thumb_path)
+             VALUES ('card_a', 'clip_ready', 'Clip Ready', 10.0, 50.0,
+                     'on_source', 'queued', 1, 'G:/DCIM/clip_ready.MP4', ?1, ?2)",
+            params![proxy_path, selected_thumb_path],
+        )
+        .unwrap();
+        drop(conn);
+
+        let state = load_state(&paths, project_id).unwrap();
+        let clips = state.get("all_clips").and_then(Value::as_array).unwrap();
+        assert_eq!(clips.len(), 1);
+        let clip = &clips[0];
+        assert_eq!(
+            clip.get("import_status").and_then(Value::as_str),
+            Some("imported"),
+            "effective source snapshot must refresh stale pending import status when project proxy exists"
+        );
+        assert_eq!(
+            clip.get("status_proxy").and_then(Value::as_str),
+            Some("ready"),
+            "green proxy dot follows materialized project proxy, not stale queued status"
+        );
+        assert_eq!(
+            clip.get("materialized").and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            clip.get("play_path").and_then(Value::as_str),
+            Some(proxy_path.as_str()),
+            "playback gate must receive path when project proxy is ready"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn segment_from_source_frames_is_durable_part_not_virtual_shot() {
+        let base = std::env::temp_dir().join(format!(
+            "qnc_story_segment_frames_test_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let paths = test_paths(&base);
+        let project_id = "story_segment_frames";
+        let conn = open_project(&paths, project_id).unwrap();
+        ensure_schema(&conn).unwrap();
+        drop(conn);
+        seed_imported_clip(&paths, project_id, "clip_a", 25.0);
+
+        let state = create_part_with_range(
+            &paths,
+            project_id,
+            "tonovi",
+            None,
+            Some("clip_a"),
+            SegmentRangeInput {
+                in_frame: Some(25),
+                out_frame: Some(75),
+                ..SegmentRangeInput::default()
+            },
+        )
+        .unwrap();
+        let part = state
+            .get("parts")
+            .and_then(Value::as_array)
+            .and_then(|parts| parts.first())
+            .unwrap();
+        assert_eq!(part.get("clip_id").and_then(Value::as_str), Some("clip_a"));
+        assert_eq!(
+            part.get("virtual_shot_id").and_then(Value::as_str),
+            Some("")
+        );
+        assert_eq!(part.get("in_frame").and_then(Value::as_i64), Some(25));
+        assert_eq!(part.get("out_frame").and_then(Value::as_i64), Some(75));
+        assert_eq!(part.get("in_seconds").and_then(Value::as_f64), Some(1.0));
+        assert_eq!(part.get("out_seconds").and_then(Value::as_f64), Some(3.0));
+
+        assert_eq!(
+            state
+                .get("virtual_shots")
+                .and_then(Value::as_array)
+                .map(Vec::len),
+            Some(0),
+            "Segment-tab virtual segment must not create a derived Virtual-tab shot"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     #[test]
     fn story_snapshot_reads_and_selects_virtual_shots_from_project_db() {
         let base = std::env::temp_dir().join(format!(
@@ -1726,7 +2536,7 @@ mod tests {
                 duration_seconds REAL NOT NULL DEFAULT 0,
                 in_seconds REAL NOT NULL DEFAULT 0,
                 out_seconds REAL NOT NULL DEFAULT 0,
-                fps REAL NOT NULL DEFAULT 25,
+                fps REAL NOT NULL DEFAULT 0,
                 in_frame INTEGER NOT NULL DEFAULT 0,
                 out_frame INTEGER NOT NULL DEFAULT 0,
                 duration_frames INTEGER NOT NULL DEFAULT 0,
@@ -1774,7 +2584,7 @@ mod tests {
             Some("shot_a")
         );
 
-        let with_part = create_part(&paths, project_id, "tonovi", None).unwrap();
+        let with_part = create_part(&paths, project_id, "tonovi", None, None, None, None).unwrap();
         let part_id = with_part
             .get("selected_part_id")
             .and_then(|v| v.as_str())
@@ -1807,21 +2617,21 @@ mod tests {
             Some("under_3")
         );
         let with_marker =
-            create_marker(&paths, project_id, None, Some(&part_id), None, Some(2.0)).unwrap();
+            create_marker(&paths, project_id, None, Some(&part_id), None, Some(1.0)).unwrap();
         let marker_id = with_marker
             .get("markers")
             .and_then(|v| v.as_array())
             .and_then(|markers| {
                 markers
                     .iter()
-                    .find(|marker| marker.get("timeline_sec").and_then(Value::as_f64) == Some(2.0))
+                    .find(|marker| marker.get("timeline_sec").and_then(Value::as_f64) == Some(1.0))
             })
             .and_then(|marker| marker.get("marker_id"))
             .and_then(Value::as_str)
             .unwrap()
             .to_string();
         let updated_marker =
-            update_marker(&paths, project_id, &marker_id, 1.5, Some("Prijelaz")).unwrap();
+            update_marker_frame(&paths, project_id, &marker_id, 38, Some("Prijelaz")).unwrap();
         let marker = updated_marker
             .get("markers")
             .and_then(Value::as_array)
@@ -1832,8 +2642,8 @@ mod tests {
             })
             .unwrap();
         assert_eq!(
-            marker.get("timeline_sec").and_then(Value::as_f64),
-            Some(1.5)
+            marker.get("timeline_frame").and_then(Value::as_i64),
+            Some(38)
         );
         assert_eq!(
             marker.get("label").and_then(Value::as_str),
@@ -1873,8 +2683,7 @@ mod tests {
             .and_then(Value::as_str)
             .unwrap();
         delete_marker(&paths, project_id, second_marker_id).unwrap();
-        let restored_marker =
-            update_marker(&paths, project_id, &marker_id, 2.0, Some("Prijelaz")).unwrap();
+        let restored_marker = delete_marker(&paths, project_id, &marker_id).unwrap();
         let slot_id = restored_marker
             .get("marker_slots")
             .and_then(|v| v.as_array())

@@ -53,11 +53,6 @@ pub fn section(ui: &mut egui::Ui, width: f32, add_contents: impl FnOnce(&mut egu
     add_contents(ui);
 }
 
-/// Field / inline label (muted, strong).
-pub fn field_label(ui: &mut egui::Ui, label: &str) {
-    ui.label(RichText::new(label).size(LABEL_FS).strong().color(MUTED));
-}
-
 /// Quiet ghost vs primary CTA — wraps `qnc_theme` buttons (no Project-only style).
 pub fn btn(ui: &mut egui::Ui, label: &str, quiet: bool) -> egui::Response {
     btn_sized(ui, label, quiet, true)

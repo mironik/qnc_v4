@@ -1,6 +1,7 @@
 //! Story builders for the shared QNC-timeline contract (`crate::timeline_model`).
 
-use crate::project::db::{open_project, project_timeline_fps, ProjectPaths};
+use crate::frame_time::is_valid_fps;
+use crate::project::db::{open_project, ProjectPaths};
 use crate::timeline_model::{
     build_source_timeline_model as shared_source_model, wrap_segment_io_pins, SegmentSchema,
     TimelineApplication, TimelineCover, TimelineMarkerSlot, TimelineModel, TimelinePin,
@@ -10,8 +11,8 @@ use crate::timeline_model::{
 use super::covers::{list_covers, StoryCoverRow};
 use super::db::{ensure_schema, list_parts, StoryPartRow};
 use super::markers::{
-    list_marker_slots_rows, list_markers_rows, part_span_seconds, timeline_duration_from_parts,
-    TIMELINE_EPS,
+    list_marker_slots_rows, list_markers_rows, part_span_frames, part_span_seconds,
+    timeline_duration_frames_from_parts,
 };
 
 fn round3(v: f64) -> f64 {
@@ -29,23 +30,25 @@ pub fn build_wrap_timeline_model(
     }
     let conn = open_project(paths, pid).map_err(|e| e.to_string())?;
     ensure_schema(&conn).map_err(|e| e.to_string())?;
-    let timeline_fps = project_timeline_fps(paths, pid);
     let parts = list_parts(&conn).map_err(|e| e.to_string())?;
+    let timeline_fps = story_program_source_fps(&parts).unwrap_or(0.0);
     let covers = list_covers(&conn).map_err(|e| e.to_string())?;
     let markers = list_markers_rows(&conn).map_err(|e| e.to_string())?;
     let slots = list_marker_slots_rows(&conn).map_err(|e| e.to_string())?;
 
-    let segments = build_segments(&parts, &covers);
-    let duration_sec = if segments.is_empty() {
-        0.0
+    let segments = build_segments(&parts, &covers, timeline_fps);
+    let duration_frames = if segments.is_empty() {
+        0
     } else {
-        timeline_duration_from_parts(&parts)
+        timeline_duration_frames_from_parts(&parts, timeline_fps)
     };
+    let duration_sec = round3(parts.iter().map(part_span_seconds).sum());
 
     Ok(TimelineModel {
         project_id: pid.to_string(),
         application: TimelineApplication::Wrap,
         timeline_fps,
+        duration_frames,
         duration_sec,
         rows: TIMELINE_ROWS.iter().map(|s| (*s).to_string()).collect(),
         io_pins: wrap_segment_io_pins(&segments),
@@ -53,6 +56,7 @@ pub fn build_wrap_timeline_model(
         markers: markers
             .into_iter()
             .map(|m| TimelinePin {
+                timeline_frame: m.timeline_frame,
                 id: m.marker_id,
                 kind: "marker".into(),
                 timeline_sec: m.timeline_sec,
@@ -67,6 +71,8 @@ pub fn build_wrap_timeline_model(
             .into_iter()
             .map(|s| TimelineMarkerSlot {
                 slot_id: s.slot_id,
+                start_frame: s.start_frame,
+                end_frame: s.end_frame,
                 start_sec: s.start_sec,
                 end_sec: s.end_sec,
                 start_marker_id: s.start_marker_id,
@@ -83,7 +89,7 @@ pub fn build_source_timeline_model(
     in_sec: f64,
     out_sec: f64,
     timeline_fps: f64,
-) -> TimelineModel {
+) -> Result<TimelineModel, String> {
     shared_source_model(
         project_id,
         clip_id,
@@ -94,15 +100,22 @@ pub fn build_source_timeline_model(
     )
 }
 
-fn build_segments(parts: &[StoryPartRow], covers: &[StoryCoverRow]) -> Vec<TimelineSegment> {
+fn build_segments(
+    parts: &[StoryPartRow],
+    covers: &[StoryCoverRow],
+    timeline_fps: f64,
+) -> Vec<TimelineSegment> {
     let mut segments = Vec::new();
-    let mut global_start = 0.0;
+    let mut global_start_frame = 0;
+    let mut global_start_sec = 0.0;
     for part in parts {
+        let span_frames = part_span_frames(part, timeline_fps);
+        let global_end_frame = global_start_frame + span_frames;
         let span = part_span_seconds(part);
-        let global_end = round3(global_start + span);
+        let global_end = global_start_sec + span;
         let schema = SegmentSchema::from_kind(&part.kind);
         let part_covers = if schema.allows_covers() {
-            map_covers_for_segment(covers, global_start, global_end)
+            map_covers_for_segment(covers, global_start_frame, global_end_frame)
         } else {
             vec![]
         };
@@ -112,40 +125,53 @@ fn build_segments(parts: &[StoryPartRow], covers: &[StoryCoverRow]) -> Vec<Timel
             kind: part.kind.clone(),
             schema,
             clip_id: clip_id.clone(),
-            global_start_sec: round3(global_start),
-            global_end_sec: global_end,
+            global_start_frame,
+            global_end_frame,
+            duration_frames: span_frames,
+            global_start_sec: round3(global_start_sec),
+            global_end_sec: round3(global_end),
             duration_sec: round3(span),
             streamable: !clip_id.is_empty(),
             rows: schema.rows().iter().map(|s| (*s).to_string()).collect(),
             emulsion: schema.emulsion().iter().map(|s| (*s).to_string()).collect(),
             covers: part_covers,
         });
-        global_start = global_end;
+        global_start_frame = global_end_frame;
+        global_start_sec = global_end;
     }
     segments
 }
 
 fn map_covers_for_segment(
     covers: &[StoryCoverRow],
-    part_start: f64,
-    part_end: f64,
+    part_start_frame: i64,
+    part_end_frame: i64,
 ) -> Vec<TimelineCover> {
     let mut out = Vec::new();
     for cover in covers {
-        let c_start = cover.timeline_start_sec;
-        let c_end = cover.timeline_end_sec;
-        if c_end <= part_start + TIMELINE_EPS || c_start >= part_end - TIMELINE_EPS {
+        let c_start_frame = cover.timeline_start_frame.max(0);
+        let c_end_frame = cover.timeline_end_frame.max(c_start_frame);
+        if c_end_frame <= part_start_frame || c_start_frame >= part_end_frame {
             continue;
         }
         out.push(TimelineCover {
             cover_id: cover.cover_id.clone(),
             clip_id: cover.clip_id.clone(),
-            timeline_start_sec: c_start,
-            timeline_end_sec: c_end,
+            timeline_start_frame: c_start_frame,
+            timeline_end_frame: c_end_frame,
+            timeline_start_sec: cover.timeline_start_sec,
+            timeline_end_sec: cover.timeline_end_sec,
             streamable: !cover.virtual_shot_id.trim().is_empty(),
         });
     }
     out
+}
+
+fn story_program_source_fps(parts: &[StoryPartRow]) -> Option<f64> {
+    parts
+        .iter()
+        .map(|part| part.fps)
+        .find(|fps| is_valid_fps(*fps))
 }
 
 #[cfg(test)]
@@ -154,8 +180,9 @@ mod tests {
 
     #[test]
     fn source_via_story_is_io_only() {
-        let model = build_source_timeline_model("p", "c1", 5.0, 1.0, 4.0, 25.0);
+        let model = build_source_timeline_model("p", "c1", 5.0, 1.0, 4.0, 50.0).unwrap();
         assert_eq!(model.application, TimelineApplication::Source);
+        assert_eq!(model.timeline_fps, 50.0);
         assert!(model.markers.is_empty());
         assert_eq!(model.io_pins.len(), 2);
     }

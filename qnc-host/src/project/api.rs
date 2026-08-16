@@ -21,7 +21,8 @@ use super::store::{
 use super::templates::{
     create_project_from_template, create_user_template, delete_user_template,
     ensure_templates_seeded, get_project_settings, get_project_template, get_project_workspace,
-    list_project_templates, list_source_templates, save_project_settings,
+    list_project_templates, list_source_templates, prepare_project_workspace,
+    save_project_settings,
 };
 use super::ui_state::{
     effective_template_settings, get_ui_state, get_ui_state_for_api, save_ui_state,
@@ -227,6 +228,14 @@ async fn api_projects_create(
     app.project.with_db(|conn| {
         let entry = create_project(conn, &app.project.paths, body.name.as_deref())
             .map_err(|e| e.to_string())?;
+        let project_id = entry
+            .get("project_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if !project_id.is_empty() {
+            prepare_project_workspace(conn, &app.project.paths, project_id)
+                .map_err(|e| e.to_string())?;
+        }
         let active = get_active_project_id(conn).map_err(|e| e.to_string())?;
         Ok(Json(json!({
             "status": "ok",
@@ -513,7 +522,7 @@ async fn api_projects_open(
         let proj =
             open_project(conn, &app.project.paths, &body.project_id).map_err(|e| e.to_string())?;
         if proj.is_some() {
-            get_project_workspace(conn, &app.project.paths, &body.project_id)
+            prepare_project_workspace(conn, &app.project.paths, &body.project_id)
                 .map_err(|e| e.to_string())?;
         }
         match proj {

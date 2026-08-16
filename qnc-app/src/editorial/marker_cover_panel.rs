@@ -10,8 +10,8 @@ use crate::editorial::types::{MarkerSlot, StoryCover, StoryMarker};
 use crate::qnc_theme::{MUTED, TEXT};
 
 pub(crate) struct MarkerCoverInput<'a> {
-    pub virtual_sec: f64,
-    pub fps: f64,
+    pub virtual_frame: i64,
+    pub playhead_sec: f64,
     pub marker_slots: &'a [MarkerSlot],
     pub covers: &'a [StoryCover],
     pub markers: &'a [StoryMarker],
@@ -25,9 +25,16 @@ pub(crate) enum MarkerCoverAction {
     None,
     AddMarker,
     CreateCover,
+    OverwriteCover,
     SelectSlot(String),
     SelectCover(String),
-    SeekMarker(f64),
+    DeleteCover(String),
+    SeekMarkerFrame(i64),
+    MoveMarker {
+        marker_id: String,
+        direction: String,
+    },
+    DeleteMarker(String),
 }
 
 pub(crate) fn show(ui: &mut egui::Ui, input: MarkerCoverInput<'_>) -> MarkerCoverAction {
@@ -36,12 +43,12 @@ pub(crate) fn show(ui: &mut egui::Ui, input: MarkerCoverInput<'_>) -> MarkerCove
     ui.separator();
     ui.horizontal_wrapped(|ui| {
         ui.label(
-            RichText::new(format!("Playhead {}", (input.tc)(input.virtual_sec)))
+            RichText::new(format!("Playhead {}", (input.tc)(input.playhead_sec)))
                 .color(TEXT)
                 .small(),
         );
         ui.label(
-            RichText::new(format!("fps {:.3}", input.fps))
+            RichText::new(format!("frame {}", input.virtual_frame.max(0)))
                 .color(MUTED)
                 .small(),
         );
@@ -50,6 +57,9 @@ pub(crate) fn show(ui: &mut egui::Ui, input: MarkerCoverInput<'_>) -> MarkerCove
         }
         if action_btn(ui, "Cover slot").clicked() {
             action = MarkerCoverAction::CreateCover;
+        }
+        if action_btn(ui, "Overwrite").clicked() {
+            action = MarkerCoverAction::OverwriteCover;
         }
     });
 
@@ -89,7 +99,7 @@ fn marker_slots(ui: &mut egui::Ui, input: &MarkerCoverInput<'_>) -> MarkerCoverA
                 format!(
                     "{cover_mark} {}–{}",
                     (input.tc)(slot.start_sec),
-                    (input.tc)(slot.end_sec)
+                    (input.tc)(slot.end_sec.max(slot.start_sec))
                 )
             };
             if ui.selectable_label(active, label).clicked() {
@@ -127,12 +137,21 @@ fn covers(ui: &mut egui::Ui, input: &MarkerCoverInput<'_>) -> MarkerCoverAction 
                         "{}  {}–{}",
                         truncate(&title, 18),
                         (input.tc)(cover.timeline_start_sec),
-                        (input.tc)(cover.timeline_end_sec)
+                        (input.tc)(cover.timeline_end_sec.max(cover.timeline_start_sec))
                     );
-                    if ui.selectable_label(active, label).clicked() {
-                        action = MarkerCoverAction::SelectCover(id);
-                    }
-                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        if ui.selectable_label(active, label).clicked() {
+                            action = MarkerCoverAction::SelectCover(id.clone());
+                        }
+                        if ui
+                            .add(egui::Button::new(RichText::new("Del").small()))
+                            .on_hover_text("Obriši cover")
+                            .clicked()
+                        {
+                            action = MarkerCoverAction::DeleteCover(id.clone());
+                        }
+                        ui.add_space(4.0);
+                    });
                 }
             });
         });
@@ -153,15 +172,47 @@ fn markers(ui: &mut egui::Ui, input: &MarkerCoverInput<'_>) -> MarkerCoverAction
         .show(ui, |ui| {
             ui.horizontal(|ui| {
                 for marker in input.markers {
+                    let frame = marker.timeline_frame.max(0);
                     let label = if !marker.label.is_empty() {
                         format!("{} {}", (input.tc)(marker.timeline_sec), marker.label)
                     } else {
                         format!("{} M", (input.tc)(marker.timeline_sec))
                     };
-                    if ui.selectable_label(false, label).clicked() {
-                        action = MarkerCoverAction::SeekMarker(marker.timeline_sec);
-                    }
-                    ui.add_space(4.0);
+                    let marker_id = marker.marker_id.clone();
+                    let locked = frame == 0;
+                    ui.horizontal(|ui| {
+                        if ui.selectable_label(false, label).clicked() {
+                            action = MarkerCoverAction::SeekMarkerFrame(frame);
+                        }
+                        if ui
+                            .add_enabled(!locked, egui::Button::new(RichText::new("Up").small()))
+                            .on_hover_text("Pomakni marker ranije")
+                            .clicked()
+                        {
+                            action = MarkerCoverAction::MoveMarker {
+                                marker_id: marker_id.clone(),
+                                direction: "up".into(),
+                            };
+                        }
+                        if ui
+                            .add_enabled(!locked, egui::Button::new(RichText::new("Down").small()))
+                            .on_hover_text("Pomakni marker kasnije")
+                            .clicked()
+                        {
+                            action = MarkerCoverAction::MoveMarker {
+                                marker_id: marker_id.clone(),
+                                direction: "down".into(),
+                            };
+                        }
+                        if ui
+                            .add_enabled(!locked, egui::Button::new(RichText::new("Del").small()))
+                            .on_hover_text("Obriši marker")
+                            .clicked()
+                        {
+                            action = MarkerCoverAction::DeleteMarker(marker_id.clone());
+                        }
+                        ui.add_space(4.0);
+                    });
                 }
             });
         });

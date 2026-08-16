@@ -18,6 +18,7 @@ use super::db::{
     mark_ingest_job_error, mark_ingest_job_processing, open_ingest, poster_exists,
     queue_ingest_job, set_meta, set_thumb_status, thumbnail_path, thumbnail_url,
 };
+use super::proxy_source::{classify_tv_source, recipe_for_source};
 use super::scanner;
 use super::thumb::probe_media;
 
@@ -113,6 +114,10 @@ fn row_to_clip(
         "fps": row.get::<_, f64>("fps")?,
         "has_audio": row.get::<_, i64>("has_audio").unwrap_or(0) != 0,
         "audio_channels": row.get::<_, i64>("audio_channels").unwrap_or(0),
+        "field_order": row.get::<_, String>("field_order").unwrap_or_default(),
+        "interlaced": row.get::<_, i64>("interlaced").unwrap_or(0) != 0,
+        "source_class": row.get::<_, String>("source_class").unwrap_or_default(),
+        "proxy_recipe": row.get::<_, String>("proxy_recipe").unwrap_or_default(),
         "proxy_status": row.get::<_, String>("status")?,
         "import_status": import_status,
         "selected": row.get::<_, i64>("selected")? != 0,
@@ -211,8 +216,6 @@ fn row_to_clip(
                         .zip(original_dir.canonicalize().ok())
                         .is_some_and(|(a, b)| a.starts_with(b)))
         };
-        let proxy_in_project = !project_proxy_path.trim().is_empty()
-            && PathBuf::from(project_proxy_path.trim()).is_file();
         let status_original = match import_status.as_str() {
             "error" => "error",
             "original_ready" | "generating_proxy" => "ready",
@@ -224,7 +227,6 @@ fn row_to_clip(
             "error" => "error",
             "imported" | "done" => "ready",
             "queued" | "processing" | "original_ready" | "generating_proxy" => "pending",
-            _ if proxy_in_project => "ready",
             _ => "idle",
         };
         obj.insert("status_original".into(), json!(status_original));
@@ -476,6 +478,8 @@ fn fill_missing_media_probe(
     let mut filled = 0usize;
     let conn = open_ingest(paths, project_id)?;
     for (clip_id, probe, _media) in results {
+        let source_class = classify_tv_source(&probe);
+        let proxy_recipe = recipe_for_source(source_class);
         conn.execute(
             "UPDATE ingest_assets SET
                 duration_sec = ?3,
@@ -483,7 +487,11 @@ fn fill_missing_media_probe(
                 resolution = CASE WHEN TRIM(?5) = '' THEN resolution ELSE ?5 END,
                 codec = CASE WHEN TRIM(?6) = '' THEN codec ELSE ?6 END,
                 has_audio = ?7,
-                audio_channels = ?8
+                audio_channels = ?8,
+                field_order = ?9,
+                interlaced = ?10,
+                source_class = ?11,
+                proxy_recipe = ?12
              WHERE source_id = ?1 AND clip_id = ?2",
             params![
                 source_id,
@@ -494,6 +502,10 @@ fn fill_missing_media_probe(
                 probe.codec,
                 if probe.has_audio { 1 } else { 0 },
                 probe.audio_channels,
+                probe.field_order,
+                if probe.interlaced { 1 } else { 0 },
+                source_class.label(),
+                proxy_recipe.id(),
             ],
         )?;
         filled += 1;

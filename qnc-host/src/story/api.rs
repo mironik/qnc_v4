@@ -7,12 +7,15 @@ use axum::{
 use serde_json::Value;
 
 use crate::app_state::AppState;
+use crate::frame_time::frame_to_seconds;
 
 use super::db::{
-    commit_story, create_cover, create_marker, create_part, delete_cover, delete_marker,
-    delete_part, load_state, move_marker, reorder_part, select_cover, select_marker_slot,
-    select_part, select_shot, set_part_mark_in, set_part_mark_out, update_cover, update_marker,
-    update_part,
+    commit_story, create_cover, create_marker, create_marker_from_frame,
+    create_marker_from_part_frame, create_part, create_part_with_range, delete_cover,
+    delete_marker, delete_part, load_state, move_marker, reorder_part, select_cover,
+    select_marker_slot, select_part, select_shot, set_part_mark_in, set_part_mark_in_frame,
+    set_part_mark_out, set_part_mark_out_frame, update_cover, update_marker, update_marker_frame,
+    update_part, SegmentRangeInput,
 };
 use super::playback::{PlaybackState, PlaybackStore};
 use super::playback_render;
@@ -32,6 +35,17 @@ struct CreatePartBody {
     #[serde(default)]
     kind: String,
     virtual_shot_id: Option<String>,
+    /// Talking Head / Voice over: source IN/OUT creates a virtual segment row.
+    #[serde(default)]
+    clip_id: Option<String>,
+    #[serde(default)]
+    in_frame: Option<i64>,
+    #[serde(default)]
+    out_frame: Option<i64>,
+    #[serde(default)]
+    in_seconds: Option<f64>,
+    #[serde(default)]
+    out_seconds: Option<f64>,
 }
 
 #[derive(serde::Deserialize)]
@@ -77,6 +91,7 @@ struct PartMarkBody {
     project_id: String,
     #[serde(default)]
     part_id: String,
+    local_frame: Option<i64>,
     local_sec: Option<f64>,
 }
 
@@ -85,13 +100,16 @@ struct CreateMarkerBody {
     #[serde(default)]
     project_id: String,
     timeline_sec: Option<f64>,
+    timeline_frame: Option<i64>,
     #[serde(default)]
     part_id: String,
     #[serde(default)]
     after_part_id: String,
     label: Option<String>,
     local_sec: Option<f64>,
+    local_frame: Option<i64>,
     origin_local_sec: Option<f64>,
+    origin_local_frame: Option<i64>,
 }
 
 #[derive(serde::Deserialize)]
@@ -118,7 +136,8 @@ struct UpdateMarkerBody {
     project_id: String,
     #[serde(default)]
     marker_id: String,
-    timeline_sec: f64,
+    timeline_sec: Option<f64>,
+    timeline_frame: Option<i64>,
     label: Option<String>,
 }
 
@@ -175,9 +194,15 @@ struct SourceTimelineQuery {
     #[serde(default)]
     clip_id: String,
     #[serde(default)]
-    duration_sec: f64,
+    duration_frames: Option<i64>,
     #[serde(default)]
-    in_sec: f64,
+    in_frame: Option<i64>,
+    #[serde(default)]
+    out_frame: Option<i64>,
+    #[serde(default)]
+    duration_sec: Option<f64>,
+    #[serde(default)]
+    in_sec: Option<f64>,
     #[serde(default)]
     out_sec: Option<f64>,
     #[serde(default)]
@@ -191,13 +216,17 @@ struct PlaybackStartBody {
     /// Source mode: durable DB-first playback unit.
     #[serde(default)]
     virtual_shot_id: String,
-    /// All/source mode: play one clip via Rust frame+audio (no browser <video>).
+    /// All/source mode: play one source clip through the neutral frame/audio path.
     #[serde(default)]
     clip_id: String,
     #[serde(default)]
     in_sec: Option<f64>,
     #[serde(default)]
     out_sec: Option<f64>,
+    #[serde(default)]
+    in_frame: Option<i64>,
+    #[serde(default)]
+    out_frame: Option<i64>,
 }
 
 #[derive(serde::Deserialize)]
@@ -210,7 +239,10 @@ struct PlaybackSessionBody {
 struct PlaybackSeekBody {
     #[serde(default)]
     session_id: String,
-    virtual_sec: f64,
+    #[serde(default)]
+    virtual_frame: Option<i64>,
+    #[serde(default)]
+    virtual_sec: Option<f64>,
 }
 
 #[derive(serde::Deserialize)]
@@ -231,7 +263,11 @@ struct PlaybackAudioQuery {
     #[serde(default)]
     session_id: String,
     #[serde(default)]
+    from_frame: Option<i64>,
+    #[serde(default)]
     from_sec: Option<f64>,
+    #[serde(default)]
+    duration_frames: Option<i64>,
     #[serde(default)]
     duration_sec: Option<f64>,
 }
@@ -240,6 +276,8 @@ struct PlaybackAudioQuery {
 struct PlaybackFrameQuery {
     #[serde(default)]
     session_id: String,
+    #[serde(default)]
+    virtual_frame: Option<i64>,
     #[serde(default)]
     virtual_sec: Option<f64>,
 }
@@ -313,9 +351,14 @@ async fn api_playback_start(
             .start(&app.project.paths, &pid)
             .map_err(map_bad_request)?
     } else {
-        playback
-            .start_source(&app.project.paths, &pid, clip, body.in_sec, body.out_sec)
-            .map_err(map_bad_request)?
+        match (body.in_frame, body.out_frame) {
+            (Some(in_frame), Some(out_frame)) => playback
+                .start_source_frames(&app.project.paths, &pid, clip, in_frame, out_frame)
+                .map_err(map_bad_request)?,
+            _ => playback
+                .start_source(&app.project.paths, &pid, clip, body.in_sec, body.out_sec)
+                .map_err(map_bad_request)?,
+        }
     };
     Ok(Json(state))
 }
@@ -334,8 +377,16 @@ async fn api_playback_seek(
     State(app): State<AppState>,
     Json(body): Json<PlaybackSeekBody>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
+    let Some(frame) = body.virtual_frame else {
+        let msg = if body.virtual_sec.is_some() {
+            "playback seek je frame-only; pošalji virtual_frame umjesto virtual_sec"
+        } else {
+            "playback seek traži virtual_frame"
+        };
+        return Err((StatusCode::BAD_REQUEST, msg.into()));
+    };
     app.story_playback
-        .seek(&body.session_id, body.virtual_sec)
+        .seek_frame(&body.session_id, frame)
         .map_err(map_bad_request)?;
     Ok(Json(serde_json::json!({ "status": "ok" })))
 }
@@ -371,8 +422,30 @@ async fn api_playback_audio(
         return Err((StatusCode::BAD_REQUEST, "session_id required".into()));
     }
     let session = app.story_playback.session(sid).map_err(map_bad_request)?;
-    let from = q.from_sec.unwrap_or(session.clock.virtual_sec).max(0.0);
-    let duration = q.duration_sec.unwrap_or(30.0).max(0.25).min(120.0);
+    let fps = session
+        .source_clip
+        .as_ref()
+        .map(|src| src.fps)
+        .unwrap_or(session.playlist.timeline_fps)
+        .max(1.0);
+    if q.from_sec.is_some() || q.duration_sec.is_some() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "playback audio je frame-only; pošalji from_frame/duration_frames umjesto sekundi"
+                .into(),
+        ));
+    }
+    let from = q
+        .from_frame
+        .map(|frame| frame_to_seconds(frame.max(0), fps))
+        .unwrap_or_else(|| frame_to_seconds(session.clock.virtual_frame, fps))
+        .max(0.0);
+    let duration = q
+        .duration_frames
+        .map(|frames| frame_to_seconds(frames.max(1), fps))
+        .unwrap_or_else(|| frame_to_seconds((30.0 * fps).round() as i64, fps))
+        .max(0.25)
+        .min(120.0);
     let path = playback_render::render_mixed_audio(&app.project.paths, &session, from, duration)
         .await
         .map_err(map_bad_request)?;
@@ -397,10 +470,20 @@ async fn api_playback_frame(
         return Err((StatusCode::BAD_REQUEST, "session_id required".into()));
     }
     let session = app.story_playback.session(sid).map_err(map_bad_request)?;
-    let virtual_sec = q.virtual_sec.unwrap_or(session.clock.virtual_sec).max(0.0);
-    let path = playback_render::render_preview_frame(&app.project.paths, &session, virtual_sec)
-        .await
-        .map_err(map_bad_request)?;
+    if q.virtual_frame.is_none() && q.virtual_sec.is_some() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "playback frame render je frame-only; pošalji virtual_frame umjesto virtual_sec".into(),
+        ));
+    }
+    let virtual_frame = q
+        .virtual_frame
+        .unwrap_or(session.clock.virtual_frame)
+        .max(0);
+    let path =
+        playback_render::render_preview_frame_at_frame(&app.project.paths, &session, virtual_frame)
+            .await
+            .map_err(map_bad_request)?;
     crate::editor_assets::serve_media_path(path, None, None).await
 }
 
@@ -424,13 +507,37 @@ async fn api_source_timeline_model(
     if clip_id.is_empty() {
         return Err((StatusCode::BAD_REQUEST, "clip_id required".into()));
     }
-    let duration = q.duration_sec.max(0.0);
-    let out_sec = q.out_sec.unwrap_or(duration);
-    let fps = q
-        .timeline_fps
-        .filter(|v| *v > 0.0)
-        .unwrap_or_else(|| crate::project::db::project_timeline_fps(&app.project.paths, &pid));
-    let model = build_source_timeline_model(&pid, clip_id, duration, q.in_sec, out_sec, fps);
+    if q.duration_sec.is_some() || q.in_sec.is_some() || q.out_sec.is_some() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "source timeline model je frame-only; pošalji duration_frames/in_frame/out_frame"
+                .into(),
+        ));
+    }
+    if q.timeline_fps.is_some() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "source timeline model FPS dolazi iz source klipa; ne šalji timeline_fps".into(),
+        ));
+    }
+    let fps = crate::media_pool::resolve_clip_fps(&app.project.paths, &pid, clip_id)
+        .map_err(map_bad_request)?;
+    let duration_frames = q
+        .duration_frames
+        .ok_or_else(|| {
+            (
+                StatusCode::BAD_REQUEST,
+                "duration_frames required".to_string(),
+            )
+        })?
+        .max(0);
+    let in_frame = q.in_frame.unwrap_or(0).max(0).min(duration_frames);
+    let out_frame = q.out_frame.unwrap_or(duration_frames).max(in_frame);
+    let duration = frame_to_seconds(duration_frames, fps);
+    let in_sec = frame_to_seconds(in_frame, fps);
+    let out_sec = frame_to_seconds(out_frame, fps);
+    let model = build_source_timeline_model(&pid, clip_id, duration, in_sec, out_sec, fps)
+        .map_err(map_bad_request)?;
     serde_json::to_value(model)
         .map(Json)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
@@ -450,12 +557,31 @@ async fn api_part_create(
     Json(body): Json<CreatePartBody>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let pid = resolve_project_id(&app, &body.project_id)?;
-    let state = create_part(
-        &app.project.paths,
-        &pid,
-        &body.kind,
-        body.virtual_shot_id.as_deref(),
-    )
+    let state = if body.in_frame.is_some() || body.out_frame.is_some() {
+        create_part_with_range(
+            &app.project.paths,
+            &pid,
+            &body.kind,
+            body.virtual_shot_id.as_deref(),
+            body.clip_id.as_deref(),
+            SegmentRangeInput {
+                in_frame: body.in_frame,
+                out_frame: body.out_frame,
+                in_seconds: body.in_seconds,
+                out_seconds: body.out_seconds,
+            },
+        )
+    } else {
+        create_part(
+            &app.project.paths,
+            &pid,
+            &body.kind,
+            body.virtual_shot_id.as_deref(),
+            body.clip_id.as_deref(),
+            body.in_seconds,
+            body.out_seconds,
+        )
+    }
     .map_err(map_bad_request)?;
     Ok(Json(state))
 }
@@ -506,9 +632,17 @@ async fn api_part_mark_in(
     Json(body): Json<PartMarkBody>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let pid = resolve_project_id(&app, &body.project_id)?;
-    let local_sec = body.local_sec.unwrap_or(0.0);
-    let state = set_part_mark_in(&app.project.paths, &pid, &body.part_id, local_sec)
-        .map_err(map_bad_request)?;
+    let state = (if let Some(local_frame) = body.local_frame {
+        set_part_mark_in_frame(&app.project.paths, &pid, &body.part_id, local_frame)
+    } else {
+        set_part_mark_in(
+            &app.project.paths,
+            &pid,
+            &body.part_id,
+            body.local_sec.unwrap_or(0.0),
+        )
+    })
+    .map_err(map_bad_request)?;
     Ok(Json(state))
 }
 
@@ -517,9 +651,17 @@ async fn api_part_mark_out(
     Json(body): Json<PartMarkBody>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let pid = resolve_project_id(&app, &body.project_id)?;
-    let local_sec = body.local_sec.unwrap_or(0.0);
-    let state = set_part_mark_out(&app.project.paths, &pid, &body.part_id, local_sec)
-        .map_err(map_bad_request)?;
+    let state = (if let Some(local_frame) = body.local_frame {
+        set_part_mark_out_frame(&app.project.paths, &pid, &body.part_id, local_frame)
+    } else {
+        set_part_mark_out(
+            &app.project.paths,
+            &pid,
+            &body.part_id,
+            body.local_sec.unwrap_or(0.0),
+        )
+    })
+    .map_err(map_bad_request)?;
     Ok(Json(state))
 }
 
@@ -546,15 +688,28 @@ async fn api_marker_create(
     } else {
         None
     };
-    let local_sec = body.local_sec.or(body.origin_local_sec);
-    let state = create_marker(
-        &app.project.paths,
-        &pid,
-        body.timeline_sec,
-        part_id,
-        label,
-        local_sec,
-    )
+    let local_frame = body.local_frame.or(body.origin_local_frame);
+    let state = (if let Some(timeline_frame) = body.timeline_frame {
+        create_marker_from_frame(
+            &app.project.paths,
+            &pid,
+            timeline_frame,
+            part_id,
+            label,
+            local_frame,
+        )
+    } else if let (Some(part_id), Some(local_frame)) = (part_id, local_frame) {
+        create_marker_from_part_frame(&app.project.paths, &pid, part_id, label, local_frame)
+    } else {
+        create_marker(
+            &app.project.paths,
+            &pid,
+            body.timeline_sec,
+            part_id,
+            label,
+            body.local_sec.or(body.origin_local_sec),
+        )
+    })
     .map_err(map_bad_request)?;
     Ok(Json(state))
 }
@@ -584,13 +739,23 @@ async fn api_marker_update(
     Json(body): Json<UpdateMarkerBody>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let pid = resolve_project_id(&app, &body.project_id)?;
-    let state = update_marker(
-        &app.project.paths,
-        &pid,
-        &body.marker_id,
-        body.timeline_sec,
-        body.label.as_deref(),
-    )
+    let state = if let Some(timeline_frame) = body.timeline_frame {
+        update_marker_frame(
+            &app.project.paths,
+            &pid,
+            &body.marker_id,
+            timeline_frame,
+            body.label.as_deref(),
+        )
+    } else {
+        update_marker(
+            &app.project.paths,
+            &pid,
+            &body.marker_id,
+            body.timeline_sec.unwrap_or(0.0),
+            body.label.as_deref(),
+        )
+    }
     .map_err(map_bad_request)?;
     Ok(Json(state))
 }
@@ -706,6 +871,10 @@ async fn api_play_media(
         "clip_id": media.clip_id,
         "kind": kind,
         "path": media.path.to_string_lossy(),
+        "field_order": media.field_order,
+        "interlaced": media.interlaced,
+        "source_class": media.source_class,
+        "proxy_recipe": media.proxy_recipe,
     })))
 }
 

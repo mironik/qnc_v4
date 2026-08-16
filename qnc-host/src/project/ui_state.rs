@@ -38,6 +38,9 @@ pub fn save_ui_state(conn: &Connection, patch: &Value) -> rusqlite::Result<Value
     let mut current = get_ui_state(conn)?;
     merge_ui_patch(&mut current, patch);
     normalize_ui_state_in_place(&mut current);
+    let effective = effective_template_settings(conn, &current)?;
+    super::templates::validate_project_export_settings(&effective)
+        .map_err(rusqlite::Error::InvalidParameterName)?;
     super::db::set_setting(conn, UI_STATE_KEY, &super::db::json_string(&current))?;
     attach_effective_settings(conn, current)
 }

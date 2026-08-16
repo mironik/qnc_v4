@@ -5,7 +5,6 @@
 
 use eframe::egui;
 
-use crate::frame_time::{frame_to_seconds, normalize_fps, seconds_to_frame};
 use crate::qnc_timeline::{
     ExpandedAudio, LayerFlags, QncTimeline, TimelineCoverSpan, TimelineFocusPaint,
     TimelineMarkerPin, TimelineSlotSpan,
@@ -13,50 +12,53 @@ use crate::qnc_timeline::{
 
 #[derive(Debug, Clone, Copy)]
 pub struct TimelineProgressModel {
-    fps: f64,
     duration_frames: i64,
     playhead_frame: i64,
-    in_frame: i64,
-    out_frame: i64,
+    shot_in_frame: i64,
+    shot_out_frame: i64,
+    draft_in_frame: i64,
+    draft_out_frame: i64,
 }
 
 impl TimelineProgressModel {
-    pub fn from_seconds(
-        fps: f64,
-        duration_sec: f64,
-        playhead_sec: f64,
-        in_sec: f64,
-        out_sec: f64,
-    ) -> Self {
-        let fps = normalize_fps(fps);
-        let duration_frames = seconds_to_frame(duration_sec.max(0.0), fps).max(1);
-        let clamp = |frame: i64| frame.clamp(0, duration_frames);
-        Self {
-            fps,
-            duration_frames,
-            playhead_frame: clamp(seconds_to_frame(playhead_sec, fps)),
-            in_frame: clamp(seconds_to_frame(in_sec, fps)),
-            out_frame: clamp(seconds_to_frame(out_sec, fps)),
-        }
-    }
-
     /// Carrier/playhead authority — use in [`crate::carrier_sync`], not form seconds.
+    #[allow(dead_code)]
     pub fn from_carrier(
-        fps: f64,
+        _fps: f64,
         duration_frames: i64,
         playhead_frame: i64,
         in_frame: i64,
         out_frame: i64,
     ) -> Self {
-        let fps = normalize_fps(fps);
+        Self::from_ranges(
+            _fps,
+            duration_frames,
+            playhead_frame,
+            in_frame,
+            out_frame,
+            in_frame,
+            out_frame,
+        )
+    }
+
+    pub fn from_ranges(
+        _fps: f64,
+        duration_frames: i64,
+        playhead_frame: i64,
+        shot_in_frame: i64,
+        shot_out_frame: i64,
+        draft_in_frame: i64,
+        draft_out_frame: i64,
+    ) -> Self {
         let duration_frames = duration_frames.max(1);
         let clamp = |frame: i64| frame.clamp(0, duration_frames);
         Self {
-            fps,
             duration_frames,
             playhead_frame: clamp(playhead_frame),
-            in_frame: clamp(in_frame),
-            out_frame: clamp(out_frame.max(in_frame)),
+            shot_in_frame: clamp(shot_in_frame),
+            shot_out_frame: clamp(shot_out_frame.max(shot_in_frame)),
+            draft_in_frame: clamp(draft_in_frame),
+            draft_out_frame: clamp(draft_out_frame.max(draft_in_frame)),
         }
     }
 
@@ -68,28 +70,20 @@ impl TimelineProgressModel {
         self.playhead_frame
     }
 
-    pub fn duration_sec(self) -> f64 {
-        frame_to_seconds(self.duration_frames, self.fps).max(0.04)
+    pub fn shot_in_frame(self) -> i64 {
+        self.shot_in_frame
     }
 
-    pub fn playhead_sec(self) -> f64 {
-        frame_to_seconds(self.playhead_frame, self.fps)
+    pub fn shot_out_frame(self) -> i64 {
+        self.shot_out_frame
     }
 
-    pub fn in_sec(self) -> f64 {
-        frame_to_seconds(self.in_frame, self.fps)
+    pub fn draft_in_frame(self) -> i64 {
+        self.draft_in_frame
     }
 
-    pub fn out_sec(self) -> f64 {
-        frame_to_seconds(self.out_frame, self.fps)
-    }
-
-    pub fn frame_at_seconds(self, seconds: f64) -> i64 {
-        seconds_to_frame(seconds, self.fps).clamp(0, self.duration_frames)
-    }
-
-    pub fn seconds_at_frame(self, frame: i64) -> f64 {
-        frame_to_seconds(frame.clamp(0, self.duration_frames), self.fps)
+    pub fn draft_out_frame(self) -> i64 {
+        self.draft_out_frame
     }
 }
 
@@ -119,10 +113,12 @@ pub struct TimelineProgressInput<'a> {
 pub fn show(ui: &mut egui::Ui, input: TimelineProgressInput<'_>) -> TimelineProgressIntent {
     let interact = QncTimeline {
         layers: input.layers,
-        duration_sec: input.model.duration_sec(),
-        playhead_sec: input.model.playhead_sec(),
-        source_in: input.model.in_sec(),
-        source_out: input.model.out_sec(),
+        duration_frames: input.model.duration_frames(),
+        playhead_frame: input.model.playhead_frame(),
+        shot_in_frame: input.model.shot_in_frame(),
+        shot_out_frame: input.model.shot_out_frame(),
+        draft_in_frame: input.model.draft_in_frame(),
+        draft_out_frame: input.model.draft_out_frame(),
         video_background: input.video_background,
         focus: input.focus,
         expanded_audio: input.expanded_audio,
@@ -139,8 +135,8 @@ pub fn show(ui: &mut egui::Ui, input: TimelineProgressInput<'_>) -> TimelineProg
 
     if let Some(lane) = interact.expand_click {
         TimelineProgressIntent::ToggleAudioExpand(lane)
-    } else if let Some(sec) = interact.seek_sec {
-        TimelineProgressIntent::CueFrame(input.model.frame_at_seconds(sec))
+    } else if let Some(frame) = interact.seek_frame {
+        TimelineProgressIntent::CueFrame(frame)
     } else {
         TimelineProgressIntent::None
     }
@@ -152,20 +148,24 @@ mod tests {
 
     #[test]
     fn progress_model_is_frame_based_and_clamped() {
-        let model = TimelineProgressModel::from_seconds(25.0, 4.0, 2.04, -1.0, 9.0);
+        let model = TimelineProgressModel::from_carrier(25.0, 100, 51, -1, 999);
 
         assert_eq!(model.duration_frames(), 100);
         assert_eq!(model.playhead_frame(), 51);
-        assert_eq!(model.in_sec(), 0.0);
-        assert_eq!(model.out_sec(), 4.0);
+        assert_eq!(model.shot_in_frame(), 0);
+        assert_eq!(model.shot_out_frame(), 100);
+        assert_eq!(model.draft_in_frame(), 0);
+        assert_eq!(model.draft_out_frame(), 100);
     }
 
     #[test]
-    fn progress_seek_returns_frame_number() {
-        let model = TimelineProgressModel::from_seconds(50.0, 10.0, 0.0, 0.0, 10.0);
+    fn from_carrier_keeps_mark_range_in_frame_space() {
+        let model = TimelineProgressModel::from_carrier(25.0, 100, 0, 75, 50);
 
-        assert_eq!(model.frame_at_seconds(1.5), 75);
-        assert_eq!(model.seconds_at_frame(75), 1.5);
+        assert_eq!(model.shot_in_frame(), 75);
+        assert_eq!(model.shot_out_frame(), 75);
+        assert_eq!(model.draft_in_frame(), 75);
+        assert_eq!(model.draft_out_frame(), 75);
     }
 
     #[test]
@@ -174,8 +174,10 @@ mod tests {
 
         assert_eq!(model.playhead_frame(), 100);
         assert_eq!(model.duration_frames(), 250);
-        assert_eq!(model.in_sec(), 0.4);
-        assert_eq!(model.out_sec(), 8.0);
+        assert_eq!(model.shot_in_frame(), 10);
+        assert_eq!(model.shot_out_frame(), 200);
+        assert_eq!(model.draft_in_frame(), 10);
+        assert_eq!(model.draft_out_frame(), 200);
     }
 
     #[test]
@@ -183,7 +185,19 @@ mod tests {
         let model = TimelineProgressModel::from_carrier(25.0, 100, 999, -5, 50);
 
         assert_eq!(model.playhead_frame(), 100);
-        assert_eq!(model.in_sec(), 0.0);
-        assert_eq!(model.out_sec(), 2.0);
+        assert_eq!(model.shot_in_frame(), 0);
+        assert_eq!(model.shot_out_frame(), 50);
+        assert_eq!(model.draft_in_frame(), 0);
+        assert_eq!(model.draft_out_frame(), 50);
+    }
+
+    #[test]
+    fn from_ranges_keeps_selected_shot_and_draft_marks_separate() {
+        let model = TimelineProgressModel::from_ranges(25.0, 200, 80, 10, 150, 40, 90);
+
+        assert_eq!(model.shot_in_frame(), 10);
+        assert_eq!(model.shot_out_frame(), 150);
+        assert_eq!(model.draft_in_frame(), 40);
+        assert_eq!(model.draft_out_frame(), 90);
     }
 }

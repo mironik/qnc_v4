@@ -27,6 +27,10 @@ pub(crate) enum MediaPoolAction {
     SelectClipId(String),
     SelectPart(String),
     DeletePart(String),
+    ReorderPart {
+        part_id: String,
+        direction: String,
+    },
     TogglePlay,
     MarkIn,
     MarkOut,
@@ -364,7 +368,7 @@ fn segment_cards(ui: &mut egui::Ui, input: &MediaPoolStripInput<'_>) -> MediaPoo
             if input.parts.is_empty() {
                 ui.colored_label(
                     t.muted,
-                    "Nema partova — Spremi virtualni kadar, zatim OFF/TON.",
+                    "Nema segmenata — označi source IN/OUT pa dodaj TON/OFF.",
                 );
                 return;
             }
@@ -387,17 +391,41 @@ fn segment_cards(ui: &mut egui::Ui, input: &MediaPoolStripInput<'_>) -> MediaPoo
                         if !part.duration_label.is_empty() {
                             ui.label(RichText::new(&part.duration_label).color(t.muted).small());
                         }
+                        if selected {
+                            ui.horizontal(|ui| {
+                                if ui
+                                    .add(egui::Button::new(RichText::new("Up").small()))
+                                    .on_hover_text("Pomakni segment ranije")
+                                    .clicked()
+                                {
+                                    action = MediaPoolAction::ReorderPart {
+                                        part_id: part.part_id.clone(),
+                                        direction: "up".into(),
+                                    };
+                                }
+                                if ui
+                                    .add(egui::Button::new(RichText::new("Down").small()))
+                                    .on_hover_text("Pomakni segment kasnije")
+                                    .clicked()
+                                {
+                                    action = MediaPoolAction::ReorderPart {
+                                        part_id: part.part_id.clone(),
+                                        direction: "down".into(),
+                                    };
+                                }
+                                if ui
+                                    .add(egui::Button::new(RichText::new("Del").small()))
+                                    .on_hover_text("Obriši segment")
+                                    .clicked()
+                                {
+                                    action = MediaPoolAction::DeletePart(part.part_id.clone());
+                                }
+                            });
+                        }
                     })
                     .response;
-                if resp.clicked() {
+                if resp.clicked() && matches!(action, MediaPoolAction::None) {
                     action = MediaPoolAction::SelectPart(part.part_id.clone());
-                }
-                if selected
-                    && ui
-                        .add(egui::Button::new(RichText::new("Del").small()))
-                        .clicked()
-                {
-                    action = MediaPoolAction::DeletePart(part.part_id.clone());
                 }
             }
         });

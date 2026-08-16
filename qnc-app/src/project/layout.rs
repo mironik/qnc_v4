@@ -65,6 +65,7 @@ const FIXED_SLOTS: &[PtsFixedSlot] = &[
 
 /// Geometry after the PTS board is allocated.
 #[derive(Debug, Clone, Copy)]
+#[allow(dead_code)]
 pub struct PtsPanelMetrics {
     pub panel: egui::Rect,
     pub content_w: f32,

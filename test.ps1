@@ -35,6 +35,12 @@ cargo test legacy_ingest --release -- --nocapture
 if ($LASTEXITCODE -ne 0) { Pop-Location; exit $LASTEXITCODE }
 Pop-Location
 
+Write-Host "Checking qnc-app unit tests..."
+Push-Location $Root
+cargo test -p qnc-app
+if ($LASTEXITCODE -ne 0) { Pop-Location; exit $LASTEXITCODE }
+Pop-Location
+
 $proc = Start-Process -FilePath $Bin -PassThru -NoNewWindow -WorkingDirectory $Root
 Start-Sleep -Seconds 2
 
@@ -267,6 +273,20 @@ try {
     $storyState = Test-GetJson "$Base/api/story/state?project_id=$([uri]::EscapeDataString($newId))" '"project_id"' "GET /api/story/state"
     if (-not $storyState) { throw "FAIL: story API state missing" }
     Write-Host "OK: story API mounted"
+
+    $storyPost = Test-PostJson "$Base/api/story/part/create" @{
+        project_id = $newId
+        kind = "tonovi"
+    } '"parts"' "POST /api/story/part/create (segment smoke)"
+    if ($storyPost.project_id -ne $newId) { throw "FAIL: story part/create project_id mismatch" }
+    if (-not $storyPost.selected_part_id) { throw "FAIL: story part/create did not select new segment" }
+    if (-not ($storyPost.parts | Where-Object { $_.part_id -eq $storyPost.selected_part_id })) {
+        throw "FAIL: story part/create selected part missing from parts"
+    }
+    $storyTimeline = Test-GetJson "$Base/api/story/timeline-model?project_id=$([uri]::EscapeDataString($newId))" '"application"' "GET /api/story/timeline-model (after segment create)"
+    if ($storyTimeline.application -ne "wrap") { throw "FAIL: story timeline application expected wrap" }
+    if (@($storyTimeline.segments).Count -lt 1) { throw "FAIL: story timeline has no segments after create" }
+    Write-Host "OK: story POST segment smoke"
 
     try {
         Invoke-WebRequest -Uri "$Base/api/media-pool/clips?project_id=$([uri]::EscapeDataString($newId))" -UseBasicParsing -ErrorAction Stop | Out-Null

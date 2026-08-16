@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use rusqlite::{params, Connection};
 use serde_json::{json, Value};
 
-use crate::project::db::{now_str, open_project, open_project_strict, ProjectPaths};
+use crate::project::db::{now_str, open_project_strict, ProjectPaths};
 
 #[derive(Clone, Debug)]
 pub struct FilmstripFrame {
@@ -41,7 +41,7 @@ pub fn filmstrip_root(paths: &ProjectPaths, project_id: &str) -> PathBuf {
 
 fn open_db(paths: &ProjectPaths, project_id: &str) -> Result<Connection, String> {
     // Validate / open project DB first — never mkdir for unknown project_id.
-    let conn = open_project(paths, project_id).map_err(|e| e.to_string())?;
+    let conn = open_project_strict(paths, project_id).map_err(|e| e.to_string())?;
     let root = filmstrip_root(paths, project_id);
     fs::create_dir_all(&root).map_err(|e| e.to_string())?;
     conn.execute_batch(
@@ -457,7 +457,9 @@ pub fn frame_path_for_index(
 mod tests {
     use super::*;
     use crate::ingest::thumb::timeline_seek_seconds;
-    use crate::project::db::open_project;
+    use crate::project::db::{
+        ensure_project_dirs_at, open_global, open_project, project_dir_in_root,
+    };
     use std::io::Write;
 
     fn test_paths(base: &Path) -> ProjectPaths {
@@ -466,6 +468,24 @@ mod tests {
             projects_root: base.join("projects"),
             seed_path: base.join("seed.json"),
         }
+    }
+
+    fn register_project(paths: &ProjectPaths, project_id: &str) {
+        let global = open_global(paths).unwrap();
+        let project_dir = project_dir_in_root(&paths.projects_root, project_id);
+        global
+            .execute(
+                "INSERT INTO projects (project_id, name, project_dir)
+                 VALUES (?1, ?2, ?3)",
+                params![
+                    project_id,
+                    project_id,
+                    project_dir.to_string_lossy().to_string()
+                ],
+            )
+            .unwrap();
+        ensure_project_dirs_at(&project_dir).unwrap();
+        let _ = open_project(paths, project_id).unwrap();
     }
 
     #[test]
@@ -506,8 +526,7 @@ mod tests {
         let paths = test_paths(&base);
         let project_id = "test_proj";
         let clip_id = "clip_a";
-        // Ephemeral project DB (test open_project) so clip dir can be created.
-        let _ = open_project(&paths, project_id).unwrap();
+        register_project(&paths, project_id);
         let dir = filmstrip_clip_dir(&paths, project_id, clip_id);
         let frame_path = dir.join("000_1_50.jpg");
         {
@@ -538,7 +557,7 @@ mod tests {
         fs::create_dir_all(&base).unwrap();
         let paths = test_paths(&base);
         let project_id = "test_proj";
-        let _ = open_project(&paths, project_id).unwrap();
+        register_project(&paths, project_id);
         let clip_id = "clip_b";
         let dir = filmstrip_clip_dir(&paths, project_id, clip_id);
         for (index, seek) in timeline_seek_seconds(30.0, 3).into_iter().enumerate() {
