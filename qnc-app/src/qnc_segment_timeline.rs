@@ -10,6 +10,14 @@
 //! Durable meaning comes from DB/API snapshots. Runtime position comes from the
 //! broadcast/player carrier. This module never derives story state and never
 //! talks to playback directly.
+//!
+//! Segment timeline cheat sheet:
+//! - Broadcast player owns play/pause/seek execution and the runtime clock.
+//! - DB/API playlist owns segment, marker slot, marker and cover ranges.
+//! - Segment stack rows are local UI projections of the same program axis.
+//! - Program overview is the final/global UI projection of that same axis.
+//! - Intents from this component are only program-frame or layer selections.
+//! - This component never decides playback, next segment, source media, or timebase.
 
 use eframe::egui::{self, Color32, Vec2};
 
@@ -226,6 +234,8 @@ pub enum SegmentTimelineIntent {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SegmentTimelineProgramIntent {
     None,
+    /// UI request for a program-frame position. The playback owner decides what
+    /// to do with it; this component does not play or seek media.
     CueProgramFrame(i64),
     ToggleAudioExpand(SegmentAudioExpansion),
     SelectMarkerSlot(String),
@@ -251,16 +261,19 @@ pub fn segment_layers() -> SegmentLayerFlags {
     }
 }
 
+/// Segment-stack UI: one row per segment, but every row is a local projection
+/// of the same continuous program timeline.
 pub fn show_program(
     ui: &mut egui::Ui,
     input: SegmentTimelineProgramInput<'_>,
 ) -> SegmentTimelineProgramIntent {
     let layers = segment_layers();
     let mut out = SegmentTimelineProgramIntent::None;
-    let count = input.segments.len();
-    if count == 0 {
+    if input.segments.is_empty() {
         return out;
     }
+    let rows = program_segment_rows(input.segments);
+    let count = rows.len();
 
     let width = ui.available_width();
     let total_h = program_content_height(count, layers, input.expanded_audio);
@@ -272,27 +285,68 @@ pub fn show_program(
             ui.set_max_height(total_h);
             ui.spacing_mut().item_spacing = Vec2::new(0.0, css::ROW_GAP);
 
-            for (index, segment) in input.segments.iter().copied().enumerate() {
-                let row = SegmentTimelineProgramRow {
-                    index,
-                    count,
-                    start_frame: segment.start_frame,
-                    end_frame: segment.end_frame,
-                };
+            for row in rows {
                 let row_intent = paint_program_row(
                     ui,
                     layers,
                     row,
-                    segment,
+                    input.segments,
                     input.playhead_program_frame,
                     input.covers,
                     input.marker_slots,
                     input.markers,
                     input.expanded_audio,
-                    index == 0 && input.show_lane_labels,
+                    row.index == 0 && input.show_lane_labels,
                 );
                 merge_program_intent(&mut out, row_intent);
-                if index + 1 < count {
+                if row.index + 1 < count {
+                    ui.add_space(css::ROW_GAP);
+                }
+            }
+        });
+
+    out
+}
+
+/// Final/program UI: one compact overview row for the whole playlist.
+/// This is still only a passive projection of the broadcast-player position.
+pub fn show_program_overview(
+    ui: &mut egui::Ui,
+    input: SegmentTimelineProgramInput<'_>,
+) -> SegmentTimelineProgramIntent {
+    let layers = segment_layers();
+    let mut out = SegmentTimelineProgramIntent::None;
+    if input.segments.is_empty() {
+        return out;
+    }
+    let rows = program_visual_rows(program_duration_frames(&input));
+    let count = rows.len();
+
+    let width = ui.available_width();
+    let total_h = program_content_height(count, layers, input.expanded_audio);
+    egui::Frame::NONE
+        .fill(css::BG)
+        .stroke(egui::Stroke::new(1.0, css::LINE))
+        .show(ui, |ui| {
+            ui.set_min_size(Vec2::new(width, total_h));
+            ui.set_max_height(total_h);
+            ui.spacing_mut().item_spacing = Vec2::new(0.0, css::ROW_GAP);
+
+            for row in rows {
+                let row_intent = paint_program_row(
+                    ui,
+                    layers,
+                    row,
+                    input.segments,
+                    input.playhead_program_frame,
+                    input.covers,
+                    input.marker_slots,
+                    input.markers,
+                    input.expanded_audio,
+                    row.index == 0 && input.show_lane_labels,
+                );
+                merge_program_intent(&mut out, row_intent);
+                if row.index + 1 < count {
                     ui.add_space(css::ROW_GAP);
                 }
             }
@@ -305,7 +359,7 @@ fn paint_program_row(
     ui: &mut egui::Ui,
     layers: SegmentLayerFlags,
     row: SegmentTimelineProgramRow,
-    segment: SegmentTimelineProgramSegment<'_>,
+    segments: &[SegmentTimelineProgramSegment<'_>],
     playhead_program_frame: i64,
     covers: &[SegmentTimelineProgramCover<'_>],
     marker_slots: &[SegmentTimelineProgramMarkerSlot<'_>],
@@ -318,14 +372,7 @@ fn paint_program_row(
     let local_covers = local_covers_for_row(row, covers);
     let local_slots = local_marker_slots_for_row(row, marker_slots);
     let local_markers = local_markers_for_row(row, markers);
-    let local_segment = SegmentTimelineSegment {
-        id: segment.id,
-        kind: segment.kind,
-        start_frame: 0,
-        end_frame: duration_frames,
-        has_base_video: segment.has_base_video,
-        selected: segment.selected,
-    };
+    let local_segments = local_segments_for_row(row, segments);
     let mut out = SegmentTimelineProgramIntent::None;
 
     if layers.audio_a1 {
@@ -351,7 +398,7 @@ fn paint_program_row(
             duration_frames,
             local_playhead.unwrap_or(0),
             local_playhead.is_some(),
-            local_segment,
+            &local_segments,
             &local_covers,
             &local_slots,
             &local_markers,
@@ -381,6 +428,55 @@ fn paint_program_row(
     }
 
     out
+}
+
+fn program_duration_frames(input: &SegmentTimelineProgramInput<'_>) -> i64 {
+    input
+        .segments
+        .iter()
+        .map(|segment| segment.end_frame.max(segment.start_frame))
+        .chain(
+            input
+                .covers
+                .iter()
+                .map(|cover| cover.end_frame.max(cover.start_frame)),
+        )
+        .chain(
+            input
+                .marker_slots
+                .iter()
+                .map(|slot| slot.end_frame.max(slot.start_frame)),
+        )
+        .chain(input.markers.iter().map(|marker| marker.frame.max(0)))
+        .chain(std::iter::once(input.playhead_program_frame.max(0)))
+        .max()
+        .unwrap_or(1)
+        .max(1)
+}
+
+fn program_visual_rows(duration_frames: i64) -> Vec<SegmentTimelineProgramRow> {
+    vec![SegmentTimelineProgramRow {
+        index: 0,
+        count: 1,
+        start_frame: 0,
+        end_frame: duration_frames.max(1),
+    }]
+}
+
+fn program_segment_rows(
+    segments: &[SegmentTimelineProgramSegment<'_>],
+) -> Vec<SegmentTimelineProgramRow> {
+    let count = segments.len();
+    segments
+        .iter()
+        .enumerate()
+        .map(|(index, segment)| SegmentTimelineProgramRow {
+            index,
+            count,
+            start_frame: segment.start_frame.max(0),
+            end_frame: segment.end_frame.max(segment.start_frame + 1),
+        })
+        .collect()
 }
 
 fn merge_program_intent(
@@ -460,6 +556,29 @@ fn local_markers_for_row<'a>(
             Some(SegmentTimelineMarker {
                 id: marker.id,
                 frame,
+            })
+        })
+        .collect()
+}
+
+fn local_segments_for_row<'a>(
+    row: SegmentTimelineProgramRow,
+    segments: &'a [SegmentTimelineProgramSegment<'a>],
+) -> Vec<SegmentTimelineSegment<'a>> {
+    segments
+        .iter()
+        .filter_map(|segment| {
+            let (start_frame, end_frame) = row.local_range(
+                segment.start_frame.max(0),
+                segment.end_frame.max(segment.start_frame),
+            )?;
+            Some(SegmentTimelineSegment {
+                id: segment.id,
+                kind: segment.kind,
+                start_frame,
+                end_frame,
+                has_base_video: segment.has_base_video,
+                selected: segment.selected,
             })
         })
         .collect()
@@ -574,7 +693,7 @@ fn paint_video_stack(
     duration_frames: i64,
     playhead_frame: i64,
     show_playhead: bool,
-    segment: SegmentTimelineSegment<'_>,
+    segments: &[SegmentTimelineSegment<'_>],
     covers: &[SegmentTimelineCover<'_>],
     marker_slots: &[SegmentTimelineMarkerSlot<'_>],
     markers: &[SegmentTimelineMarker<'_>],
@@ -602,7 +721,9 @@ fn paint_video_stack(
     );
 
     paint_marker_slots(painter, inner, duration_frames, marker_slots);
-    paint_segment_range(painter, inner, duration_frames, segment);
+    for segment in segments.iter().copied() {
+        paint_segment_range(painter, inner, duration_frames, segment);
+    }
     paint_covers(painter, inner, duration_frames, covers);
     paint_markers(painter, inner, duration_frames, markers);
     if show_playhead {
@@ -992,6 +1113,112 @@ mod tests {
         assert_eq!(row.program_frame_from_local(0), 50);
         assert_eq!(row.program_frame_from_local(12), 62);
         assert_eq!(row.program_frame_from_local(200), 100);
+    }
+
+    #[test]
+    fn program_visual_rows_are_not_playlist_item_rows() {
+        let segments = [
+            SegmentTimelineProgramSegment {
+                id: "part_a",
+                kind: "tonovi",
+                start_frame: 0,
+                end_frame: 50,
+                has_base_video: true,
+                selected: false,
+            },
+            SegmentTimelineProgramSegment {
+                id: "part_b",
+                kind: "offovi",
+                start_frame: 50,
+                end_frame: 90,
+                has_base_video: false,
+                selected: true,
+            },
+        ];
+        let input = SegmentTimelineProgramInput {
+            playhead_program_frame: 55,
+            segments: &segments,
+            covers: &[],
+            marker_slots: &[],
+            markers: &[],
+            expanded_audio: SegmentAudioExpansion::None,
+            show_lane_labels: true,
+        };
+
+        let rows = program_visual_rows(program_duration_frames(&input));
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].start_frame(), 0);
+        assert_eq!(rows[0].end_frame(), 90);
+        assert_eq!(rows[0].local_playhead_frame(55), Some(55));
+    }
+
+    #[test]
+    fn program_segment_rows_are_local_ui_projections_of_playlist_items() {
+        let segments = [
+            SegmentTimelineProgramSegment {
+                id: "part_a",
+                kind: "tonovi",
+                start_frame: 0,
+                end_frame: 50,
+                has_base_video: true,
+                selected: false,
+            },
+            SegmentTimelineProgramSegment {
+                id: "part_b",
+                kind: "offovi",
+                start_frame: 50,
+                end_frame: 90,
+                has_base_video: false,
+                selected: true,
+            },
+        ];
+
+        let rows = program_segment_rows(&segments);
+
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].start_frame(), 0);
+        assert_eq!(rows[0].end_frame(), 50);
+        assert_eq!(rows[1].start_frame(), 50);
+        assert_eq!(rows[1].end_frame(), 90);
+        assert_eq!(rows[1].program_frame_from_local(5), 55);
+    }
+
+    #[test]
+    fn playlist_items_are_ranges_inside_the_same_visual_row() {
+        let row = SegmentTimelineProgramRow {
+            index: 0,
+            count: 1,
+            start_frame: 0,
+            end_frame: 90,
+        };
+        let segments = [
+            SegmentTimelineProgramSegment {
+                id: "part_a",
+                kind: "tonovi",
+                start_frame: 0,
+                end_frame: 50,
+                has_base_video: true,
+                selected: false,
+            },
+            SegmentTimelineProgramSegment {
+                id: "part_b",
+                kind: "offovi",
+                start_frame: 50,
+                end_frame: 90,
+                has_base_video: false,
+                selected: true,
+            },
+        ];
+
+        let local = local_segments_for_row(row, &segments);
+
+        assert_eq!(local.len(), 2);
+        assert_eq!(local[0].start_frame, 0);
+        assert_eq!(local[0].end_frame, 50);
+        assert_eq!(local[1].start_frame, 50);
+        assert_eq!(local[1].end_frame, 90);
+        assert!(local[1].selected);
     }
 
     #[test]

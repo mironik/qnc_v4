@@ -187,6 +187,15 @@ fn require_current_story_program_source_fps(conn: &Connection) -> Result<f64, St
     require_story_program_source_fps(&parts)
 }
 
+fn finalize_current_story_mutation(conn: &Connection) -> rusqlite::Result<()> {
+    let parts = list_parts(conn)?;
+    if let Some(timeline_fps) = story_program_source_fps(&parts) {
+        finalize_story_mutation(conn, timeline_fps)
+    } else {
+        touch_draft(conn)
+    }
+}
+
 fn ensure_row(conn: &Connection) -> rusqlite::Result<()> {
     ensure_schema(conn)?;
     conn.execute(
@@ -1377,8 +1386,7 @@ pub fn create_part_with_range(
     )
     .map_err(|e| e.to_string())?;
     set_selected_part_id(&conn, &part_id).map_err(|e| e.to_string())?;
-    let timeline_fps = require_current_story_program_source_fps(&conn)?;
-    finalize_story_mutation(&conn, timeline_fps).map_err(|e| e.to_string())?;
+    finalize_current_story_mutation(&conn).map_err(|e| e.to_string())?;
     load_snapshot(paths, &conn, pid).map_err(|e| e.to_string())
 }
 
@@ -1493,7 +1501,6 @@ pub fn update_part(
         return Err("part_id required".into());
     }
     let conn = open_project(paths, pid).map_err(|e| e.to_string())?;
-    let timeline_fps = require_current_story_program_source_fps(&conn)?;
     if !part_exists(&conn, part_id).map_err(|e| e.to_string())? {
         return Err(format!("part not found: {part_id}"));
     }
@@ -1515,7 +1522,7 @@ pub fn update_part(
         )
         .map_err(|e| e.to_string())?;
     }
-    finalize_story_mutation(&conn, timeline_fps).map_err(|e| e.to_string())?;
+    finalize_current_story_mutation(&conn).map_err(|e| e.to_string())?;
     load_snapshot(paths, &conn, pid).map_err(|e| e.to_string())
 }
 
@@ -1665,7 +1672,6 @@ pub fn delete_part(paths: &ProjectPaths, project_id: &str, part_id: &str) -> Res
         return Err("part_id required".into());
     }
     let conn = open_project(paths, pid).map_err(|e| e.to_string())?;
-    let timeline_fps = require_current_story_program_source_fps(&conn)?;
     let deleted_sort: i64 = conn
         .query_row(
             "SELECT sort_index FROM story_parts WHERE part_id = ?1",
@@ -1674,13 +1680,16 @@ pub fn delete_part(paths: &ProjectPaths, project_id: &str, part_id: &str) -> Res
         )
         .map_err(|_| format!("part not found: {part_id}"))?;
     let parts_before_delete = list_parts(&conn).map_err(|e| e.to_string())?;
+    let timeline_fps = story_program_source_fps(&parts_before_delete);
     conn.execute(
         "DELETE FROM story_parts WHERE part_id = ?1",
         params![part_id],
     )
     .map_err(|e| e.to_string())?;
-    delete_markers_for_part(&conn, part_id, timeline_fps, &parts_before_delete)
-        .map_err(|e| e.to_string())?;
+    if let Some(timeline_fps) = timeline_fps {
+        delete_markers_for_part(&conn, part_id, timeline_fps, &parts_before_delete)
+            .map_err(|e| e.to_string())?;
+    }
     let next_selected =
         resolve_selection_after_delete(&conn, part_id, deleted_sort).map_err(|e| e.to_string())?;
     set_selected_part_id(&conn, &next_selected).map_err(|e| e.to_string())?;
@@ -1692,7 +1701,11 @@ pub fn delete_part(paths: &ProjectPaths, project_id: &str, part_id: &str) -> Res
         )
         .map_err(|e| e.to_string())?;
     }
-    finalize_story_mutation(&conn, timeline_fps).map_err(|e| e.to_string())?;
+    if let Some(timeline_fps) = timeline_fps {
+        finalize_story_mutation(&conn, timeline_fps).map_err(|e| e.to_string())?;
+    } else {
+        touch_draft(&conn).map_err(|e| e.to_string())?;
+    }
     load_snapshot(paths, &conn, pid).map_err(|e| e.to_string())
 }
 
@@ -1712,7 +1725,6 @@ pub fn reorder_part(
         return Err(format!("invalid direction: {direction}"));
     }
     let conn = open_project(paths, pid).map_err(|e| e.to_string())?;
-    let timeline_fps = require_current_story_program_source_fps(&conn)?;
     let mut parts = list_parts(&conn).map_err(|e| e.to_string())?;
     let idx = parts
         .iter()
@@ -1736,7 +1748,7 @@ pub fn reorder_part(
         )
         .map_err(|e| e.to_string())?;
     }
-    finalize_story_mutation(&conn, timeline_fps).map_err(|e| e.to_string())?;
+    finalize_current_story_mutation(&conn).map_err(|e| e.to_string())?;
     load_snapshot(paths, &conn, pid).map_err(|e| e.to_string())
 }
 
@@ -2512,6 +2524,59 @@ mod tests {
                 .map(Vec::len),
             Some(0),
             "Segment-tab virtual segment must not create a derived Virtual-tab shot"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn source_less_segment_keeps_basic_part_mutations_available() {
+        let base = std::env::temp_dir().join(format!(
+            "qnc_story_source_less_segment_test_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let paths = test_paths(&base);
+        let project_id = "story_source_less_segment";
+        let conn = open_project(&paths, project_id).unwrap();
+        ensure_schema(&conn).unwrap();
+        drop(conn);
+
+        let state = create_part(&paths, project_id, "tonovi", None, None, None, None).unwrap();
+        let part_id = state
+            .get("selected_part_id")
+            .and_then(Value::as_str)
+            .unwrap()
+            .to_string();
+        let parts = state.get("parts").and_then(Value::as_array).unwrap();
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0].get("clip_id").and_then(Value::as_str), Some(""));
+        assert_eq!(parts[0].get("fps").and_then(Value::as_f64), Some(0.0));
+        assert_eq!(
+            state
+                .get("marker_slots")
+                .and_then(Value::as_array)
+                .map(Vec::len),
+            Some(0)
+        );
+
+        let updated = update_part(&paths, project_id, &part_id, Some("Draft"), None, None).unwrap();
+        assert_eq!(
+            updated
+                .get("parts")
+                .and_then(Value::as_array)
+                .and_then(|parts| parts.first())
+                .and_then(|part| part.get("title"))
+                .and_then(Value::as_str),
+            Some("Draft")
+        );
+
+        create_part(&paths, project_id, "offovi", None, None, None, None).unwrap();
+        reorder_part(&paths, project_id, &part_id, "down").unwrap();
+        let deleted = delete_part(&paths, project_id, &part_id).unwrap();
+        assert_eq!(
+            deleted.get("parts").and_then(Value::as_array).map(Vec::len),
+            Some(1)
         );
         let _ = std::fs::remove_dir_all(&base);
     }

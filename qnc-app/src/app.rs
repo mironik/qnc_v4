@@ -1803,23 +1803,37 @@ impl QncApp {
     fn tick_playback(&mut self, ctx: &egui::Context) {
         self.playback.player_mut().pump(ctx);
         let events = self.playback_rx.try_recv_all();
-        let segment_boundary_frames: Vec<_> = events
-            .iter()
-            .filter_map(|event| match event {
-                PlayerEvent::BoundaryReached { source_frame } => Some(*source_frame),
-                PlayerEvent::Frame {
-                    source_frame,
-                    playing: true,
-                    ..
-                }
-                | PlayerEvent::State {
-                    source_frame,
-                    playing: true,
-                    ..
-                } => Some(*source_frame),
-                _ => None,
-            })
-            .collect();
+        let mut program_playback_intents = Vec::new();
+        if self.phase == Phase::Workspace {
+            for event in &events {
+                let (source_frame, transport_playing) = match event {
+                    PlayerEvent::BoundaryReached { source_frame } => (*source_frame, false),
+                    PlayerEvent::Frame {
+                        source_frame,
+                        playing: true,
+                        ..
+                    }
+                    | PlayerEvent::State {
+                        source_frame,
+                        playing: true,
+                        ..
+                    } => (*source_frame, true),
+                    _ => continue,
+                };
+                let intents = match self.screen {
+                    Screen::Story => self
+                        .story
+                        .playback_boundary_intents_with_transport(source_frame, transport_playing),
+                    Screen::MediaAssist => self.media_assist.playback_boundary_intents_with_transport(
+                        source_frame,
+                        transport_playing,
+                    ),
+                    _ => Vec::new(),
+                };
+                program_playback_intents.extend(intents);
+            }
+        }
+
         self.playback.ingest_events(&events);
         if self.phase == Phase::Workspace {
             match self.screen {
@@ -1840,16 +1854,7 @@ impl QncApp {
                 ),
                 _ => {}
             }
-            for source_frame in segment_boundary_frames {
-                let intents = match self.screen {
-                    Screen::Story => self.story.playback_boundary_intents(source_frame),
-                    Screen::MediaAssist => {
-                        self.media_assist.playback_boundary_intents(source_frame)
-                    }
-                    _ => Vec::new(),
-                };
-                self.playback_transport_intents(intents);
-            }
+            self.playback_transport_intents(program_playback_intents);
         }
     }
 

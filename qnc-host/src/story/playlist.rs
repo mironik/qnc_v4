@@ -243,15 +243,12 @@ fn build_segments(
     segments
 }
 
-fn story_program_source_fps(parts: &[StoryPartRow]) -> Result<f64, String> {
-    if parts.is_empty() {
-        return Ok(0.0);
-    }
+fn story_program_source_fps(parts: &[StoryPartRow]) -> f64 {
     parts
         .iter()
         .map(|part| part.fps)
         .find(|fps| is_valid_fps(*fps))
-        .ok_or_else(|| "story program nema valjan source FPS iz probe/DB".to_string())
+        .unwrap_or(0.0)
 }
 
 /// Build the canonical editorial playlist from project DB rows.
@@ -266,7 +263,7 @@ pub fn build_editorial_playlist(
     let conn = open_project(paths, pid).map_err(|e| e.to_string())?;
     ensure_schema(&conn).map_err(|e| e.to_string())?;
     let parts = list_parts(&conn).map_err(|e| e.to_string())?;
-    let timeline_fps = story_program_source_fps(&parts)?;
+    let timeline_fps = story_program_source_fps(&parts);
     let covers = list_covers(&conn).map_err(|e| e.to_string())?;
     let segments = build_segments(&conn, &parts, &covers, timeline_fps);
     let duration_frames = if segments.is_empty() {
@@ -334,6 +331,29 @@ mod tests {
         assert_eq!(plan.project_id, project_id);
         assert!(plan.segments.is_empty());
         assert_eq!(plan.duration_sec, 0.0);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn build_editorial_playlist_source_less_segment_without_timebase() {
+        let base =
+            std::env::temp_dir().join(format!("qnc_playlist_source_less_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let paths = test_paths(&base);
+        let project_id = "playlist_source_less";
+        let conn = open_project(&paths, project_id).unwrap();
+        ensure_schema(&conn).unwrap();
+        drop(conn);
+
+        create_part(&paths, project_id, "tonovi", None, None, None, None).unwrap();
+
+        let plan = build_editorial_playlist(&paths, project_id).unwrap();
+        assert_eq!(plan.project_id, project_id);
+        assert_eq!(plan.timeline_fps, 0.0);
+        assert_eq!(plan.segments.len(), 1);
+        assert!(!plan.segments[0].streamable);
+        assert_eq!(plan.segments[0].source_fps, 0.0);
         let _ = std::fs::remove_dir_all(&base);
     }
 

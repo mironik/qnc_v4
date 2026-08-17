@@ -201,17 +201,21 @@ impl SegmentProgramModel {
         )
     }
 
-    pub(crate) fn boundary_transition_after_source_frame(
+    /// While playing, hand off on the last in-range source frame — before the player
+    /// would cross a wrap-row cut. Wrap rows are UI-only; the program axis is continuous.
+    pub(crate) fn boundary_transition_imminent_after_source_frame(
         &self,
         current_part_id: &str,
         open_clip_id: &str,
         source_frame: i64,
+        playing: bool,
     ) -> Option<SegmentBoundaryTransition> {
-        boundary_transition_after_source_frame(
+        boundary_transition_imminent_after_source_frame(
             &self.program_parts(),
             current_part_id,
             open_clip_id,
             source_frame,
+            playing,
         )
     }
 
@@ -393,6 +397,22 @@ pub(crate) fn boundary_transition_after_source_frame(
     open_clip_id: &str,
     source_frame: i64,
 ) -> Option<SegmentBoundaryTransition> {
+    boundary_transition_imminent_after_source_frame(
+        parts,
+        current_part_id,
+        open_clip_id,
+        source_frame,
+        false,
+    )
+}
+
+pub(crate) fn boundary_transition_imminent_after_source_frame(
+    parts: &[SegmentProgramPart<'_>],
+    current_part_id: &str,
+    open_clip_id: &str,
+    source_frame: i64,
+    playing: bool,
+) -> Option<SegmentBoundaryTransition> {
     let current = part_by_id(parts, current_part_id)?;
     if !valid_part(current) {
         return None;
@@ -400,17 +420,27 @@ pub(crate) fn boundary_transition_after_source_frame(
     if !open_clip_id.trim().is_empty() && current.clip_id.trim() != open_clip_id.trim() {
         return None;
     }
-    if source_frame.max(0) < current.source_out_frame.max(current.source_in_frame + 1) {
+    let out = current.source_out_frame.max(current.source_in_frame + 1);
+    let frame = source_frame.max(0);
+    let crossed_out = frame >= out;
+    let imminent_while_playing = playing && frame + 1 >= out;
+    if !crossed_out && !imminent_while_playing {
         return None;
     }
+    next_valid_program_part(parts, current.part_id)
+}
+
+fn next_valid_program_part(
+    parts: &[SegmentProgramPart<'_>],
+    current_part_id: &str,
+) -> Option<SegmentBoundaryTransition> {
     let current_index = parts
         .iter()
-        .position(|part| part.part_id == current.part_id)?;
+        .position(|part| part.part_id == current_part_id)?;
     parts
         .iter()
         .skip(current_index + 1)
-        .filter(|part| valid_part(part))
-        .next()
+        .find(|part| valid_part(part))
         .map(|part| SegmentBoundaryTransition {
             part_id: part.part_id.to_string(),
             program_frame: program_start_frame(part),
@@ -552,6 +582,24 @@ mod tests {
                 source_frame: 200,
             })
         );
+    }
+
+    #[test]
+    fn boundary_transition_imminent_hands_off_on_last_in_range_frame_while_playing() {
+        let parts = parts();
+
+        assert_eq!(
+            boundary_transition_imminent_after_source_frame(&parts, "part_a", "clip_a", 149, true),
+            Some(SegmentBoundaryTransition {
+                part_id: "part_b".into(),
+                program_frame: 50,
+                source_frame: 200,
+            })
+        );
+        assert!(boundary_transition_imminent_after_source_frame(
+            &parts, "part_a", "clip_a", 149, false
+        )
+        .is_none());
     }
 
     #[test]

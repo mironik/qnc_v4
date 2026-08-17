@@ -296,6 +296,7 @@ pub fn get_project_workspace(
 ) -> rusqlite::Result<Value> {
     let pid = project_id.trim();
     let conn = open_project(paths, pid)?;
+    migrate_legacy_ingest_workflow(&conn, pid)?;
     let item = project_settings_from_conn(&conn, pid)?;
     let steps = list_workflow_steps(&conn, pid)?;
     if steps.is_empty() {
@@ -1534,6 +1535,49 @@ mod legacy_ingest_tests {
             .unwrap();
         assert_eq!(active, "step_ingest");
         assert_eq!(entry, "step_ingest");
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn workspace_get_migrates_legacy_ingest_proxy_state() {
+        let base = std::env::temp_dir().join(format!(
+            "qnc_legacy_ingest_get_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::create_dir_all(&base);
+        let paths = test_paths(&base);
+        let project_id = "qa_legacy_ingest_get";
+        let global = open_global(&paths).unwrap();
+        let conn = open_registered_project(&paths, project_id).unwrap();
+        seed_project(&conn, project_id, &breaking_news_settings()).unwrap();
+        corrupt_to_legacy(&conn, project_id).unwrap();
+        drop(conn);
+
+        let workspace = get_project_workspace(&global, &paths, project_id).unwrap();
+        assert_eq!(
+            workspace
+                .get("active_step_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or(""),
+            "step_ingest"
+        );
+        assert_eq!(
+            workspace
+                .get("entry_step_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or(""),
+            "step_ingest"
+        );
+        let tabs = workspace
+            .get("tabs")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        assert!(!tabs.iter().any(|tab| tab.as_str() == Some("ingest_proxy")));
 
         let _ = std::fs::remove_dir_all(&base);
     }

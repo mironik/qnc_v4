@@ -2,6 +2,7 @@
 //!
 //! Uses standalone [`crate::qnc_segment_timeline`] for paint.
 //! Editorial segment/part list stays in this panel — not inside the timeline component.
+//! Segment rows are only projections of one continuous program timeline.
 
 use eframe::egui::{self, RichText, Vec2};
 
@@ -37,7 +38,6 @@ pub(crate) enum SegmentPanelAction {
     SelectMarkerSlot(String),
     SelectCover(String),
     SelectMarker { marker_id: String, frame: i64 },
-    SelectSegment { part_id: String, start_frame: i64 },
 }
 
 pub(crate) fn show(ui: &mut egui::Ui, input: SegmentPanelInput<'_>) -> SegmentPanelAction {
@@ -66,12 +66,14 @@ pub(crate) fn show(ui: &mut egui::Ui, input: SegmentPanelInput<'_>) -> SegmentPa
                 return;
             }
 
-            let stack_height = (input.height - 210.0).max(140.0);
+            let stack_height = (input.height - 320.0).max(140.0);
             let timeline_covers = segment_timeline_covers(input.covers, input.selected_cover_id);
             let timeline_slots =
                 segment_timeline_slots(input.program.marker_slots(), effective_selected_slot_id);
             let timeline_markers = segment_timeline_markers(input.markers);
             let timeline_segments = segment_timeline_segments(input.program, input.virtual_frame);
+            // Segment stack: local row projections only. Playback remains outside
+            // this panel; returned frame is a global program-frame request.
             egui::ScrollArea::vertical()
                 .max_height(stack_height)
                 .show(ui, |ui| {
@@ -137,13 +139,30 @@ pub(crate) fn show(ui: &mut egui::Ui, input: SegmentPanelInput<'_>) -> SegmentPa
                             .selectable_label(active, RichText::new(label).size(12.0))
                             .clicked()
                         {
-                            action = SegmentPanelAction::SelectSegment {
-                                part_id: seg.part_id.clone(),
-                                start_frame: seg.global_start_frame,
-                            };
+                            action = segment_row_click_action(seg.global_start_frame);
                         }
                     }
                 });
+
+            ui.add_space(8.0);
+            ui.label(RichText::new("Program").color(t.muted).small());
+            // Final program timeline: one overview of the DB playlist, still
+            // only a graphic projection of the broadcast-player progress.
+            let overview_intent = qnc_segment_timeline::show_program_overview(
+                ui,
+                SegmentTimelineProgramInput {
+                    playhead_program_frame: input.virtual_frame,
+                    segments: &timeline_segments,
+                    covers: &timeline_covers,
+                    marker_slots: &timeline_slots,
+                    markers: &timeline_markers,
+                    expanded_audio: SegmentAudioExpansion::None,
+                    show_lane_labels: true,
+                },
+            );
+            if matches!(action, SegmentPanelAction::None) {
+                action = segment_action_from_timeline_intent(overview_intent);
+            }
         });
 
     action
@@ -170,6 +189,12 @@ fn segment_timeline_segments<'a>(
 ) -> Vec<SegmentTimelineProgramSegment<'a>> {
     let active_part_id = program
         .active_part_at_program_frame(virtual_frame)
+        .or_else(|| {
+            program
+                .segments()
+                .last()
+                .filter(|_| virtual_frame >= program.duration_frames())
+        })
         .map(|segment| segment.part_id.as_str());
     program
         .segments()
@@ -235,6 +260,10 @@ fn segment_action_from_timeline_intent(intent: SegmentTimelineProgramIntent) -> 
             frame: program_frame,
         },
     }
+}
+
+fn segment_row_click_action(global_start_frame: i64) -> SegmentPanelAction {
+    SegmentPanelAction::SeekTimelineFrame(global_start_frame.max(0))
 }
 
 #[cfg(test)]
@@ -341,6 +370,29 @@ mod tests {
         );
         assert!(segment_timeline_slots(program_with_slots.marker_slots(), "slot_a")[0].selected);
         assert_eq!(segment_timeline_markers(&markers)[0].frame, 0);
+    }
+
+    #[test]
+    fn segment_panel_projects_program_end_to_last_segment() {
+        let program = program_fixture();
+        let program_segments = segment_timeline_segments(&program, program.duration_frames());
+
+        assert_eq!(program.duration_frames(), 90);
+        assert_eq!(program_segments.len(), 2);
+        assert!(!program_segments[0].selected);
+        assert!(program_segments[1].selected);
+    }
+
+    #[test]
+    fn segment_row_click_seeks_same_continuous_program_timeline() {
+        assert_eq!(
+            segment_row_click_action(50),
+            SegmentPanelAction::SeekTimelineFrame(50)
+        );
+        assert_eq!(
+            segment_row_click_action(-10),
+            SegmentPanelAction::SeekTimelineFrame(0)
+        );
     }
 
     #[test]

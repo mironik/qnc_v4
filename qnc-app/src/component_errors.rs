@@ -36,6 +36,7 @@ impl ComponentErrorKey {
         }
     }
 
+    #[cfg(test)]
     fn label(&self) -> String {
         format!(
             "{}:{}:{}:{}",
@@ -77,7 +78,7 @@ impl ComponentErrorBoundary {
 
     pub fn last_message(&self) -> Option<String> {
         let record = self.last.as_ref()?;
-        Some(format!("{} · {}", record.key.label(), record.message))
+        Some(record.message.clone())
     }
 
     #[cfg(test)]
@@ -98,9 +99,26 @@ mod tests {
         let mut boundary = ComponentErrorBoundary::default();
         boundary.record(key.clone(), "failed");
         assert_eq!(boundary.len(), 1);
-        assert!(boundary.last_message().unwrap().contains("failed"));
+        assert_eq!(boundary.last_message().unwrap(), "failed");
         boundary.clear(&key);
         assert_eq!(boundary.len(), 0);
         assert!(boundary.last_message().is_none());
+    }
+
+    #[test]
+    fn user_message_does_not_expose_internal_request_key() {
+        let command = ComponentBackendCommand::get(
+            "editorial.edit",
+            "mutation",
+            "part.delete",
+            "story\u{1f}project\u{1f}1\u{1f}part_abc",
+            "/x",
+        );
+        let key = ComponentErrorKey::from_command(&command);
+        let mut boundary = ComponentErrorBoundary::default();
+        boundary.record(key.clone(), "delete failed");
+
+        assert!(key.label().contains("editorial.edit:mutation:part.delete"));
+        assert_eq!(boundary.last_message().unwrap(), "delete failed");
     }
 }

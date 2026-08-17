@@ -521,23 +521,6 @@ impl StoryScreen {
             .map(|projection| (projection.part_id, projection.program_frame))
     }
 
-    fn segment_boundary_transition(
-        &self,
-        source_frame: FrameNumber,
-    ) -> Option<SegmentBoundaryTransition> {
-        let source_clip_id = self
-            .wrap_source_ref
-            .as_ref()
-            .map(|source| source.clip_id.trim())
-            .unwrap_or("");
-        self.segment_program_model()
-            .boundary_transition_after_source_frame(
-                &self.selected_part_id,
-                source_clip_id,
-                source_frame.0,
-            )
-    }
-
     fn prepare_wrap_source_from_snapshot(
         &mut self,
         selected_part_id: Option<String>,
@@ -588,30 +571,57 @@ impl StoryScreen {
         self.wrap_source_has_audio = has_audio;
         self.wrap_source_audio_channels = audio_channels;
         self.wrap_play_path = path_hint;
-        let duration_frames = meta_duration_frames
-            .max(segment.source_out_frame)
-            .max(segment.duration_frames)
-            .max(1);
-        let source_identity = format!(
-            "{}:{}-{}",
-            segment.part_id,
-            segment.source_in_frame.max(0),
-            segment.source_out_frame.max(segment.source_in_frame + 1)
-        );
+        let duration_frames = meta_duration_frames.max(1);
+        let mapped_source = self
+            .source_frame_for_wrap_frame(self.wrap_playhead_frame)
+            .unwrap_or_else(|| segment.source_in_frame.max(0))
+            .clamp(0, duration_frames.saturating_sub(1));
+        // Wrap rows are UI-only. Broadcast player gets clip-level bounds; Story maps
+        // program ↔ source and chains segment cuts via transport intents.
+        let source_identity = format!("wrap-program:{clip_id}");
         let source_ref = BroadcastHostSourceRef::from_frame_fields(
             &self.project_id,
             source_identity,
             "",
             clip_id,
-            Some(FrameNumber(segment.source_in_frame.max(0))),
-            Some(FrameNumber(
-                segment.source_out_frame.max(segment.source_in_frame + 1),
-            )),
+            Some(FrameNumber(mapped_source)),
+            None,
             FrameNumber(duration_frames),
         )
         .map_err(|err| err.message)?;
         self.wrap_source_ref = Some(source_ref);
         Ok(())
+    }
+
+    fn wrap_program_end_reached(&self, source_frame: FrameNumber) -> bool {
+        let program = self.segment_program_model();
+        let Some(current) = program.active_part_at_program_frame(self.wrap_playhead_frame) else {
+            return false;
+        };
+        if program
+            .adjacent_part(&current.part_id, self.wrap_playhead_frame, 1)
+            .is_some()
+        {
+            return false;
+        }
+        let out = current.source_out_frame.max(current.source_in_frame + 1);
+        source_frame.0 + 1 >= out
+    }
+
+    fn wrap_program_handoff_intents(
+        &mut self,
+        transition: SegmentBoundaryTransition,
+    ) -> Vec<PlaybackTransportIntent> {
+        self.set_wrap_playhead_frame(transition.program_frame);
+        match self.prepare_wrap_source_from_snapshot(Some(transition.part_id)) {
+            Ok(()) => vec![PlaybackTransportIntent::ScrubFrameAndPlay(
+                transition.source_frame,
+            )],
+            Err(e) => {
+                self.status = e;
+                Vec::new()
+            }
+        }
     }
 
     fn source_tc_frame(&self, frame: i64) -> String {
@@ -1351,23 +1361,43 @@ impl StoryScreen {
         &mut self,
         source_frame: FrameNumber,
     ) -> Vec<PlaybackTransportIntent> {
+        self.playback_boundary_intents_with_transport(source_frame, self.playing)
+    }
+
+    pub(crate) fn playback_boundary_intents_with_transport(
+        &mut self,
+        source_frame: FrameNumber,
+        transport_playing: bool,
+    ) -> Vec<PlaybackTransportIntent> {
         if self.view_mode != ViewMode::Wrap {
             return Vec::new();
         }
-        if let Some(transition) = self.segment_boundary_transition(source_frame) {
-            self.set_wrap_playhead_frame(transition.program_frame);
-            let scrub = self.start_wrap_session_from_snapshot(Some(transition.part_id));
-            if scrub == PlaybackTransportIntent::None {
-                return Vec::new();
-            }
-            return match scrub {
-                PlaybackTransportIntent::ScrubFrame(frame) => {
-                    vec![PlaybackTransportIntent::ScrubFrameAndPlay(frame)]
-                }
-                other => vec![other],
-            };
+
+        // UI projection: broadcast player source frame → continuous program playhead.
+        if let Some((part_id, program_frame)) = self.wrap_frame_for_source_frame(source_frame.0) {
+            self.selected_part_id = part_id;
+            self.set_wrap_playhead_frame(program_frame);
         }
-        self.sync_playhead_from_player_frame(source_frame);
+
+        let playing = transport_playing || self.playing;
+        let source_clip_id = self
+            .wrap_source_ref
+            .as_ref()
+            .map(|source| source.clip_id.as_str())
+            .unwrap_or("");
+        if let Some(transition) = self.segment_program_model().boundary_transition_imminent_after_source_frame(
+            &self.selected_part_id,
+            source_clip_id,
+            source_frame.0,
+            playing,
+        ) {
+            return self.wrap_program_handoff_intents(transition);
+        }
+
+        if playing && self.wrap_program_end_reached(source_frame) {
+            return vec![PlaybackTransportIntent::TogglePlay];
+        }
+
         Vec::new()
     }
 
@@ -1734,18 +1764,6 @@ impl StoryScreen {
             }
             segment_panel::SegmentPanelAction::SelectMarker { marker_id, frame } => {
                 self.select_marker(host, &marker_id, frame)
-            }
-            segment_panel::SegmentPanelAction::SelectSegment {
-                part_id,
-                start_frame,
-            } => {
-                self.set_wrap_playhead_frame(start_frame);
-                self.selected_part_id = part_id.clone();
-                if self.view_mode != ViewMode::Wrap {
-                    self.start_wrap_session_for_part(host, Some(part_id))
-                } else {
-                    self.scrub_soft(host)
-                }
             }
         }
     }
@@ -3198,7 +3216,7 @@ mod tests {
         assert_eq!(screen.selected_part_id, "part_a");
         assert_eq!(
             screen.wrap_source_ref.as_ref().and_then(|s| s.in_frame),
-            Some(FrameNumber(100))
+            Some(FrameNumber(110))
         );
     }
 
@@ -3410,7 +3428,7 @@ mod tests {
                 .wrap_source_ref
                 .as_ref()
                 .and_then(|source| source.in_frame),
-            Some(FrameNumber(200))
+            Some(FrameNumber(210))
         );
     }
 
