@@ -8,7 +8,7 @@ use eframe::egui::{self, RichText, Vec2};
 
 use crate::editorial::marker_cover_panel;
 use crate::editorial::segment_program::{SegmentProgramMarkerSlot, SegmentProgramModel};
-use crate::editorial::types::{MarkerSlot, StoryCover, StoryMarker};
+use crate::editorial::types::{StoryCover, StoryMarker};
 use crate::qnc_segment_timeline::{
     self, SegmentAudioExpansion, SegmentTimelineProgramCover, SegmentTimelineProgramInput,
     SegmentTimelineProgramIntent, SegmentTimelineProgramMarker, SegmentTimelineProgramMarkerSlot,
@@ -16,18 +16,20 @@ use crate::qnc_segment_timeline::{
 };
 use crate::qnc_theme::current;
 
+const PANEL_MARGIN: f32 = 10.0;
+const BOTTOM_GAP: f32 = 4.0;
+const PLAYLIST_INPUT_H: f32 = 128.0;
+
 pub(crate) struct SegmentPanelInput<'a> {
     pub height: f32,
     pub virtual_frame: i64,
     pub playhead_sec: f64,
     pub program: &'a SegmentProgramModel,
-    pub marker_slots: &'a [MarkerSlot],
     pub covers: &'a [StoryCover],
     pub markers: &'a [StoryMarker],
     pub selected_slot_id: &'a str,
     pub selected_cover_id: &'a str,
     pub tc: &'a dyn Fn(f64) -> String,
-    pub tc_frame: &'a dyn Fn(i64) -> String,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -43,127 +45,151 @@ pub(crate) enum SegmentPanelAction {
 pub(crate) fn show(ui: &mut egui::Ui, input: SegmentPanelInput<'_>) -> SegmentPanelAction {
     let mut action = SegmentPanelAction::None;
     let t = current(ui);
+    let panel_size = Vec2::new(
+        ui.available_width(),
+        input.height.min(ui.available_height()).max(0.0),
+    );
+    let (panel_rect, _) = ui.allocate_exact_size(panel_size, egui::Sense::hover());
+    ui.painter().rect_filled(panel_rect, 0.0, t.surface);
+    ui.painter().rect_stroke(
+        panel_rect,
+        0.0,
+        egui::Stroke::new(1.0, t.border),
+        egui::StrokeKind::Inside,
+    );
 
-    egui::Frame::NONE
-        .fill(t.surface)
-        .stroke(egui::Stroke::new(1.0, t.border))
-        .inner_margin(10.0)
-        .show(ui, |ui| {
-            let effective_selected_slot_id = input
-                .program
-                .effective_marker_slot_id(input.selected_slot_id);
-            ui.set_min_size(Vec2::new(ui.available_width(), input.height));
-            ui.label(RichText::new("Segmenti").color(t.text).strong());
-            ui.add_space(8.0);
+    let content_rect = panel_rect.shrink(PANEL_MARGIN);
+    if content_rect.is_positive() {
+        ui.allocate_new_ui(
+            egui::UiBuilder::new()
+                .max_rect(content_rect)
+                .layout(egui::Layout::top_down(egui::Align::Min)),
+            |ui| {
+                ui.set_clip_rect(content_rect);
+                let effective_selected_slot_id = input
+                    .program
+                    .effective_marker_slot_id(input.selected_slot_id);
+                ui.set_min_size(content_rect.size());
+                ui.label(RichText::new("Segmenti").color(t.text).strong());
+                ui.add_space(8.0);
 
-            if input.program.is_empty() {
-                ui.vertical_centered(|ui| {
-                    ui.add_space(input.height * 0.35);
-                    ui.label(
-                        RichText::new("Nema segmenata — dodaj ton i off segment").color(t.muted),
-                    );
-                });
-                return;
-            }
+                if input.program.is_empty() {
+                    ui.vertical_centered(|ui| {
+                        ui.add_space(ui.available_height() * 0.35);
+                        ui.label(
+                            RichText::new("Nema segmenata — dodaj ton i off segment")
+                                .color(t.muted),
+                        );
+                    });
+                    return;
+                }
 
-            let stack_height = (input.height - 320.0).max(140.0);
-            let timeline_covers = segment_timeline_covers(input.covers, input.selected_cover_id);
-            let timeline_slots =
-                segment_timeline_slots(input.program.marker_slots(), effective_selected_slot_id);
-            let timeline_markers = segment_timeline_markers(input.markers);
-            let timeline_segments = segment_timeline_segments(input.program, input.virtual_frame);
-            // Segment stack: local row projections only. Playback remains outside
-            // this panel; returned frame is a global program-frame request.
-            egui::ScrollArea::vertical()
-                .max_height(stack_height)
-                .show(ui, |ui| {
-                    let timeline_intent = qnc_segment_timeline::show_program(
-                        ui,
-                        SegmentTimelineProgramInput {
-                            playhead_program_frame: input.virtual_frame,
-                            segments: &timeline_segments,
-                            covers: &timeline_covers,
-                            marker_slots: &timeline_slots,
-                            markers: &timeline_markers,
-                            expanded_audio: SegmentAudioExpansion::None,
-                            show_lane_labels: true,
+                let timeline_covers =
+                    segment_timeline_covers(input.covers, input.selected_cover_id);
+                let timeline_slots = segment_timeline_slots(
+                    input.program.marker_slots(),
+                    effective_selected_slot_id,
+                );
+                let timeline_markers = segment_timeline_markers(input.markers);
+                let timeline_segments =
+                    segment_timeline_segments(input.program, input.virtual_frame);
+
+                let body_size = Vec2::new(ui.available_width(), ui.available_height().max(0.0));
+                let (body_rect, _) = ui.allocate_exact_size(body_size, egui::Sense::hover());
+                let playlist_h = PLAYLIST_INPUT_H.min(body_rect.height());
+                let playlist_rect = egui::Rect::from_min_max(
+                    egui::pos2(body_rect.left(), body_rect.bottom() - playlist_h),
+                    body_rect.right_bottom(),
+                );
+                let stack_bottom = (playlist_rect.top() - BOTTOM_GAP).max(body_rect.top());
+                let stack_rect = egui::Rect::from_min_max(
+                    body_rect.left_top(),
+                    egui::pos2(body_rect.right(), stack_bottom),
+                );
+
+                // Segment stack: local row projections only. Playback remains outside
+                // this panel; returned frame is a global program-frame request.
+                if stack_rect.height() > 0.0 {
+                    ui.allocate_new_ui(
+                        egui::UiBuilder::new()
+                            .max_rect(stack_rect)
+                            .layout(egui::Layout::top_down(egui::Align::Min)),
+                        |ui| {
+                            ui.set_clip_rect(stack_rect);
+                            egui::ScrollArea::vertical()
+                                .id_salt("story_segment_stack_scroll")
+                                .max_height(stack_rect.height())
+                                .auto_shrink([false, false])
+                                .show(ui, |ui| {
+                                    ui.set_min_width(stack_rect.width());
+                                    let timeline_intent = qnc_segment_timeline::show_program(
+                                        ui,
+                                        SegmentTimelineProgramInput {
+                                            playhead_program_frame: input.virtual_frame,
+                                            segments: &timeline_segments,
+                                            covers: &timeline_covers,
+                                            marker_slots: &timeline_slots,
+                                            markers: &timeline_markers,
+                                            expanded_audio: SegmentAudioExpansion::None,
+                                            show_lane_labels: true,
+                                        },
+                                    );
+                                    if matches!(action, SegmentPanelAction::None) {
+                                        action =
+                                            segment_action_from_timeline_intent(timeline_intent);
+                                    }
+                                });
                         },
                     );
-                    if matches!(action, SegmentPanelAction::None) {
-                        action = segment_action_from_timeline_intent(timeline_intent);
-                    }
-                });
+                }
 
-            ui.add_space(8.0);
-            let marker_action = marker_cover_panel::show(
-                ui,
-                marker_cover_panel::MarkerCoverInput {
-                    virtual_frame: input.virtual_frame,
-                    playhead_sec: input.playhead_sec,
-                    marker_slots: input.marker_slots,
-                    covers: input.covers,
-                    markers: input.markers,
-                    selected_slot_id: effective_selected_slot_id,
-                    selected_cover_id: input.selected_cover_id,
-                    tc: input.tc,
-                },
-            );
-            if !matches!(marker_action, marker_cover_panel::MarkerCoverAction::None)
-                && matches!(action, SegmentPanelAction::None)
-            {
-                action = SegmentPanelAction::MarkerCover(marker_action);
-            }
-
-            ui.add_space(8.0);
-            ui.label(RichText::new("Redoslijed segmenata").color(t.muted).small());
-            egui::ScrollArea::vertical()
-                .max_height(120.0)
-                .show(ui, |ui| {
-                    let active_part_id = input
-                        .program
-                        .active_part_at_program_frame(input.virtual_frame)
-                        .map(|segment| segment.part_id.as_str());
-                    for seg in input.program.segments() {
-                        let active = active_part_id.is_some_and(|id| id == seg.part_id.as_str());
-                        let label = format!(
-                            "{}  {}–{}",
-                            if seg.kind.is_empty() {
-                                "segment"
-                            } else {
-                                seg.kind.as_str()
-                            },
-                            (input.tc_frame)(seg.global_start_frame),
-                            (input.tc_frame)(seg.global_end_frame.max(seg.global_start_frame))
-                        );
-                        if ui
-                            .selectable_label(active, RichText::new(label).size(12.0))
-                            .clicked()
-                        {
-                            action = segment_row_click_action(seg.global_start_frame);
-                        }
-                    }
-                });
-
-            ui.add_space(8.0);
-            ui.label(RichText::new("Playlist input").color(t.muted).small());
-            // Final playlist-input timeline: one overview of the DB playlist,
-            // still only a graphic projection of broadcast-player progress.
-            let overview_intent = qnc_segment_timeline::show_program_overview(
-                ui,
-                SegmentTimelineProgramInput {
-                    playhead_program_frame: input.virtual_frame,
-                    segments: &timeline_segments,
-                    covers: &timeline_covers,
-                    marker_slots: &timeline_slots,
-                    markers: &timeline_markers,
-                    expanded_audio: SegmentAudioExpansion::None,
-                    show_lane_labels: true,
-                },
-            );
-            if matches!(action, SegmentPanelAction::None) {
-                action = segment_action_from_timeline_intent(overview_intent);
-            }
-        });
+                if playlist_rect.height() > 0.0 {
+                    ui.allocate_new_ui(
+                        egui::UiBuilder::new()
+                            .max_rect(playlist_rect)
+                            .layout(egui::Layout::top_down(egui::Align::Min)),
+                        |ui| {
+                            ui.set_clip_rect(playlist_rect);
+                            ui.set_min_width(playlist_rect.width());
+                            ui.separator();
+                            let marker_action = marker_cover_panel::show(
+                                ui,
+                                marker_cover_panel::MarkerCoverInput {
+                                    leading_label: Some("Playlist input"),
+                                    virtual_frame: input.virtual_frame,
+                                    playhead_sec: input.playhead_sec,
+                                    tc: input.tc,
+                                },
+                            );
+                            if !matches!(marker_action, marker_cover_panel::MarkerCoverAction::None)
+                                && matches!(action, SegmentPanelAction::None)
+                            {
+                                action = SegmentPanelAction::MarkerCover(marker_action);
+                            }
+                            ui.add_space(2.0);
+                            // Final playlist-input timeline: one overview of the DB playlist,
+                            // still only a graphic projection of broadcast-player progress.
+                            let overview_intent = qnc_segment_timeline::show_program_overview(
+                                ui,
+                                SegmentTimelineProgramInput {
+                                    playhead_program_frame: input.virtual_frame,
+                                    segments: &timeline_segments,
+                                    covers: &timeline_covers,
+                                    marker_slots: &timeline_slots,
+                                    markers: &timeline_markers,
+                                    expanded_audio: SegmentAudioExpansion::None,
+                                    show_lane_labels: true,
+                                },
+                            );
+                            if matches!(action, SegmentPanelAction::None) {
+                                action = segment_action_from_timeline_intent(overview_intent);
+                            }
+                        },
+                    );
+                }
+            },
+        );
+    }
 
     action
 }
@@ -262,14 +288,11 @@ fn segment_action_from_timeline_intent(intent: SegmentTimelineProgramIntent) -> 
     }
 }
 
-fn segment_row_click_action(global_start_frame: i64) -> SegmentPanelAction {
-    SegmentPanelAction::SeekTimelineFrame(global_start_frame.max(0))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::api::{EditorialPlaylist, EditorialPlaylistSegment};
+    use crate::editorial::types::MarkerSlot;
 
     fn program_fixture() -> SegmentProgramModel {
         SegmentProgramModel::from_playlist(
@@ -381,18 +404,6 @@ mod tests {
         assert_eq!(program_segments.len(), 2);
         assert!(!program_segments[0].selected);
         assert!(program_segments[1].selected);
-    }
-
-    #[test]
-    fn segment_row_click_seeks_same_continuous_program_timeline() {
-        assert_eq!(
-            segment_row_click_action(50),
-            SegmentPanelAction::SeekTimelineFrame(50)
-        );
-        assert_eq!(
-            segment_row_click_action(-10),
-            SegmentPanelAction::SeekTimelineFrame(0)
-        );
     }
 
     #[test]

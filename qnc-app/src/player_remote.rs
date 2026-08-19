@@ -422,6 +422,7 @@ struct PlaylistInputVideoDecode {
     source_id: String,
     video_format: VideoFormat,
     program: PlayerProgramState,
+    start_program_frame: CoreFrameNumber,
     prepared_sources: BTreeSet<String>,
     inner: FfmpegVideoDecode,
 }
@@ -434,7 +435,11 @@ impl VideoDecodeAdapter for PlaylistInputVideoDecode {
         source: &EngineSourceHandle,
     ) -> Result<Vec<BroadcastEvent>, BroadcastEngineError> {
         self.require_playlist_source(source.source_id.as_str())?;
-        for point in playlist_preroll_points(&self.program, 0, PlayerProgramSource::has_video) {
+        for point in playlist_preroll_points(
+            &self.program,
+            self.start_program_frame,
+            PlayerProgramSource::has_video,
+        ) {
             self.prime_video_source(&point.source, point.program_frame)?;
         }
         Ok(Vec::new())
@@ -531,6 +536,7 @@ struct PlaylistInputAudioOutput {
     timebase: CoreTimebase,
     audio_format: AudioFormat,
     program: PlayerProgramState,
+    start_program_frame: CoreFrameNumber,
     prepared_sources: BTreeSet<String>,
     inner: FfmpegPlayerAudioOutput,
 }
@@ -543,7 +549,11 @@ impl AudioOutputAdapter for PlaylistInputAudioOutput {
         source: &EngineSourceHandle,
     ) -> Result<Vec<BroadcastEvent>, BroadcastEngineError> {
         self.require_playlist_source(source.source_id.as_str())?;
-        for point in playlist_preroll_points(&self.program, 0, PlayerProgramSource::has_audio) {
+        for point in playlist_preroll_points(
+            &self.program,
+            self.start_program_frame,
+            PlayerProgramSource::has_audio,
+        ) {
             self.prime_audio_source(&point.source, point.program_frame)?;
         }
         Ok(Vec::new())
@@ -1555,6 +1565,8 @@ fn build_program_runtime_session(
     decode_policy: &PlayerDecodePolicy,
 ) -> Result<ProgramRuntimeBuild, String> {
     let duration_frames = request.duration_frames.max(1) as CoreFrameNumber;
+    let start_program_frame =
+        old_to_core_frame(request.start_program_frame).min(duration_frames.saturating_sub(1));
     if request.items.is_empty() {
         return Err("Program nema playlist iteme".into());
     }
@@ -1653,6 +1665,7 @@ fn build_program_runtime_session(
             source_id: playlist_source_id.clone(),
             video_format: playlist_video_format,
             program: program.clone(),
+            start_program_frame,
             prepared_sources: BTreeSet::new(),
             inner: video_decode,
         }),
@@ -1661,6 +1674,7 @@ fn build_program_runtime_session(
             timebase,
             audio_format: playlist_audio_format,
             program: program.clone(),
+            start_program_frame,
             prepared_sources: BTreeSet::new(),
             inner: audio,
         }),

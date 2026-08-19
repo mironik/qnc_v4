@@ -71,14 +71,6 @@ impl EditorialStateComponent {
         )
     }
 
-    pub fn load_all(instance_id: &str, project_id: &str) -> [ComponentBackendCommand; 3] {
-        [
-            Self::load_story_state(instance_id, project_id),
-            Self::load_timeline_model(instance_id, project_id),
-            Self::load_playlist(instance_id, project_id),
-        ]
-    }
-
     pub fn accepts_event(event: &ComponentBackendEvent) -> bool {
         event.component_id == COMPONENT_ID
             && event.operation_id == OP_LOAD
@@ -153,8 +145,12 @@ mod tests {
     use crate::api::HostRequestMethod;
 
     #[test]
-    fn load_all_uses_independent_ports_for_latest_wins() {
-        let commands = EditorialStateComponent::load_all("story", "p1");
+    fn state_projection_commands_use_independent_ports_for_latest_wins() {
+        let commands = [
+            EditorialStateComponent::load_story_state("story", "p1"),
+            EditorialStateComponent::load_timeline_model("story", "p1"),
+            EditorialStateComponent::load_playlist("story", "p1"),
+        ];
         let ports: std::collections::BTreeSet<_> = commands
             .iter()
             .map(|command| command.port_id.as_str())

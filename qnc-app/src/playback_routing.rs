@@ -13,6 +13,7 @@ pub(crate) enum PlaybackTransportIntent {
     CueFrame(i64),
     ScrubFrame(i64),
     /// Broadcast Player owns one playlist input.
+    PreloadProgram(BroadcastProgramOpenRequest),
     PlayProgram(BroadcastProgramOpenRequest),
     PlayLoadedInput,
     Pause,
@@ -88,6 +89,9 @@ impl QncApp {
             PlaybackTransportIntent::ScrubFrame(frame) => {
                 self.playback_transport_scrub_frame(frame)
             }
+            PlaybackTransportIntent::PreloadProgram(request) => {
+                self.playback_transport_preload_program(request)
+            }
             PlaybackTransportIntent::PlayProgram(request) => {
                 self.playback_transport_play_program(request)
             }
@@ -112,6 +116,8 @@ impl QncApp {
                 if self.playback.playlist_input_active() {
                     seek_loaded_input(&mut self.playback, frame, coalesce)
                 } else {
+                    let intent = self.story.playlist_input_preload_intent();
+                    self.playback_transport_intent(intent);
                     Ok(())
                 }
             }
@@ -148,6 +154,12 @@ impl QncApp {
 
     fn playback_transport_play_program(&mut self, request: BroadcastProgramOpenRequest) {
         if let Err(err) = self.playback.play_program(request) {
+            self.playback_transport_error(err);
+        }
+    }
+
+    fn playback_transport_preload_program(&mut self, request: BroadcastProgramOpenRequest) {
+        if let Err(err) = self.playback.preload_program(request) {
             self.playback_transport_error(err);
         }
     }

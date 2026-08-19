@@ -33,7 +33,8 @@ const POLL_INTERVAL: Duration = Duration::from_millis(1500);
 pub struct IngestScreen {
     pub path_edit: String,
     pub state: Option<IngestState>,
-    pub busy: bool,
+    state_busy: bool,
+    command_busy: bool,
     pub last_poll: Option<Instant>,
     pub loaded_for_project: String,
     pub message: Option<String>,
@@ -104,7 +105,8 @@ impl Default for IngestScreen {
         Self {
             path_edit: String::new(),
             state: None,
-            busy: false,
+            state_busy: false,
+            command_busy: false,
             last_poll: None,
             loaded_for_project: String::new(),
             message: None,
@@ -244,7 +246,8 @@ impl IngestScreen {
         self.reset_player_session();
         let _ = host;
         self.state = None;
-        self.busy = false;
+        self.state_busy = false;
+        self.command_busy = false;
         self.last_poll = None;
         self.dir_path.clear();
         self.dir_entries.clear();
@@ -270,7 +273,7 @@ impl IngestScreen {
     pub fn begin_state_load(&mut self, project_id: &str) {
         self.project_id = project_id.to_string();
         self.loaded_for_project = project_id.to_string();
-        self.busy = true;
+        self.state_busy = true;
         self.message = None;
         self.last_poll = Some(Instant::now());
     }
@@ -278,13 +281,13 @@ impl IngestScreen {
     pub fn begin_state_poll(&mut self, project_id: &str) {
         self.project_id = project_id.to_string();
         self.loaded_for_project = project_id.to_string();
-        self.busy = true;
+        self.state_busy = true;
         self.last_poll = Some(Instant::now());
     }
 
     pub fn apply_loaded_state(&mut self, st: IngestState) {
         self.apply(st);
-        self.busy = false;
+        self.state_busy = false;
         self.message = None;
     }
 
@@ -292,20 +295,20 @@ impl IngestScreen {
         let path_keep = self.path_edit.clone();
         self.apply(st);
         self.path_edit = path_keep;
-        self.busy = false;
+        self.state_busy = false;
     }
 
     pub fn begin_import_command(&mut self, project_id: &str) {
         self.project_id = project_id.to_string();
         self.loaded_for_project = project_id.to_string();
-        self.busy = true;
+        self.command_busy = true;
         self.message = None;
         self.last_poll = Some(Instant::now());
     }
 
     pub fn apply_import_command_state(&mut self, st: IngestState, message: impl Into<String>) {
         self.apply(st);
-        self.busy = false;
+        self.command_busy = false;
         self.message = Some(message.into());
     }
 
@@ -316,19 +319,105 @@ impl IngestScreen {
             .unwrap_or_default()
     }
 
+    pub fn toggle_clip_selection_local(&mut self, clip_id: &str) -> Option<bool> {
+        let st = self.state.as_mut()?;
+        let clip_id = clip_id.trim();
+        if clip_id.is_empty() {
+            return None;
+        }
+        let clip = st.clips.iter_mut().find(|clip| clip.clip_id == clip_id)?;
+        let previous = clip.selected;
+        clip.selected = !clip.selected;
+        rebuild_selected_clip_ids(st);
+        self.last_poll = Some(Instant::now());
+        Some(previous)
+    }
+
+    pub fn set_clip_selection_local(&mut self, clip_id: &str, selected: bool) -> bool {
+        let Some(st) = self.state.as_mut() else {
+            return false;
+        };
+        let clip_id = clip_id.trim();
+        if clip_id.is_empty() {
+            return false;
+        }
+        let Some(clip) = st.clips.iter_mut().find(|clip| clip.clip_id == clip_id) else {
+            return false;
+        };
+        if clip.selected == selected {
+            return true;
+        }
+        clip.selected = selected;
+        rebuild_selected_clip_ids(st);
+        self.last_poll = Some(Instant::now());
+        true
+    }
+
+    pub fn select_all_clip_selection_local(&mut self) -> Option<Vec<(String, bool)>> {
+        let st = self.state.as_mut()?;
+        if st.clips.is_empty() {
+            return None;
+        }
+        let previous = clip_selection_snapshot(st);
+        for clip in &mut st.clips {
+            clip.selected = true;
+        }
+        rebuild_selected_clip_ids(st);
+        self.last_poll = Some(Instant::now());
+        Some(previous)
+    }
+
+    pub fn clear_clip_selection_local(&mut self) -> Option<Vec<(String, bool)>> {
+        let st = self.state.as_mut()?;
+        if st.clips.is_empty() {
+            return None;
+        }
+        let previous = clip_selection_snapshot(st);
+        for clip in &mut st.clips {
+            clip.selected = false;
+        }
+        rebuild_selected_clip_ids(st);
+        self.last_poll = Some(Instant::now());
+        Some(previous)
+    }
+
+    pub fn restore_clip_selection_local(&mut self, previous: Vec<(String, bool)>) -> bool {
+        let Some(st) = self.state.as_mut() else {
+            return false;
+        };
+        if previous.is_empty() {
+            return false;
+        }
+        let previous: HashMap<String, bool> = previous.into_iter().collect();
+        for clip in &mut st.clips {
+            if let Some(selected) = previous.get(&clip.clip_id).copied() {
+                clip.selected = selected;
+            }
+        }
+        rebuild_selected_clip_ids(st);
+        self.last_poll = Some(Instant::now());
+        true
+    }
+
     pub fn apply_archive_option_state(&mut self, st: IngestState, message: impl Into<String>) {
         self.archive_local = st.archive_original;
         if let Some(current) = self.state.as_mut() {
             current.archive_original = st.archive_original;
         }
-        self.busy = false;
+        self.command_busy = false;
         self.message = Some(message.into());
         self.last_poll = Some(Instant::now());
     }
 
-    pub fn set_state_error(&mut self, error: impl Into<String>) {
+    pub fn set_state_request_error(&mut self, error: impl Into<String>) {
         self.message = Some(error.into());
-        self.busy = false;
+        self.state_busy = false;
+        self.last_poll = Some(Instant::now());
+    }
+
+    pub fn set_import_command_error(&mut self, error: impl Into<String>) {
+        self.message = Some(error.into());
+        self.command_busy = false;
         self.last_poll = Some(Instant::now());
     }
 
@@ -351,7 +440,7 @@ impl IngestScreen {
     }
 
     pub fn should_request_poll(&self) -> bool {
-        if self.busy {
+        if self.state_busy || self.command_busy {
             return false;
         }
         let due = self
@@ -514,7 +603,7 @@ impl IngestScreen {
         }
 
         let mut action = IngestAction::None;
-        if self.state.is_none() && !self.busy && !project_id.trim().is_empty() {
+        if self.state.is_none() && !self.state_busy && !project_id.trim().is_empty() {
             action = IngestAction::RequestState(project_id.to_string());
         } else if !self.dir_loaded
             && !self.dir_busy
@@ -559,7 +648,7 @@ impl IngestScreen {
                                 parent: self.dir_parent.as_deref(),
                                 entries: &self.dir_entries,
                                 error: self.dir_error.as_deref(),
-                                busy: self.busy || self.dir_busy,
+                                busy: self.command_busy || self.dir_busy,
                             };
                             match dir_list::show(ui, input) {
                                 DirListAction::None => {}
@@ -603,12 +692,13 @@ impl IngestScreen {
                         if self.preview_clip_id != id {
                             self.image_asset_loader.cancel_pending();
                         }
-                        self.preview_clip_id = id.clone();
-                        action = IngestAction::Toggle(id);
+                        action = IngestAction::FocusPreview(id);
                     }
+                    MediaPoolAction::ToggleClipSelection(id) => action = IngestAction::Toggle(id),
                     MediaPoolAction::None
                     | MediaPoolAction::SwitchTab(_)
                     | MediaPoolAction::SelectShot(_)
+                    | MediaPoolAction::ToggleShotSelection(_)
                     | MediaPoolAction::SelectPart(_)
                     | MediaPoolAction::DeletePart(_)
                     | MediaPoolAction::ReorderPart { .. }
@@ -646,7 +736,9 @@ impl IngestScreen {
             | MediaPoolAction::MarkIn
             | MediaPoolAction::MarkOut
             | MediaPoolAction::SelectShot(_)
+            | MediaPoolAction::ToggleShotSelection(_)
             | MediaPoolAction::SelectClipId(_)
+            | MediaPoolAction::ToggleClipSelection(_)
             | MediaPoolAction::SelectPart(_)
             | MediaPoolAction::DeletePart(_)
             | MediaPoolAction::ReorderPart { .. } => IngestAction::None,
@@ -746,7 +838,7 @@ impl IngestScreen {
                 show_import_actions: true,
                 archive_original: self.archive_local,
                 ai_mining: self.ai_mining,
-                import_enabled: !self.busy && selected_n > 0,
+                import_enabled: !self.command_busy && selected_n > 0,
                 ingest_status: &status,
                 expanded_audio: self.expanded_audio,
             },
@@ -838,6 +930,22 @@ impl IngestScreen {
     }
 }
 
+fn clip_selection_snapshot(st: &IngestState) -> Vec<(String, bool)> {
+    st.clips
+        .iter()
+        .map(|clip| (clip.clip_id.clone(), clip.selected))
+        .collect()
+}
+
+fn rebuild_selected_clip_ids(st: &mut IngestState) {
+    st.selected_clip_ids = st
+        .clips
+        .iter()
+        .filter(|clip| clip.selected)
+        .map(|clip| clip.clip_id.clone())
+        .collect();
+}
+
 fn format_duration(sec: f64) -> String {
     if !sec.is_finite() || sec <= 0.0 {
         return "—".into();
@@ -872,4 +980,96 @@ fn format_tc(sec: f64, fps: f64) -> String {
     let mm = total_min.rem_euclid(60);
     let hh = total_min / 60;
     format!("{hh:02}:{mm:02}:{ss:02}:{ff:02}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn clip(clip_id: &str, selected: bool) -> IngestClip {
+        IngestClip {
+            clip_id: clip_id.to_string(),
+            selected,
+            ..Default::default()
+        }
+    }
+
+    fn screen_with_selection(selection: &[(&str, bool)]) -> IngestScreen {
+        let mut state = IngestState {
+            clips: selection
+                .iter()
+                .map(|(clip_id, selected)| clip(clip_id, *selected))
+                .collect(),
+            ..Default::default()
+        };
+        rebuild_selected_clip_ids(&mut state);
+        IngestScreen {
+            state: Some(state),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn toggle_clip_selection_local_rebuilds_selected_ids() {
+        let mut screen = screen_with_selection(&[("a", false), ("b", true)]);
+
+        assert_eq!(screen.toggle_clip_selection_local("a"), Some(false));
+
+        assert_eq!(
+            screen.selected_clip_ids(),
+            vec!["a".to_string(), "b".to_string()]
+        );
+    }
+
+    #[test]
+    fn state_load_busy_is_independent_from_command_busy() {
+        let mut screen = IngestScreen::default();
+
+        screen.begin_state_load("p1");
+
+        assert!(screen.state_busy);
+        assert!(!screen.command_busy);
+    }
+
+    #[test]
+    fn import_command_busy_is_independent_from_state_load_busy() {
+        let mut screen = IngestScreen::default();
+
+        screen.begin_import_command("p1");
+
+        assert!(!screen.state_busy);
+        assert!(screen.command_busy);
+    }
+
+    #[test]
+    fn select_all_clip_selection_local_checks_every_clip() {
+        let mut screen = screen_with_selection(&[("a", true), ("b", false)]);
+
+        let previous = screen
+            .select_all_clip_selection_local()
+            .expect("selection snapshot");
+
+        assert_eq!(
+            screen.selected_clip_ids(),
+            vec!["a".to_string(), "b".to_string()]
+        );
+        assert!(screen.restore_clip_selection_local(previous));
+        assert_eq!(screen.selected_clip_ids(), vec!["a".to_string()]);
+    }
+
+    #[test]
+    fn clear_clip_selection_local_unchecks_every_clip() {
+        let mut screen = screen_with_selection(&[("a", true), ("b", true)]);
+
+        let previous = screen
+            .clear_clip_selection_local()
+            .expect("selection snapshot");
+
+        assert!(screen.selected_clip_ids().is_empty());
+        assert!(screen.restore_clip_selection_local(previous));
+        assert_eq!(
+            screen.selected_clip_ids(),
+            vec!["a".to_string(), "b".to_string()]
+        );
+    }
 }

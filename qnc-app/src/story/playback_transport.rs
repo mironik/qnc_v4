@@ -7,6 +7,7 @@ use crate::components::{EditorialProgramPlaybackComponent, EditorialProgramPlayb
 use crate::editorial::segment_program::SegmentProgramModel;
 use crate::editorial::types::{StoryCover, StoryShot};
 use crate::playback_routing::PlaybackTransportIntent;
+use crate::player_remote::BroadcastProgramOpenRequest;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum StoryPlaybackView {
@@ -20,6 +21,10 @@ pub(crate) struct StoryTogglePlayInput<'a> {
     pub story_playing: bool,
     pub playlist_input_active: bool,
     pub playlist_input_playing: bool,
+    pub playlist_program: StoryPlaylistProgramInput<'a>,
+}
+
+pub(crate) struct StoryPlaylistProgramInput<'a> {
     pub project_id: &'a str,
     pub program_id: &'a str,
     pub start_program_frame: i64,
@@ -27,6 +32,25 @@ pub(crate) struct StoryTogglePlayInput<'a> {
     pub covers: &'a [StoryCover],
     pub all_clips: &'a [StoryShot],
     pub virtual_shots: &'a [StoryShot],
+}
+
+pub(crate) fn build_program_request(
+    input: StoryPlaylistProgramInput<'_>,
+) -> Result<BroadcastProgramOpenRequest, String> {
+    let clips = input
+        .all_clips
+        .iter()
+        .chain(input.virtual_shots.iter())
+        .cloned()
+        .collect::<Vec<_>>();
+    EditorialProgramPlaybackComponent::build_program(EditorialProgramPlaybackInput {
+        project_id: input.project_id,
+        program_id: input.program_id,
+        start_program_frame: input.start_program_frame,
+        program: input.program,
+        covers: input.covers,
+        clips: &clips,
+    })
 }
 
 pub(crate) struct StoryTogglePlayOutcome {
@@ -96,20 +120,12 @@ pub(crate) fn toggle_play(input: StoryTogglePlayInput<'_>) -> StoryTogglePlayOut
         );
     }
 
-    let clips = input
-        .all_clips
-        .iter()
-        .chain(input.virtual_shots.iter())
-        .cloned()
-        .collect::<Vec<_>>();
-    let request = EditorialProgramPlaybackComponent::build_program(EditorialProgramPlaybackInput {
-        project_id: input.project_id,
-        program_id: input.program_id,
-        start_program_frame: input.start_program_frame,
-        program: input.program,
-        covers: input.covers,
-        clips: &clips,
-    });
+    let selected_part_id = input
+        .playlist_program
+        .program
+        .active_part_at_program_frame(input.playlist_program.start_program_frame)
+        .map(|segment| segment.part_id.clone());
+    let request = build_program_request(input.playlist_program);
 
     match request {
         Ok(request) => StoryTogglePlayOutcome {
@@ -117,10 +133,7 @@ pub(crate) fn toggle_play(input: StoryTogglePlayInput<'_>) -> StoryTogglePlayOut
             view_mode: None,
             playing: Some(true),
             status: Some("Playlist input play".into()),
-            selected_part_id: input
-                .program
-                .active_part_at_program_frame(input.start_program_frame)
-                .map(|segment| segment.part_id.clone()),
+            selected_part_id,
         },
         Err(error) => StoryTogglePlayOutcome {
             intent: PlaybackTransportIntent::None,

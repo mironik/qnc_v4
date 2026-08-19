@@ -29,6 +29,7 @@ pub struct PlaybackStack {
     carrier: CarrierSync,
     active_source_ref: Option<BroadcastHostSourceRef>,
     playlist_input_active: bool,
+    playlist_program_request: Option<BroadcastProgramOpenRequest>,
     pending_seek: Option<PendingSeek>,
 }
 
@@ -45,6 +46,7 @@ impl PlaybackStack {
             carrier: CarrierSync::new(),
             active_source_ref: None,
             playlist_input_active: false,
+            playlist_program_request: None,
             pending_seek: None,
         }
     }
@@ -87,6 +89,7 @@ impl PlaybackStack {
         {
             self.active_source_ref = None;
             self.playlist_input_active = false;
+            self.playlist_program_request = None;
             self.pending_seek = None;
         }
         self.carrier.ingest_player_events(events);
@@ -105,6 +108,7 @@ impl PlaybackStack {
         self.carrier.clear();
         self.active_source_ref = None;
         self.playlist_input_active = false;
+        self.playlist_program_request = None;
         self.pending_seek = None;
     }
 
@@ -241,12 +245,14 @@ impl PlaybackStack {
         if self.player.matches_source(&request) && self.player.snapshot().has_source {
             self.active_source_ref = Some(request.source_ref);
             self.playlist_input_active = false;
+            self.playlist_program_request = None;
             return Ok(());
         }
         let source_ref = request.source_ref.clone();
         self.carrier.clear();
         self.active_source_ref = None;
         self.playlist_input_active = false;
+        self.playlist_program_request = None;
         self.pending_seek = None;
         let _ = self.player.tx().stop();
         self.player.tx().open(request)?;
@@ -297,14 +303,52 @@ impl PlaybackStack {
 
     /// Open one playlist input in the Broadcast Player.
     pub fn play_program(&mut self, request: BroadcastProgramOpenRequest) -> Result<(), String> {
+        if self.playlist_program_matches(&request) {
+            self.playlist_input_active = true;
+            self.cue_frame(request.start_program_frame.0);
+            return self.play_loaded_input();
+        }
+        let loaded_request = request.clone();
         crate::player_log::log_info("bridge", "OpenProgram + Play");
         self.carrier.clear();
         self.active_source_ref = None;
         self.playlist_input_active = false;
+        self.playlist_program_request = None;
         self.pending_seek = None;
         self.player.tx().open_program(request)?;
         self.playlist_input_active = true;
+        self.playlist_program_request = Some(loaded_request);
         self.player.tx().play()
+    }
+
+    /// Prepare one playlist input without starting transport.
+    pub fn preload_program(&mut self, request: BroadcastProgramOpenRequest) -> Result<(), String> {
+        if self.playlist_program_matches(&request) {
+            self.playlist_input_active = true;
+            self.cue_frame(request.start_program_frame.0);
+            return Ok(());
+        }
+        crate::player_log::log_info("bridge", "PreloadProgram");
+        self.carrier.clear();
+        self.active_source_ref = None;
+        self.playlist_input_active = false;
+        self.playlist_program_request = None;
+        self.pending_seek = None;
+        self.player.tx().open_program(request.clone())?;
+        self.playlist_input_active = true;
+        self.playlist_program_request = Some(request);
+        Ok(())
+    }
+
+    pub fn invalidate_playlist_input(&mut self) {
+        if self.playlist_input_active {
+            self.player.stop();
+        }
+        self.carrier.clear();
+        self.active_source_ref = None;
+        self.playlist_input_active = false;
+        self.playlist_program_request = None;
+        self.pending_seek = None;
     }
 
     /// Pause playback deterministically; used when program play reaches an unsupported layer.
@@ -317,6 +361,14 @@ impl PlaybackStack {
     pub fn play_loaded_input(&self) -> Result<(), String> {
         crate::player_log::log_info("bridge", "PlayLoadedInput");
         self.player.tx().play()
+    }
+
+    fn playlist_program_matches(&self, request: &BroadcastProgramOpenRequest) -> bool {
+        self.playlist_input_active
+            && self
+                .playlist_program_request
+                .as_ref()
+                .is_some_and(|loaded| same_playlist_program(loaded, request))
     }
 
     pub fn cue_frame(&mut self, frame: i64) -> bool {
@@ -377,11 +429,25 @@ impl Default for PlaybackStack {
     }
 }
 
+fn same_playlist_program(
+    left: &BroadcastProgramOpenRequest,
+    right: &BroadcastProgramOpenRequest,
+) -> bool {
+    left.program_id == right.program_id
+        && left.project_id == right.project_id
+        && (left.timeline_fps - right.timeline_fps).abs() < 0.01
+        && left.duration_frames == right.duration_frames
+        && left.items == right.items
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::player_contract::{BroadcastHostSourceRef, FrameNumber};
-    use crate::player_remote::{BroadcastPlayerOpenRequest, PlayerEvent};
+    use crate::player_remote::{
+        BroadcastPlayerOpenRequest, BroadcastProgramItem, BroadcastProgramOpenRequest,
+        BroadcastProgramSource, PlayerEvent, PROGRAM_AUDIO_OUTPUT_CH1,
+    };
 
     fn open_request() -> BroadcastPlayerOpenRequest {
         BroadcastPlayerOpenRequest {
@@ -414,6 +480,30 @@ mod tests {
             FrameNumber(250),
         )
         .unwrap()
+    }
+
+    fn program_request(start_frame: i64) -> BroadcastProgramOpenRequest {
+        BroadcastProgramOpenRequest {
+            program_id: "story".into(),
+            project_id: "project".into(),
+            timeline_fps: 50.0,
+            duration_frames: 100,
+            start_program_frame: FrameNumber(start_frame),
+            items: vec![BroadcastProgramItem {
+                item_id: "item:0-100".into(),
+                record_in_frame: FrameNumber(0),
+                record_out_frame: FrameNumber(100),
+                sources: vec![BroadcastProgramSource {
+                    source_ref: source_ref("part_a", 10, 110),
+                    media_input: "media.mov".into(),
+                    source_fps: 50.0,
+                    has_video: true,
+                    has_audio: true,
+                    audio_channels: 2,
+                    audio_output_channel: Some(PROGRAM_AUDIO_OUTPUT_CH1),
+                }],
+            }],
+        }
     }
 
     #[test]
@@ -535,6 +625,28 @@ mod tests {
         stack.playlist_input_active = true;
         assert_eq!(stack.playlist_display_frame(12, 250), 80);
         assert_eq!(stack.playlist_display_frame(12, 60), 60);
+    }
+
+    #[test]
+    fn preloaded_program_makes_playlist_input_active_without_playing() {
+        let mut stack = PlaybackStack::new();
+
+        stack.preload_program(program_request(25)).unwrap();
+
+        assert!(stack.playlist_input_active());
+        assert!(!stack.playlist_input_playing());
+        assert!(stack.playlist_program_matches(&program_request(60)));
+    }
+
+    #[test]
+    fn playlist_invalidation_clears_preloaded_program() {
+        let mut stack = PlaybackStack::new();
+        stack.preload_program(program_request(25)).unwrap();
+
+        stack.invalidate_playlist_input();
+
+        assert!(!stack.playlist_input_active());
+        assert!(!stack.playlist_program_matches(&program_request(25)));
     }
 
     #[test]

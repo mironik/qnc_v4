@@ -261,28 +261,6 @@ impl EditorialEditComponent {
         )
     }
 
-    pub fn move_marker(
-        instance_id: &str,
-        request_id: u64,
-        project_id: &str,
-        marker_id: &str,
-        direction: &str,
-    ) -> ComponentBackendCommand {
-        Self::post(
-            instance_id,
-            request_id,
-            project_id,
-            EditorialEditKind::MoveMarker,
-            marker_id,
-            "/api/story/marker/move",
-            json!({
-                "project_id": project_id,
-                "marker_id": marker_id,
-                "direction": direction,
-            }),
-        )
-    }
-
     pub fn select_marker_slot(
         instance_id: &str,
         request_id: u64,
@@ -365,23 +343,6 @@ impl EditorialEditComponent {
                 "in_frame": in_frame.max(0),
                 "out_frame": out_frame.max(in_frame + 1),
             }),
-        )
-    }
-
-    pub fn delete_cover(
-        instance_id: &str,
-        request_id: u64,
-        project_id: &str,
-        cover_id: &str,
-    ) -> ComponentBackendCommand {
-        Self::post(
-            instance_id,
-            request_id,
-            project_id,
-            EditorialEditKind::DeleteCover,
-            cover_id,
-            "/api/story/cover/delete",
-            json!({ "project_id": project_id, "cover_id": cover_id }),
         )
     }
 

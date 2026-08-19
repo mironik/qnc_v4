@@ -2,7 +2,7 @@
 
 use crate::editorial::types::StoryShot;
 
-pub(crate) use crate::qnc_theme::{action_btn, truncate};
+pub(crate) use crate::qnc_theme::truncate;
 
 pub(crate) fn shot_id(shot: &StoryShot) -> String {
     if !shot.shot_id.trim().is_empty() {

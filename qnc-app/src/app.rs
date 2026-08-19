@@ -3,7 +3,7 @@
 use eframe::egui::{self, Color32, RichText};
 use serde_json::Value;
 
-use crate::api::{self, HostClient, ProjectRow, Workspace};
+use crate::api::{self, EditorialPlaylist, HostClient, ProjectRow, TimelineModel, Workspace};
 use crate::component_errors::{ComponentErrorBoundary, ComponentErrorKey};
 use crate::component_runtime::{ComponentBackendCommand, ComponentBackendRuntime};
 use crate::components::{
@@ -387,13 +387,11 @@ impl QncApp {
         }
         let next = Self::screen_from_tab(tab);
         if self.screen == Screen::Story && next != Screen::Story {
-            self.story.reset_session(&self.host);
-            self.story = StoryScreen::story();
+            self.story.suspend_playback_session();
             self.playback.stop();
         }
         if self.screen == Screen::MediaAssist && next != Screen::MediaAssist {
-            self.media_assist.reset_session(&self.host);
-            self.media_assist = StoryScreen::media_assist();
+            self.media_assist.suspend_playback_session();
             self.playback.stop();
         }
         if self.screen == Screen::Ingest && next != Screen::Ingest {
@@ -456,19 +454,35 @@ impl QncApp {
                 return;
             }
             crate::ingest::IngestAction::SelectAll => {
-                self.submit_source_import_command(
-                    pid,
-                    SourceImportCommandComponent::select_all(pid),
-                    Some(ctx.clone()),
-                );
+                let previous = self.ingest.select_all_clip_selection_local();
+                if previous.is_some() {
+                    ctx.request_repaint();
+                }
+                if let Some(previous) = previous {
+                    let selected_clip_ids = self.ingest.selected_clip_ids();
+                    if let Err(e) =
+                        self.save_import_selection(pid, &selected_clip_ids, Some(ctx.clone()))
+                    {
+                        self.ingest.restore_clip_selection_local(previous);
+                        self.error = Some(e);
+                    }
+                }
                 return;
             }
             crate::ingest::IngestAction::ClearSelection => {
-                self.submit_source_import_command(
-                    pid,
-                    SourceImportCommandComponent::clear_selection(pid),
-                    Some(ctx.clone()),
-                );
+                let previous = self.ingest.clear_clip_selection_local();
+                if previous.is_some() {
+                    ctx.request_repaint();
+                }
+                if let Some(previous) = previous {
+                    let selected_clip_ids = self.ingest.selected_clip_ids();
+                    if let Err(e) =
+                        self.save_import_selection(pid, &selected_clip_ids, Some(ctx.clone()))
+                    {
+                        self.ingest.restore_clip_selection_local(previous);
+                        self.error = Some(e);
+                    }
+                }
                 return;
             }
             crate::ingest::IngestAction::SetArchive(archive_original) => {
@@ -493,19 +507,24 @@ impl QncApp {
                 return;
             }
             crate::ingest::IngestAction::Toggle(clip_id) => {
-                self.ingest.activate_preview_clip(pid, &clip_id);
-                if let Some(frame) = self.ingest.transport_cue_frame() {
-                    self.playback_transport_cue_frame(frame);
+                let previous = self.ingest.toggle_clip_selection_local(&clip_id);
+                if previous.is_some() {
+                    ctx.request_repaint();
                 }
-                self.toggle_import_selection(pid, &clip_id, Some(ctx.clone()));
+                if let Some(previous) = previous {
+                    let selected_clip_ids = self.ingest.selected_clip_ids();
+                    if let Err(e) =
+                        self.save_import_selection(pid, &selected_clip_ids, Some(ctx.clone()))
+                    {
+                        self.ingest.set_clip_selection_local(&clip_id, previous);
+                        self.error = Some(e);
+                    }
+                }
                 return;
             }
             _ => {}
         }
-        let cue_after_dispatch = matches!(
-            &action,
-            crate::ingest::IngestAction::Toggle(_) | crate::ingest::IngestAction::FocusPreview(_)
-        );
+        let cue_after_dispatch = matches!(&action, crate::ingest::IngestAction::FocusPreview(_));
         if let Err(e) = self.ingest.dispatch(&self.host, pid, action) {
             self.error = Some(e);
         } else {
@@ -552,18 +571,14 @@ impl QncApp {
         if project_id.trim().is_empty() {
             return;
         }
-        let commands = EditorialStateComponent::load_all(instance_id, project_id);
+        let command = EditorialStateComponent::load_story_state(instance_id, project_id);
         match instance_id {
-            EDITORIAL_INSTANCE_STORY => self.story.begin_meta_load(project_id, commands.len()),
-            EDITORIAL_INSTANCE_MEDIA_ASSIST => self
-                .media_assist
-                .begin_meta_load(project_id, commands.len()),
+            EDITORIAL_INSTANCE_STORY => self.story.begin_meta_load(project_id, 3),
+            EDITORIAL_INSTANCE_MEDIA_ASSIST => self.media_assist.begin_meta_load(project_id, 3),
             _ => return,
         }
-        for command in commands {
-            if let Err(e) = self.submit_component_backend_command(command, ctx.clone()) {
-                self.set_editorial_state_error(instance_id, project_id, e);
-            }
+        if let Err(e) = self.submit_component_backend_command(command, ctx) {
+            self.set_editorial_state_error(instance_id, project_id, e);
         }
     }
 
@@ -584,6 +599,99 @@ impl QncApp {
             if let Err(e) = self.submit_component_backend_command(command, ctx.clone()) {
                 self.set_editorial_state_error(instance_id, project_id, e);
             }
+        }
+    }
+
+    fn ensure_cached_editorial_project(screen: &mut StoryScreen, project_id: &str) {
+        if !screen.has_editorial_project(project_id) {
+            screen.begin_cached_meta_load(project_id);
+        }
+    }
+
+    fn mirror_editorial_story_state_to_peer(
+        &mut self,
+        instance_id: &str,
+        project_id: &str,
+        state: Value,
+    ) {
+        match instance_id {
+            EDITORIAL_INSTANCE_STORY => {
+                Self::ensure_cached_editorial_project(&mut self.media_assist, project_id);
+                self.media_assist
+                    .apply_editorial_story_state(project_id, state);
+            }
+            EDITORIAL_INSTANCE_MEDIA_ASSIST => {
+                Self::ensure_cached_editorial_project(&mut self.story, project_id);
+                self.story.apply_editorial_story_state(project_id, state);
+            }
+            _ => {}
+        }
+    }
+
+    fn mirror_editorial_timeline_model_to_peer(
+        &mut self,
+        instance_id: &str,
+        project_id: &str,
+        timeline: TimelineModel,
+    ) {
+        match instance_id {
+            EDITORIAL_INSTANCE_STORY => {
+                if self.media_assist.has_editorial_project(project_id) {
+                    let _ = self
+                        .media_assist
+                        .apply_editorial_timeline_model(project_id, timeline);
+                }
+            }
+            EDITORIAL_INSTANCE_MEDIA_ASSIST => {
+                if self.story.has_editorial_project(project_id) {
+                    let _ = self
+                        .story
+                        .apply_editorial_timeline_model(project_id, timeline);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn mirror_editorial_playlist_to_peer(
+        &mut self,
+        instance_id: &str,
+        project_id: &str,
+        playlist: EditorialPlaylist,
+    ) {
+        match instance_id {
+            EDITORIAL_INSTANCE_STORY => {
+                if self.media_assist.has_editorial_project(project_id) {
+                    let _ = self
+                        .media_assist
+                        .apply_editorial_playlist(project_id, playlist);
+                }
+            }
+            EDITORIAL_INSTANCE_MEDIA_ASSIST => {
+                if self.story.has_editorial_project(project_id) {
+                    let _ = self.story.apply_editorial_playlist(project_id, playlist);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn mirror_editorial_edit_data_to_peer(
+        &mut self,
+        instance_id: &str,
+        project_id: &str,
+        data: EditorialEditData,
+    ) {
+        match instance_id {
+            EDITORIAL_INSTANCE_STORY => {
+                Self::ensure_cached_editorial_project(&mut self.media_assist, project_id);
+                let _ = self.media_assist.apply_editorial_edit_data(data);
+            }
+            EDITORIAL_INSTANCE_MEDIA_ASSIST => {
+                Self::ensure_cached_editorial_project(&mut self.story, project_id);
+                let _ = self.story.apply_editorial_edit_data(data);
+            }
+            _ => {}
         }
     }
 
@@ -735,7 +843,7 @@ impl QncApp {
         self.ingest.begin_state_load(project_id);
         let command = SourceImportStateComponent::load(project_id);
         if let Err(e) = self.submit_component_backend_command(command, ctx) {
-            self.ingest.set_state_error(e);
+            self.ingest.set_state_request_error(e);
         }
     }
 
@@ -746,23 +854,22 @@ impl QncApp {
         self.ingest.begin_state_poll(project_id);
         let command = SourceImportStateComponent::poll(project_id);
         if let Err(e) = self.submit_component_backend_command(command, ctx) {
-            self.ingest.set_state_error(e);
+            self.ingest.set_state_request_error(e);
         }
     }
 
-    fn toggle_import_selection(
+    fn save_import_selection(
         &mut self,
         project_id: &str,
-        clip_id: &str,
+        selected_clip_ids: &[String],
         ctx: Option<egui::Context>,
-    ) {
-        if project_id.trim().is_empty() || clip_id.trim().is_empty() {
-            return;
+    ) -> Result<(), String> {
+        if project_id.trim().is_empty() {
+            return Ok(());
         }
-        let command = SourceImportSelectionComponent::toggle(project_id, clip_id);
-        if let Err(e) = self.submit_component_backend_command(command, ctx) {
-            self.error = Some(e);
-        }
+        let command = SourceImportSelectionComponent::set(project_id, selected_clip_ids);
+        self.submit_component_backend_command(command, ctx)
+            .map(|_| ())
     }
 
     fn browse_import_source(&mut self, project_id: &str, path: &str, ctx: Option<egui::Context>) {
@@ -784,7 +891,7 @@ impl QncApp {
         }
         self.ingest.begin_import_command(project_id);
         if let Err(e) = self.submit_component_backend_command(command, ctx) {
-            self.ingest.set_state_error(e);
+            self.ingest.set_import_command_error(e);
         }
     }
 
@@ -1539,7 +1646,7 @@ impl QncApp {
                 match result {
                     Ok(data) => {
                         self.clear_component_error(&error_key);
-                        self.apply_editorial_state_data(data);
+                        self.apply_editorial_state_data(data, ctx.clone());
                     }
                     Err(e) => {
                         let e = self.record_component_error(error_key, e);
@@ -1629,7 +1736,7 @@ impl QncApp {
                     }
                     Err(e) => {
                         let e = self.record_component_error(error_key, e);
-                        self.ingest.set_state_error(e);
+                        self.ingest.set_import_command_error(e);
                     }
                 }
             } else if SourceImportStateComponent::accepts_event(&event) {
@@ -1647,76 +1754,126 @@ impl QncApp {
                     }
                     (_, Err(e)) => {
                         let e = self.record_component_error(error_key, e);
-                        self.ingest.set_state_error(e);
+                        self.ingest.set_state_request_error(e);
                     }
                 }
             }
         }
     }
 
-    fn apply_editorial_state_data(&mut self, data: EditorialStateData) {
+    fn apply_editorial_state_data(&mut self, data: EditorialStateData, ctx: Option<egui::Context>) {
         match data {
             EditorialStateData::StoryState {
                 instance_id,
                 project_id,
                 state,
-            } => match instance_id.as_str() {
-                EDITORIAL_INSTANCE_STORY => {
-                    self.story.apply_editorial_story_state(&project_id, state)
+            } => {
+                let peer_state = state.clone();
+                match instance_id.as_str() {
+                    EDITORIAL_INSTANCE_STORY => {
+                        self.story.apply_editorial_story_state(&project_id, state);
+                        self.mirror_editorial_story_state_to_peer(
+                            &instance_id,
+                            &project_id,
+                            peer_state,
+                        );
+                        self.load_editorial_timeline_model(&instance_id, &project_id, ctx);
+                    }
+                    EDITORIAL_INSTANCE_MEDIA_ASSIST => {
+                        self.media_assist
+                            .apply_editorial_story_state(&project_id, state);
+                        self.mirror_editorial_story_state_to_peer(
+                            &instance_id,
+                            &project_id,
+                            peer_state,
+                        );
+                        self.load_editorial_timeline_model(&instance_id, &project_id, ctx);
+                    }
+                    _ => {}
                 }
-                EDITORIAL_INSTANCE_MEDIA_ASSIST => self
-                    .media_assist
-                    .apply_editorial_story_state(&project_id, state),
-                _ => {}
-            },
+            }
             EditorialStateData::TimelineModel {
                 instance_id,
                 project_id,
                 timeline,
-            } => match instance_id.as_str() {
-                EDITORIAL_INSTANCE_STORY => {
-                    let intent = self
-                        .story
-                        .apply_editorial_timeline_model(&project_id, timeline);
-                    self.playback_transport_intent(intent);
+            } => {
+                let peer_timeline = timeline.clone();
+                match instance_id.as_str() {
+                    EDITORIAL_INSTANCE_STORY => {
+                        let intent = self
+                            .story
+                            .apply_editorial_timeline_model(&project_id, timeline);
+                        self.playback_transport_intent(intent);
+                        self.mirror_editorial_timeline_model_to_peer(
+                            &instance_id,
+                            &project_id,
+                            peer_timeline,
+                        );
+                    }
+                    EDITORIAL_INSTANCE_MEDIA_ASSIST => {
+                        let intent = self
+                            .media_assist
+                            .apply_editorial_timeline_model(&project_id, timeline);
+                        self.playback_transport_intent(intent);
+                        self.mirror_editorial_timeline_model_to_peer(
+                            &instance_id,
+                            &project_id,
+                            peer_timeline,
+                        );
+                    }
+                    _ => {}
                 }
-                EDITORIAL_INSTANCE_MEDIA_ASSIST => {
-                    let intent = self
-                        .media_assist
-                        .apply_editorial_timeline_model(&project_id, timeline);
-                    self.playback_transport_intent(intent);
-                }
-                _ => {}
-            },
+            }
             EditorialStateData::Playlist {
                 instance_id,
                 project_id,
                 playlist,
-            } => match instance_id.as_str() {
-                EDITORIAL_INSTANCE_STORY => {
-                    let intent = self.story.apply_editorial_playlist(&project_id, playlist);
-                    self.playback_transport_intent(intent);
+            } => {
+                let peer_playlist = playlist.clone();
+                match instance_id.as_str() {
+                    EDITORIAL_INSTANCE_STORY => {
+                        let intent = self.story.apply_editorial_playlist(&project_id, playlist);
+                        self.playback_transport_intent(intent);
+                        self.mirror_editorial_playlist_to_peer(
+                            &instance_id,
+                            &project_id,
+                            peer_playlist,
+                        );
+                    }
+                    EDITORIAL_INSTANCE_MEDIA_ASSIST => {
+                        let intent = self
+                            .media_assist
+                            .apply_editorial_playlist(&project_id, playlist);
+                        self.playback_transport_intent(intent);
+                        self.mirror_editorial_playlist_to_peer(
+                            &instance_id,
+                            &project_id,
+                            peer_playlist,
+                        );
+                    }
+                    _ => {}
                 }
-                EDITORIAL_INSTANCE_MEDIA_ASSIST => {
-                    let intent = self
-                        .media_assist
-                        .apply_editorial_playlist(&project_id, playlist);
-                    self.playback_transport_intent(intent);
-                }
-                _ => {}
-            },
+            }
         }
     }
 
     fn apply_editorial_edit_data(&mut self, data: EditorialEditData, ctx: Option<egui::Context>) {
         let instance_id = data.instance_id.clone();
         let project_id = data.project_id.clone();
+        let peer_data = data.clone();
+        if matches!(
+            instance_id.as_str(),
+            EDITORIAL_INSTANCE_STORY | EDITORIAL_INSTANCE_MEDIA_ASSIST
+        ) {
+            self.playback.invalidate_playlist_input();
+        }
         let intent = match instance_id.as_str() {
             EDITORIAL_INSTANCE_STORY => self.story.apply_editorial_edit_data(data),
             EDITORIAL_INSTANCE_MEDIA_ASSIST => self.media_assist.apply_editorial_edit_data(data),
             _ => PlaybackTransportIntent::None,
         };
         self.playback_transport_intent(intent);
+        self.mirror_editorial_edit_data_to_peer(&instance_id, &project_id, peer_data);
         self.load_editorial_timeline_model(&instance_id, &project_id, ctx);
     }
 
@@ -1772,8 +1929,6 @@ impl QncApp {
                 }
             }
             SourceImportCommandKind::Discover => "Ponovo otkrij gotov.".into(),
-            SourceImportCommandKind::SelectAll => "Odabrani su svi klipovi.".into(),
-            SourceImportCommandKind::ClearSelection => "Odabir očišćen.".into(),
             SourceImportCommandKind::SetArchive => unreachable!("handled above"),
             SourceImportCommandKind::ImportSelected => {
                 let queued = state
@@ -1931,22 +2086,23 @@ impl eframe::App for QncApp {
         // Pre-UI: decode clock + RX. Transport commands are routed explicitly below.
         self.pump_active_player(ctx);
 
-        if story_active && self.story.meta_ready() && self.story.shortcuts_ready() {
-            let intents = self.story.handle_shortcuts(ctx, &self.host, &self.playback);
-            self.playback_transport_intents(intents);
+        if story_active {
+            if self.story.meta_ready() && self.story.shortcuts_ready() {
+                let intents = self.story.handle_shortcuts(ctx, &self.host, &self.playback);
+                self.playback_transport_intents(intents);
+            }
             self.submit_editorial_backend_commands(EDITORIAL_INSTANCE_STORY, Some(ctx.clone()));
             // Apply catalog CueFrame before dock paint so playhead moves this frame.
             self.tick_playback(ctx);
             self.story.prepare_frame(&self.host, ctx);
             self.story.tick(&self.host, ctx);
-        } else if media_assist_active
-            && self.media_assist.meta_ready()
-            && self.media_assist.shortcuts_ready()
-        {
-            let intents = self
-                .media_assist
-                .handle_shortcuts(ctx, &self.host, &self.playback);
-            self.playback_transport_intents(intents);
+        } else if media_assist_active {
+            if self.media_assist.meta_ready() && self.media_assist.shortcuts_ready() {
+                let intents = self
+                    .media_assist
+                    .handle_shortcuts(ctx, &self.host, &self.playback);
+                self.playback_transport_intents(intents);
+            }
             self.submit_editorial_backend_commands(
                 EDITORIAL_INSTANCE_MEDIA_ASSIST,
                 Some(ctx.clone()),

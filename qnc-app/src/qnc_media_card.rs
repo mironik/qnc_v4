@@ -189,6 +189,10 @@ pub fn paint_media_card(ui: &egui::Ui, rect: Rect, input: &MediaCardInput<'_>) {
     );
 }
 
+pub fn selection_check_hit_rect(card_rect: Rect) -> Rect {
+    selection_check_rect(thumb_rect(card_rect)).expand(4.0)
+}
+
 #[derive(Clone, Copy)]
 enum StatusDotsLayout {
     None,
@@ -212,12 +216,7 @@ const DOT_READY_GREEN: Color32 = Color32::from_rgb(0x30, 0xd1, 0x58);
 
 /// Ingest-style check: bottom-left on thumb (web `.qnc-ip-clip-check`).
 fn paint_selection_check(ui: &egui::Ui, thumb_rect: Rect, checked: bool) {
-    let size = 16.0;
-    let pad = 6.0;
-    let check_rect = Rect::from_min_size(
-        egui::pos2(thumb_rect.left() + pad, thumb_rect.bottom() - pad - size),
-        Vec2::splat(size),
-    );
+    let check_rect = selection_check_rect(thumb_rect);
     let painter = ui.painter_at(thumb_rect);
     if checked {
         let fill = Color32::from_rgb(0xff, 0x95, 0x00);
@@ -254,6 +253,20 @@ fn paint_selection_check(ui: &egui::Ui, thumb_rect: Rect, checked: bool) {
             egui::StrokeKind::Inside,
         );
     }
+}
+
+fn thumb_rect(card_rect: Rect) -> Rect {
+    let thumb_h = (card_rect.height() - CARD_TEXT_H).max(72.0);
+    Rect::from_min_size(card_rect.min, Vec2::new(card_rect.width(), thumb_h))
+}
+
+fn selection_check_rect(thumb_rect: Rect) -> Rect {
+    let size = 16.0;
+    let pad = 6.0;
+    Rect::from_min_size(
+        egui::pos2(thumb_rect.left() + pad, thumb_rect.bottom() - pad - size),
+        Vec2::splat(size),
+    )
 }
 
 fn proxy_dot_color(status: &str) -> Color32 {

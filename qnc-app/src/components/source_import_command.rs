@@ -4,13 +4,10 @@ use crate::component_runtime::{ComponentBackendCommand, ComponentBackendEvent};
 const COMPONENT_ID: &str = "source.import.command";
 const PORT_BROWSE: &str = "browse";
 const PORT_DISCOVER: &str = "discover";
-const PORT_SELECTION: &str = "selection";
 const PORT_OPTIONS: &str = "options";
 const PORT_IMPORT: &str = "import";
 const OP_BROWSE: &str = "browse";
 const OP_DISCOVER: &str = "discover";
-const OP_SELECT_ALL: &str = "selection.select_all";
-const OP_CLEAR_SELECTION: &str = "selection.clear";
 const OP_SET_ARCHIVE: &str = "options.archive_original";
 const OP_IMPORT_SELECTED: &str = "import.selected";
 
@@ -18,8 +15,6 @@ const OP_IMPORT_SELECTED: &str = "import.selected";
 pub(crate) enum SourceImportCommandKind {
     Browse,
     Discover,
-    SelectAll,
-    ClearSelection,
     SetArchive,
     ImportSelected,
 }
@@ -29,8 +24,6 @@ impl SourceImportCommandKind {
         match operation_id {
             OP_BROWSE => Some(Self::Browse),
             OP_DISCOVER => Some(Self::Discover),
-            OP_SELECT_ALL => Some(Self::SelectAll),
-            OP_CLEAR_SELECTION => Some(Self::ClearSelection),
             OP_SET_ARCHIVE => Some(Self::SetArchive),
             OP_IMPORT_SELECTED => Some(Self::ImportSelected),
             _ => None,
@@ -63,28 +56,6 @@ impl SourceImportCommandComponent {
             serde_json::json!({ "project_id": project_id, "source_id": "" }),
         )
         .with_timeout(HostRequestTimeout::Long)
-    }
-
-    pub fn select_all(project_id: &str) -> ComponentBackendCommand {
-        ComponentBackendCommand::post(
-            COMPONENT_ID,
-            PORT_SELECTION,
-            OP_SELECT_ALL,
-            project_id,
-            "/api/ingest/selection/select-all",
-            serde_json::json!({ "project_id": project_id }),
-        )
-    }
-
-    pub fn clear_selection(project_id: &str) -> ComponentBackendCommand {
-        ComponentBackendCommand::post(
-            COMPONENT_ID,
-            PORT_SELECTION,
-            OP_CLEAR_SELECTION,
-            project_id,
-            "/api/ingest/selection",
-            serde_json::json!({ "project_id": project_id, "selected_clip_ids": [] }),
-        )
     }
 
     pub fn set_archive_original(
@@ -120,7 +91,7 @@ impl SourceImportCommandComponent {
         event.component_id == COMPONENT_ID
             && matches!(
                 event.port_id.as_str(),
-                PORT_BROWSE | PORT_DISCOVER | PORT_SELECTION | PORT_OPTIONS | PORT_IMPORT
+                PORT_BROWSE | PORT_DISCOVER | PORT_OPTIONS | PORT_IMPORT
             )
             && SourceImportCommandKind::from_operation(&event.operation_id).is_some()
     }

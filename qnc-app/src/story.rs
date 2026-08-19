@@ -42,7 +42,9 @@ use crate::qnc_timeline::{ExpandedAudio, TimelineFocusPaint};
 use crate::shortcuts::{StoryBindings, STORYBOARD_SHORTCUT_SCOPE as STORY_SHORTCUT_SCOPE};
 
 use self::focus::{FocusTarget, TimelineFocus};
-use self::playback_transport::{StoryPlaybackView, StoryTogglePlayInput, StoryTogglePlayOutcome};
+use self::playback_transport::{
+    StoryPlaybackView, StoryPlaylistProgramInput, StoryTogglePlayInput, StoryTogglePlayOutcome,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ViewMode {
@@ -529,6 +531,14 @@ impl StoryScreen {
         !project_id.is_empty() && self.loaded_project_id != project_id && !self.meta_loading
     }
 
+    pub fn has_editorial_project(&self, project_id: &str) -> bool {
+        !project_id.trim().is_empty() && self.loaded_project_id == project_id
+    }
+
+    pub fn begin_cached_meta_load(&mut self, project_id: &str) {
+        self.begin_meta_load(project_id, 3);
+    }
+
     pub fn begin_meta_load(&mut self, project_id: &str, expected_results: usize) {
         let role = self.role;
         *self = Self::with_role(role);
@@ -583,7 +593,12 @@ impl StoryScreen {
         self.playlist = Some(playlist);
         self.playlist_loaded = true;
         self.finish_meta_result();
-        self.wrap_projection_after_program_refresh(was_wrap)
+        let projection = self.wrap_projection_after_program_refresh(was_wrap);
+        if projection != PlaybackTransportIntent::None {
+            projection
+        } else {
+            self.playlist_input_preload_intent()
+        }
     }
 
     fn wrap_projection_after_program_refresh(&mut self, was_wrap: bool) -> PlaybackTransportIntent {
@@ -638,14 +653,17 @@ impl StoryScreen {
     }
 
     fn apply_initial_projection_if_ready(&mut self) {
-        if !self.meta_ready() || self.initial_selection_done {
+        if self.initial_selection_done {
             return;
         }
-        self.initial_selection_done = true;
         // Classic Story opens on source/All — not empty wrap.
         if let Some(first) = self.all_clips.first().cloned() {
+            self.initial_selection_done = true;
             self.select_shot_from_snapshot(&first);
-        } else {
+            return;
+        }
+        if self.meta_ready() {
+            self.initial_selection_done = true;
             self.view_mode = ViewMode::Wrap;
             self.playing = false;
             self.status = "Wrap · broadcast".into();
@@ -654,6 +672,12 @@ impl StoryScreen {
 
     pub fn reset_session(&mut self, _host: &HostClient) {
         *self = Self::with_role(self.role);
+    }
+
+    pub fn suspend_playback_session(&mut self) {
+        self.broadcast_preview_active = false;
+        self.playing = false;
+        self.source_media_retry_at = None;
     }
 
     pub fn drain_backend_commands(&mut self) -> Vec<ComponentBackendCommand> {
@@ -764,7 +788,7 @@ impl StoryScreen {
     fn start_wrap_session(&mut self, host: &HostClient) -> PlaybackTransportIntent {
         let _ = host;
         self.start_wrap_session_from_snapshot(None);
-        PlaybackTransportIntent::None
+        self.playlist_input_preload_intent()
     }
 
     fn start_wrap_session_from_snapshot(&mut self, selected_part_id: Option<String>) {
@@ -790,7 +814,7 @@ impl StoryScreen {
     ) -> PlaybackTransportIntent {
         let _ = host;
         self.start_wrap_session_from_snapshot(selected_part_id);
-        PlaybackTransportIntent::None
+        self.playlist_input_preload_intent()
     }
 
     fn defer_wrap_scrub_after_timeline(&mut self, preferred_part_id: Option<String>) {
@@ -871,6 +895,8 @@ impl StoryScreen {
         }
         self.story_state_snapshot = Some(data.state.clone());
         self.apply_story_state(&data.state);
+        self.state_loaded = true;
+        self.finish_meta_result();
         self.pending_wrap_scrub_part_id = None;
         self.timeline_loaded = false;
         self.playlist_loaded = false;
@@ -1462,6 +1488,7 @@ impl StoryScreen {
                 }
             }
             media_pool::MediaPoolAction::SelectShot(shot) => self.select_shot(host, &shot),
+            media_pool::MediaPoolAction::ToggleShotSelection(shot) => self.select_shot(host, &shot),
             media_pool::MediaPoolAction::SelectPart(part_id) => {
                 self.selected_part_id = part_id.clone();
                 self.start_wrap_session_for_part(host, Some(part_id))
@@ -1488,7 +1515,8 @@ impl StoryScreen {
                 self.export_commit(host);
                 PlaybackTransportIntent::None
             }
-            media_pool::MediaPoolAction::SelectClipId(_) => PlaybackTransportIntent::None,
+            media_pool::MediaPoolAction::SelectClipId(_)
+            | media_pool::MediaPoolAction::ToggleClipSelection(_) => PlaybackTransportIntent::None,
         }
     }
 
@@ -1544,11 +1572,6 @@ impl StoryScreen {
         let display_frame =
             playback.playlist_display_frame(self.wrap_playhead_frame, program.duration_frames());
         let tc = |sec| self.tc(sec);
-        let tc_frame = |frame| {
-            self.timeline_sec_from_frame(frame)
-                .map(|sec| self.tc(sec))
-                .unwrap_or_else(|| "--:--:--:--".into())
-        };
         let playhead_sec = self.timeline_sec_from_frame(display_frame).unwrap_or(0.0);
         let action = segment_panel::show(
             ui,
@@ -1557,13 +1580,11 @@ impl StoryScreen {
                 virtual_frame: display_frame,
                 playhead_sec,
                 program: &program,
-                marker_slots: &self.marker_slots,
                 covers: &self.covers,
                 markers: &self.markers,
                 selected_slot_id: &self.selected_slot_id,
                 selected_cover_id: &self.selected_cover_id,
                 tc: &tc,
-                tc_frame: &tc_frame,
             },
         );
         self.dispatch_segment_panel(host, action)
@@ -1582,34 +1603,6 @@ impl StoryScreen {
             }
             marker_cover_panel::MarkerCoverAction::CreateCover => self.quick_cover(host),
             marker_cover_panel::MarkerCoverAction::OverwriteCover => self.overwrite_cover(host),
-            marker_cover_panel::MarkerCoverAction::SelectSlot(id) => {
-                self.select_marker_slot(host, &id);
-                PlaybackTransportIntent::None
-            }
-            marker_cover_panel::MarkerCoverAction::SelectCover(id) => {
-                self.select_cover(host, &id);
-                PlaybackTransportIntent::None
-            }
-            marker_cover_panel::MarkerCoverAction::DeleteCover(id) => {
-                self.delete_cover(host, &id);
-                PlaybackTransportIntent::None
-            }
-            marker_cover_panel::MarkerCoverAction::SeekMarkerFrame(frame) => {
-                self.selected_marker_id.clear();
-                self.set_wrap_playhead_frame(frame);
-                self.ensure_wrap_or_scrub(host)
-            }
-            marker_cover_panel::MarkerCoverAction::MoveMarker {
-                marker_id,
-                direction,
-            } => {
-                self.move_marker(host, &marker_id, &direction);
-                PlaybackTransportIntent::None
-            }
-            marker_cover_panel::MarkerCoverAction::DeleteMarker(id) => {
-                self.delete_marker(host, &id);
-                PlaybackTransportIntent::None
-            }
         }
     }
 
@@ -1690,6 +1683,25 @@ impl StoryScreen {
             story_playing: self.playing,
             playlist_input_active,
             playlist_input_playing,
+            playlist_program: StoryPlaylistProgramInput {
+                project_id: &self.project_id,
+                program_id: self.edit_instance_id(),
+                start_program_frame: self.wrap_playhead_frame,
+                program: &program,
+                covers: &self.covers,
+                all_clips: &self.all_clips,
+                virtual_shots: &self.virtual_shots,
+            },
+        });
+        self.apply_story_toggle_play_outcome(outcome)
+    }
+
+    pub(crate) fn playlist_input_preload_intent(&self) -> PlaybackTransportIntent {
+        if self.view_mode != ViewMode::Wrap || !self.playlist_input_available() {
+            return PlaybackTransportIntent::None;
+        }
+        let program = self.segment_program_model();
+        match playback_transport::build_program_request(StoryPlaylistProgramInput {
             project_id: &self.project_id,
             program_id: self.edit_instance_id(),
             start_program_frame: self.wrap_playhead_frame,
@@ -1697,8 +1709,10 @@ impl StoryScreen {
             covers: &self.covers,
             all_clips: &self.all_clips,
             virtual_shots: &self.virtual_shots,
-        });
-        self.apply_story_toggle_play_outcome(outcome)
+        }) {
+            Ok(request) => PlaybackTransportIntent::PreloadProgram(request),
+            Err(_) => PlaybackTransportIntent::None,
+        }
     }
 
     fn ui_source_editor(
@@ -2216,18 +2230,6 @@ impl StoryScreen {
         self.status = format!("Brišem marker {}", truncate(&marker_id, 24));
     }
 
-    fn move_marker(&mut self, _host: &HostClient, marker_id: &str, direction: &str) {
-        if marker_id.trim().is_empty() {
-            return;
-        }
-        let marker_id = marker_id.to_string();
-        let direction = direction.to_string();
-        self.enqueue_edit_command(|instance, request, project| {
-            EditorialEditComponent::move_marker(instance, request, project, &marker_id, &direction)
-        });
-        self.status = format!("Pomičem marker {}", truncate(&marker_id, 24));
-    }
-
     fn select_marker_slot(&mut self, _host: &HostClient, slot_id: &str) {
         if slot_id.trim().is_empty() {
             return;
@@ -2301,17 +2303,6 @@ impl StoryScreen {
             EditorialEditComponent::select_cover(instance, request, project, &cover_id)
         });
         self.status = format!("Biranje covera {}", truncate(&cover_id, 24));
-    }
-
-    fn delete_cover(&mut self, _host: &HostClient, cover_id: &str) {
-        if cover_id.trim().is_empty() {
-            return;
-        }
-        let cover_id = cover_id.to_string();
-        self.enqueue_edit_command(|instance, request, project| {
-            EditorialEditComponent::delete_cover(instance, request, project, &cover_id)
-        });
-        self.status = format!("Brišem cover {}", truncate(&cover_id, 24));
     }
 
     fn select_marker(
@@ -3028,6 +3019,39 @@ mod tests {
     }
 
     #[test]
+    fn story_state_selects_initial_source_before_timeline_and_playlist_load() {
+        let mut screen = StoryScreen::story();
+        screen.begin_meta_load("p", 3);
+
+        screen.apply_editorial_story_state("p", story_state_with_selected_part("part_a"));
+
+        assert!(screen.state_loaded);
+        assert!(!screen.meta_ready());
+        assert!(screen.initial_selection_done);
+        assert_eq!(screen.view_mode, ViewMode::Source);
+        assert_eq!(screen.selected_clip_id, "clip_a");
+        assert_eq!(screen.selected_play_path, "C:/qnc/proxy/clip_a.mp4");
+    }
+
+    #[test]
+    fn suspend_playback_session_keeps_loaded_story_components() {
+        let mut screen = StoryScreen::story();
+        screen.begin_meta_load("p", 3);
+        screen.apply_editorial_story_state("p", story_state_with_selected_part("part_a"));
+        screen.playing = true;
+        screen.broadcast_preview_active = true;
+
+        screen.suspend_playback_session();
+
+        assert!(!screen.playing);
+        assert!(!screen.broadcast_preview_active);
+        assert_eq!(screen.loaded_project_id, "p");
+        assert!(screen.state_loaded);
+        assert_eq!(screen.all_clips.len(), 1);
+        assert_eq!(screen.selected_clip_id, "clip_a");
+    }
+
+    #[test]
     fn wrap_timeline_refresh_selects_part_under_playhead_without_native_scrub() {
         let mut screen = StoryScreen::story();
         screen.project_id = "p".into();
@@ -3184,6 +3208,35 @@ mod tests {
         assert!(source.has_audio);
         assert_eq!(source.audio_channels, 2);
         assert_eq!(source.audio_output_channel, Some(PROGRAM_AUDIO_OUTPUT_CH1));
+    }
+
+    #[test]
+    fn wrap_entry_preloads_playlist_input_without_starting_playback() {
+        let mut screen = StoryScreen::story();
+        screen.project_id = "p".into();
+        screen.loaded_project_id = "p".into();
+        screen.playlist = Some(two_part_playlist());
+        screen.all_clips = vec![StoryShot {
+            clip_id: "clip_a".into(),
+            fps: 50.0,
+            duration_frames: 300,
+            play_path: "C:/qnc/proxy/clip_a.mp4".into(),
+            has_audio: true,
+            audio_channels: 2,
+            ..StoryShot::default()
+        }];
+        screen.wrap_playhead_frame = 50;
+
+        let intent = screen.start_wrap_session(&HostClient::new("http://127.0.0.1:1"));
+
+        let request = match intent {
+            PlaybackTransportIntent::PreloadProgram(request) => request,
+            other => panic!("expected PreloadProgram, got {other:?}"),
+        };
+        assert_eq!(screen.view_mode, ViewMode::Wrap);
+        assert!(!screen.playing);
+        assert_eq!(request.start_program_frame, FrameNumber(50));
+        assert_eq!(request.items.len(), 2);
     }
 
     #[test]
@@ -3390,6 +3443,10 @@ mod tests {
         });
 
         assert_eq!(edit_intent, PlaybackTransportIntent::None);
+        assert!(screen.state_loaded);
+        assert!(!screen.timeline_loaded);
+        assert!(!screen.playlist_loaded);
+        assert!(!screen.meta_ready());
         assert_eq!(screen.library_tab, LibraryTab::All);
         assert!(screen.selected_source_ref.is_none());
 
@@ -3399,7 +3456,10 @@ mod tests {
 
         let playlist_intent = screen.apply_editorial_playlist("p", playlist_with_part("part_new"));
 
-        assert_eq!(playlist_intent, PlaybackTransportIntent::None);
+        assert!(matches!(
+            playlist_intent,
+            PlaybackTransportIntent::PreloadProgram(_)
+        ));
         assert_eq!(screen.library_tab, LibraryTab::All);
         assert_eq!(screen.view_mode, ViewMode::Wrap);
         assert_eq!(screen.selected_part_id, "part_new");
@@ -3425,6 +3485,10 @@ mod tests {
         });
 
         assert_eq!(edit_intent, PlaybackTransportIntent::None);
+        assert!(screen.state_loaded);
+        assert!(!screen.timeline_loaded);
+        assert!(!screen.playlist_loaded);
+        assert!(!screen.meta_ready());
         assert_eq!(screen.selected_part_id, "part_remaining");
 
         let timeline_intent =
@@ -3434,7 +3498,10 @@ mod tests {
         let playlist_intent =
             screen.apply_editorial_playlist("p", playlist_with_part("part_remaining"));
 
-        assert_eq!(playlist_intent, PlaybackTransportIntent::None);
+        assert!(matches!(
+            playlist_intent,
+            PlaybackTransportIntent::PreloadProgram(_)
+        ));
         assert_eq!(screen.view_mode, ViewMode::Wrap);
         assert_eq!(screen.selected_part_id, "part_remaining");
         assert_eq!(screen.wrap_playhead_frame, 10);

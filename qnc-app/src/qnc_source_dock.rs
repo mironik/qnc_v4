@@ -54,6 +54,7 @@ pub enum SourceDockAction {
 
 /// Horizontal inset shared by workspace columns and the bottom timeline dock.
 pub const SHELL_MARGIN_X: i8 = 8;
+const HEADER_TIMELINE_GAP_H: f32 = 4.0;
 
 /// Owner layer mask for source dock (presets later — not a second timeline type).
 fn source_layers() -> LayerFlags {
@@ -100,7 +101,7 @@ pub fn dock_height(expanded_audio: ExpandedAudio, show_header: bool) -> f32 {
     .content_height()
         + 2.0; // Frame stroke outside content
     if show_header {
-        track + qnc_theme::CHROME_ROW_H
+        track + qnc_theme::CHROME_ROW_H + HEADER_TIMELINE_GAP_H
     } else {
         track
     }
@@ -252,6 +253,7 @@ pub fn show(ui: &mut egui::Ui, input: SourceDockInput<'_>) -> SourceDockAction {
                         );
                     }
                 });
+                ui.add_space(HEADER_TIMELINE_GAP_H);
             }
 
             let filmstrip_background = |ui: &mut egui::Ui, rect: egui::Rect| {

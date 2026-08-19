@@ -23,8 +23,11 @@ pub(crate) enum MediaPoolAction {
     None,
     SwitchTab(LibraryTab),
     SelectShot(StoryShot),
-    /// Ingest: clicked clip id — owner toggles selection / focus.
+    ToggleShotSelection(StoryShot),
+    /// Ingest: card/thumb activation, independent from the checkbox hit zone.
     SelectClipId(String),
+    /// Ingest: checkbox-only selection toggle.
+    ToggleClipSelection(String),
     SelectPart(String),
     DeletePart(String),
     ReorderPart {
@@ -87,6 +90,12 @@ pub(crate) struct MediaPoolCardGridInput<'a> {
     pub card_features: qnc_media_card::MediaCardFeatures,
     pub empty_message: &'a str,
     pub id_salt: &'a str,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum MediaPoolCardGridAction {
+    Activate(String),
+    ToggleSelection(String),
 }
 
 pub(crate) fn show_head(ui: &mut egui::Ui, input: MediaPoolHeadInput) -> MediaPoolAction {
@@ -188,7 +197,7 @@ pub(crate) fn show_ingest_strip(
         .collect();
 
     qnc_ui::content_panel(ui, height, |ui| {
-        if let Some(id) = show_card_grid(
+        if let Some(grid_action) = show_card_grid(
             ui,
             &MediaPoolCardGridInput {
                 height: ui.available_height().max(0.0),
@@ -201,7 +210,12 @@ pub(crate) fn show_ingest_strip(
                 id_salt: "ingest_media_grid",
             },
         ) {
-            action = MediaPoolAction::SelectClipId(id);
+            action = match grid_action {
+                MediaPoolCardGridAction::Activate(id) => MediaPoolAction::SelectClipId(id),
+                MediaPoolCardGridAction::ToggleSelection(id) => {
+                    MediaPoolAction::ToggleClipSelection(id)
+                }
+            };
         }
     });
     action
@@ -211,8 +225,8 @@ pub(crate) fn show_ingest_strip(
 pub(crate) fn show_card_grid(
     ui: &mut egui::Ui,
     input: &MediaPoolCardGridInput<'_>,
-) -> Option<String> {
-    let mut clicked: Option<String> = None;
+) -> Option<MediaPoolCardGridAction> {
+    let mut clicked: Option<MediaPoolCardGridAction> = None;
     let cards = input.cards;
     let t = current(ui);
     let muted = t.muted;
@@ -279,7 +293,15 @@ pub(crate) fn show_card_grid(
                             },
                         );
                         if resp.clicked() {
-                            clicked = Some(card.id.to_string());
+                            let is_checkbox_click = input.card_features.selection_check
+                                && resp.interact_pointer_pos().is_some_and(|pos| {
+                                    qnc_media_card::selection_check_hit_rect(rect).contains(pos)
+                                });
+                            clicked = Some(if is_checkbox_click {
+                                MediaPoolCardGridAction::ToggleSelection(card.id.to_string())
+                            } else {
+                                MediaPoolCardGridAction::Activate(card.id.to_string())
+                            });
                         }
                     }
                 });
@@ -340,7 +362,7 @@ fn shot_cards(ui: &mut egui::Ui, input: &MediaPoolStripInput<'_>) -> MediaPoolAc
         .collect();
 
     let mut action = MediaPoolAction::None;
-    if let Some(id) = show_card_grid(
+    if let Some(grid_action) = show_card_grid(
         ui,
         &MediaPoolCardGridInput {
             height: ui.available_height().max(0.0),
@@ -353,8 +375,16 @@ fn shot_cards(ui: &mut egui::Ui, input: &MediaPoolStripInput<'_>) -> MediaPoolAc
             id_salt: "story_media_grid",
         },
     ) {
+        let (id, checkbox_click) = match &grid_action {
+            MediaPoolCardGridAction::Activate(id) => (id.as_str(), false),
+            MediaPoolCardGridAction::ToggleSelection(id) => (id.as_str(), true),
+        };
         if let Some(shot) = shots.iter().find(|s| shot_id(s) == id) {
-            action = MediaPoolAction::SelectShot(shot.clone());
+            action = if checkbox_click {
+                MediaPoolAction::ToggleShotSelection(shot.clone())
+            } else {
+                MediaPoolAction::SelectShot(shot.clone())
+            };
         }
     }
     action
