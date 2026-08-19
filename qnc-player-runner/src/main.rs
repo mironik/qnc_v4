@@ -28,7 +28,6 @@ use qnc_player_output::{
 use qnc_player_runtime::{BroadcastPlayerRuntime, PlayerRuntimeCommand};
 use serde_json::{Value, json};
 
-const RUNNER_REALTIME_MAX_CATCHUP_FRAMES: usize = 1;
 const RUNNER_TOOL_CHECK_TIMEOUT: Duration = Duration::from_millis(5_000);
 const RUNNER_TOOL_TERMINATE_TIMEOUT: Duration = Duration::from_millis(5);
 const RUNNER_TOOL_CHECK_POLL: Duration = Duration::from_millis(10);
@@ -382,8 +381,7 @@ fn build_runtime(
             AudioPacketTelemetry::new(AvSyncAudioPacketSink::new(audio_sink, av_sync)),
         ),
         video_presenter,
-    )
-    .with_max_catchup_frames(RUNNER_REALTIME_MAX_CATCHUP_FRAMES);
+    );
     BroadcastPlayerRuntime::new(engine)
 }
 
@@ -1181,8 +1179,7 @@ struct RunnerArgs {
     source_id: String,
     request_id: String,
     duration_frames: Option<u64>,
-    timebase: Timebase,
-    timebase_explicit: bool,
+    timebase: Option<Timebase>,
     in_frame: u64,
     out_frame: Option<u64>,
     rate_num: i32,
@@ -1225,8 +1222,7 @@ impl RunnerArgs {
         let mut source_id = "runner-source".to_string();
         let mut request_id = "runner-request".to_string();
         let mut duration_frames = None;
-        let mut timebase = Timebase::new(25, 1)?;
-        let mut timebase_explicit = false;
+        let mut timebase = None;
         let mut in_frame = 0;
         let mut out_frame = None;
         let mut rate_num = 1;
@@ -1276,8 +1272,7 @@ impl RunnerArgs {
                     )?)
                 }
                 "--timebase" => {
-                    timebase = parse_timebase(&next_value(&mut args, "--timebase")?)?;
-                    timebase_explicit = true;
+                    timebase = Some(parse_timebase(&next_value(&mut args, "--timebase")?)?);
                 }
                 "--in-frame" => {
                     in_frame = parse_u64(&next_value(&mut args, "--in-frame")?, "--in-frame")?
@@ -1432,7 +1427,6 @@ impl RunnerArgs {
                 request_id,
                 duration_frames: Some(1),
                 timebase,
-                timebase_explicit,
                 in_frame,
                 out_frame,
                 rate_num,
@@ -1492,7 +1486,7 @@ impl RunnerArgs {
                         .to_string(),
                 );
             }
-            if !timebase_explicit {
+            if timebase.is_none() {
                 return Err(
                     "--timebase is required unless --probe-source-runtime is used".to_string(),
                 );
@@ -1535,7 +1529,6 @@ impl RunnerArgs {
             request_id,
             duration_frames,
             timebase,
-            timebase_explicit,
             in_frame,
             out_frame,
             rate_num,
@@ -1579,12 +1572,7 @@ fn source_runtime_from_args(
     toolchain: &FfmpegToolchain,
 ) -> Result<SourceRuntime, String> {
     let mut source = if args.probe_source_runtime {
-        probe_source_runtime_with_toolchain(
-            &args.path,
-            args.source_id.clone(),
-            args.timebase_explicit.then_some(args.timebase),
-            toolchain,
-        )
+        probe_source_runtime_with_toolchain(&args.path, args.source_id.clone(), toolchain)
         .map_err(|err| err.to_string())?
         .source
     } else {
@@ -1592,12 +1580,10 @@ fn source_runtime_from_args(
             args.source_id.clone(),
             args.duration_frames
                 .ok_or_else(|| "--duration-frames is required".to_string())?,
-            args.timebase,
+            args.timebase
+                .ok_or_else(|| "--timebase is required".to_string())?,
         )?
     };
-    if args.timebase_explicit {
-        source.timebase = args.timebase;
-    }
     if let Some(duration_frames) = args.duration_frames {
         source.duration_frames = duration_frames;
     }
