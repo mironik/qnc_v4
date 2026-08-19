@@ -157,6 +157,14 @@ struct CreateCoverBody {
     slot_id: String,
     clip_id: Option<String>,
     virtual_shot_id: Option<String>,
+    #[serde(default)]
+    in_frame: Option<i64>,
+    #[serde(default)]
+    out_frame: Option<i64>,
+    #[serde(default)]
+    source_in_frame: Option<i64>,
+    #[serde(default)]
+    source_out_frame: Option<i64>,
     title: Option<String>,
     note: Option<String>,
 }
@@ -783,6 +791,11 @@ async fn api_cover_create(
         body.virtual_shot_id.as_deref(),
         body.title.as_deref(),
         body.note.as_deref(),
+        SegmentRangeInput {
+            in_frame: body.in_frame.or(body.source_in_frame),
+            out_frame: body.out_frame.or(body.source_out_frame),
+            ..SegmentRangeInput::default()
+        },
     )
     .map_err(map_bad_request)?;
     Ok(Json(state))
@@ -911,15 +924,66 @@ fn map_store_err(e: String) -> (StatusCode, String) {
 }
 
 fn map_bad_request(e: String) -> (StatusCode, String) {
-    if e.contains("not found")
-        || e.contains("invalid")
-        || e.contains("required")
-        || e.contains("already exists")
-        || e.contains("proxy_missing")
-        || e.contains("original_missing")
-    {
+    if is_story_client_error(&e) {
         (StatusCode::BAD_REQUEST, e)
     } else {
         (StatusCode::INTERNAL_SERVER_ERROR, e)
+    }
+}
+
+fn is_story_client_error(message: &str) -> bool {
+    let msg = message.to_lowercase();
+    [
+        "not found",
+        "invalid",
+        "required",
+        "already exists",
+        "proxy_missing",
+        "original_missing",
+        "slot_id",
+        "clip_id",
+        "cover_id",
+        "marker_id",
+        "part_id",
+        "virtual_shot_id",
+        "nije prona",
+        "nije uvezen",
+        "nije potvr",
+        "nema proxy",
+        "nema marker",
+        "nema m-m",
+        "nema valjan",
+        "nedostaje",
+        "odaberi",
+        "treba",
+        "mora biti",
+        "prazan",
+        "poslije in",
+        "timeline_fps_invalid",
+    ]
+    .iter()
+    .any(|needle| msg.contains(needle))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{is_story_client_error, map_bad_request};
+    use axum::http::StatusCode;
+
+    #[test]
+    fn cover_validation_errors_are_bad_request() {
+        assert!(is_story_client_error(
+            "Pokrivalica iz source frameova treba clip_id"
+        ));
+        assert!(is_story_client_error(
+            "Klip 'mironik_2002' nije uvezen u ingest"
+        ));
+        assert!(is_story_client_error("nema proxy za 'mironik_2002'"));
+    }
+
+    #[test]
+    fn map_bad_request_keeps_unknown_errors_internal() {
+        let (status, _) = map_bad_request("database is locked".into());
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
     }
 }

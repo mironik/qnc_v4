@@ -466,14 +466,14 @@ Za source playback native app treba preferirati client-local original ako je dos
 
 Obavezna pravila za Story/source playback:
 
-- postoje dvije vrste virtualnih kadrova: source virtual shot (`import_root`, cijeli source clip, Story All tab) i derived virtual shot (`derived`, dio source virtual shot-a, Story Virtual tab)
+- postoje dvije vrste virtualnih kadrova: source virtual shot (`import_root`, cijeli source clip, Story All tab) i virtual shot (`virtual`, dio source virtual shot-a, Story Virtual tab)
 - Story Segment tab koristi virtual segment (`story_parts.part_id`), koji može referencirati `virtual_shot_id` ili vlastiti `clip_id + in_frame/out_frame` source range
 - primarni playback input je `virtual_shot_id`; host iz SQLite resolvea `clip_id`, source frame IN/OUT i source FPS
 - za Segment-tab playback primarni input je `part_id`; host iz SQLite resolvea `clip_id`, source frame IN/OUT i source FPS
 - `clip_id + in/out` smije ostati samo fallback za privremeni source preview prije nego postoji durable shot ili segment identitet
 - source FPS dolazi iz probea source datoteke (`ingest_assets.fps` / virtual-shot source metadata), nikad iz project timeline FPS-a
 - project/export FPS je samo export postavka; Story/Segment runtime, marker/slot math i playback koriste source FPS iz probe/DB
-- news export smije biti p50 ili i50; `fps=25 + upper_first + i50` je 50-field delivery, ne p25. Jedini dozvoljeni progresivni 25 izvoz je Telekino PsF25.
+- news export smije biti p50 ili i50; `fps=25 + upper_first + i50` je 50-field delivery. PAL single-rate progressive export nije valjan project/export profil.
 - trenutni `ffmpeg rawvideo + rodio` path je privremeni preview; broadcast motor mora imati jedan master clock, frame queue, audio device latency compensation i drop/repeat politiku
 
 ## Faza 8 — native Story screen

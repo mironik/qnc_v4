@@ -175,8 +175,10 @@ mod tests {
 
     #[test]
     fn import_selected_sends_explicit_clip_intent() {
-        let command =
-            SourceImportCommandComponent::import_selected("p1", &["clip_a".into(), "clip_b".into()]);
+        let command = SourceImportCommandComponent::import_selected(
+            "p1",
+            &["clip_a".into(), "clip_b".into()],
+        );
         let payload = command.payload.expect("payload");
         let ids = payload["clip_ids"].as_array().expect("clip_ids");
         assert_eq!(ids.len(), 2);

@@ -81,3 +81,46 @@ Test: `.\test.ps1` (API + qnc-app unit smoke, bez web asset testova).
 ## DB-first
 
 Workflow stanje živi u SQLite preko Rust API-ja. UI je projekcija — nikad vlasnik.
+
+## Jedinstveni model
+
+- Problem se ne smije popravljati samo u jednom tabu, formi ili panelu. Ako
+  isti koncept postoji u Source timelineu, Segment timelineu, Program/playlist
+  overviewu, Storyju, Media Assistu ili Ingestu, rješenje mora ići kroz
+  zajednički model/contract i vrijediti za sve opcije.
+- "Riješeno" znači da je riješeno na cijelom zajedničkom toku: isti timeline
+  layer contract, isti broadcast-player input/progress princip i isti
+  frame-based model. Zabranjeni su lokalni workaroundi koji poprave samo
+  jedan prikaz, a ostave drugi na starom modelu.
+- Nijedan FPS ne smije biti zakljucan kao preset, fallback ili implicitno
+  pravilo play komponente. Ako probe/metapodaci sourcea vrate 25, 30, 50, 60,
+  59.94 ili drugi valjan rate, playback koristi upravo taj probed timebase.
+  Zabranjeno je samo izmisljanje FPS-a kad probe nije spreman ili valjan.
+- Forme su pasivne komponente: prikaz, unos i emitiranje neutralnih intentova.
+  Kompletan aktivni kod dolazi iz komponenti/modula koji posjeduju taj
+  contract. Dok se rješava modul ili komponenta, promjene ostaju unutar tog
+  modula / komponente i njezinog eksplicitnog contracta; ne dirati druge
+  komponente kao usputni workaround.
+- Sve komponente moraju biti neutralne i samostalne: ne smiju čitati stanje iz
+  forme kao poslovno pravilo, ne smiju pretpostavljati aktivni tab i ne smiju
+  uvoditi lokalne fallback modele koji zaobilaze njihov contract.
+- Play ritam, streaming tick, frame catch-up i pause/play lifecycle vlasništvo
+  su play/broadcast-player komponente. Source timeline, segment timeline,
+  program/playlist prikaz, Story i Media Assist smiju samo slati neutralne
+  intentove i koristiti tu istu komponentu univerzalno.
+- FPS za playback određuje probe/metapodaci sourcea. Play komponenta ne smije
+  koristiti project/export FPS, hardkodirani FPS ili lokalni fallback kad
+  otvara source input; ako probe FPS nije spreman, open/play se odbija kao
+  nespreman.
+- `QncTimeline` je jedan neutralni timeline core. Source, Segment i Program ne
+  smiju imati paralelne timeline implementacije; smiju imati samo adaptere koji
+  pune isti layer contract i aktiviraju/deaktiviraju potrebne layere.
+- Svi timeline elementi su virtualni kadrovi po contractu. Razlika izmedu
+  source virtuala, segmenta, pokrivalice ili drugog prikaza smije biti samo
+  `kind`/hint/workflow naziv, ne drugi aktivni playback model.
+- Svaki virtualni kadar ima vlastiti `source_in`/`source_out`. Segmenti takoder
+  imaju svoj IN/OUT i tretiraju se kao virtualni kadrovi u EDL/playlist
+  contractu, iako se ne prikazuju u Virtual tabu nego u Segment prikazu.
+- Timeline, Segment i Program UI su pasivni: prikazuju virtualne rangeove i
+  emitiraju frame/selection intent. Playlist/EDL builder pretvara te virtualne
+  kadrove u jedan broadcast-player input; UI elementi sami ne playaju media.

@@ -3,14 +3,16 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 use crate::engine_contract::{
-    AudioOutputAdapter, BroadcastEngineError, BroadcastEngineErrorKind, EngineFrameRequest,
-    EngineSourceHandle, FramePresenter, SourceOpenAdapter, VideoDecodeAdapter,
+    AudioFramePacket, AudioOutputAdapter, BroadcastEngineError, BroadcastEngineErrorKind,
+    DecodedVideoFrame, EngineFrameRequest, EngineSourceHandle, FramePresenter, SourceOpenAdapter,
+    VideoDecodeAdapter,
 };
 use crate::event::BroadcastEvent;
 use crate::frame_clock::{ClockTick, FrameClock, FrameClockConfig, FrameClockRate};
 use crate::model::{FrameNumber, FrameRange, SourceRuntime, TransportStatus};
 
-const DEFAULT_MAX_CATCHUP_FRAMES: usize = 4;
+const DEFAULT_DECODE_BURST_FRAMES: usize = 4;
+const MIN_PLAYOUT_BUFFER_FRAMES: usize = 4;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TransportEngineState {
@@ -21,7 +23,7 @@ pub struct TransportEngineState {
     pub active_range: Option<FrameRange>,
     pub playback_rate_num: i32,
     pub playback_rate_den: u32,
-    pub max_catchup_frames: usize,
+    pub decode_burst_frames: usize,
 }
 
 impl Default for TransportEngineState {
@@ -34,7 +36,7 @@ impl Default for TransportEngineState {
             active_range: None,
             playback_rate_num: 1,
             playback_rate_den: 1,
-            max_catchup_frames: DEFAULT_MAX_CATCHUP_FRAMES,
+            decode_burst_frames: DEFAULT_DECODE_BURST_FRAMES,
         }
     }
 }
@@ -52,6 +54,7 @@ where
     frame_presenter: P,
     clock: Option<FrameClock>,
     state: TransportEngineState,
+    playout: PlayoutBuffer<V::VideoFrame, A::AudioPacket>,
 }
 
 impl<S, V, A, P> TransportEngine<S, V, A, P>
@@ -69,11 +72,12 @@ where
             frame_presenter,
             clock: None,
             state: TransportEngineState::default(),
+            playout: PlayoutBuffer::default(),
         }
     }
 
-    pub fn with_max_catchup_frames(mut self, max_catchup_frames: usize) -> Self {
-        self.state.max_catchup_frames = max_catchup_frames.max(1);
+    pub fn with_decode_burst_frames(mut self, decode_burst_frames: usize) -> Self {
+        self.state.decode_burst_frames = decode_burst_frames.max(1);
         self
     }
 
@@ -131,6 +135,7 @@ where
         let mut events = self.interrupt_motion()?;
         self.close_active_source()?;
         self.close_preloaded_sources()?;
+        self.playout.clear();
         self.state.carrier_frame = 0;
         self.state.status = TransportStatus::Empty;
         self.state.active_range = None;
@@ -162,9 +167,11 @@ where
             now_tick,
         ));
         self.state.status = TransportStatus::Playing;
-        Ok(vec![BroadcastEvent::TransportStatusChanged {
+        let mut events = Vec::new();
+        events.push(BroadcastEvent::TransportStatusChanged {
             status: TransportStatus::Playing,
-        }])
+        });
+        Ok(events)
     }
 
     pub fn pause(&mut self) -> Result<Vec<BroadcastEvent>, BroadcastEngineError> {
@@ -206,6 +213,7 @@ where
         self.state.active_range = Some(resolved_range);
         self.require_frame_in_active_range(carrier_frame)?;
         self.state.carrier_frame = carrier_frame;
+        self.playout.reset_for_frame(carrier_frame);
 
         events.push(BroadcastEvent::RangeChanged {
             range: Some(resolved_range),
@@ -248,30 +256,49 @@ where
         &mut self,
         now_tick: ClockTick,
     ) -> Result<Vec<BroadcastEvent>, BroadcastEngineError> {
-        let Some(clock) = self.clock.as_mut() else {
+        if self.clock.is_none() {
             return Ok(Vec::new());
         };
-        let due_frames = clock.drain_due_frames(now_tick, self.state.max_catchup_frames);
         let mut events = Vec::new();
-        for scheduled in due_frames {
+        let max_due = self.state.decode_burst_frames.max(1);
+        for _ in 0..max_due {
+            let Some((scheduled, advanced_clock)) = self.peek_next_due_frame(now_tick) else {
+                break;
+            };
+
             if self.frame_outside_source(scheduled.frame)? {
                 events.extend(self.stop()?);
-                break;
+                return Ok(events);
             }
+
             let range = self.current_range()?;
-            let frame = if scheduled.frame >= range.end_frame {
-                range.end_frame
-            } else {
-                scheduled.frame
-            };
-            self.state.carrier_frame = frame;
-            events.extend(self.present_current_frame()?);
+            let frame = scheduled.frame.min(range.end_frame);
+            if !self.playout_ready(frame)? {
+                self.playout.reset_for_frame(frame);
+                events.extend(self.refill_playout_buffer(frame, 1)?);
+                if !self.playout_ready(frame)? {
+                    return Ok(events);
+                }
+            }
+
+            self.clock = Some(advanced_clock);
+            events.extend(self.present_buffered_frame(frame)?);
             if frame >= range.end_frame {
                 events.extend(self.apply_playback_boundary()?);
-                break;
+                return Ok(events);
             }
         }
+        events.extend(self.refill_from_current_position()?);
         Ok(events)
+    }
+
+    fn peek_next_due_frame(
+        &self,
+        now_tick: ClockTick,
+    ) -> Option<(crate::ScheduledFrame, FrameClock)> {
+        let mut clock = self.clock.clone()?;
+        let scheduled = clock.next_due_frame(now_tick)?;
+        Some((scheduled, clock))
     }
 
     fn apply_playback_boundary(&mut self) -> Result<Vec<BroadcastEvent>, BroadcastEngineError> {
@@ -335,6 +362,7 @@ where
         self.state.active_range = source_range(&handle);
         self.state.playback_rate_num = 1;
         self.state.playback_rate_den = 1;
+        self.playout.reset_for_frame(0);
         vec![
             BroadcastEvent::SourceReady {
                 source_id: handle.source_id,
@@ -353,6 +381,7 @@ where
         if let Some(active_source) = self.state.source.take() {
             self.source_open.close_source(&active_source.source_id)?;
         }
+        self.playout.clear();
         Ok(())
     }
 
@@ -372,20 +401,111 @@ where
     }
 
     fn present_current_frame(&mut self) -> Result<Vec<BroadcastEvent>, BroadcastEngineError> {
-        let source = self.require_source()?.clone();
-        let request = EngineFrameRequest::new(&source, self.state.carrier_frame)?;
-        let mut events = vec![self.position_event()];
+        self.decode_frame_to_buffer(self.state.carrier_frame)?;
+        self.present_buffered_frame(self.state.carrier_frame)
+    }
 
+    fn decode_frame_to_buffer(&mut self, frame: FrameNumber) -> Result<(), BroadcastEngineError> {
+        let source = self.require_source()?.clone();
+        let request = EngineFrameRequest::new(&source, frame)?;
+        if source.video_format.is_some() && !self.playout.video.contains_key(&frame) {
+            let video_frame = self.video_decode.decode_video_frame(request.clone())?;
+            self.playout.video.insert(frame, video_frame);
+        }
+        if source.audio_format.is_some() && !self.playout.audio.contains_key(&frame) {
+            let audio_packet = self.audio_output.render_audio_for_frame(request)?;
+            self.playout.audio.insert(frame, audio_packet);
+        }
+        Ok(())
+    }
+
+    fn present_buffered_frame(
+        &mut self,
+        frame: FrameNumber,
+    ) -> Result<Vec<BroadcastEvent>, BroadcastEngineError> {
+        let source = self.require_source()?.clone();
+        self.state.carrier_frame = frame;
+        let mut events = vec![self.position_event()];
         if source.audio_format.is_some() {
-            let audio_packet = self.audio_output.render_audio_for_frame(request.clone())?;
+            let audio_packet = self.playout.audio.remove(&frame).ok_or_else(|| {
+                BroadcastEngineError::new(
+                    BroadcastEngineErrorKind::AudioOutput,
+                    format!("audio frame {frame} is not ready for playout"),
+                )
+                .with_source_id(source.source_id.clone())
+                .with_frame(frame)
+            })?;
             events.extend(self.audio_output.submit_audio_packet(audio_packet)?);
         }
         if source.video_format.is_some() {
-            let video_frame = self.video_decode.decode_video_frame(request)?;
+            let video_frame = self.playout.video.remove(&frame).ok_or_else(|| {
+                BroadcastEngineError::new(
+                    BroadcastEngineErrorKind::VideoDecode,
+                    format!("video frame {frame} is not ready for playout"),
+                )
+                .with_source_id(source.source_id.clone())
+                .with_frame(frame)
+            })?;
             events.extend(self.frame_presenter.present_frame(video_frame)?);
         }
-
+        self.playout.trim_before(frame.saturating_sub(1));
         Ok(events)
+    }
+
+    fn refill_from_current_position(
+        &mut self,
+    ) -> Result<Vec<BroadcastEvent>, BroadcastEngineError> {
+        let ahead = self.buffered_ahead_from(self.state.carrier_frame)?;
+        let budget = refill_budget(
+            matches!(self.state.status, TransportStatus::Playing),
+            ahead,
+            self.healthy_buffer_frames(),
+            self.state.decode_burst_frames,
+        );
+        self.refill_playout_buffer(self.state.carrier_frame, budget)
+    }
+
+    fn refill_playout_buffer(
+        &mut self,
+        anchor_frame: FrameNumber,
+        max_frames: usize,
+    ) -> Result<Vec<BroadcastEvent>, BroadcastEngineError> {
+        let range = self.current_range()?;
+        let mut frame = self
+            .playout
+            .next_decode_frame
+            .filter(|frame| *frame >= anchor_frame)
+            .unwrap_or(anchor_frame);
+        let mut decoded = 0;
+        while decoded < max_frames && frame <= range.end_frame {
+            self.decode_frame_to_buffer(frame)?;
+            decoded += 1;
+            frame = frame.saturating_add(1);
+            self.playout.next_decode_frame = Some(frame);
+        }
+        Ok(Vec::new())
+    }
+
+    fn playout_ready(&self, frame: FrameNumber) -> Result<bool, BroadcastEngineError> {
+        let source = self.require_source()?;
+        Ok(self.playout.has_ready_frame(source, frame))
+    }
+
+    fn buffered_ahead_from(&self, frame: FrameNumber) -> Result<usize, BroadcastEngineError> {
+        let source = self.require_source()?;
+        Ok(self
+            .playout
+            .newest_ready_frame(source)
+            .and_then(|newest| newest.checked_sub(frame))
+            .and_then(|ahead| usize::try_from(ahead).ok())
+            .unwrap_or(0))
+    }
+
+    fn healthy_buffer_frames(&self) -> usize {
+        self.state
+            .decode_burst_frames
+            .saturating_mul(4)
+            .max(MIN_PLAYOUT_BUFFER_FRAMES)
     }
 
     fn position_event(&self) -> BroadcastEvent {
@@ -465,6 +585,71 @@ where
     }
 }
 
+struct PlayoutBuffer<V, A> {
+    video: BTreeMap<FrameNumber, DecodedVideoFrame<V>>,
+    audio: BTreeMap<FrameNumber, AudioFramePacket<A>>,
+    next_decode_frame: Option<FrameNumber>,
+}
+
+impl<V, A> Default for PlayoutBuffer<V, A> {
+    fn default() -> Self {
+        Self {
+            video: BTreeMap::new(),
+            audio: BTreeMap::new(),
+            next_decode_frame: None,
+        }
+    }
+}
+
+impl<V, A> PlayoutBuffer<V, A> {
+    fn clear(&mut self) {
+        self.video.clear();
+        self.audio.clear();
+        self.next_decode_frame = None;
+    }
+
+    fn reset_for_frame(&mut self, frame: FrameNumber) {
+        self.clear();
+        self.next_decode_frame = Some(frame);
+    }
+
+    fn has_ready_frame(&self, source: &EngineSourceHandle, frame: FrameNumber) -> bool {
+        source
+            .video_format
+            .as_ref()
+            .map_or(true, |_| self.video.contains_key(&frame))
+            && source
+                .audio_format
+                .as_ref()
+                .map_or(true, |_| self.audio.contains_key(&frame))
+    }
+
+    fn newest_ready_frame(&self, source: &EngineSourceHandle) -> Option<FrameNumber> {
+        match (source.video_format.is_some(), source.audio_format.is_some()) {
+            (true, true) => {
+                Some((*self.video.keys().next_back()?).min(*self.audio.keys().next_back()?))
+            }
+            (true, false) => self.video.keys().next_back().copied(),
+            (false, true) => self.audio.keys().next_back().copied(),
+            (false, false) => None,
+        }
+    }
+
+    fn trim_before(&mut self, frame: FrameNumber) {
+        self.video.retain(|candidate, _| *candidate >= frame);
+        self.audio.retain(|candidate, _| *candidate >= frame);
+    }
+}
+
+fn refill_budget(playing: bool, ahead: usize, healthy: usize, max_burst: usize) -> usize {
+    let healthy = healthy.max(1);
+    let max_burst = max_burst.max(1);
+    if playing && ahead >= healthy {
+        return 0;
+    }
+    healthy.saturating_sub(ahead).max(1).min(max_burst)
+}
+
 fn source_range(source: &EngineSourceHandle) -> Option<FrameRange> {
     FrameRange::new(0, source.duration_frames).ok()
 }
@@ -492,11 +677,45 @@ mod tests {
                 peak_dbfs_x100: -900
             } if track_id == "monitor"
         )));
-        assert!(
-            events
-                .iter()
-                .any(|event| matches!(event, BroadcastEvent::FramePresented { frame: 0 }))
-        );
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, BroadcastEvent::FramePresented { frame: 0 })));
+    }
+
+    #[test]
+    fn play_starts_clock_without_synchronous_preroll() {
+        let mut engine = fake_engine();
+        engine.load_source(&source_runtime(), Some(1)).unwrap();
+
+        let events = engine.play(1_000).unwrap();
+
+        assert!(events.iter().any(|event| matches!(
+            event,
+            BroadcastEvent::TransportStatusChanged {
+                status: TransportStatus::Playing
+            }
+        )));
+        assert!(engine.playout.video.is_empty());
+        assert!(engine.playout.audio.is_empty());
+    }
+
+    #[test]
+    fn delayed_tick_catches_up_without_skipping_frames() {
+        let mut engine = fake_engine();
+        engine.load_source(&source_runtime(), Some(1)).unwrap();
+        engine.play(0).unwrap();
+
+        let events = engine.tick(100_000_000).unwrap();
+
+        assert_eq!(engine.state().carrier_frame, 3);
+        for expected in 0..=3 {
+            assert!(events.iter().any(|event| {
+                matches!(event, BroadcastEvent::FramePresented { frame } if *frame == expected)
+            }));
+        }
+        assert!(events.iter().all(|event| {
+            !matches!(event, BroadcastEvent::FramePresented { frame } if *frame > 3)
+        }));
     }
 
     #[test]
@@ -513,11 +732,9 @@ mod tests {
         assert!(events.iter().any(|event| {
             matches!(event, BroadcastEvent::FramePresented { frame } if *frame == 0)
         }));
-        assert!(
-            events
-                .iter()
-                .all(|event| !matches!(event, BroadcastEvent::AudioLevelChanged { .. }))
-        );
+        assert!(events
+            .iter()
+            .all(|event| !matches!(event, BroadcastEvent::AudioLevelChanged { .. })));
     }
 
     #[test]
@@ -538,18 +755,16 @@ mod tests {
                 peak_dbfs_x100: -900
             } if track_id == "monitor"
         )));
-        assert!(
-            events
-                .iter()
-                .all(|event| !matches!(event, BroadcastEvent::FramePresented { .. }))
-        );
+        assert!(events
+            .iter()
+            .all(|event| !matches!(event, BroadcastEvent::FramePresented { .. })));
     }
 
     #[test]
     fn source_without_declared_tracks_is_rejected() {
         let mut engine = fake_engine();
         let source =
-            SourceRuntime::new("metadata-only", 20, Timebase::new(25, 1).unwrap()).unwrap();
+            SourceRuntime::new("metadata-only", 20, Timebase::new(50, 1).unwrap()).unwrap();
 
         let error = engine.load_source(&source, None).unwrap_err();
 
@@ -618,7 +833,8 @@ mod tests {
         let mut engine = fake_engine();
         engine.load_source(&source_runtime(), None).unwrap();
         engine.play(0).unwrap();
-        engine.tick(40_000_000).unwrap();
+        engine.tick(0).unwrap();
+        engine.tick(20_000_000).unwrap();
 
         let events = engine.stop().unwrap();
 
@@ -671,7 +887,9 @@ mod tests {
             .unwrap();
         engine.play(0).unwrap();
 
-        let events = engine.tick(40_000_000).unwrap();
+        let mut events = engine.tick(0).unwrap();
+        events.extend(engine.tick(20_000_000).unwrap());
+        events.extend(engine.tick(40_000_000).unwrap());
 
         let frame_presented_index = event_index(&events, |event| {
             matches!(event, BroadcastEvent::FramePresented { frame: 20 })
@@ -702,7 +920,9 @@ mod tests {
             .unwrap();
         engine.play(0).unwrap();
 
-        let events = engine.tick(160_000_000).unwrap();
+        let mut events = engine.tick(0).unwrap();
+        events.extend(engine.tick(20_000_000).unwrap());
+        events.extend(engine.tick(40_000_000).unwrap());
 
         let frame_presented_index = event_index(&events, |event| {
             matches!(event, BroadcastEvent::FramePresented { frame: 20 })
@@ -762,14 +982,14 @@ mod tests {
             "active_range",
             "playback_rate_num",
             "playback_rate_den",
-            "max_catchup_frames",
+            "decode_burst_frames",
         ] {
             assert!(fields.contains_key(field), "missing field: {field}");
         }
     }
 
-    fn fake_engine()
-    -> TransportEngine<FakeSourceOpen, FakeVideoDecode, FakeAudioOutput, FakePresenter> {
+    fn fake_engine(
+    ) -> TransportEngine<FakeSourceOpen, FakeVideoDecode, FakeAudioOutput, FakePresenter> {
         TransportEngine::new(
             FakeSourceOpen,
             FakeVideoDecode,
@@ -778,8 +998,8 @@ mod tests {
         )
     }
 
-    fn video_only_engine()
-    -> TransportEngine<FakeSourceOpen, FakeVideoDecode, RejectingAudioOutput, FakePresenter> {
+    fn video_only_engine(
+    ) -> TransportEngine<FakeSourceOpen, FakeVideoDecode, RejectingAudioOutput, FakePresenter> {
         TransportEngine::new(
             FakeSourceOpen,
             FakeVideoDecode,
@@ -788,8 +1008,8 @@ mod tests {
         )
     }
 
-    fn audio_only_engine()
-    -> TransportEngine<FakeSourceOpen, RejectingVideoDecode, FakeAudioOutput, RejectingPresenter>
+    fn audio_only_engine(
+    ) -> TransportEngine<FakeSourceOpen, RejectingVideoDecode, FakeAudioOutput, RejectingPresenter>
     {
         TransportEngine::new(
             FakeSourceOpen,
@@ -799,8 +1019,8 @@ mod tests {
         )
     }
 
-    fn rejecting_open_engine()
-    -> TransportEngine<RejectBadSourceOpen, FakeVideoDecode, FakeAudioOutput, FakePresenter> {
+    fn rejecting_open_engine(
+    ) -> TransportEngine<RejectBadSourceOpen, FakeVideoDecode, FakeAudioOutput, FakePresenter> {
         TransportEngine::new(
             RejectBadSourceOpen,
             FakeVideoDecode,
@@ -814,7 +1034,7 @@ mod tests {
     }
 
     fn source_runtime_with_id(source_id: &str) -> SourceRuntime {
-        SourceRuntime::new(source_id, 20, Timebase::new(25, 1).unwrap())
+        SourceRuntime::new(source_id, 20, Timebase::new(50, 1).unwrap())
             .unwrap()
             .with_video_format(
                 VideoFormat::new(1920, 1080, FieldMode::Progressive, ColorSpace::Rec709).unwrap(),
@@ -823,7 +1043,7 @@ mod tests {
     }
 
     fn video_only_source_runtime() -> SourceRuntime {
-        SourceRuntime::new("video-only", 20, Timebase::new(25, 1).unwrap())
+        SourceRuntime::new("video-only", 20, Timebase::new(50, 1).unwrap())
             .unwrap()
             .with_video_format(
                 VideoFormat::new(1920, 1080, FieldMode::Progressive, ColorSpace::Rec709).unwrap(),
@@ -831,7 +1051,7 @@ mod tests {
     }
 
     fn audio_only_source_runtime() -> SourceRuntime {
-        SourceRuntime::new("audio-only", 20, Timebase::new(25, 1).unwrap())
+        SourceRuntime::new("audio-only", 20, Timebase::new(50, 1).unwrap())
             .unwrap()
             .with_audio_format(AudioFormat::new(48_000, 2).unwrap())
     }

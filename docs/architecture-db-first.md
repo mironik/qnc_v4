@@ -137,7 +137,7 @@ Story montage is based on durable virtual entities, not transient UI trims.
 There are two virtual-shot types:
 
 - **Source virtual shot** (`kind = 'import_root'`) — the whole source clip; shown in Story **All** tab.
-- **Derived virtual shot** (`kind = 'derived'`) — a frame range derived from one source virtual shot; shown in Story **Virtual** tab.
+- **Virtual shot** (`kind = 'virtual'`) — a frame range cut from one source virtual shot; shown in Story **Virtual** tab.
 
 Story also has **virtual segments**:
 
@@ -160,8 +160,9 @@ Rules:
 2. A saved Segment-tab edit must become a durable virtual segment in `story_parts`; it does not have to create or reference a derived `virtual_shot_id`.
 3. Playback/export must resolve source clip, frame range and FPS from Rust API + SQLite, not from client-only state.
 4. FPS is source-file metadata from probe/DB. Project/export FPS is only an export setting and must not set source, virtual-shot, Segment/Story timeline, marker, slot, or playback math.
-5. News export may be p50 or i50; `fps=25 + upper_first + i50` is interlaced 50-field delivery, not p25. Progressive 25 export is allowed only as explicit Telekino PsF25.
+5. News export may be p50 or i50; `fps=25 + upper_first + i50` is interlaced 50-field delivery. PAL single-rate progressive export is not a valid project/export profile.
 6. If client and host disagree, host database wins; client state is discarded/reloaded.
+7. Story/program playback uses a streaming playlist input: open only the current item and a small forward window, never decode the whole playlist at open/play start, and never silently drop video frames or audio packets.
 
 ---
 

@@ -4,7 +4,7 @@
 //! It only maps between a global program axis and source-frame ranges stored in
 //! the editorial playlist.
 
-use crate::api::{EditorialPlaylist, EditorialPlaylistSegment};
+use crate::api::{EditorialPlaylist, EditorialPlaylistCover, EditorialPlaylistSegment};
 use crate::editorial::types::{MarkerSlot, StoryCover, StoryMarker};
 use crate::frame_time::normalize_fps;
 
@@ -24,6 +24,7 @@ pub(crate) struct SegmentProgramSegment {
     pub part_id: String,
     pub kind: String,
     pub clip_id: String,
+    pub virtual_shot_id: String,
     pub global_start_frame: i64,
     pub global_end_frame: i64,
     pub duration_frames: i64,
@@ -36,11 +37,17 @@ pub(crate) struct SegmentProgramSegment {
     pub streamable: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct SegmentProgramCover {
     pub cover_id: String,
+    pub clip_id: String,
+    pub virtual_shot_id: String,
     pub start_frame: i64,
     pub end_frame: i64,
+    pub source_in_frame: i64,
+    pub source_out_frame: i64,
+    pub source_fps: f64,
+    pub streamable: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -96,14 +103,7 @@ impl SegmentProgramModel {
             duration_frames,
             duration_sec,
             segments,
-            covers: covers
-                .iter()
-                .map(|cover| SegmentProgramCover {
-                    cover_id: cover.cover_id.clone(),
-                    start_frame: cover.timeline_start_frame.max(0),
-                    end_frame: cover.timeline_end_frame.max(cover.timeline_start_frame),
-                })
-                .collect(),
+            covers: segment_program_covers(playlist, covers),
             marker_slots: marker_slots
                 .iter()
                 .map(|slot| SegmentProgramMarkerSlot {
@@ -144,7 +144,6 @@ impl SegmentProgramModel {
         &self.segments
     }
 
-    #[cfg(test)]
     pub(crate) fn covers(&self) -> &[SegmentProgramCover] {
         &self.covers
     }
@@ -169,6 +168,7 @@ impl SegmentProgramModel {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn program_parts(&self) -> Vec<SegmentProgramPart<'_>> {
         self.segments
             .iter()
@@ -177,16 +177,20 @@ impl SegmentProgramModel {
                 clip_id: segment.clip_id.as_str(),
                 program_start_frame: segment.global_start_frame,
                 program_end_frame: segment.global_end_frame,
+                timeline_fps: self.timeline_fps,
                 source_in_frame: segment.source_in_frame,
                 source_out_frame: segment.source_out_frame,
+                source_fps: segment.source_fps,
             })
             .collect()
     }
 
+    #[cfg(test)]
     pub(crate) fn source_frame_for_program_frame(&self, program_frame: i64) -> Option<i64> {
         source_frame_for_program_frame(&self.program_parts(), program_frame)
     }
 
+    #[cfg(test)]
     pub(crate) fn program_frame_for_source_frame(
         &self,
         selected_part_id: &str,
@@ -198,24 +202,6 @@ impl SegmentProgramModel {
             selected_part_id,
             open_clip_id,
             source_frame,
-        )
-    }
-
-    /// While playing, hand off on the last in-range source frame — before the player
-    /// would cross a wrap-row cut. Wrap rows are UI-only; the program axis is continuous.
-    pub(crate) fn boundary_transition_imminent_after_source_frame(
-        &self,
-        current_part_id: &str,
-        open_clip_id: &str,
-        source_frame: i64,
-        playing: bool,
-    ) -> Option<SegmentBoundaryTransition> {
-        boundary_transition_imminent_after_source_frame(
-            &self.program_parts(),
-            current_part_id,
-            open_clip_id,
-            source_frame,
-            playing,
         )
     }
 
@@ -311,6 +297,25 @@ impl SegmentProgramModel {
     }
 }
 
+fn segment_program_covers(
+    playlist: Option<&EditorialPlaylist>,
+    story_covers: &[StoryCover],
+) -> Vec<SegmentProgramCover> {
+    let playlist_covers: Vec<_> = playlist
+        .into_iter()
+        .flat_map(|playlist| playlist.segments.iter())
+        .flat_map(|segment| segment.covers.iter())
+        .map(SegmentProgramCover::from_playlist_cover)
+        .collect();
+    if !playlist_covers.is_empty() {
+        return playlist_covers;
+    }
+    story_covers
+        .iter()
+        .map(SegmentProgramCover::from_story_cover)
+        .collect()
+}
+
 impl SegmentProgramSegment {
     fn from_playlist_segment(segment: &EditorialPlaylistSegment) -> Self {
         let start = segment.global_start_frame.max(0);
@@ -323,6 +328,7 @@ impl SegmentProgramSegment {
             part_id: segment.part_id.clone(),
             kind: segment.kind.clone(),
             clip_id: segment.clip_id.clone(),
+            virtual_shot_id: segment.virtual_shot_id.clone(),
             global_start_frame: start,
             global_end_frame: end,
             duration_frames,
@@ -337,22 +343,68 @@ impl SegmentProgramSegment {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+impl SegmentProgramCover {
+    fn from_playlist_cover(cover: &EditorialPlaylistCover) -> Self {
+        let start = cover.timeline_start_frame.max(0);
+        let end = cover.timeline_end_frame.max(start + 1);
+        let source_in = cover.source_in_frame.max(0);
+        Self {
+            cover_id: cover.cover_id.clone(),
+            clip_id: cover.clip_id.clone(),
+            virtual_shot_id: cover.virtual_shot_id.clone(),
+            start_frame: start,
+            end_frame: end,
+            source_in_frame: source_in,
+            source_out_frame: cover.source_out_frame.max(source_in + 1),
+            source_fps: cover.source_fps,
+            streamable: cover.streamable,
+        }
+    }
+
+    fn from_story_cover(cover: &StoryCover) -> Self {
+        let start = cover.timeline_start_frame.max(0);
+        let end = cover.timeline_end_frame.max(start + 1);
+        let source_in = cover.source_in_frame.max(0);
+        let source_out = if cover.source_out_frame > cover.source_in_frame {
+            cover.source_out_frame.max(source_in + 1)
+        } else {
+            source_in + (end - start).max(1)
+        };
+        Self {
+            cover_id: cover.cover_id.clone(),
+            clip_id: cover.clip_id.clone(),
+            virtual_shot_id: cover.virtual_shot_id.clone(),
+            start_frame: start,
+            end_frame: end,
+            source_in_frame: source_in,
+            source_out_frame: source_out,
+            source_fps: cover.source_fps,
+            streamable: !cover.clip_id.trim().is_empty(),
+        }
+    }
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct SegmentProgramPart<'a> {
     pub part_id: &'a str,
     pub clip_id: &'a str,
     pub program_start_frame: i64,
     pub program_end_frame: i64,
+    pub timeline_fps: f64,
     pub source_in_frame: i64,
     pub source_out_frame: i64,
+    pub source_fps: f64,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SegmentFrameProjection {
     pub part_id: String,
     pub program_frame: i64,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SegmentBoundaryTransition {
     pub part_id: String,
@@ -360,6 +412,175 @@ pub(crate) struct SegmentBoundaryTransition {
     pub source_frame: i64,
 }
 
+/// Active playback layer at a program frame — mirrors host `resolve_active_layer_frozen`.
+#[cfg(test)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SegmentPlaybackLayerKind {
+    PartVideo,
+    CoverVideo,
+    OffAudio,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct SegmentPlaybackTarget {
+    pub kind: SegmentPlaybackLayerKind,
+    pub part_id: String,
+    pub cover_id: String,
+    pub clip_id: String,
+    pub virtual_shot_id: String,
+    pub program_frame: i64,
+    pub local_program_frame: i64,
+    pub source_frame: i64,
+    pub source_in_frame: i64,
+    pub source_out_frame: i64,
+    pub source_fps: f64,
+}
+
+#[cfg(test)]
+impl SegmentPlaybackTarget {
+    #[allow(dead_code)]
+    pub(crate) fn sync_key(&self) -> String {
+        format!("{:?}|{}", self.kind, self.clip_id)
+    }
+}
+
+/// One row of the program EDL at a record frame — no transport semantics.
+#[cfg(test)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ProgramEdlFrame {
+    pub kind: SegmentPlaybackLayerKind,
+    pub program_frame: i64,
+    pub part_id: String,
+    pub cover_id: String,
+    pub clip_id: String,
+    pub source_frame: i64,
+}
+
+#[cfg(test)]
+impl ProgramEdlFrame {
+    #[allow(dead_code)]
+    pub(crate) fn from_target(program_frame: i64, target: &SegmentPlaybackTarget) -> Self {
+        Self {
+            kind: target.kind.clone(),
+            program_frame: program_frame.max(0),
+            part_id: target.part_id.clone(),
+            cover_id: target.cover_id.clone(),
+            clip_id: target.clip_id.clone(),
+            source_frame: target.source_frame.max(0),
+        }
+    }
+
+    /// True at an edit (record) cut — clip change or non-contiguous source take.
+    pub(crate) fn is_edl_cut_from(&self, previous: &Self) -> bool {
+        if self.kind != previous.kind {
+            return true;
+        }
+        if self.part_id != previous.part_id {
+            return true;
+        }
+        if self.cover_id != previous.cover_id {
+            return true;
+        }
+        if self.clip_id != previous.clip_id {
+            return true;
+        }
+        false
+    }
+}
+
+impl SegmentProgramModel {
+    #[cfg(test)]
+    pub(crate) fn active_cover_at_program_frame(
+        &self,
+        program_frame: i64,
+    ) -> Option<&SegmentProgramCover> {
+        let frame = program_frame.max(0);
+        self.covers.iter().find(|cover| {
+            frame >= cover.start_frame.max(0) && frame < cover.end_frame.max(cover.start_frame + 1)
+        })
+    }
+
+    /// Resolve which clip/range the player should follow at `program_frame`.
+    #[cfg(test)]
+    pub(crate) fn resolve_playback_target(
+        &self,
+        program_frame: i64,
+        _story_covers: &[StoryCover],
+    ) -> Option<SegmentPlaybackTarget> {
+        let segment = self.active_part_at_program_frame(program_frame)?;
+        let local_program_frame = program_frame.saturating_sub(segment.global_start_frame.max(0));
+
+        if let Some(cover) = self.active_cover_at_program_frame(program_frame) {
+            let clip_id = cover.clip_id.trim();
+            if !clip_id.is_empty() && cover.streamable {
+                let cover_local = program_frame.saturating_sub(cover.start_frame.max(0));
+                let source_in = cover.source_in_frame.max(0);
+                let source_out = cover.source_out_frame.max(source_in + 1);
+                return Some(SegmentPlaybackTarget {
+                    kind: SegmentPlaybackLayerKind::CoverVideo,
+                    part_id: segment.part_id.clone(),
+                    cover_id: cover.cover_id.clone(),
+                    clip_id: clip_id.to_string(),
+                    virtual_shot_id: cover.virtual_shot_id.clone(),
+                    program_frame: program_frame.max(0),
+                    local_program_frame,
+                    source_frame: source_frame_for_segment_local_frame(
+                        self.timeline_fps,
+                        cover.source_fps,
+                        source_in,
+                        source_out,
+                        cover_local,
+                    ),
+                    source_in_frame: source_in,
+                    source_out_frame: source_out,
+                    source_fps: cover.source_fps,
+                });
+            }
+        }
+
+        if segment.kind.trim().eq_ignore_ascii_case("offovi") {
+            let clip_id = segment.clip_id.trim();
+            return Some(SegmentPlaybackTarget {
+                kind: SegmentPlaybackLayerKind::OffAudio,
+                part_id: segment.part_id.clone(),
+                cover_id: String::new(),
+                clip_id: clip_id.to_string(),
+                virtual_shot_id: segment.virtual_shot_id.clone(),
+                program_frame: program_frame.max(0),
+                local_program_frame,
+                source_frame: source_frame_for_segment_local_frame(
+                    self.timeline_fps,
+                    segment.source_fps,
+                    segment.source_in_frame,
+                    segment.source_out_frame,
+                    local_program_frame,
+                ),
+                source_in_frame: segment.source_in_frame.max(0),
+                source_out_frame: segment.source_out_frame.max(segment.source_in_frame + 1),
+                source_fps: segment.source_fps,
+            });
+        }
+
+        let source_frame =
+            source_frame_for_program_frame(&self.program_parts(), program_frame.max(0))?;
+        Some(SegmentPlaybackTarget {
+            kind: SegmentPlaybackLayerKind::PartVideo,
+            part_id: segment.part_id.clone(),
+            cover_id: String::new(),
+            clip_id: segment.clip_id.clone(),
+            virtual_shot_id: segment.virtual_shot_id.clone(),
+            program_frame: program_frame.max(0),
+            local_program_frame,
+            source_frame,
+            source_in_frame: segment.source_in_frame.max(0),
+            source_out_frame: segment.source_out_frame.max(segment.source_in_frame + 1),
+            source_fps: segment.source_fps,
+        })
+    }
+}
+
+#[cfg(test)]
 pub(crate) fn source_frame_for_program_frame(
     parts: &[SegmentProgramPart<'_>],
     program_frame: i64,
@@ -371,10 +592,42 @@ pub(crate) fn source_frame_for_program_frame(
     let local_frame = program_frame
         .max(0)
         .saturating_sub(program_start_frame(part).max(0));
-    let span = source_span(part);
-    Some(part.source_in_frame.max(0) + local_frame.clamp(0, span.saturating_sub(1)))
+    Some(source_frame_for_segment_local_frame(
+        part.timeline_fps,
+        part.source_fps,
+        part.source_in_frame,
+        part.source_out_frame,
+        local_frame,
+    ))
 }
 
+#[cfg(test)]
+fn source_frame_for_segment_local_frame(
+    timeline_fps: f64,
+    source_fps: f64,
+    source_in_frame: i64,
+    source_out_frame: i64,
+    local_program_frame: i64,
+) -> i64 {
+    let source_in = source_in_frame.max(0);
+    let source_out = source_out_frame.max(source_in + 1);
+    let source_span = (source_out - source_in).max(1);
+    let local_source_frame =
+        source_offset_for_program_frame(local_program_frame, timeline_fps, source_fps)
+            .clamp(0, source_span.saturating_sub(1));
+    source_in + local_source_frame
+}
+
+#[cfg(test)]
+fn source_offset_for_program_frame(
+    local_program_frame: i64,
+    _timeline_fps: f64,
+    _source_fps: f64,
+) -> i64 {
+    local_program_frame.max(0)
+}
+
+#[cfg(test)]
 pub(crate) fn program_frame_for_source_frame(
     parts: &[SegmentProgramPart<'_>],
     selected_part_id: &str,
@@ -391,28 +644,49 @@ pub(crate) fn program_frame_for_source_frame(
         })
 }
 
+#[cfg(test)]
 pub(crate) fn boundary_transition_after_source_frame(
     parts: &[SegmentProgramPart<'_>],
     current_part_id: &str,
     open_clip_id: &str,
     source_frame: i64,
 ) -> Option<SegmentBoundaryTransition> {
-    boundary_transition_imminent_after_source_frame(
-        parts,
-        current_part_id,
-        open_clip_id,
-        source_frame,
-        false,
-    )
+    let current = part_by_id(parts, current_part_id)?;
+    if !valid_part(current) {
+        return None;
+    }
+    if !open_clip_id.trim().is_empty() && current.clip_id.trim() != open_clip_id.trim() {
+        return None;
+    }
+    if source_frame.max(0) < current.source_out_frame.max(current.source_in_frame + 1) {
+        return None;
+    }
+    let current_index = parts
+        .iter()
+        .position(|part| part.part_id == current.part_id)?;
+    parts
+        .iter()
+        .skip(current_index + 1)
+        .filter(|part| valid_part(part))
+        .next()
+        .map(|part| SegmentBoundaryTransition {
+            part_id: part.part_id.to_string(),
+            program_frame: program_start_frame(part),
+            source_frame: part.source_in_frame.max(0),
+        })
 }
 
+#[cfg(test)]
 pub(crate) fn boundary_transition_imminent_after_source_frame(
     parts: &[SegmentProgramPart<'_>],
     current_part_id: &str,
     open_clip_id: &str,
     source_frame: i64,
-    playing: bool,
+    transport_playing: bool,
 ) -> Option<SegmentBoundaryTransition> {
+    if !transport_playing {
+        return None;
+    }
     let current = part_by_id(parts, current_part_id)?;
     if !valid_part(current) {
         return None;
@@ -422,25 +696,18 @@ pub(crate) fn boundary_transition_imminent_after_source_frame(
     }
     let out = current.source_out_frame.max(current.source_in_frame + 1);
     let frame = source_frame.max(0);
-    let crossed_out = frame >= out;
-    let imminent_while_playing = playing && frame + 1 >= out;
-    if !crossed_out && !imminent_while_playing {
+    // Last in-range frame before broadcast player pauses at OUT.
+    if frame + 1 < out {
         return None;
     }
-    next_valid_program_part(parts, current.part_id)
-}
-
-fn next_valid_program_part(
-    parts: &[SegmentProgramPart<'_>],
-    current_part_id: &str,
-) -> Option<SegmentBoundaryTransition> {
     let current_index = parts
         .iter()
-        .position(|part| part.part_id == current_part_id)?;
+        .position(|part| part.part_id == current.part_id)?;
     parts
         .iter()
         .skip(current_index + 1)
-        .find(|part| valid_part(part))
+        .filter(|part| valid_part(part))
+        .next()
         .map(|part| SegmentBoundaryTransition {
             part_id: part.part_id.to_string(),
             program_frame: program_start_frame(part),
@@ -448,6 +715,7 @@ fn next_valid_program_part(
         })
 }
 
+#[cfg(test)]
 fn project_source_frame(
     part: &SegmentProgramPart<'_>,
     open_clip_id: &str,
@@ -473,6 +741,7 @@ fn project_source_frame(
     })
 }
 
+#[cfg(test)]
 fn active_part_at_program_frame<'a>(
     parts: &'a [SegmentProgramPart<'a>],
     program_frame: i64,
@@ -484,6 +753,7 @@ fn active_part_at_program_frame<'a>(
     })
 }
 
+#[cfg(test)]
 fn part_by_id<'a>(
     parts: &'a [SegmentProgramPart<'a>],
     part_id: &str,
@@ -495,6 +765,7 @@ fn part_by_id<'a>(
     parts.iter().find(|part| part.part_id == part_id)
 }
 
+#[cfg(test)]
 fn valid_part(part: &SegmentProgramPart<'_>) -> bool {
     !part.part_id.trim().is_empty()
         && !part.clip_id.trim().is_empty()
@@ -502,19 +773,18 @@ fn valid_part(part: &SegmentProgramPart<'_>) -> bool {
         && part.source_out_frame > part.source_in_frame
 }
 
-fn source_span(part: &SegmentProgramPart<'_>) -> i64 {
-    (part.source_out_frame - part.source_in_frame).max(1)
-}
-
+#[cfg(test)]
 fn program_start_frame(part: &SegmentProgramPart<'_>) -> i64 {
     part.program_start_frame.max(0)
 }
 
+#[cfg(test)]
 fn program_end_frame(part: &SegmentProgramPart<'_>) -> i64 {
     let start = program_start_frame(part);
     part.program_end_frame.max(start + 1)
 }
 
+#[cfg(test)]
 fn program_span(part: &SegmentProgramPart<'_>) -> i64 {
     (program_end_frame(part) - program_start_frame(part)).max(1)
 }
@@ -522,6 +792,7 @@ fn program_span(part: &SegmentProgramPart<'_>) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::{EditorialPlaylist, EditorialPlaylistSegment};
     use crate::editorial::types::{MarkerSlot, StoryCover, StoryMarker};
 
     fn parts() -> Vec<SegmentProgramPart<'static>> {
@@ -531,18 +802,54 @@ mod tests {
                 clip_id: "clip_a",
                 program_start_frame: 0,
                 program_end_frame: 50,
+                timeline_fps: 50.0,
                 source_in_frame: 100,
                 source_out_frame: 150,
+                source_fps: 50.0,
             },
             SegmentProgramPart {
                 part_id: "part_b",
                 clip_id: "clip_a",
                 program_start_frame: 50,
                 program_end_frame: 100,
+                timeline_fps: 50.0,
                 source_in_frame: 200,
                 source_out_frame: 250,
+                source_fps: 50.0,
             },
         ]
+    }
+
+    #[test]
+    fn program_edl_frame_detects_edit_cut() {
+        use super::ProgramEdlFrame;
+        let prev = ProgramEdlFrame {
+            kind: SegmentPlaybackLayerKind::PartVideo,
+            program_frame: 49,
+            part_id: "part_a".into(),
+            cover_id: String::new(),
+            clip_id: "clip_a".into(),
+            source_frame: 149,
+        };
+        let at_cut = ProgramEdlFrame {
+            kind: SegmentPlaybackLayerKind::PartVideo,
+            program_frame: 50,
+            part_id: "part_b".into(),
+            cover_id: String::new(),
+            clip_id: "clip_a".into(),
+            source_frame: 200,
+        };
+        assert!(at_cut.is_edl_cut_from(&prev));
+
+        let mixed_fps_step_inside_same_take = ProgramEdlFrame {
+            kind: SegmentPlaybackLayerKind::PartVideo,
+            program_frame: 50,
+            part_id: "part_a".into(),
+            cover_id: String::new(),
+            clip_id: "clip_a".into(),
+            source_frame: 151,
+        };
+        assert!(!mixed_fps_step_inside_same_take.is_edl_cut_from(&prev));
     }
 
     #[test]
@@ -560,6 +867,65 @@ mod tests {
             program_frame_for_source_frame(&parts, "part_a", "clip_a", 150),
             None
         );
+    }
+
+    #[test]
+    fn resolve_playback_target_maps_tonovi_source_in_out() {
+        let parts = parts();
+        let model = SegmentProgramModel::from_playlist(
+            Some(&EditorialPlaylist {
+                project_id: "p".into(),
+                timeline_fps: 50.0,
+                duration_frames: 100,
+                duration_sec: 4.0,
+                segments: parts
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, part)| EditorialPlaylistSegment {
+                        part_id: part.part_id.to_string(),
+                        kind: "tonovi".into(),
+                        clip_id: part.clip_id.to_string(),
+                        global_start_frame: if idx == 0 { 0 } else { 50 },
+                        global_end_frame: if idx == 0 { 50 } else { 100 },
+                        duration_frames: 50,
+                        source_in_frame: part.source_in_frame,
+                        source_out_frame: part.source_out_frame,
+                        source_fps: 50.0,
+                        streamable: true,
+                        ..EditorialPlaylistSegment::default()
+                    })
+                    .collect(),
+            }),
+            &[],
+            &[],
+            &[],
+        );
+        let target = model.resolve_playback_target(55, &[]).expect("part_b");
+        assert_eq!(target.kind, SegmentPlaybackLayerKind::PartVideo);
+        assert_eq!(target.part_id, "part_b");
+        assert_eq!(target.source_frame, 205);
+    }
+
+    #[test]
+    fn boundary_transition_imminent_detects_last_in_range_frame_while_playing() {
+        let parts = parts();
+
+        assert_eq!(
+            boundary_transition_imminent_after_source_frame(&parts, "part_a", "clip_a", 149, true),
+            Some(SegmentBoundaryTransition {
+                part_id: "part_b".into(),
+                program_frame: 50,
+                source_frame: 200,
+            })
+        );
+        assert!(boundary_transition_imminent_after_source_frame(
+            &parts, "part_a", "clip_a", 149, false
+        )
+        .is_none());
+        assert!(boundary_transition_imminent_after_source_frame(
+            &parts, "part_a", "clip_a", 148, true
+        )
+        .is_none());
     }
 
     #[test]
@@ -585,29 +951,76 @@ mod tests {
     }
 
     #[test]
-    fn boundary_transition_imminent_hands_off_on_last_in_range_frame_while_playing() {
-        let parts = parts();
-
-        assert_eq!(
-            boundary_transition_imminent_after_source_frame(&parts, "part_a", "clip_a", 149, true),
-            Some(SegmentBoundaryTransition {
-                part_id: "part_b".into(),
-                program_frame: 50,
-                source_frame: 200,
-            })
-        );
-        assert!(boundary_transition_imminent_after_source_frame(
-            &parts, "part_a", "clip_a", 149, false
-        )
-        .is_none());
-    }
-
-    #[test]
     fn program_seek_maps_to_active_part_source_range() {
         let parts = parts();
 
         assert_eq!(source_frame_for_program_frame(&parts, 50), Some(200));
         assert_eq!(source_frame_for_program_frame(&parts, 99), Some(249));
+    }
+
+    #[test]
+    fn program_seek_keeps_mixed_fps_source_frames_contiguous() {
+        let parts = [SegmentProgramPart {
+            part_id: "part_50fps",
+            clip_id: "clip_fast",
+            program_start_frame: 0,
+            program_end_frame: 25,
+            timeline_fps: 50.0,
+            source_in_frame: 100,
+            source_out_frame: 150,
+            source_fps: 59.94,
+        }];
+
+        assert_eq!(source_frame_for_program_frame(&parts, 0), Some(100));
+        assert_eq!(source_frame_for_program_frame(&parts, 1), Some(101));
+        assert_eq!(source_frame_for_program_frame(&parts, 24), Some(124));
+        assert_eq!(
+            program_frame_for_source_frame(&parts, "part_50fps", "clip_fast", 124)
+                .map(|projection| projection.program_frame),
+            Some(24)
+        );
+    }
+
+    #[test]
+    fn cover_target_keeps_mixed_fps_source_frames_contiguous() {
+        let playlist = EditorialPlaylist {
+            project_id: "p".into(),
+            timeline_fps: 50.0,
+            duration_frames: 50,
+            segments: vec![EditorialPlaylistSegment {
+                part_id: "part_a".into(),
+                kind: "tonovi".into(),
+                clip_id: "clip_a".into(),
+                global_start_frame: 0,
+                global_end_frame: 50,
+                duration_frames: 50,
+                source_in_frame: 100,
+                source_out_frame: 150,
+                source_fps: 50.0,
+                streamable: true,
+                covers: vec![EditorialPlaylistCover {
+                    cover_id: "cover_fast".into(),
+                    clip_id: "clip_b".into(),
+                    virtual_shot_id: "vcover".into(),
+                    timeline_start_frame: 10,
+                    timeline_end_frame: 20,
+                    source_in_frame: 40,
+                    source_out_frame: 80,
+                    source_fps: 50.0,
+                    streamable: true,
+                    source: Default::default(),
+                }],
+                ..EditorialPlaylistSegment::default()
+            }],
+            ..EditorialPlaylist::default()
+        };
+        let program = SegmentProgramModel::from_playlist(Some(&playlist), &[], &[], &[]);
+
+        let target = program.resolve_playback_target(11, &[]).unwrap();
+
+        assert_eq!(target.kind, SegmentPlaybackLayerKind::CoverVideo);
+        assert_eq!(target.source_fps, 50.0);
+        assert_eq!(target.source_frame, 41);
     }
 
     #[test]
@@ -693,7 +1106,7 @@ mod tests {
     fn program_model_steps_parts_and_marker_slots_without_form_state() {
         let playlist = EditorialPlaylist {
             project_id: "p".into(),
-            timeline_fps: 25.0,
+            timeline_fps: 50.0,
             duration_frames: 100,
             segments: vec![
                 EditorialPlaylistSegment {

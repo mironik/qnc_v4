@@ -576,10 +576,9 @@ pub(crate) fn validate_project_export_settings(settings: &Value) -> Result<(), S
     let Some(export) = settings.get("export") else {
         return Ok(());
     };
-    if export_is_progressive_25(export) && !export_allows_progressive_25(export) {
+    if export_is_forbidden_pal_progressive(export) {
         return Err(
-            "25p export je dozvoljen samo kao telekino PsF profil; za news koristi p50 ili i50."
-                .into(),
+            "PAL single-rate progressive export nije dozvoljen; koristi p50 ili i50.".into(),
         );
     }
     Ok(())
@@ -603,21 +602,22 @@ fn export_fps(export: &Value) -> f64 {
         .unwrap_or(0.0)
 }
 
-fn export_allows_progressive_25(export: &Value) -> bool {
-    ["purpose", "preset", "format", "name"].iter().any(|key| {
-        let value = export_str(export, key).to_ascii_lowercase();
-        value.contains("telekino") || value.contains("psf")
+fn contains_forbidden_pal_progressive_marker(format: &str) -> bool {
+    let bytes = format.as_bytes();
+    bytes.windows(3).any(|window| {
+        (window[0].eq_ignore_ascii_case(&b'p') && window[1] == b'2' && window[2] == b'5')
+            || (window[0] == b'2' && window[1] == b'5' && window[2].eq_ignore_ascii_case(&b'p'))
     })
 }
 
-fn export_is_progressive_25(export: &Value) -> bool {
+fn export_is_forbidden_pal_progressive(export: &Value) -> bool {
     let fps = export_fps(export);
     let field_order = export_str(export, "field_order").to_ascii_lowercase();
     let format = export_str(export, "format").to_ascii_lowercase();
-    let looks_25 = (fps - 25.0).abs() < 0.01;
-    let explicit_p25 = format.contains("p25");
+    let single_rate_pal = (fps - 25.0).abs() < 0.01;
+    let explicit_forbidden = contains_forbidden_pal_progressive_marker(&format);
     let explicit_i50 = format.contains("i50") || field_order.contains("upper");
-    explicit_p25 || (looks_25 && field_order == "progressive" && !explicit_i50)
+    explicit_forbidden || (single_rate_pal && field_order == "progressive" && !explicit_i50)
 }
 
 /// Legacy v1 workspace tab id → registered plugin tab id.
@@ -1695,11 +1695,11 @@ mod legacy_ingest_tests {
     }
 
     #[test]
-    fn export_settings_reject_generic_progressive_25_for_news() {
+    fn export_settings_reject_forbidden_pal_progressive() {
         let settings = json!({
             "export": {
-                "preset": "h264_1080p25",
-                "format": "HD 1080p25",
+                "preset": "single_rate_pal",
+                "format": "PAL single-rate progressive",
                 "fps": 25,
                 "field_order": "progressive"
             }
@@ -1709,7 +1709,7 @@ mod legacy_ingest_tests {
     }
 
     #[test]
-    fn export_settings_allow_i50_and_telekino_psf25() {
+    fn export_settings_allow_i50() {
         let i50 = json!({
             "export": {
                 "preset": "xdcam_hd422_50i",
@@ -1718,17 +1718,7 @@ mod legacy_ingest_tests {
                 "field_order": "upper_first"
             }
         });
-        let telekino_psf = json!({
-            "export": {
-                "preset": "telekino_psf25",
-                "purpose": "telekino_psf",
-                "format": "HD 1080PsF25",
-                "fps": 25,
-                "field_order": "upper_first"
-            }
-        });
 
         assert!(validate_project_export_settings(&i50).is_ok());
-        assert!(validate_project_export_settings(&telekino_psf).is_ok());
     }
 }

@@ -11,6 +11,10 @@ pub(crate) enum LibraryTab {
 #[derive(Debug, Clone, Deserialize, Default)]
 #[allow(dead_code)]
 pub(crate) struct StoryPart {
+    #[serde(default)]
+    pub shot_id: String,
+    #[serde(default)]
+    pub root_shot_id: String,
     pub part_id: String,
     #[serde(default)]
     pub kind: String,
@@ -36,6 +40,8 @@ pub(crate) struct StoryPart {
     pub duration_frames: i64,
     #[serde(default)]
     pub duration_label: String,
+    #[serde(default)]
+    pub source_class: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -121,6 +127,12 @@ pub(crate) struct StoryCover {
     pub timeline_start_frame: i64,
     #[serde(default)]
     pub timeline_end_frame: i64,
+    #[serde(default)]
+    pub source_in_frame: i64,
+    #[serde(default)]
+    pub source_out_frame: i64,
+    #[serde(default)]
+    pub source_fps: f64,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]

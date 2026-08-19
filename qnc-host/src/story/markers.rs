@@ -206,7 +206,10 @@ pub fn timeline_duration_from_parts(parts: &[StoryPartRow]) -> f64 {
     round3(parts.iter().map(part_span_seconds).sum())
 }
 
-pub fn part_span_frames(part: &StoryPartRow, _timeline_fps: f64) -> i64 {
+pub fn part_span_frames(part: &StoryPartRow, timeline_fps: f64) -> i64 {
+    if is_valid_fps(timeline_fps) {
+        return seconds_to_frame(part_span_seconds(part), timeline_fps).max(1);
+    }
     if part.duration_frames > 0 {
         return part.duration_frames.max(1);
     }
@@ -264,48 +267,6 @@ pub(crate) fn list_marker_slots_rows(
     list_marker_slots(conn)
 }
 
-/// Match cover → materialized M–M slot (authoritative bounds + duration).
-pub(crate) fn cover_slot_for_cover(
-    conn: &Connection,
-    cover: &super::covers::StoryCoverRow,
-) -> rusqlite::Result<Option<StoryMarkerSlotRow>> {
-    ensure_marker_schema(conn)?;
-    let slots = list_marker_slots(conn)?;
-    let sig = cover.slot_signature.trim();
-    if !sig.is_empty() {
-        if let Some(slot) = slots.iter().find(|slot| slot.slot_signature.trim() == sig) {
-            return Ok(Some(slot.clone()));
-        }
-    }
-    if let Some(slot) = slots.iter().find(|slot| {
-        (cover.timeline_start_frame > 0 || cover.timeline_end_frame > 0)
-            && slot.start_frame == cover.timeline_start_frame
-            && slot.end_frame == cover.timeline_end_frame
-    }) {
-        return Ok(Some(slot.clone()));
-    }
-    if let Some(slot) = slots.iter().find(|slot| {
-        (slot.start_sec - cover.timeline_start_sec).abs() < TIMELINE_EPS
-            && (slot.end_sec - cover.timeline_end_sec).abs() < TIMELINE_EPS
-    }) {
-        return Ok(Some(slot.clone()));
-    }
-    Ok(slots
-        .iter()
-        .find(|slot| slot.slot_index == cover.slot_index)
-        .cloned())
-}
-
-/// Authoritative M–M slot width for a cover (marker_slots table, not stale cover bounds).
-pub(crate) fn cover_slot_duration_sec(
-    conn: &Connection,
-    cover: &super::covers::StoryCoverRow,
-) -> rusqlite::Result<f64> {
-    Ok(cover_slot_for_cover(conn, cover)?
-        .map(|slot| slot.duration_sec.max(0.0))
-        .unwrap_or_else(|| (cover.timeline_end_sec - cover.timeline_start_sec).max(0.0)))
-}
-
 fn list_marker_slots(conn: &Connection) -> rusqlite::Result<Vec<StoryMarkerSlotRow>> {
     ensure_marker_schema(conn)?;
     let mut stmt = conn.prepare(
@@ -352,8 +313,20 @@ pub fn marker_json(row: &StoryMarkerRow, _parts: &[StoryPartRow], timeline_fps: 
     })
 }
 
-pub fn marker_slot_json(row: &StoryMarkerSlotRow) -> Value {
-    json!({
+fn marker_slot_has_cover(conn: &Connection, row: &StoryMarkerSlotRow) -> rusqlite::Result<bool> {
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM story_covers
+         WHERE slot_signature = ?1
+            OR (timeline_start_frame = ?2 AND timeline_end_frame = ?3)",
+        params![row.slot_signature, row.start_frame, row.end_frame],
+        |r| r.get(0),
+    )?;
+    Ok(count > 0)
+}
+
+pub fn marker_slot_json(conn: &Connection, row: &StoryMarkerSlotRow) -> rusqlite::Result<Value> {
+    let has_cover = marker_slot_has_cover(conn, row)?;
+    Ok(json!({
         "slot_id": row.slot_id,
         "slot_index": row.slot_index,
         "start_frame": row.start_frame,
@@ -365,8 +338,9 @@ pub fn marker_slot_json(row: &StoryMarkerSlotRow) -> Value {
         "start_marker_id": row.start_marker_id,
         "end_marker_id": row.end_marker_id,
         "slot_signature": row.slot_signature,
+        "has_cover": has_cover,
         "updated_at": row.updated_at,
-    })
+    }))
 }
 
 pub fn markers_snapshot(conn: &Connection, timeline_fps: f64) -> rusqlite::Result<Vec<Value>> {
@@ -379,10 +353,10 @@ pub fn markers_snapshot(conn: &Connection, timeline_fps: f64) -> rusqlite::Resul
 }
 
 pub fn marker_slots_snapshot(conn: &Connection) -> rusqlite::Result<Vec<Value>> {
-    Ok(list_marker_slots(conn)?
+    list_marker_slots(conn)?
         .iter()
-        .map(marker_slot_json)
-        .collect())
+        .map(|row| marker_slot_json(conn, row))
+        .collect()
 }
 
 pub fn get_slot_by_id(conn: &Connection, slot_id: &str) -> Result<StoryMarkerSlotRow, String> {
@@ -1225,6 +1199,26 @@ mod tests {
         assert_eq!(slots[0].start_frame, 0);
         assert_eq!(slots[0].end_frame, 80);
         assert_eq!(slots[0].duration_frames, 80);
+    }
+
+    #[test]
+    fn materializes_boundaries_on_timeline_fps_not_source_frame_count() {
+        let conn = setup_conn();
+        insert_part(&conn, "a", 0, 50);
+        insert_part(&conn, "b", 1, 50);
+
+        recompute_marker_slots(&conn, 25.0).unwrap();
+
+        let markers = list_markers(&conn).unwrap();
+        assert!(markers
+            .iter()
+            .any(|m| m.timeline_frame == 50 && m.system_role == SYSTEM_MARKER_END));
+
+        let slots = list_marker_slots(&conn).unwrap();
+        assert_eq!(slots.len(), 1);
+        assert_eq!(slots[0].start_frame, 0);
+        assert_eq!(slots[0].end_frame, 50);
+        assert_eq!(slots[0].duration_frames, 50);
     }
 
     #[test]

@@ -1,8 +1,8 @@
 //! Shared editorial Segmenti panel.
 //!
 //! Uses standalone [`crate::qnc_segment_timeline`] for paint.
-//! Editorial segment/part list stays in this panel — not inside the timeline component.
-//! Segment rows are only projections of one continuous program timeline.
+//! Editorial segment list stays in this panel — not inside the timeline component.
+//! Segment rows are only projections of one continuous playlist input timeline.
 
 use eframe::egui::{self, RichText, Vec2};
 
@@ -115,7 +115,7 @@ pub(crate) fn show(ui: &mut egui::Ui, input: SegmentPanelInput<'_>) -> SegmentPa
             }
 
             ui.add_space(8.0);
-            ui.label(RichText::new("Parts").color(t.muted).small());
+            ui.label(RichText::new("Redoslijed segmenata").color(t.muted).small());
             egui::ScrollArea::vertical()
                 .max_height(120.0)
                 .show(ui, |ui| {
@@ -128,7 +128,7 @@ pub(crate) fn show(ui: &mut egui::Ui, input: SegmentPanelInput<'_>) -> SegmentPa
                         let label = format!(
                             "{}  {}–{}",
                             if seg.kind.is_empty() {
-                                "part"
+                                "segment"
                             } else {
                                 seg.kind.as_str()
                             },
@@ -145,9 +145,9 @@ pub(crate) fn show(ui: &mut egui::Ui, input: SegmentPanelInput<'_>) -> SegmentPa
                 });
 
             ui.add_space(8.0);
-            ui.label(RichText::new("Program").color(t.muted).small());
-            // Final program timeline: one overview of the DB playlist, still
-            // only a graphic projection of the broadcast-player progress.
+            ui.label(RichText::new("Playlist input").color(t.muted).small());
+            // Final playlist-input timeline: one overview of the DB playlist,
+            // still only a graphic projection of broadcast-player progress.
             let overview_intent = qnc_segment_timeline::show_program_overview(
                 ui,
                 SegmentTimelineProgramInput {
@@ -275,7 +275,7 @@ mod tests {
         SegmentProgramModel::from_playlist(
             Some(&EditorialPlaylist {
                 project_id: "p".into(),
-                timeline_fps: 25.0,
+                timeline_fps: 50.0,
                 duration_frames: 90,
                 segments: vec![
                     EditorialPlaylistSegment {

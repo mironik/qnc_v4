@@ -213,7 +213,7 @@ impl ProxyGenerateWorker {
             }
         };
         let dest = proxy_dest_for_source(&proxy_dir, &job.clip_id, &source)?;
-        // Proxy generate prema tipu izvora (PAL/NTSC × 50p/50i/25p).
+        // Proxy generate prema tipu izvora (PAL/NTSC broadcast klase).
         let result = generate_field_proxy(&source, &dest);
         match result {
             Ok(()) => {

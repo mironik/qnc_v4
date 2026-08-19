@@ -1,19 +1,19 @@
-//! F2 — server-side mixed audio (A1 + A2 u cover slotu) i preview frame.
+//! F2 — server-side program audio (A1/A2 dual-mono) i preview frame.
 //! Play media path: proxy-only via `media::resolve_play_media` (see docs/qnc-playback-engine.md).
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use crate::editor_assets::{ensure_virtual_stream_cached_kind, VirtualStreamKind};
-use crate::frame_time::{frame_to_seconds, seconds_to_frame};
+use crate::frame_time::{frame_to_seconds, is_valid_fps, seconds_to_frame};
 use crate::ingest::thumb::{extract_preview_jpeg_at_seek, media_has_audio_stream, resolve_ffmpeg};
 use crate::media::resolve_play_media;
 use crate::project::db::ProjectPaths;
 
 use super::db::{cover_stream_frames, part_stream_frames};
 use super::playback::{
-    find_cover_frame, find_segment_frame, resolve_active_layer_frame_public, ActiveLayerKind,
-    PlaybackSession,
+    find_cover_frame, find_segment_frame, resolve_active_layer_frame_public,
+    source_offset_for_record_frame, ActiveLayerKind, PlaybackSession,
 };
 
 const EPS: f64 = 0.001;
@@ -279,6 +279,16 @@ fn mix_cache_path(session_id: &str, from_sec: f64, dur: f64) -> PathBuf {
         ))
 }
 
+fn dual_mono_filter(part_ss: &str, cover_ss: &str, dur: &str) -> String {
+    format!(
+        "[0:a]atrim=start={part_ss}:duration={dur},asetpts=PTS-STARTPTS,\
+         pan=mono|c0=c0,aresample=48000[a1];\
+         [1:a]atrim=start={cover_ss}:duration={dur},asetpts=PTS-STARTPTS,\
+         pan=mono|c0=c0,aresample=48000[a2];\
+         [a1][a2]join=inputs=2:channel_layout=stereo:map=0.0-FL|1.0-FR[aout]"
+    )
+}
+
 pub(crate) fn plan_mix_slices(
     session: &PlaybackSession,
     from_sec: f64,
@@ -314,11 +324,17 @@ pub(crate) fn plan_mix_slices(
         }
         let part_local_in = frame_to_seconds(local_frame.max(0), fps);
         let (cover_id, cover_source_in) = if let Some(c) = cover {
+            let source_fps = if is_valid_fps(c.source_fps) {
+                c.source_fps
+            } else {
+                fps
+            };
+            let record_offset_frame = (frame - c.timeline_start_frame).max(0);
             let source_offset_frame =
-                (frame - c.timeline_start_frame).max(0) + c.source_offset_frames.max(0);
+                source_offset_for_record_frame(record_offset_frame, fps, source_fps);
             (
                 Some(c.cover_id.clone()),
-                frame_to_seconds(source_offset_frame, fps),
+                frame_to_seconds(source_offset_frame, source_fps),
             )
         } else {
             (None, 0.0)
@@ -386,7 +402,7 @@ fn render_source_audio_blocking(
         .map_err(|e| e.to_string())?;
     if !status.success() || !out.is_file() {
         return Err(format!(
-            "playback audio: source clip mix nije uspio ({clip_id})"
+            "playback audio: source clip render nije uspio ({clip_id})"
         ));
     }
     Ok(out)
@@ -452,7 +468,7 @@ fn render_mix_blocking(
         .map_err(|e| e.to_string())?;
     let _ = std::fs::remove_dir_all(&work);
     if !status.success() || !out.is_file() {
-        return Err("ffmpeg concat mix nije uspio".into());
+        return Err("ffmpeg concat program audio nije uspio".into());
     }
     Ok(out)
 }
@@ -490,11 +506,7 @@ fn render_one_slice(
             VirtualStreamKind::AudioOnly,
         )?;
         let cover_ss = format!("{:.6}", slice.cover_source_in_sec.max(0.0));
-        let filter = format!(
-            "[0:a]atrim=start={part_ss}:duration={dur},asetpts=PTS-STARTPTS[a1];\
-             [1:a]atrim=start={cover_ss}:duration={dur},asetpts=PTS-STARTPTS[a2];\
-             [a1][a2]amix=inputs=2:duration=longest:dropout_transition=0[aout]"
-        );
+        let filter = dual_mono_filter(&part_ss, &cover_ss, &dur);
         let status = Command::new(ffmpeg)
             .args(["-hide_banner", "-loglevel", "error", "-y"])
             .arg("-i")
@@ -507,25 +519,40 @@ fn render_one_slice(
             .status()
             .map_err(|e| e.to_string())?;
         if !status.success() {
-            return Err(format!("amix slice failed for cover {cover_id}"));
+            return Err(format!("dual-mono slice failed for cover {cover_id}"));
         }
         return Ok(());
     }
 
+    let filter = dual_mono_filter(&part_ss, "0", &dur);
     let status = Command::new(ffmpeg)
         .args(["-hide_banner", "-loglevel", "error", "-y"])
-        .arg("-ss")
-        .arg(&part_ss)
         .arg("-i")
         .arg(&part_audio)
-        .arg("-t")
-        .arg(&dur)
-        .args(["-vn", "-c:a", "aac", "-b:a", "192k", "-ar", "48000"])
+        .args([
+            "-f",
+            "lavfi",
+            "-i",
+            "anullsrc=channel_layout=mono:sample_rate=48000",
+            "-filter_complex",
+            &filter,
+            "-map",
+            "[aout]",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "192k",
+            "-ar",
+            "48000",
+        ])
         .arg(output)
         .status()
         .map_err(|e| e.to_string())?;
     if !status.success() {
-        return Err(format!("a1 slice failed for part {}", slice.part_id));
+        return Err(format!(
+            "dual-mono A1 slice failed for part {}",
+            slice.part_id
+        ));
     }
     Ok(())
 }
@@ -565,4 +592,19 @@ fn render_silence_audio_file(
         return Err("playback audio: silence lane nije generiran".into());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::dual_mono_filter;
+
+    #[test]
+    fn dual_mono_filter_keeps_a1_and_a2_separate() {
+        let filter = dual_mono_filter("1.000000", "2.000000", "3.000000");
+
+        assert!(filter.contains("pan=mono|c0=c0"));
+        assert!(filter.contains("join=inputs=2:channel_layout=stereo"));
+        assert!(filter.contains("map=0.0-FL|1.0-FR"));
+        assert!(!filter.contains("amix"));
+    }
 }

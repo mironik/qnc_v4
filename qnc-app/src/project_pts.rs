@@ -3,8 +3,6 @@
 use serde_json::{json, Value};
 
 pub const INPUT_FORMATS: &[(&str, &str)] = &[
-    ("HD 1080p25", "HD 1080p25 (Telekino/PsF only)"),
-    ("HD 1080PsF25", "HD 1080PsF25 (Telekino)"),
     ("HD 1080p50", "HD 1080p50 (PAL)"),
     ("HD 1080i50", "HD 1080i50 (PAL)"),
     ("HD 1080p30", "HD 1080p29.97 (NTSC)"),
@@ -30,8 +28,6 @@ pub const VIDEO_CODECS: &[(&str, &str)] = &[
     ("prores_422", "ProRes 422"),
     ("dnxhd_hq", "DNxHD HQ"),
 ];
-
-pub const EXPORT_PURPOSE_TELEKINO_PSF: &str = "telekino_psf";
 
 pub const INGEST_PROFILES: &[(&str, &str)] = &[("field", "Teren"), ("house", "TV kuća")];
 
@@ -84,64 +80,6 @@ fn preset_values(
     })
 }
 
-fn purpose_preset_values(
-    purpose: &str,
-    format: &str,
-    fps: f64,
-    width: i64,
-    height: i64,
-    field_order: &str,
-    color_space: &str,
-    container: &str,
-    video_codec: &str,
-    audio_sample_rate: i64,
-    audio_channels: i64,
-) -> Value {
-    let mut values = preset_values(
-        format,
-        fps,
-        width,
-        height,
-        field_order,
-        color_space,
-        container,
-        video_codec,
-        audio_sample_rate,
-        audio_channels,
-    );
-    if let Some(obj) = values.as_object_mut() {
-        obj.insert("purpose".into(), json!(purpose));
-    }
-    values
-}
-
-fn telekino_psf_preset_values(
-    format: &str,
-    fps: f64,
-    width: i64,
-    height: i64,
-    field_order: &str,
-    color_space: &str,
-    container: &str,
-    video_codec: &str,
-    audio_sample_rate: i64,
-    audio_channels: i64,
-) -> Value {
-    purpose_preset_values(
-        EXPORT_PURPOSE_TELEKINO_PSF,
-        format,
-        fps,
-        width,
-        height,
-        field_order,
-        color_space,
-        container,
-        video_codec,
-        audio_sample_rate,
-        audio_channels,
-    )
-}
-
 /// Built-in export presets (same ids as web).
 pub fn builtin_export_presets() -> Vec<(&'static str, &'static str, Value)> {
     vec![
@@ -167,22 +105,6 @@ pub fn builtin_export_presets() -> Vec<(&'static str, &'static str, Value)> {
             preset_values(
                 "HD 1080i60",
                 29.97,
-                1920,
-                1080,
-                "upper_first",
-                "rec709",
-                "mxf_op1a",
-                "mpeg2_422_50mbit",
-                48000,
-                2,
-            ),
-        ),
-        (
-            "telekino_psf25",
-            "Telekino PsF25",
-            telekino_psf_preset_values(
-                "HD 1080PsF25",
-                25.0,
                 1920,
                 1080,
                 "upper_first",
@@ -289,39 +211,31 @@ fn value_fps(value: &Value) -> f64 {
         .unwrap_or(0.0)
 }
 
-pub fn export_profile_allows_progressive_25(id: &str, name: &str, values: &Value) -> bool {
-    let purpose = value_str(values, "purpose");
-    let id = id.to_ascii_lowercase();
-    let name = name.to_ascii_lowercase();
-    let purpose = purpose.to_ascii_lowercase();
-    purpose == EXPORT_PURPOSE_TELEKINO_PSF
-        || purpose.contains("telekino")
-        || purpose.contains("psf")
-        || id.contains("telekino")
-        || id.contains("psf")
-        || name.contains("telekino")
-        || name.contains("psf")
+fn contains_forbidden_pal_progressive_marker(format: &str) -> bool {
+    let bytes = format.as_bytes();
+    bytes.windows(3).any(|window| {
+        (window[0].eq_ignore_ascii_case(&b'p') && window[1] == b'2' && window[2] == b'5')
+            || (window[0] == b'2' && window[1] == b'5' && window[2].eq_ignore_ascii_case(&b'p'))
+    })
 }
 
-pub fn export_profile_is_progressive_25(values: &Value) -> bool {
+pub fn export_profile_is_forbidden_pal_progressive(values: &Value) -> bool {
     let fps = value_fps(values);
     let field_order = value_str(values, "field_order").to_ascii_lowercase();
     let format = value_str(values, "format").to_ascii_lowercase();
-    let looks_25 = (fps - 25.0).abs() < 0.01;
-    let explicit_p25 = format.contains("p25");
+    let single_rate_pal = (fps - 25.0).abs() < 0.01;
+    let explicit_forbidden = contains_forbidden_pal_progressive_marker(&format);
     let explicit_i50 = format.contains("i50") || field_order.contains("upper");
-    explicit_p25 || (looks_25 && field_order == "progressive" && !explicit_i50)
+    explicit_forbidden || (single_rate_pal && field_order == "progressive" && !explicit_i50)
 }
 
 pub fn validate_export_profile(id: &str, name: &str, values: &Value) -> Result<(), String> {
-    if export_profile_is_progressive_25(values)
-        && !export_profile_allows_progressive_25(id, name, values)
-    {
+    if export_profile_is_forbidden_pal_progressive(values) {
         return Err(
-            "25p export je dozvoljen samo kao telekino PsF profil; za news koristi p50 ili i50."
-                .into(),
+            "PAL single-rate progressive export nije dozvoljen; koristi p50 ili i50.".into(),
         );
     }
+    let _ = (id, name);
     Ok(())
 }
 
@@ -464,7 +378,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn builtin_export_presets_have_no_generic_progressive_25() {
+    fn builtin_export_presets_have_no_forbidden_pal_progressive() {
         let ids = builtin_export_presets()
             .into_iter()
             .map(|(id, name, values)| {
@@ -473,16 +387,15 @@ mod tests {
             })
             .collect::<Vec<_>>();
 
-        assert!(!ids.iter().any(|(id, _)| id == "xdcam_hd422_25p"));
-        assert!(!ids.iter().any(|(id, _)| id == "h264_1080p25"));
-        assert!(ids.iter().any(|(id, values)| id == "telekino_psf25"
-            && export_profile_allows_progressive_25(id, "Telekino PsF", values)));
+        assert!(!ids
+            .iter()
+            .any(|(_, values)| export_profile_is_forbidden_pal_progressive(values)));
     }
 
     #[test]
-    fn generic_progressive_25_export_is_rejected() {
+    fn forbidden_pal_progressive_export_is_rejected() {
         let values = preset_values(
-            "HD 1080p25",
+            "PAL single-rate progressive",
             25.0,
             1920,
             1080,
@@ -494,11 +407,13 @@ mod tests {
             2,
         );
 
-        assert!(validate_export_profile("h264_1080p25", "H.264 1080p25", &values).is_err());
+        assert!(
+            validate_export_profile("single_rate_pal", "H.264 single-rate PAL", &values).is_err()
+        );
     }
 
     #[test]
-    fn i50_uses_25_frame_rate_but_is_not_progressive_25() {
+    fn i50_uses_25_frame_rate_but_is_not_forbidden_pal_progressive() {
         let values = preset_values(
             "HD 1080i50",
             25.0,
@@ -512,25 +427,7 @@ mod tests {
             2,
         );
 
-        assert!(!export_profile_is_progressive_25(&values));
+        assert!(!export_profile_is_forbidden_pal_progressive(&values));
         assert!(validate_export_profile("xdcam_hd422_50i", "XDCAM HD422 50i", &values).is_ok());
-    }
-
-    #[test]
-    fn telekino_psf_is_the_explicit_progressive_25_exception() {
-        let psf = telekino_psf_preset_values(
-            "HD 1080PsF25",
-            25.0,
-            1920,
-            1080,
-            "progressive",
-            "rec709",
-            "mxf_op1a",
-            "mpeg2_422_50mbit",
-            48000,
-            2,
-        );
-
-        assert!(validate_export_profile("telekino_psf25", "Telekino PsF", &psf).is_ok());
     }
 }

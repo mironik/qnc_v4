@@ -1,30 +1,41 @@
 //! Native Story edit target helpers.
 
-use crate::editorial::common::shot_id;
-
-use super::{MarkerSlot, StoryCover, StoryShot};
+use super::{MarkerSlot, StoryCover};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct CoverTarget {
     pub slot_id: String,
-    pub clip_id: Option<String>,
-    pub virtual_shot_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(super) struct CoverSourceRange {
+    pub clip_id: String,
+    pub in_frame: i64,
+    pub out_frame: i64,
+    pub fps: f64,
 }
 
 pub(super) fn quick_cover_target(
+    selected_slot_id: &str,
     marker_slots: &[MarkerSlot],
-    selected_shot_id: &str,
-    virtual_shots: &[StoryShot],
 ) -> Result<CoverTarget, String> {
-    let slot_id = first_empty_marker_slot(marker_slots)
-        .map(|slot| slot.slot_id.clone())
-        .unwrap_or_default();
+    let selected_slot_id = selected_slot_id.trim();
+    let selected_empty_slot = marker_slots.iter().find(|slot| {
+        slot.slot_id == selected_slot_id && !slot.has_cover && !slot.slot_id.trim().is_empty()
+    });
+    let slot_id = if let Some(slot) = selected_empty_slot {
+        slot.slot_id.clone()
+    } else {
+        first_empty_marker_slot(marker_slots)
+            .map(|slot| slot.slot_id.clone())
+            .unwrap_or_default()
+    };
 
     if slot_id.trim().is_empty() {
-        return Err("Nema praznog marker slota; odaberi slot za overwrite".into());
+        return Err("Nema marker slota za pokrivalicu".into());
     }
 
-    cover_target(slot_id, selected_shot_id, virtual_shots)
+    Ok(CoverTarget { slot_id })
 }
 
 pub(super) fn overwrite_cover_target(
@@ -32,8 +43,6 @@ pub(super) fn overwrite_cover_target(
     selected_cover_id: &str,
     marker_slots: &[MarkerSlot],
     covers: &[StoryCover],
-    selected_shot_id: &str,
-    virtual_shots: &[StoryShot],
 ) -> Result<CoverTarget, String> {
     let slot_id = if !selected_slot_id.trim().is_empty() {
         selected_slot_id.to_string()
@@ -46,30 +55,39 @@ pub(super) fn overwrite_cover_target(
     };
 
     if slot_id.trim().is_empty() {
-        return Err("Odaberi marker slot ili cover za overwrite".into());
+        return Err("Odaberi marker slot za pokrivalicu".into());
     }
 
-    cover_target(slot_id, selected_shot_id, virtual_shots)
+    Ok(CoverTarget { slot_id })
 }
 
-fn cover_target(
-    slot_id: String,
-    selected_shot_id: &str,
-    virtual_shots: &[StoryShot],
-) -> Result<CoverTarget, String> {
-    let selected_shot_id = selected_shot_id.trim();
-    if selected_shot_id.is_empty()
-        || !virtual_shots
-            .iter()
-            .any(|shot| shot_id(shot) == selected_shot_id)
-    {
-        return Err("Odaberi derived virtualni kadar u Virtual tabu za cover".into());
+pub(super) fn cover_source_range(
+    selected_clip_id: &str,
+    mark_in_set: bool,
+    mark_out_set: bool,
+    source_in_frame: i64,
+    source_out_frame: i64,
+    source_fps: Option<f64>,
+) -> Result<CoverSourceRange, String> {
+    let clip_id = selected_clip_id.trim();
+    if clip_id.is_empty() {
+        return Err("Odaberi source klip za pokrivalicu".into());
+    }
+    let fps = source_fps.ok_or_else(|| "Source FPS još nije potvrđen".to_string())?;
+    if !mark_in_set || !mark_out_set {
+        return Err("Pokrivalica treba IN/OUT na source klipu".into());
+    }
+    let in_frame = source_in_frame.max(0);
+    let out_frame = source_out_frame.max(in_frame + 1);
+    if out_frame <= in_frame {
+        return Err("OUT mora biti poslije IN".into());
     }
 
-    Ok(CoverTarget {
-        slot_id,
-        clip_id: None,
-        virtual_shot_id: Some(selected_shot_id.to_string()),
+    Ok(CoverSourceRange {
+        clip_id: clip_id.to_string(),
+        in_frame,
+        out_frame,
+        fps,
     })
 }
 
@@ -98,40 +116,44 @@ fn selected_cover_slot_id<'a>(
 mod tests {
     use super::*;
 
-    fn slot() -> MarkerSlot {
-        MarkerSlot {
-            slot_id: "slot_a".into(),
-            ..MarkerSlot::default()
-        }
-    }
-
-    fn virtual_shot() -> StoryShot {
-        StoryShot {
-            shot_id: "shot_virtual_a".into(),
-            clip_id: "clip_a".into(),
-            ..StoryShot::default()
-        }
-    }
-
     #[test]
-    fn quick_cover_requires_selected_virtual_tab_shot() {
-        let slots = vec![slot()];
-        let shots = vec![virtual_shot()];
+    fn quick_cover_uses_selected_empty_slot() {
+        let slots = vec![
+            MarkerSlot {
+                slot_id: "slot_a".into(),
+                has_cover: false,
+                ..MarkerSlot::default()
+            },
+            MarkerSlot {
+                slot_id: "slot_b".into(),
+                has_cover: false,
+                ..MarkerSlot::default()
+            },
+        ];
 
-        let err = quick_cover_target(&slots, "root_clip_a", &shots)
-            .expect_err("All/root selection must not create cover");
-        assert!(err.contains("Virtual tabu"));
-    }
+        let target = quick_cover_target("slot_a", &slots).unwrap();
 
-    #[test]
-    fn quick_cover_uses_virtual_shot_without_all_clip_fallback() {
-        let slots = vec![slot()];
-        let shots = vec![virtual_shot()];
-
-        let target = quick_cover_target(&slots, "shot_virtual_a", &shots).unwrap();
         assert_eq!(target.slot_id, "slot_a");
-        assert_eq!(target.clip_id, None);
-        assert_eq!(target.virtual_shot_id.as_deref(), Some("shot_virtual_a"));
+    }
+
+    #[test]
+    fn quick_cover_skips_selected_filled_slot() {
+        let slots = vec![
+            MarkerSlot {
+                slot_id: "slot_a".into(),
+                has_cover: true,
+                ..MarkerSlot::default()
+            },
+            MarkerSlot {
+                slot_id: "slot_b".into(),
+                has_cover: false,
+                ..MarkerSlot::default()
+            },
+        ];
+
+        let target = quick_cover_target("slot_a", &slots).unwrap();
+
+        assert_eq!(target.slot_id, "slot_b");
     }
 
     #[test]
@@ -152,15 +174,14 @@ mod tests {
                 ..MarkerSlot::default()
             },
         ];
-        let shots = vec![virtual_shot()];
 
-        let target = quick_cover_target(&slots, "shot_virtual_a", &shots).unwrap();
+        let target = quick_cover_target("", &slots).unwrap();
 
         assert_eq!(target.slot_id, "slot_b");
     }
 
     #[test]
-    fn quick_cover_requires_empty_slot_when_none_selected() {
+    fn quick_cover_requires_slot() {
         let slots = vec![MarkerSlot {
             slot_id: "slot_a".into(),
             start_frame: 10,
@@ -168,26 +189,10 @@ mod tests {
             has_cover: true,
             ..MarkerSlot::default()
         }];
-        let shots = vec![virtual_shot()];
 
-        let err = quick_cover_target(&slots, "shot_virtual_a", &shots).unwrap_err();
+        let err = quick_cover_target("", &slots).unwrap_err();
 
-        assert!(err.contains("praznog marker slota"));
-    }
-
-    #[test]
-    fn overwrite_cover_uses_selected_slot_even_when_it_has_cover() {
-        let slots = vec![MarkerSlot {
-            slot_id: "slot_a".into(),
-            has_cover: true,
-            ..MarkerSlot::default()
-        }];
-        let shots = vec![virtual_shot()];
-
-        let target =
-            overwrite_cover_target("slot_a", "", &slots, &[], "shot_virtual_a", &shots).unwrap();
-
-        assert_eq!(target.slot_id, "slot_a");
+        assert!(err.contains("marker slota"));
     }
 
     #[test]
@@ -197,11 +202,26 @@ mod tests {
             slot_id: "slot_a".into(),
             ..StoryCover::default()
         }];
-        let shots = vec![virtual_shot()];
 
-        let target =
-            overwrite_cover_target("", "cover_a", &[], &covers, "shot_virtual_a", &shots).unwrap();
+        let target = overwrite_cover_target("", "cover_a", &[], &covers).unwrap();
 
         assert_eq!(target.slot_id, "slot_a");
+    }
+
+    #[test]
+    fn cover_source_range_requires_source_marks() {
+        let err = cover_source_range("clip_a", true, false, 10, 20, Some(50.0)).unwrap_err();
+
+        assert!(err.contains("IN/OUT"));
+    }
+
+    #[test]
+    fn cover_source_range_keeps_source_fps_frames() {
+        let range = cover_source_range("clip_a", true, true, 100, 160, Some(50.0)).unwrap();
+
+        assert_eq!(range.clip_id, "clip_a");
+        assert_eq!(range.in_frame, 100);
+        assert_eq!(range.out_frame, 160);
+        assert_eq!(range.fps, 50.0);
     }
 }

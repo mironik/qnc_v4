@@ -13,7 +13,7 @@ use rusqlite::params;
 use serde_json::{json, Value};
 use tracing::{info, warn};
 
-use crate::frame_time::{normalize_fps, rational_fps, DEFAULT_FPS};
+use crate::frame_time::{normalize_fps, rational_fps, require_fps, DEFAULT_FPS};
 use crate::ingest::db::open_ingest;
 use crate::ingest::project_media::sanitize_clip_id;
 use crate::ingest::proxy_source::{classify_tv_source, recipe_for_source};
@@ -62,11 +62,7 @@ pub fn broadcast_region_from_settings(settings: &Value) -> BroadcastRegion {
     if blob.contains("ntsc") || blob.contains("29.97") || blob.contains("59.94") {
         return BroadcastRegion::Ntsc;
     }
-    if blob.contains("pal")
-        || blob.contains("1080i50")
-        || blob.contains("1080p50")
-        || blob.contains("1080p25")
-    {
+    if blob.contains("pal") || blob.contains("1080i50") || blob.contains("1080p50") {
         return BroadcastRegion::Pal;
     }
 
@@ -115,6 +111,9 @@ pub fn audio_wrap_dest_for_fps(proxy_dir: &Path, clip_id: &str, fps: f64) -> Pat
 
 fn fps_path_tag(fps: f64) -> String {
     let n = normalize_fps(fps);
+    if n <= 0.0 {
+        return "unknown".into();
+    }
     if (n - n.round()).abs() < 0.001 {
         format!("{}", n.round() as i64)
     } else {
@@ -439,7 +438,7 @@ pub fn wrap_audio_with_timecode(source: &Path, dest: &Path, fps: f64) -> Result<
         return Err(format!("audio izvor ne postoji: {}", source.display()));
     }
     let ffmpeg = resolve_ffmpeg().ok_or_else(|| "ffmpeg nije dostupan".to_string())?;
-    let fps = normalize_fps(fps);
+    let fps = require_fps(fps, "audio wrap fps")?;
     let (num, den) = rational_fps(fps);
     let rate = if den == 1 {
         format!("{num}")

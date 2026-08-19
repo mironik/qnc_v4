@@ -11,6 +11,7 @@ pub struct FrameNumber(pub i64);
 pub enum BroadcastSourceKind {
     VideoAndAudio,
     VideoOnly,
+    AudioOnly,
 }
 
 #[derive(Debug, Clone, PartialEq)]

@@ -23,7 +23,8 @@ use crate::player_remote::PlayerRemote;
 use crate::qnc_ui;
 
 pub use crate::player_remote::{
-    BroadcastPlayerOpenRequest, PlayerCommand, PlayerEvent, PlayerRemoteState,
+    BroadcastPlayerOpenRequest, BroadcastProgramOpenRequest, PlayerCommand, PlayerEvent,
+    PlayerRemoteState,
 };
 
 /// Bounded RX capacity — drop-newest when a subscriber falls behind (Phase D).
@@ -102,6 +103,10 @@ impl BroadcastPlayerTx {
 
     pub fn open(&self, request: BroadcastPlayerOpenRequest) -> Result<(), String> {
         self.send(PlayerCommand::Open(request))
+    }
+
+    pub fn open_program(&self, request: BroadcastProgramOpenRequest) -> Result<(), String> {
+        self.send(PlayerCommand::OpenProgram(request))
     }
 
     #[allow(dead_code)]
@@ -184,6 +189,25 @@ pub struct QncBroadcastPlayer {
     remote: PlayerRemote,
     texture: Option<TextureHandle>,
     snapshot: Arc<Mutex<PlayerSnapshot>>,
+    transport_tick_gate: TransportTickGate,
+}
+
+#[derive(Debug, Default)]
+struct TransportTickGate {
+    last_ui_time: Option<f64>,
+}
+
+impl TransportTickGate {
+    fn should_advance(&mut self, ui_time: f64) -> bool {
+        if self
+            .last_ui_time
+            .is_some_and(|last| last.to_bits() == ui_time.to_bits())
+        {
+            return false;
+        }
+        self.last_ui_time = Some(ui_time);
+        true
+    }
 }
 
 impl Default for QncBroadcastPlayer {
@@ -202,6 +226,7 @@ impl QncBroadcastPlayer {
             remote: PlayerRemote::new(),
             texture: None,
             snapshot: Arc::new(Mutex::new(PlayerSnapshot::default())),
+            transport_tick_gate: TransportTickGate::default(),
         }
     }
 
@@ -245,7 +270,12 @@ impl QncBroadcastPlayer {
             }
         }
 
-        let events = self.remote.tick(ctx);
+        let ui_time = ctx.input(|input| input.time);
+        let events = if self.transport_tick_gate.should_advance(ui_time) {
+            self.remote.tick(ctx)
+        } else {
+            self.remote.poll(ctx)
+        };
         for event in events {
             match &event {
                 PlayerEvent::Frame { image, .. } => {
@@ -328,5 +358,19 @@ impl QncBroadcastPlayer {
                 sense: egui::Sense::hover(),
             },
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::TransportTickGate;
+
+    #[test]
+    fn transport_tick_gate_allows_one_transport_advance_per_ui_time() {
+        let mut gate = TransportTickGate::default();
+
+        assert!(gate.should_advance(1.0));
+        assert!(!gate.should_advance(1.0));
+        assert!(gate.should_advance(1.016));
     }
 }

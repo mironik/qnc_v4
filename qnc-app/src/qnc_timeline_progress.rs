@@ -106,7 +106,7 @@ pub struct TimelineProgressInput<'a> {
     pub a4_peaks: &'a [f32],
     pub covers: &'a [TimelineCoverSpan<'a>],
     pub marker_slots: &'a [TimelineSlotSpan<'a>],
-    pub markers: &'a [TimelineMarkerPin],
+    pub markers: &'a [TimelineMarkerPin<'a>],
     pub base_video_blank: bool,
 }
 
@@ -121,11 +121,13 @@ pub fn show(ui: &mut egui::Ui, input: TimelineProgressInput<'_>) -> TimelineProg
         draft_out_frame: input.model.draft_out_frame(),
         video_background: input.video_background,
         focus: input.focus,
+        show_lane_labels: true,
         expanded_audio: input.expanded_audio,
         a1_peaks: input.a1_peaks,
         a2_peaks: input.a2_peaks,
         a3_peaks: input.a3_peaks,
         a4_peaks: input.a4_peaks,
+        virtual_spans: &[],
         covers: input.covers,
         marker_slots: input.marker_slots,
         markers: input.markers,
@@ -148,7 +150,7 @@ mod tests {
 
     #[test]
     fn progress_model_is_frame_based_and_clamped() {
-        let model = TimelineProgressModel::from_carrier(25.0, 100, 51, -1, 999);
+        let model = TimelineProgressModel::from_carrier(0.0, 100, 51, -1, 999);
 
         assert_eq!(model.duration_frames(), 100);
         assert_eq!(model.playhead_frame(), 51);
@@ -160,7 +162,7 @@ mod tests {
 
     #[test]
     fn from_carrier_keeps_mark_range_in_frame_space() {
-        let model = TimelineProgressModel::from_carrier(25.0, 100, 0, 75, 50);
+        let model = TimelineProgressModel::from_carrier(0.0, 100, 0, 75, 50);
 
         assert_eq!(model.shot_in_frame(), 75);
         assert_eq!(model.shot_out_frame(), 75);
@@ -170,7 +172,7 @@ mod tests {
 
     #[test]
     fn from_carrier_uses_frame_authority_not_seconds() {
-        let model = TimelineProgressModel::from_carrier(25.0, 250, 100, 10, 200);
+        let model = TimelineProgressModel::from_carrier(0.0, 250, 100, 10, 200);
 
         assert_eq!(model.playhead_frame(), 100);
         assert_eq!(model.duration_frames(), 250);
@@ -182,7 +184,7 @@ mod tests {
 
     #[test]
     fn from_carrier_clamps_playhead_and_marks() {
-        let model = TimelineProgressModel::from_carrier(25.0, 100, 999, -5, 50);
+        let model = TimelineProgressModel::from_carrier(0.0, 100, 999, -5, 50);
 
         assert_eq!(model.playhead_frame(), 100);
         assert_eq!(model.shot_in_frame(), 0);
@@ -193,7 +195,7 @@ mod tests {
 
     #[test]
     fn from_ranges_keeps_selected_shot_and_draft_marks_separate() {
-        let model = TimelineProgressModel::from_ranges(25.0, 200, 80, 10, 150, 40, 90);
+        let model = TimelineProgressModel::from_ranges(0.0, 200, 80, 10, 150, 40, 90);
 
         assert_eq!(model.shot_in_frame(), 10);
         assert_eq!(model.shot_out_frame(), 150);

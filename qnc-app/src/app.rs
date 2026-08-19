@@ -21,7 +21,7 @@ use crate::playback_routing::PlaybackTransportIntent;
 use crate::playback_stack::PlaybackStack;
 use crate::player_bridge;
 use crate::project::{ProjectAction, ProjectScreen};
-use crate::qnc_broadcast_player::{BroadcastPlayerRx, PlayerEvent};
+use crate::qnc_broadcast_player::BroadcastPlayerRx;
 use crate::qnc_theme;
 use crate::shortcuts::{PROJECT_SHORTCUT_SCOPE, STORYBOARD_SHORTCUT_SCOPE};
 use crate::story::StoryScreen;
@@ -1803,37 +1803,6 @@ impl QncApp {
     fn tick_playback(&mut self, ctx: &egui::Context) {
         self.playback.player_mut().pump(ctx);
         let events = self.playback_rx.try_recv_all();
-        let mut program_playback_intents = Vec::new();
-        if self.phase == Phase::Workspace {
-            for event in &events {
-                let (source_frame, transport_playing) = match event {
-                    PlayerEvent::BoundaryReached { source_frame } => (*source_frame, false),
-                    PlayerEvent::Frame {
-                        source_frame,
-                        playing: true,
-                        ..
-                    }
-                    | PlayerEvent::State {
-                        source_frame,
-                        playing: true,
-                        ..
-                    } => (*source_frame, true),
-                    _ => continue,
-                };
-                let intents = match self.screen {
-                    Screen::Story => self
-                        .story
-                        .playback_boundary_intents_with_transport(source_frame, transport_playing),
-                    Screen::MediaAssist => self.media_assist.playback_boundary_intents_with_transport(
-                        source_frame,
-                        transport_playing,
-                    ),
-                    _ => Vec::new(),
-                };
-                program_playback_intents.extend(intents);
-            }
-        }
-
         self.playback.ingest_events(&events);
         if self.phase == Phase::Workspace {
             match self.screen {
@@ -1854,7 +1823,38 @@ impl QncApp {
                 ),
                 _ => {}
             }
-            self.playback_transport_intents(program_playback_intents);
+            self.flush_playback_transport(ctx);
+        }
+    }
+
+    /// Process transport commands emitted during event application in the same tick.
+    fn flush_playback_transport(&mut self, ctx: &egui::Context) {
+        self.playback.player_mut().pump(ctx);
+        let follow_up = self.playback_rx.try_recv_all();
+        if follow_up.is_empty() {
+            return;
+        }
+        self.playback.ingest_events(&follow_up);
+        if self.phase != Phase::Workspace {
+            return;
+        }
+        match self.screen {
+            Screen::Ingest => player_bridge::apply_player_events(
+                &mut self.ingest,
+                &follow_up,
+                self.playback.player(),
+            ),
+            Screen::Story => player_bridge::apply_player_events(
+                &mut self.story,
+                &follow_up,
+                self.playback.player(),
+            ),
+            Screen::MediaAssist => player_bridge::apply_player_events(
+                &mut self.media_assist,
+                &follow_up,
+                self.playback.player(),
+            ),
+            _ => {}
         }
     }
 

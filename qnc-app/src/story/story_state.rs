@@ -102,7 +102,7 @@ pub(super) fn summary(
     let segs = timeline.map(|t| t.segments.len()).unwrap_or(0);
     let dur = timeline.map(|t| t.duration_sec).unwrap_or(0.0);
     format!(
-        "{segs} seg · {dur:.1}s · parts={} · clips={} · virtual={} · covers={} · markers={}",
+        "{segs} seg · {dur:.1}s · segments={} · clips={} · virtual={} · covers={} · markers={}",
         parts.len(),
         all_clips.len(),
         virtual_shots.len(),

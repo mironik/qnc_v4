@@ -3,7 +3,7 @@ use std::env;
 use std::io::{ErrorKind, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdout, Command, Stdio};
-use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, TryRecvError, sync_channel};
+use std::sync::mpsc::{sync_channel, Receiver, RecvTimeoutError, SyncSender, TryRecvError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -180,16 +180,14 @@ pub struct FfmpegProbeReport {
 pub fn probe_source_runtime(
     path: &Path,
     source_id: impl Into<String>,
-    timebase_hint: Option<Timebase>,
 ) -> Result<FfmpegProbeReport, BroadcastEngineError> {
     let toolchain = FfmpegToolchain::default();
-    probe_source_runtime_with_toolchain(path, source_id, timebase_hint, &toolchain)
+    probe_source_runtime_with_toolchain(path, source_id, &toolchain)
 }
 
 pub fn probe_source_runtime_with_toolchain(
     path: &Path,
     source_id: impl Into<String>,
-    timebase_hint: Option<Timebase>,
     toolchain: &FfmpegToolchain,
 ) -> Result<FfmpegProbeReport, BroadcastEngineError> {
     let source_id = source_id.into();
@@ -203,12 +201,16 @@ pub fn probe_source_runtime_with_toolchain(
         .with_source_id(source_id));
     }
 
-    // File probe wins — form/UI fps is only a fallback when probe has no video.
     let timebase = video_probe
         .as_ref()
         .map(|probe| probe.timebase)
-        .or(timebase_hint)
-        .unwrap_or(Timebase::new(25, 1).map_err(contract_error)?);
+        .ok_or_else(|| {
+            BroadcastEngineError::new(
+                BroadcastEngineErrorKind::SourceOpen,
+                "video probe did not return playback timebase",
+            )
+            .with_source_id(source_id.clone())
+        })?;
     let duration_frames = if let Some(video_probe) = &video_probe {
         video_probe.duration_frames
     } else {
@@ -488,7 +490,11 @@ fn normalized_label(value: impl AsRef<str>) -> String {
 
 fn normalized_rule_value(value: impl AsRef<str>) -> Option<String> {
     let value = normalized_label(value);
-    if value.is_empty() { None } else { Some(value) }
+    if value.is_empty() {
+        None
+    } else {
+        Some(value)
+    }
 }
 
 fn rule_contains_matches(rule_value: &Option<String>, profile_value: Option<&str>) -> bool {
@@ -2594,24 +2600,21 @@ fn parse_probe_timebase(
     values: &BTreeMap<String, String>,
     source_id: &str,
 ) -> Result<Timebase, BroadcastEngineError> {
-    let rate = values
-        .get("r_frame_rate")
-        .or_else(|| values.get("avg_frame_rate"))
+    let (num, den) = ["avg_frame_rate", "r_frame_rate"]
+        .into_iter()
+        .filter_map(|key| values.get(key))
+        .find_map(|rate| parse_u32_ratio(rate))
         .ok_or_else(|| {
             BroadcastEngineError::new(
                 BroadcastEngineErrorKind::SourceOpen,
-                "video probe did not return frame rate",
+                "video probe did not return valid frame rate",
             )
             .with_source_id(source_id.to_string())
         })?;
-    let (num, den) = parse_u32_ratio(rate).ok_or_else(|| {
-        BroadcastEngineError::new(
-            BroadcastEngineErrorKind::SourceOpen,
-            "video probe returned invalid frame rate",
-        )
-        .with_source_id(source_id.to_string())
-    })?;
-    Timebase::new(num, den).map_err(contract_error)
+    Timebase::new(num, den).map_err(|err| {
+        BroadcastEngineError::new(BroadcastEngineErrorKind::SourceOpen, err)
+            .with_source_id(source_id.to_string())
+    })
 }
 
 fn parse_audio_duration_samples(
@@ -3384,16 +3387,16 @@ mod tests {
     }
 
     #[test]
-    fn audio_sample_span_is_exact_for_25_timebase() {
-        let timebase = Timebase::new(25, 1).unwrap();
+    fn audio_sample_span_is_exact_for_50_timebase() {
+        let timebase = Timebase::new(50, 1).unwrap();
 
         assert_eq!(
             audio_sample_span_for_frame(0, 48_000, timebase).unwrap(),
-            (0, 1920)
+            (0, 960)
         );
         assert_eq!(
             audio_sample_span_for_frame(1, 48_000, timebase).unwrap(),
-            (1920, 3840)
+            (960, 1920)
         );
     }
 
@@ -3423,11 +3426,11 @@ mod tests {
     #[test]
     fn audio_packet_byte_len_uses_integer_frame_sample_span() {
         let audio_format = AudioFormat::new(48_000, 2).unwrap();
-        let timebase = Timebase::new(25, 1).unwrap();
+        let timebase = Timebase::new(50, 1).unwrap();
 
         assert_eq!(
             audio_packet_byte_len_for_frame(0, &audio_format, timebase).unwrap(),
-            7680
+            3840
         );
     }
 
@@ -3502,9 +3505,46 @@ mod tests {
     }
 
     #[test]
+    fn parse_probe_timebase_prefers_average_frame_rate_for_playback_cadence() {
+        let mut values = BTreeMap::new();
+        values.insert("avg_frame_rate".to_string(), "50/1".to_string());
+        values.insert("r_frame_rate".to_string(), "25/1".to_string());
+
+        let timebase = parse_probe_timebase(&values, "src").unwrap();
+
+        assert_eq!(timebase, Timebase::new(50, 1).unwrap());
+    }
+
+    #[test]
+    fn parse_probe_timebase_accepts_probe_rate_as_authority() {
+        for (rate, expected) in [
+            ("25/1", Timebase::new(25, 1).unwrap()),
+            ("30/1", Timebase::new(30, 1).unwrap()),
+            ("50/1", Timebase::new(50, 1).unwrap()),
+            ("60/1", Timebase::new(60, 1).unwrap()),
+            ("60000/1001", Timebase::new(60_000, 1_001).unwrap()),
+        ] {
+            let mut values = BTreeMap::new();
+            values.insert("avg_frame_rate".to_string(), rate.to_string());
+
+            assert_eq!(parse_probe_timebase(&values, "src").unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn parse_probe_timebase_rejects_missing_valid_probe_rate() {
+        let mut values = BTreeMap::new();
+        values.insert("avg_frame_rate".to_string(), "0/0".to_string());
+        values.insert("r_frame_rate".to_string(), "0/0".to_string());
+
+        let err = parse_probe_timebase(&values, "src").unwrap_err();
+
+        assert!(err.to_string().contains("valid frame rate"));
+    }
+
+    #[test]
     fn audio_sample_spans_accumulate_without_drift_for_broadcast_timebases() {
         for (timebase, frames) in [
-            (Timebase::new(25, 1).unwrap(), 1_000),
             (Timebase::new(50, 1).unwrap(), 1_000),
             (Timebase::new(30, 1).unwrap(), 1_000),
             (Timebase::new(60, 1).unwrap(), 1_000),
@@ -3520,7 +3560,7 @@ mod tests {
             source_id: "src".to_string(),
             source_revision: None,
             duration_frames,
-            timebase: Timebase::new(25, 1).unwrap(),
+            timebase: Timebase::new(50, 1).unwrap(),
             video_format: Some(
                 VideoFormat::new(width, height, FieldMode::Progressive, ColorSpace::Rec709)
                     .unwrap(),
@@ -3551,7 +3591,7 @@ mod tests {
             source_id: "src".to_string(),
             source_revision: None,
             duration_frames,
-            timebase: Timebase::new(25, 1).unwrap(),
+            timebase: Timebase::new(50, 1).unwrap(),
             video_format: None,
             audio_format: Some(AudioFormat::new(48_000, 1).unwrap()),
         };

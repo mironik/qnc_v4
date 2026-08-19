@@ -466,6 +466,43 @@ pub struct TimelineModel {
 
 #[derive(Debug, Clone, Deserialize, Default)]
 #[allow(dead_code)]
+pub struct EditorialPlaylistSource {
+    #[serde(default, rename = "type")]
+    pub kind: String,
+    #[serde(default)]
+    pub part_id: String,
+    #[serde(default)]
+    pub cover_id: String,
+    #[serde(default)]
+    pub virtual_shot_id: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+#[allow(dead_code)]
+pub struct EditorialPlaylistCover {
+    pub cover_id: String,
+    #[serde(default)]
+    pub clip_id: String,
+    #[serde(default)]
+    pub virtual_shot_id: String,
+    #[serde(default)]
+    pub timeline_start_frame: i64,
+    #[serde(default)]
+    pub timeline_end_frame: i64,
+    #[serde(default)]
+    pub source_in_frame: i64,
+    #[serde(default)]
+    pub source_out_frame: i64,
+    #[serde(default)]
+    pub source_fps: f64,
+    #[serde(default)]
+    pub streamable: bool,
+    #[serde(default)]
+    pub source: EditorialPlaylistSource,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+#[allow(dead_code)]
 pub struct EditorialPlaylistSegment {
     pub part_id: String,
     #[serde(default)]
@@ -496,6 +533,10 @@ pub struct EditorialPlaylistSegment {
     pub source_fps: f64,
     #[serde(default)]
     pub streamable: bool,
+    #[serde(default)]
+    pub source: EditorialPlaylistSource,
+    #[serde(default)]
+    pub covers: Vec<EditorialPlaylistCover>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]

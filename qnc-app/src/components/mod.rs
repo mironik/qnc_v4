@@ -1,5 +1,6 @@
 //! Neutral UI components used by layout hosts.
 
+mod editorial_broadcast_program;
 mod editorial_edit;
 mod editorial_state;
 mod filesystem_list;
@@ -13,6 +14,9 @@ mod source_import_selection;
 mod source_import_state;
 mod theme_picker;
 
+pub(crate) use editorial_broadcast_program::{
+    EditorialProgramPlaybackComponent, EditorialProgramPlaybackInput,
+};
 pub(crate) use editorial_edit::{EditorialEditComponent, EditorialEditData, EditorialEditKind};
 pub(crate) use editorial_state::{EditorialStateComponent, EditorialStateData};
 pub(crate) use filesystem_list::FilesystemListComponent;

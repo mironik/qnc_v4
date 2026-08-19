@@ -312,7 +312,48 @@ mod tests {
     }
 
     #[test]
-    fn resolves_story_segment_playlist_actions_from_catalog() {
+    fn resolves_core_story_shortcuts_from_seed_presets() {
+        let catalog: serde_json::Value =
+            serde_json::from_str(include_str!("../../../seed/keyboard-shortcuts.json"))
+                .expect("valid keyboard shortcut seed");
+        let presets = catalog
+            .get("presets")
+            .and_then(|v| v.as_object())
+            .expect("seed presets");
+        let mut shift = egui::Modifiers::NONE;
+        shift.shift = true;
+
+        for preset_id in presets.keys() {
+            let user = json!({ "active_preset": preset_id });
+            let bindings = StoryBindings::from_catalog(&catalog, &user, "storyboard");
+
+            assert_eq!(
+                resolve_playback_action(
+                    &bindings.matching_actions(egui::Key::Space, egui::Modifiers::NONE)
+                ),
+                Some(PlaybackAction::TogglePlay),
+                "play_pause missing for preset {preset_id}"
+            );
+            assert_eq!(
+                resolve_playback_action(&bindings.matching_actions(egui::Key::B, shift)),
+                Some(PlaybackAction::OverwriteCover),
+                "overwrite_cover missing for preset {preset_id}"
+            );
+            assert_eq!(
+                resolve_playback_action(&bindings.matching_actions(egui::Key::T, shift)),
+                Some(PlaybackAction::AddTonSegment),
+                "add_ton_segment missing for preset {preset_id}"
+            );
+            assert_eq!(
+                resolve_playback_action(&bindings.matching_actions(egui::Key::V, shift)),
+                Some(PlaybackAction::AddOffSegment),
+                "add_off_segment missing for preset {preset_id}"
+            );
+        }
+    }
+
+    #[test]
+    fn resolves_story_playlist_input_actions_from_catalog() {
         let bindings = storyboard_bindings();
 
         assert_eq!(

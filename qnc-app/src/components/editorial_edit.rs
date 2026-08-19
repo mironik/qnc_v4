@@ -317,6 +317,7 @@ impl EditorialEditComponent {
         )
     }
 
+    #[allow(dead_code)]
     pub fn create_cover(
         instance_id: &str,
         request_id: u64,
@@ -337,6 +338,32 @@ impl EditorialEditComponent {
                 "slot_id": slot_id,
                 "clip_id": clip_id,
                 "virtual_shot_id": virtual_shot_id,
+            }),
+        )
+    }
+
+    pub fn create_cover_from_source(
+        instance_id: &str,
+        request_id: u64,
+        project_id: &str,
+        slot_id: &str,
+        clip_id: &str,
+        in_frame: i64,
+        out_frame: i64,
+    ) -> ComponentBackendCommand {
+        Self::post(
+            instance_id,
+            request_id,
+            project_id,
+            EditorialEditKind::CreateCover,
+            slot_id,
+            "/api/story/cover/create",
+            json!({
+                "project_id": project_id,
+                "slot_id": slot_id,
+                "clip_id": clip_id,
+                "in_frame": in_frame.max(0),
+                "out_frame": out_frame.max(in_frame + 1),
             }),
         )
     }

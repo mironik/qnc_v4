@@ -5,7 +5,7 @@ use std::time::Instant;
 use serde::{Deserialize, Serialize};
 
 use crate::editor_assets::ensure_virtual_stream_cached;
-use crate::frame_time::{frame_to_seconds, seconds_to_frame};
+use crate::frame_time::{frame_to_seconds, is_valid_fps, seconds_to_frame};
 use crate::media::resolve_play_media;
 use crate::media_pool::resolve_clip_fps;
 use crate::project::db::ProjectPaths;
@@ -75,7 +75,7 @@ struct CoverStreamRef {
     audio_channels: u8,
 }
 
-/// All-tab / source dock — one clip, clock = source seconds (Rust frame + mixed audio).
+/// All-tab / source dock — one clip, clock = source seconds (Rust frame + audio).
 #[derive(Debug, Clone, Serialize)]
 pub struct SourceClipPlayback {
     pub clip_id: String,
@@ -128,7 +128,7 @@ pub struct ActiveLayer {
     /// A1 kostur — audio-only part stream whenever segment is active.
     #[serde(skip_serializing_if = "String::is_empty")]
     pub a1_stream_url: String,
-    /// Server-mixed A1 (+ A2 u cover slotu) — jedan audio izlaz (F2).
+    /// Program audio URL. Legacy field name; payload is A1/A2 dual-mono, not a mix.
     #[serde(skip_serializing_if = "String::is_empty")]
     pub mixed_audio_url: String,
     /// Preview kadar (JPEG) za aktivni video sloj.
@@ -699,8 +699,13 @@ fn resolve_active_layer_frozen(session: &PlaybackSession, virtual_frame: i64) ->
         let cover_has_audio = cover_ref.map(|row| row.has_audio).unwrap_or(false);
         let cover_audio_channels = cover_ref.map(|row| row.audio_channels).unwrap_or(0);
         let has_video = !stream_url.trim().is_empty();
-        let source_frame = (v - cover.timeline_start_frame).max(0);
-        let source_sec = frame_to_seconds(source_frame, timeline_fps);
+        let source_fps = if is_valid_fps(cover.source_fps) {
+            cover.source_fps
+        } else {
+            cover_ref.map(|row| row.fps).unwrap_or(timeline_fps)
+        };
+        let source_frame = cover_source_offset_frame(cover, v, timeline_fps, source_fps).max(0);
+        let source_sec = frame_to_seconds(source_frame, source_fps);
         return ActiveLayer {
             layer: ActiveLayerKind::Cover,
             part_id: segment.part_id.clone(),
@@ -763,6 +768,28 @@ fn resolve_active_layer_frozen(session: &PlaybackSession, virtual_frame: i64) ->
         local_sec: frame_to_seconds(local_frame, timeline_fps),
         source_sec: frame_to_seconds(local_frame, timeline_fps),
     }
+}
+
+pub(crate) fn source_offset_for_record_frame(
+    record_offset_frame: i64,
+    _timeline_fps: f64,
+    _source_fps: f64,
+) -> i64 {
+    record_offset_frame.max(0)
+}
+
+fn cover_source_offset_frame(
+    cover: &EditorialCover,
+    virtual_frame: i64,
+    timeline_fps: f64,
+    source_fps: f64,
+) -> i64 {
+    let record_offset = virtual_frame
+        .max(0)
+        .saturating_sub(cover.timeline_start_frame.max(0));
+    let source_offset = source_offset_for_record_frame(record_offset, timeline_fps, source_fps);
+    let source_span = (cover.source_out_frame - cover.source_in_frame).max(1);
+    source_offset.clamp(0, source_span.saturating_sub(1))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -986,6 +1013,7 @@ mod tests {
                     slot_duration_sec: 2.0,
                     source_in_frame: 25,
                     source_out_frame: 75,
+                    source_fps: 25.0,
                     source_offset_frames: 0,
                     source_in_sec: 1.0,
                     source_out_sec: 3.0,
@@ -1311,6 +1339,28 @@ mod tests {
     }
 
     #[test]
+    fn cover_active_layer_uses_cover_source_fps() {
+        let mut session = frozen_session(playlist_one());
+        let cover = &mut session.playlist.segments[0].covers[0];
+        cover.source_in_frame = 100;
+        cover.source_out_frame = 200;
+        cover.source_fps = 50.0;
+        if let Some(stream) = session.cover_streams.get_mut("cover_a") {
+            stream.in_frame = 100;
+            stream.out_frame = 200;
+            stream.fps = 50.0;
+        }
+        session.clock.virtual_frame = 51;
+        session.clock.virtual_sec = frame_to_seconds(51, session.playlist.timeline_fps);
+
+        let state = state_from_session(&session);
+
+        assert_eq!(state.active.layer, ActiveLayerKind::Cover);
+        assert_eq!(state.active.source_frame, 1);
+        assert!((state.active.source_sec - 0.02).abs() < EPS);
+    }
+
+    #[test]
     fn mix_plan_off_window_is_a1_only() {
         use super::super::playback_render::plan_mix_slices;
         let session = frozen_session(playlist_one());
@@ -1326,6 +1376,18 @@ mod tests {
         let slices = plan_mix_slices(&session, 2.5, 1.0);
         assert_eq!(slices.len(), 1);
         assert_eq!(slices[0].cover_id.as_deref(), Some("cover_a"));
+    }
+
+    #[test]
+    fn mix_plan_cover_seek_uses_cover_source_fps() {
+        use super::super::playback_render::plan_mix_slices;
+        let mut session = frozen_session(playlist_one());
+        session.playlist.segments[0].covers[0].source_fps = 50.0;
+        let slices = plan_mix_slices(&session, 2.04, 0.5);
+
+        assert_eq!(slices.len(), 1);
+        assert_eq!(slices[0].cover_id.as_deref(), Some("cover_a"));
+        assert!((slices[0].cover_source_in_sec - 0.02).abs() < EPS);
     }
 
     #[test]

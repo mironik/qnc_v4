@@ -4,7 +4,7 @@ use std::time::Instant;
 
 use tracing::{info, warn};
 
-use crate::frame_time::{rational_fps, seconds_to_frame};
+use crate::frame_time::{rational_fps, require_fps, seconds_to_frame};
 use crate::ingest::thumb::{probe_media, resolve_ffmpeg, MediaProbe};
 
 use super::proxy_encode::{
@@ -71,7 +71,6 @@ pub fn proxy_recipe_policy_snapshot() -> serde_json::Value {
     let classes = [
         TvSourceClass::Pal50p,
         TvSourceClass::Pal50i,
-        TvSourceClass::Pal25p,
         TvSourceClass::Ntsc60p,
         TvSourceClass::Ntsc60i,
         TvSourceClass::Ntsc30p,
@@ -91,7 +90,7 @@ pub fn proxy_recipe_policy_snapshot() -> serde_json::Value {
     serde_json::Value::Object(map)
 }
 
-/// Terenski proxy prema tipu izvora (50p/50i/25p + NTSC ekvivalenti).
+/// Terenski proxy prema tipu izvora (PAL 50p/50i + NTSC ekvivalenti).
 pub fn generate_field_proxy(source: &Path, dest: &Path) -> Result<(), String> {
     if !source.is_file() {
         return Err(format!("izvor ne postoji: {}", source.display()));
@@ -233,6 +232,7 @@ fn run_xdcam_hd422_encode(
     probe: &MediaProbe,
     recipe: ProxyRecipe,
 ) -> Result<(), String> {
+    require_fps(probe.fps, "xdcam proxy source fps")?;
     // XDCAM HD422: MPEG-2 4:2:2 @ 50 Mbit CBR, MXF OP1a, PCM 48 kHz
     // (usklađeno s template `xdcam_hd_422` / `mpeg2_422_50mbit`).
     let (fps_num, fps_den) = rational_fps(probe.fps);
@@ -335,6 +335,7 @@ fn run_encode_inner(
     _audio: AudioMode,
     _extra: Option<&[&str]>,
 ) -> Result<(), String> {
+    require_fps(probe.fps, "h264 proxy source fps")?;
     let (fps_num, fps_den) = rational_fps(probe.fps);
     let fps_arg = if fps_den == 1 {
         fps_num.to_string()
@@ -375,8 +376,10 @@ fn run_encode_inner(
 }
 
 fn verify_frame_parity(dest: &Path, source_probe: &MediaProbe) -> Result<(), String> {
+    require_fps(source_probe.fps, "proxy source fps")?;
     let dest_probe = probe_media(dest)
         .ok_or_else(|| format!("ffprobe ne može pročitati proxy: {}", dest.display()))?;
+    require_fps(dest_probe.fps, "proxy output fps")?;
     if (source_probe.fps - dest_probe.fps).abs() > 0.08 {
         return Err(format!(
             "proxy fps {} != izvor {} — timecode bi se razmaknuo",

@@ -23,15 +23,25 @@ pub struct ProgramBounds {
 impl ProgramBounds {
     #[allow(dead_code)]
     pub fn from_seconds(fps: f64, duration_sec: f64, in_sec: f64, out_sec: f64) -> Self {
-        use crate::frame_time::{normalize_fps, seconds_to_frame};
-        let fps = normalize_fps(fps);
-        let duration_frames = seconds_to_frame(duration_sec.max(0.0), fps).max(1);
+        let fps = if fps.is_finite() && fps > 0.0 {
+            fps
+        } else {
+            0.0
+        };
+        let seconds_to_frame = |seconds: f64| {
+            if fps > 0.0 {
+                (seconds.max(0.0) * fps).round() as i64
+            } else {
+                0
+            }
+        };
+        let duration_frames = seconds_to_frame(duration_sec.max(0.0)).max(1);
         let clamp = |frame: i64| frame.clamp(0, duration_frames);
         Self {
             fps,
             duration_frames,
-            in_frame: clamp(seconds_to_frame(in_sec.max(0.0), fps)),
-            out_frame: clamp(seconds_to_frame(out_sec.max(in_sec), fps)),
+            in_frame: clamp(seconds_to_frame(in_sec.max(0.0))),
+            out_frame: clamp(seconds_to_frame(out_sec.max(in_sec))),
             field_mode: FieldMode::Progressive,
         }
     }
@@ -229,13 +239,13 @@ mod tests {
     use super::*;
 
     fn bounds() -> ProgramBounds {
-        ProgramBounds::from_seconds(25.0, 10.0, 0.0, 10.0)
+        ProgramBounds::from_seconds(50.0, 5.0, 0.0, 5.0)
     }
 
     fn state(frame: i64, playing: bool) -> PlayerEvent {
         PlayerEvent::State {
             source_frame: FrameNumber(frame),
-            source_sec: frame as f64 / 25.0,
+            source_sec: frame as f64 / 50.0,
             playing,
             status: if playing {
                 "Playing".into()

@@ -9,7 +9,7 @@
 //!
 //! Layers are visual UI only. They do not play media.
 //!
-//! Editorial segments/parts are owner data — not part of this component.
+//! Virtual-shot grouping is owner data; this component only paints supplied spans.
 //!
 //! # M markers — not owned here
 //!
@@ -154,8 +154,17 @@ pub enum TimelineFocusPaint {
 }
 
 #[derive(Debug, Clone, Copy)]
+pub struct TimelineVirtualSpan<'a> {
+    pub id: &'a str,
+    pub label: &'a str,
+    pub start_frame: i64,
+    pub end_frame: i64,
+    pub has_base_video: bool,
+    pub selected: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
 pub struct TimelineCoverSpan<'a> {
-    #[allow(dead_code)]
     pub id: &'a str,
     pub start_frame: i64,
     pub end_frame: i64,
@@ -165,7 +174,6 @@ pub struct TimelineCoverSpan<'a> {
 /// Slot band for paint — geometry from broadcast/owner, not derived here.
 #[derive(Debug, Clone, Copy)]
 pub struct TimelineSlotSpan<'a> {
-    #[allow(dead_code)]
     pub id: &'a str,
     pub start_frame: i64,
     pub end_frame: i64,
@@ -175,7 +183,8 @@ pub struct TimelineSlotSpan<'a> {
 
 /// M pin for paint — position from owner projection to carrier frame.
 #[derive(Debug, Clone, Copy)]
-pub struct TimelineMarkerPin {
+pub struct TimelineMarkerPin<'a> {
+    pub id: &'a str,
     pub timeline_frame: i64,
 }
 
@@ -190,23 +199,29 @@ pub struct QncTimeline<'a> {
     pub draft_out_frame: i64,
     pub video_background: Option<&'a dyn Fn(&mut egui::Ui, egui::Rect)>,
     pub focus: TimelineFocusPaint,
+    pub show_lane_labels: bool,
     pub expanded_audio: ExpandedAudio,
     pub a1_peaks: &'a [f32],
     pub a2_peaks: &'a [f32],
     pub a3_peaks: &'a [f32],
     pub a4_peaks: &'a [f32],
+    pub virtual_spans: &'a [TimelineVirtualSpan<'a>],
     pub covers: &'a [TimelineCoverSpan<'a>],
     /// Ready-made slots from owner (broadcast M→slot); painted only if covers on.
     pub marker_slots: &'a [TimelineSlotSpan<'a>],
     /// Ready-made M pins from owner; painted only if covers on.
-    pub markers: &'a [TimelineMarkerPin],
+    pub markers: &'a [TimelineMarkerPin<'a>],
     pub base_video_blank: bool,
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct TimelineInteract {
     pub seek_frame: Option<i64>,
     pub expand_click: Option<ExpandedAudio>,
+    pub select_virtual: Option<String>,
+    pub select_cover: Option<String>,
+    pub select_marker_slot: Option<String>,
+    pub select_marker: Option<String>,
 }
 
 struct AudioRowInteract {
@@ -289,11 +304,7 @@ impl QncTimeline<'_> {
                 }
 
                 if self.video_stack_on() {
-                    if let Some(frame) = self.paint_video_stack(ui, duration_frames) {
-                        if out.seek_frame.is_none() {
-                            out.seek_frame = Some(frame);
-                        }
-                    }
+                    merge_interact(&mut out, self.paint_video_stack(ui, duration_frames));
                 }
 
                 if self.layers.audio_a2 {
@@ -398,7 +409,8 @@ impl QncTimeline<'_> {
         if label_resp.hovered() {
             ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
         }
-        Self::paint_label(ui, row, label, self.expanded_audio == lane);
+        let paint_label = self.show_lane_labels.then_some(label).unwrap_or("");
+        Self::paint_label(ui, row, paint_label, self.expanded_audio == lane);
         let inner = Self::track_inner(row);
         let painter = ui.painter();
         painter.rect_filled(inner, 0.0, bg);
@@ -444,7 +456,7 @@ impl QncTimeline<'_> {
                 self.focus,
             );
         }
-        if label_resp.clicked() {
+        if self.show_lane_labels && label_resp.clicked() {
             return AudioRowInteract {
                 expand_click: true,
                 seek_frame: None,
@@ -457,13 +469,18 @@ impl QncTimeline<'_> {
     }
 
     /// V: video/control row. Filmstrip thumbnails are a separate UI background component.
-    fn paint_video_stack(&self, ui: &mut egui::Ui, duration_frames: i64) -> Option<i64> {
+    fn paint_video_stack(&self, ui: &mut egui::Ui, duration_frames: i64) -> TimelineInteract {
         let width = ui.available_width();
         let (row, response) = ui.allocate_exact_size(
             Vec2::new(width, self.video_stack_h()),
             egui::Sense::click_and_drag(),
         );
-        Self::paint_label(ui, row, "V", false);
+        Self::paint_label(
+            ui,
+            row,
+            self.show_lane_labels.then_some("V").unwrap_or(""),
+            false,
+        );
         let inner = Self::track_inner(row);
         let track_rect = inner;
         // M pins/slots are cover-layer companions: paint only when covers is active.
@@ -493,12 +510,18 @@ impl QncTimeline<'_> {
                 paint_marker_slots(painter, track_rect, duration_frames, self.marker_slots);
             }
 
-            if self.layers.base_video && !self.base_video_blank {
-                painter.rect_filled(
-                    track_rect.shrink2(Vec2::new(0.0, 10.0)),
-                    2.0,
-                    css::WAVE_A1.linear_multiply(0.25),
-                );
+            if self.layers.base_video {
+                if self.virtual_spans.is_empty() {
+                    if !self.base_video_blank {
+                        painter.rect_filled(
+                            track_rect.shrink2(Vec2::new(0.0, 10.0)),
+                            2.0,
+                            css::WAVE_A1.linear_multiply(0.25),
+                        );
+                    }
+                } else {
+                    paint_virtual_spans(painter, track_rect, duration_frames, self.virtual_spans);
+                }
             }
 
             if self.layers.shot_range {
@@ -545,7 +568,36 @@ impl QncTimeline<'_> {
             }
         }
 
-        seek_from_pointer(&response, inner, duration_frames)
+        pointer_interact(
+            &response,
+            inner,
+            duration_frames,
+            self.virtual_spans,
+            self.covers,
+            self.marker_slots,
+            self.markers,
+        )
+    }
+}
+
+fn merge_interact(out: &mut TimelineInteract, update: TimelineInteract) {
+    if out.expand_click.is_none() {
+        out.expand_click = update.expand_click;
+    }
+    if out.select_marker.is_none() {
+        out.select_marker = update.select_marker;
+    }
+    if out.select_cover.is_none() {
+        out.select_cover = update.select_cover;
+    }
+    if out.select_marker_slot.is_none() {
+        out.select_marker_slot = update.select_marker_slot;
+    }
+    if out.select_virtual.is_none() {
+        out.select_virtual = update.select_virtual;
+    }
+    if out.seek_frame.is_none() {
+        out.seek_frame = update.seek_frame;
     }
 }
 
@@ -592,6 +644,49 @@ fn paint_covers(
     }
 }
 
+fn paint_virtual_spans(
+    painter: &egui::Painter,
+    area: egui::Rect,
+    duration_frames: i64,
+    spans: &[TimelineVirtualSpan<'_>],
+) {
+    for span in spans {
+        if span.end_frame <= span.start_frame {
+            continue;
+        }
+        let x0 = x_for_frame(area, duration_frames, span.start_frame);
+        let x1 = x_for_frame(area, duration_frames, span.end_frame);
+        let rect = egui::Rect::from_min_max(
+            egui::pos2(x0, area.top() + 17.0),
+            egui::pos2(x1.max(x0 + 3.0), area.bottom() - 10.0),
+        );
+        let base = if span.has_base_video {
+            css::WAVE_A1
+        } else {
+            css::WAVE_A2
+        };
+        painter.rect_filled(rect, 2.0, base.linear_multiply(0.24));
+        painter.rect_stroke(
+            rect,
+            2.0,
+            egui::Stroke::new(
+                if span.selected { 1.8 } else { 1.0 },
+                if span.selected { css::FOCUS } else { base },
+            ),
+            egui::StrokeKind::Inside,
+        );
+        if rect.width() >= 42.0 {
+            painter.text(
+                rect.center(),
+                egui::Align2::CENTER_CENTER,
+                span.label,
+                egui::FontId::proportional(10.0),
+                Color32::from_rgb(229, 231, 235),
+            );
+        }
+    }
+}
+
 fn paint_marker_slots(
     painter: &egui::Painter,
     area: egui::Rect,
@@ -629,7 +724,7 @@ fn paint_markers(
     painter: &egui::Painter,
     area: egui::Rect,
     duration_frames: i64,
-    markers: &[TimelineMarkerPin],
+    markers: &[TimelineMarkerPin<'_>],
 ) {
     let pink = Color32::from_rgb(244, 114, 182);
     for m in markers {
@@ -646,6 +741,125 @@ fn paint_markers(
             pink,
         );
     }
+}
+
+fn pointer_interact(
+    response: &egui::Response,
+    inner: egui::Rect,
+    duration_frames: i64,
+    virtual_spans: &[TimelineVirtualSpan<'_>],
+    covers: &[TimelineCoverSpan<'_>],
+    slots: &[TimelineSlotSpan<'_>],
+    markers: &[TimelineMarkerPin<'_>],
+) -> TimelineInteract {
+    let mut out = TimelineInteract::default();
+    let Some(pos) = response.interact_pointer_pos() else {
+        return out;
+    };
+    if !inner.expand(2.0).contains(pos) || inner.width() <= 0.0 {
+        return out;
+    }
+
+    if response.clicked() {
+        if let Some(id) = marker_hit(inner, duration_frames, pos, markers) {
+            out.select_marker = Some(id.to_string());
+            return out;
+        }
+        if let Some(id) = cover_hit(inner, duration_frames, pos, covers) {
+            out.select_cover = Some(id.to_string());
+            return out;
+        }
+        if let Some(id) = marker_slot_hit(inner, duration_frames, pos, slots) {
+            out.select_marker_slot = Some(id.to_string());
+            return out;
+        }
+        if let Some(id) = virtual_span_hit(inner, duration_frames, pos, virtual_spans) {
+            out.select_virtual = Some(id.to_string());
+            out.seek_frame = frame_from_pos(inner, duration_frames, pos);
+            return out;
+        }
+    }
+
+    if response.clicked() || response.dragged() {
+        out.seek_frame = frame_from_pos(inner, duration_frames, pos);
+    }
+    out
+}
+
+fn marker_hit<'a>(
+    area: egui::Rect,
+    duration_frames: i64,
+    pos: egui::Pos2,
+    markers: &'a [TimelineMarkerPin<'a>],
+) -> Option<&'a str> {
+    let tolerance = 5.0;
+    markers.iter().find_map(|marker| {
+        let x = x_for_frame(area, duration_frames, marker.timeline_frame);
+        (!marker.id.trim().is_empty() && (pos.x - x).abs() <= tolerance).then_some(marker.id)
+    })
+}
+
+fn cover_hit<'a>(
+    area: egui::Rect,
+    duration_frames: i64,
+    pos: egui::Pos2,
+    covers: &'a [TimelineCoverSpan<'a>],
+) -> Option<&'a str> {
+    covers.iter().rev().find_map(|cover| {
+        if cover.end_frame <= cover.start_frame || cover.id.trim().is_empty() {
+            return None;
+        }
+        let x0 = x_for_frame(area, duration_frames, cover.start_frame);
+        let x1 = x_for_frame(area, duration_frames, cover.end_frame);
+        let rect = egui::Rect::from_min_max(
+            egui::pos2(x0, area.top() + 2.0),
+            egui::pos2(x1.max(x0 + 3.0), area.top() + area.height() * 0.42),
+        )
+        .expand(2.0);
+        rect.contains(pos).then_some(cover.id)
+    })
+}
+
+fn marker_slot_hit<'a>(
+    area: egui::Rect,
+    duration_frames: i64,
+    pos: egui::Pos2,
+    slots: &'a [TimelineSlotSpan<'a>],
+) -> Option<&'a str> {
+    slots.iter().find_map(|slot| {
+        if slot.end_frame <= slot.start_frame || slot.id.trim().is_empty() {
+            return None;
+        }
+        let x0 = x_for_frame(area, duration_frames, slot.start_frame);
+        let x1 = x_for_frame(area, duration_frames, slot.end_frame);
+        let rect = egui::Rect::from_min_max(
+            egui::pos2(x0, area.top() + 2.0),
+            egui::pos2(x1.max(x0 + 3.0), area.bottom() - 2.0),
+        )
+        .expand(2.0);
+        rect.contains(pos).then_some(slot.id)
+    })
+}
+
+fn virtual_span_hit<'a>(
+    area: egui::Rect,
+    duration_frames: i64,
+    pos: egui::Pos2,
+    spans: &'a [TimelineVirtualSpan<'a>],
+) -> Option<&'a str> {
+    spans.iter().rev().find_map(|span| {
+        if span.end_frame <= span.start_frame || span.id.trim().is_empty() {
+            return None;
+        }
+        let x0 = x_for_frame(area, duration_frames, span.start_frame);
+        let x1 = x_for_frame(area, duration_frames, span.end_frame);
+        let rect = egui::Rect::from_min_max(
+            egui::pos2(x0, area.top() + 17.0),
+            egui::pos2(x1.max(x0 + 3.0), area.bottom() - 10.0),
+        )
+        .expand(2.0);
+        rect.contains(pos).then_some(span.id)
+    })
 }
 
 fn paint_shot_range(
@@ -782,6 +996,13 @@ fn seek_from_pointer(
     if inner.width() <= 0.0 {
         return None;
     }
+    frame_from_pos(inner, duration_frames, pos)
+}
+
+fn frame_from_pos(inner: egui::Rect, duration_frames: i64, pos: egui::Pos2) -> Option<i64> {
+    if inner.width() <= 0.0 {
+        return None;
+    }
     let t = ((pos.x - inner.left()) / inner.width()).clamp(0.0, 1.0) as f64;
     let duration_frames = duration_frames.max(1);
     Some(((t * duration_frames as f64).round() as i64).clamp(0, duration_frames))
@@ -826,5 +1047,34 @@ mod tests {
         assert!(!d.audio_a4);
         assert!(LayerFlags::ALL.audio_a3);
         assert!(LayerFlags::ALL.audio_a4);
+    }
+
+    #[test]
+    fn virtual_span_hit_uses_shared_frame_geometry() {
+        let area = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), Vec2::new(100.0, 60.0));
+        let spans = [
+            TimelineVirtualSpan {
+                id: "virtual_a",
+                label: "tonovi",
+                start_frame: 10,
+                end_frame: 40,
+                has_base_video: true,
+                selected: false,
+            },
+            TimelineVirtualSpan {
+                id: "virtual_b",
+                label: "offovi",
+                start_frame: 20,
+                end_frame: 50,
+                has_base_video: true,
+                selected: true,
+            },
+        ];
+
+        assert_eq!(
+            virtual_span_hit(area, 100, egui::pos2(30.0, 30.0), &spans),
+            Some("virtual_b")
+        );
+        assert_eq!(frame_from_pos(area, 100, egui::pos2(30.0, 30.0)), Some(30));
     }
 }

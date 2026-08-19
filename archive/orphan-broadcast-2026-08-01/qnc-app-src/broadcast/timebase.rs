@@ -27,14 +27,14 @@ impl TimebaseParseError {
 }
 
 impl Timebase {
-    pub const FPS_25: Self = Self {
-        num: 25,
+    pub const DEFAULT_SOURCE_TIMEBASE: Self = Self {
+        num: 50,
         den: 1,
         drop_frame: false,
     };
 
     pub fn from_source_fps(fps: f64) -> Self {
-        Self::try_from_source_fps(fps).unwrap_or(Self::FPS_25)
+        Self::try_from_source_fps(fps).unwrap_or(Self::DEFAULT_SOURCE_TIMEBASE)
     }
 
     pub fn try_from_source_fps(fps: f64) -> Result<Self, TimebaseParseError> {

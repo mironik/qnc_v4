@@ -1,4 +1,4 @@
-pub const DEFAULT_FPS: f64 = 25.0;
+pub const DEFAULT_FPS: f64 = 0.0;
 pub const DEFAULT_DURATION_MARKS_SEC: [f64; 3] = [3.0, 5.0, 7.0];
 
 pub fn is_valid_fps(raw: f64) -> bool {
@@ -40,11 +40,17 @@ pub fn rational_fps(fps: f64) -> (i64, i64) {
 
 pub fn seconds_to_frame(seconds: f64, fps: f64) -> i64 {
     let fps = normalize_fps(fps);
+    if fps <= 0.0 {
+        return 0;
+    }
     (seconds.max(0.0) * fps).round() as i64
 }
 
 pub fn frame_to_seconds(frame: i64, fps: f64) -> f64 {
     let fps = normalize_fps(fps);
+    if fps <= 0.0 {
+        return 0.0;
+    }
     (frame.max(0) as f64) / fps
 }
 
@@ -59,7 +65,11 @@ pub fn duration_frames(in_seconds: f64, out_seconds: f64, fps: f64) -> i64 {
 }
 
 pub fn seconds_frames_label_from_frames(frames: i64, fps: f64) -> String {
-    let fps = normalize_fps(fps).round().max(1.0) as i64;
+    let fps = normalize_fps(fps);
+    if fps <= 0.0 {
+        return "0:00".into();
+    }
+    let fps = fps.round().max(1.0) as i64;
     let frames = frames.max(0);
     let seconds = frames / fps;
     let rem = frames % fps;
@@ -68,6 +78,9 @@ pub fn seconds_frames_label_from_frames(frames: i64, fps: f64) -> String {
 
 pub fn duration_color_key_from_frames(frames: i64, fps: f64) -> &'static str {
     let fps = normalize_fps(fps);
+    if fps <= 0.0 {
+        return "over_7";
+    }
     let seconds = (frames.max(0) as f64) / fps;
     if seconds < DEFAULT_DURATION_MARKS_SEC[0] {
         "under_3"
@@ -81,7 +94,13 @@ pub fn duration_color_key_from_frames(frames: i64, fps: f64) -> &'static str {
 }
 
 pub fn seconds_to_timecode(seconds: f64, fps: f64) -> String {
+    if !seconds.is_finite() || seconds < 0.0 {
+        return "00:00:00:00".into();
+    }
     let fps_norm = normalize_fps(fps);
+    if fps_norm <= 0.0 {
+        return "00:00:00:00".into();
+    }
     let total = seconds_to_frame(seconds, fps_norm);
     frame_to_timecode(total, fps_norm)
 }
@@ -104,8 +123,12 @@ pub fn dual_fps_snapshot(
     let source_fps = normalize_fps(source_fps);
     let timeline_fps = normalize_fps(timeline_fps);
     let source_duration_frames = (out_frame - in_frame).max(0);
-    let duration_sec = source_duration_frames as f64 / source_fps;
-    let timeline_duration_frames = seconds_to_frame(duration_sec, timeline_fps);
+    let timeline_duration_frames = if source_fps > 0.0 && timeline_fps > 0.0 {
+        let duration_sec = source_duration_frames as f64 / source_fps;
+        seconds_to_frame(duration_sec, timeline_fps)
+    } else {
+        0
+    };
     DualFpsSnapshot {
         source_fps,
         timeline_fps,
@@ -116,6 +139,9 @@ pub fn dual_fps_snapshot(
 
 pub fn frame_to_timecode(frame: i64, fps: f64) -> String {
     let fps_norm = normalize_fps(fps);
+    if fps_norm <= 0.0 {
+        return "00:00:00:00".into();
+    }
     let fps_int = fps_norm.round().max(1.0) as i64;
     let total = frame.max(0);
     let frames = total % fps_int;
@@ -161,7 +187,7 @@ mod tests {
         assert_eq!(rational_fps(29.97), (30000, 1001));
         assert_eq!(rational_fps(23.976), (24000, 1001));
         assert_eq!(rational_fps(59.94), (60000, 1001));
-        assert_eq!(rational_fps(0.0), (25, 1)); // normalize fallback
+        assert_eq!(rational_fps(0.0), (0, 1000));
     }
 
     #[test]

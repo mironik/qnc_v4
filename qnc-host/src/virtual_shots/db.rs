@@ -1,4 +1,4 @@
-//! Neutral editorial domain: virtual shots (root + derived).
+//! Neutral editorial domain: virtual shots (root + virtual cuts).
 //!
 //! This module OWNS the `virtual_shots` table (schema, migrations, CRUD) and the
 //! per-shot cover artifacts. Ingest, QStory and Media Pool all depend on this
@@ -45,7 +45,7 @@ pub(crate) fn ensure(
         "CREATE TABLE IF NOT EXISTS virtual_shots (
             shot_id TEXT PRIMARY KEY,
             clip_id TEXT NOT NULL DEFAULT '',
-            kind TEXT NOT NULL DEFAULT 'derived',
+            kind TEXT NOT NULL DEFAULT 'virtual',
             source_shot_id TEXT NOT NULL DEFAULT '',
             locked INTEGER NOT NULL DEFAULT 0,
             display_name TEXT NOT NULL DEFAULT '',
@@ -89,6 +89,7 @@ pub(crate) fn ensure(
     migrate_shot_identity_standard(conn)?;
     backfill_frame_fields(paths, project_id, conn)?;
     backfill_dual_fps(paths, project_id, conn)?;
+    sync_virtual_shot_source_fps(paths, project_id, conn)?;
     sync_virtual_shot_probe_meta(conn)?;
     Ok(())
 }
@@ -116,7 +117,7 @@ fn migrate_columns(conn: &Connection) -> Result<(), String> {
         );
     }
     for (column, sql_type) in [
-        ("kind", "TEXT NOT NULL DEFAULT 'derived'"),
+        ("kind", "TEXT NOT NULL DEFAULT 'virtual'"),
         ("source_shot_id", "TEXT NOT NULL DEFAULT ''"),
         ("locked", "INTEGER NOT NULL DEFAULT 0"),
         ("display_name", "TEXT NOT NULL DEFAULT ''"),
@@ -256,7 +257,7 @@ fn migrate_virtual_shots_json(
 
 /// One naming standard:
 /// - root (full length): `{clip}_root` / `{clip}_root.ext`
-/// - derived: `{clip}_shot_001` / `{clip}_shot_001.ext`
+/// - virtual cut: `{clip}_shot_001` / `{clip}_shot_001.ext`
 fn migrate_shot_identity_standard(conn: &Connection) -> Result<(), String> {
     // Legacy root ids: `root_{clip}` → `{clip}_root`
     let mut stmt = conn
@@ -301,7 +302,7 @@ fn migrate_shot_identity_standard(conn: &Connection) -> Result<(), String> {
         }
     }
 
-    // Legacy derived UUID ids (`…_shot_a1b2c3…`) → `{clip}_shot_001` ordered by created_at.
+    // Legacy virtual UUID ids (`…_shot_a1b2c3…`) → `{clip}_shot_001` ordered by created_at.
     // Do not touch already-standard `_shot_NNN` or unrelated test ids.
     let mut clip_stmt = conn
         .prepare(
@@ -581,6 +582,83 @@ fn backfill_dual_fps(
             ],
         )
         .map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+fn sync_virtual_shot_source_fps(
+    paths: &ProjectPaths,
+    project_id: &str,
+    conn: &Connection,
+) -> Result<(), String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT shot_id, clip_id, in_frame, out_frame, source_fps, timeline_fps
+             FROM virtual_shots
+             WHERE TRIM(clip_id) != ''",
+        )
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, i64>(2)?,
+                r.get::<_, i64>(3)?,
+                r.get::<_, f64>(4)?,
+                r.get::<_, f64>(5)?,
+            ))
+        })
+        .map_err(|e| e.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+    for (shot_id, clip_id, in_frame, out_frame, source_fps, timeline_fps) in rows {
+        let Ok(fps) = fps_for_clip(paths, project_id, &clip_id) else {
+            continue;
+        };
+        if !is_valid_fps(fps)
+            || ((source_fps - fps).abs() <= 0.01 && (timeline_fps - fps).abs() <= 0.01)
+        {
+            continue;
+        }
+        let in_frame = in_frame.max(0);
+        let out_frame = out_frame.max(in_frame + 1);
+        let duration_frames = (out_frame - in_frame).max(0);
+        let in_sec = round3(frame_to_seconds(in_frame, fps));
+        let out_sec = round3(frame_to_seconds(out_frame, fps));
+        let duration = round3(frame_to_seconds(duration_frames, fps));
+        let duration_label = seconds_frames_label_from_frames(duration_frames, fps);
+        let duration_color_key = duration_color_key_from_frames(duration_frames, fps).to_string();
+        let in_tc = seconds_to_timecode(in_sec, fps);
+        let out_tc = seconds_to_timecode(out_sec, fps);
+        let dual = dual_fps_for_virtual_shot(paths, project_id, in_frame, out_frame, fps);
+        conn.execute(
+            "UPDATE virtual_shots
+             SET fps = ?2, source_fps = ?2, timeline_fps = ?3,
+                 in_seconds = ?4, out_seconds = ?5, duration_seconds = ?6,
+                 out_frame = ?7, duration_frames = ?8, timeline_duration_frames = ?9,
+                 duration_label = ?10, duration_color_key = ?11,
+                 in_tc = ?12, out_tc = ?13, updated_at = ?14
+             WHERE shot_id = ?1",
+            params![
+                shot_id,
+                dual.source_fps,
+                dual.timeline_fps,
+                in_sec,
+                out_sec,
+                duration,
+                out_frame,
+                duration_frames,
+                dual.timeline_duration_frames,
+                duration_label,
+                duration_color_key,
+                in_tc,
+                out_tc,
+                now_str(),
+            ],
+        )
+        .map_err(|e| e.to_string())?;
+        set_shot_rational_fps(conn, &shot_id, dual.source_fps, dual.timeline_fps)?;
     }
     Ok(())
 }
@@ -893,7 +971,7 @@ pub fn add_virtual_shot_from_frames(
              display_name, virtual_name, kind, field_order, interlaced, source_class,
              proxy_recipe, data_json, created_at, updated_at)
          VALUES (?1, ?2, 'manual', 'ok', ?3, ?4, ?5, ?6, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
-                 ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, 'derived', ?22, ?23, ?24, ?25,
+                 ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, 'virtual', ?22, ?23, ?24, ?25,
                  '{}', ?26, ?26)",
         params![
             shot_id,

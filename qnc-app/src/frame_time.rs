@@ -1,13 +1,16 @@
 //! Frame/time helpers for the native client.
 //!
 //! Keep UI timecode frame-based. The host remains the source of truth for
-//! persisted frame values; these helpers prevent native Story from falling back
-//! to hardcoded 25 fps math.
+//! persisted frame values; these helpers must not invent a playback FPS.
 
-pub const DEFAULT_FPS: f64 = 25.0;
+pub const DEFAULT_FPS: f64 = 0.0;
+
+pub fn is_valid_fps(raw: f64) -> bool {
+    raw.is_finite() && raw > 0.0
+}
 
 pub fn normalize_fps(raw: f64) -> f64 {
-    if raw.is_finite() && raw > 0.0 {
+    if is_valid_fps(raw) {
         raw
     } else {
         DEFAULT_FPS
@@ -16,11 +19,17 @@ pub fn normalize_fps(raw: f64) -> f64 {
 
 pub fn seconds_to_frame(seconds: f64, fps: f64) -> i64 {
     let fps = normalize_fps(fps);
+    if fps <= 0.0 {
+        return 0;
+    }
     (seconds.max(0.0) * fps).round() as i64
 }
 
 pub fn frame_to_seconds(frame: i64, fps: f64) -> f64 {
     let fps = normalize_fps(fps);
+    if fps <= 0.0 {
+        return 0.0;
+    }
     (frame.max(0) as f64) / fps
 }
 
@@ -32,7 +41,11 @@ pub fn seconds_to_timecode(seconds: f64, fps: f64) -> String {
 }
 
 pub fn frame_to_timecode(frame: i64, fps: f64) -> String {
-    let fps_int = normalize_fps(fps).round().max(1.0) as i64;
+    let fps = normalize_fps(fps);
+    if fps <= 0.0 {
+        return "00:00:00:00".into();
+    }
+    let fps_int = fps.round().max(1.0) as i64;
     let total = frame.max(0);
     let ff = total % fps_int;
     let total_sec = total / fps_int;

@@ -2,6 +2,7 @@
 //!
 //! Reads montage rows from SQLite; no ffprobe in the hot path.
 
+#[cfg(test)]
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 
@@ -9,10 +10,9 @@ use crate::frame_time::{frame_to_seconds, is_valid_fps, seconds_to_frame};
 use crate::project::db::{open_project, ProjectPaths};
 
 use super::covers::{list_covers, StoryCoverRow};
-use super::db::{ensure_schema, list_parts, StoryPartRow};
+use super::db::{ensure_schema, list_parts, sync_story_part_source_fps, StoryPartRow};
 use super::markers::{
-    cover_slot_duration_sec, part_span_frames, part_span_seconds,
-    timeline_duration_frames_from_parts, TIMELINE_EPS,
+    part_span_frames, part_span_seconds, timeline_duration_frames_from_parts, TIMELINE_EPS,
 };
 
 /// Seconds before a cover slot to begin stream preload (playback worker, phase 4).
@@ -44,6 +44,7 @@ pub struct EditorialCover {
     pub slot_duration_sec: f64,
     pub source_in_frame: i64,
     pub source_out_frame: i64,
+    pub source_fps: f64,
     pub source_in_sec: f64,
     pub source_out_sec: f64,
     /// When cover timeline starts before segment global start (ton under cover).
@@ -90,18 +91,41 @@ fn round3(v: f64) -> f64 {
     (v * 1000.0).round() / 1000.0
 }
 
-fn cover_playback_trim(conn: &Connection, cover: &StoryCoverRow) -> (f64, f64, f64) {
-    let in_s = cover.in_seconds.unwrap_or(0.0).max(0.0);
-    let raw_out = cover.out_seconds.unwrap_or(in_s).max(in_s);
-    let source_span = raw_out - in_s;
-    let slot_dur = cover_slot_duration_sec(conn, cover)
-        .unwrap_or_else(|_| (cover.timeline_end_sec - cover.timeline_start_sec).max(0.0));
-    let playback_span = if slot_dur > TIMELINE_EPS {
-        source_span.min(slot_dur)
+#[derive(Debug, Clone, Copy)]
+struct CoverPlaybackTrim {
+    source_in_frame: i64,
+    source_out_frame: i64,
+    source_fps: f64,
+}
+
+fn cover_playback_trim(cover: &StoryCoverRow, fallback_fps: f64) -> CoverPlaybackTrim {
+    let source_fps = if is_valid_fps(cover.source_fps) {
+        cover.source_fps
     } else {
-        source_span
+        fallback_fps
     };
-    (in_s, in_s + playback_span.max(0.0), slot_dur)
+    let (source_in_frame, source_out_frame) = if cover.source_out_frame > cover.source_in_frame {
+        let source_in_frame = cover.source_in_frame.max(0);
+        (
+            source_in_frame,
+            cover.source_out_frame.max(source_in_frame + 1),
+        )
+    } else if is_valid_fps(source_fps) {
+        let in_sec = cover.in_seconds.unwrap_or(0.0).max(0.0);
+        let out_sec = cover.out_seconds.unwrap_or(in_sec).max(in_sec);
+        let in_frame = seconds_to_frame(in_sec, source_fps).max(0);
+        (
+            in_frame,
+            seconds_to_frame(out_sec, source_fps).max(in_frame + 1),
+        )
+    } else {
+        (0, 1)
+    };
+    CoverPlaybackTrim {
+        source_in_frame,
+        source_out_frame,
+        source_fps,
+    }
 }
 
 fn cover_is_streamable(cover: &StoryCoverRow) -> bool {
@@ -109,7 +133,6 @@ fn cover_is_streamable(cover: &StoryCoverRow) -> bool {
 }
 
 fn map_covers_for_segment(
-    conn: &Connection,
     covers: &[StoryCoverRow],
     part_start_frame: i64,
     part_end_frame: i64,
@@ -140,10 +163,10 @@ fn map_covers_for_segment(
         if local_end_frame <= local_start_frame {
             continue;
         }
-        let (source_in, source_out, slot_duration) = cover_playback_trim(conn, cover);
-        let source_in_frame = seconds_to_frame(source_in, timeline_fps);
-        let source_out_frame = seconds_to_frame(source_out, timeline_fps).max(source_in_frame + 1);
-        let slot_duration_frames = seconds_to_frame(slot_duration, timeline_fps).max(0);
+        let trim = cover_playback_trim(cover, timeline_fps);
+        let source_in_frame = trim.source_in_frame;
+        let source_out_frame = trim.source_out_frame.max(source_in_frame + 1);
+        let slot_duration_frames = (local_end_frame - local_start_frame).max(0);
         let source_offset_frames = (part_start_frame - c_start_frame).max(0);
         let streamable = cover_is_streamable(cover);
         let stream_error = if streamable {
@@ -173,8 +196,17 @@ fn map_covers_for_segment(
             )),
             source_in_frame,
             source_out_frame,
-            source_in_sec: round3(source_in),
-            source_out_sec: round3(source_out),
+            source_fps: trim.source_fps,
+            source_in_sec: if is_valid_fps(trim.source_fps) {
+                round3(frame_to_seconds(source_in_frame, trim.source_fps))
+            } else {
+                0.0
+            },
+            source_out_sec: if is_valid_fps(trim.source_fps) {
+                round3(frame_to_seconds(source_out_frame, trim.source_fps))
+            } else {
+                0.0
+            },
             source_offset_frames,
             source_offset_sec: round3((part_start - c_start).max(0.0)),
             streamable,
@@ -194,7 +226,6 @@ fn map_covers_for_segment(
 }
 
 fn build_segments(
-    conn: &Connection,
     parts: &[StoryPartRow],
     covers: &[StoryCoverRow],
     timeline_fps: f64,
@@ -208,7 +239,6 @@ fn build_segments(
         let span = part_span_seconds(part);
         let global_end = global_start_sec + span;
         let part_covers = map_covers_for_segment(
-            conn,
             covers,
             global_start_frame,
             global_end_frame,
@@ -262,10 +292,11 @@ pub fn build_editorial_playlist(
     }
     let conn = open_project(paths, pid).map_err(|e| e.to_string())?;
     ensure_schema(&conn).map_err(|e| e.to_string())?;
+    sync_story_part_source_fps(paths, pid, &conn)?;
     let parts = list_parts(&conn).map_err(|e| e.to_string())?;
     let timeline_fps = story_program_source_fps(&parts);
     let covers = list_covers(&conn).map_err(|e| e.to_string())?;
-    let segments = build_segments(&conn, &parts, &covers, timeline_fps);
+    let segments = build_segments(&parts, &covers, timeline_fps);
     let duration_frames = if segments.is_empty() {
         0
     } else {
@@ -289,7 +320,9 @@ pub fn build_editorial_playlist(
 mod tests {
     use super::*;
     use crate::project::db::ProjectPaths;
-    use crate::story::db::{create_cover, create_marker, create_part, ensure_schema, load_state};
+    use crate::story::db::{
+        create_cover, create_marker, create_part, ensure_schema, load_state, SegmentRangeInput,
+    };
 
     fn test_paths(base: &std::path::Path) -> ProjectPaths {
         ProjectPaths {
@@ -308,10 +341,50 @@ mod tests {
                  in_frame, out_frame, duration_frames, timeline_duration_frames,
                  duration_label, duration_color_key, in_tc, out_tc, description, category_key,
                  created_at, updated_at)
-             VALUES ('shot_a', 'clip_a', 'derived', '', 0, '', 'manual', 'ok', 2.0, 1.0, 3.0,
+             VALUES ('shot_a', 'clip_a', 'virtual', '', 0, '', 'manual', 'ok', 2.0, 1.0, 3.0,
                      25.0, 25.0, 25.0, 25, 75, 50, 50, '2:00', 'under_3',
                      '00:00:01:00', '00:00:03:00', 'Opis', 'manual_cut', 'epoch_1', 'epoch_1')",
             [],
+        )
+        .unwrap();
+    }
+
+    fn seed_virtual_shot_frames(
+        paths: &ProjectPaths,
+        project_id: &str,
+        conn: &Connection,
+        shot_id: &str,
+        clip_id: &str,
+        fps: f64,
+        in_frame: i64,
+        out_frame: i64,
+    ) {
+        crate::virtual_shots::db::ensure(paths, project_id, conn).unwrap();
+        let duration_frames = (out_frame - in_frame).max(1);
+        let in_seconds = frame_to_seconds(in_frame, fps);
+        let out_seconds = frame_to_seconds(out_frame, fps);
+        let duration_seconds = frame_to_seconds(duration_frames, fps);
+        conn.execute(
+            "INSERT INTO virtual_shots
+                (shot_id, clip_id, kind, source_shot_id, locked, display_name, source, quality,
+                 duration_seconds, in_seconds, out_seconds, fps, source_fps, timeline_fps,
+                 in_frame, out_frame, duration_frames, timeline_duration_frames,
+                 duration_label, duration_color_key, in_tc, out_tc, description, category_key,
+                 created_at, updated_at)
+             VALUES (?1, ?2, 'virtual', '', 0, '', 'manual', 'ok', ?3, ?4, ?5,
+                     ?6, ?6, ?6, ?7, ?8, ?9, ?9, 'frames', 'under_3',
+                     '', '', 'Opis', 'manual_cut', 'epoch_1', 'epoch_1')",
+            rusqlite::params![
+                shot_id,
+                clip_id,
+                duration_seconds,
+                in_seconds,
+                out_seconds,
+                fps,
+                in_frame,
+                out_frame,
+                duration_frames
+            ],
         )
         .unwrap();
     }
@@ -397,6 +470,7 @@ mod tests {
             Some("shot_a"),
             None,
             None,
+            SegmentRangeInput::default(),
         )
         .unwrap();
 
@@ -427,6 +501,68 @@ mod tests {
         );
         assert!(cover.local_end_sec > cover.local_start_sec);
         assert_eq!(cover.preload_lead_sec, DEFAULT_PRELOAD_LEAD_SEC);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn build_editorial_playlist_cover_source_range_uses_cover_source_fps() {
+        let base = std::env::temp_dir().join(format!(
+            "qnc_playlist_cover_source_fps_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let paths = test_paths(&base);
+        let project_id = "playlist_cover_source_fps";
+        let conn = open_project(&paths, project_id).unwrap();
+        ensure_schema(&conn).unwrap();
+        seed_virtual_shot_frames(&paths, project_id, &conn, "part_25", "clip_a", 25.0, 0, 50);
+        seed_virtual_shot_frames(
+            &paths, project_id, &conn, "cover_50", "clip_b", 50.0, 100, 200,
+        );
+        drop(conn);
+
+        create_part(
+            &paths,
+            project_id,
+            "tonovi",
+            Some("part_25"),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        create_marker(&paths, project_id, Some(1.0), None, Some("slot-end"), None).unwrap();
+        let state = load_state(&paths, project_id).unwrap();
+        let slot_id = state
+            .get("marker_slots")
+            .and_then(|v| v.as_array())
+            .and_then(|slots| slots.first())
+            .and_then(|s| s.get("slot_id"))
+            .and_then(|v| v.as_str())
+            .unwrap()
+            .to_string();
+        create_cover(
+            &paths,
+            project_id,
+            &slot_id,
+            None,
+            Some("cover_50"),
+            None,
+            None,
+            SegmentRangeInput::default(),
+        )
+        .unwrap();
+
+        let plan = build_editorial_playlist(&paths, project_id).unwrap();
+        let cover = &plan.segments[0].covers[0];
+
+        assert_eq!(plan.timeline_fps, 25.0);
+        assert_eq!(cover.clip_id, "clip_b");
+        assert_eq!(cover.source_in_frame, 100);
+        assert_eq!(cover.source_out_frame, 200);
+        assert_eq!(cover.source_in_sec, 2.0);
+        assert_eq!(cover.source_out_sec, 4.0);
         let _ = std::fs::remove_dir_all(&base);
     }
 
@@ -469,6 +605,54 @@ mod tests {
             plan.segments[1].global_start_sec >= plan.segments[0].global_end_sec - TIMELINE_EPS
         );
         assert_eq!(plan.duration_sec, plan.segments[1].global_end_sec);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn build_editorial_playlist_mixed_source_fps_uses_program_timeline_frames() {
+        let base =
+            std::env::temp_dir().join(format!("qnc_playlist_mixed_fps_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let paths = test_paths(&base);
+        let project_id = "playlist_mixed_fps";
+        let conn = open_project(&paths, project_id).unwrap();
+        ensure_schema(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO story_parts
+                (part_id, kind, sort_index, title, text, clip_id, virtual_shot_id,
+                 in_tc, out_tc, in_seconds, out_seconds, fps,
+                 in_frame, out_frame, duration_frames,
+                 duration_label, duration_color_key, created_at, updated_at)
+             VALUES ('part_25', 'tonovi', 0, '', '', 'clip_a', '',
+                     '', '', 0, 1, 25, 0, 25, 25, '1:00', 'under_3', 't', 't')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO story_parts
+                (part_id, kind, sort_index, title, text, clip_id, virtual_shot_id,
+                 in_tc, out_tc, in_seconds, out_seconds, fps,
+                 in_frame, out_frame, duration_frames,
+                 duration_label, duration_color_key, created_at, updated_at)
+             VALUES ('part_50', 'tonovi', 1, '', '', 'clip_b', '',
+                     '', '', 0, 1, 50, 0, 50, 50, '1:00', 'under_3', 't', 't')",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        let plan = build_editorial_playlist(&paths, project_id).unwrap();
+
+        assert_eq!(plan.timeline_fps, 25.0);
+        assert_eq!(plan.duration_frames, 50);
+        assert_eq!(plan.duration_sec, 2.0);
+        assert_eq!(plan.segments.len(), 2);
+        assert_eq!(plan.segments[0].duration_frames, 25);
+        assert_eq!(plan.segments[1].global_start_frame, 25);
+        assert_eq!(plan.segments[1].global_end_frame, 50);
+        assert_eq!(plan.segments[1].duration_frames, 25);
+        assert_eq!(plan.segments[1].source_fps, 50.0);
         let _ = std::fs::remove_dir_all(&base);
     }
 

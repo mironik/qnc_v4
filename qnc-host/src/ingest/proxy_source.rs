@@ -1,6 +1,6 @@
 //! Klasifikacija TV izvora (PAL / NTSC) i recept za terenski proxy.
 //!
-//! Playback cilj = native Rust player. Interlace / 25p·30p → XDCAM HD422 MXF
+//! Playback cilj = native Rust player. Interlace / NTSC progressive → XDCAM HD422 MXF
 //! (isti profil kao `video.timeline_codec = xdcam_hd_422` / `mpeg2_422_50mbit`).
 //! H.264 editorial proxy zadržava **raster izvora** (ffprobe) — bez hardcodirane 720/1080 skale.
 
@@ -22,8 +22,6 @@ pub enum TvSourceClass {
     Pal50p,
     /// PAL 50 interlaced (25 fps, 50 polja)
     Pal50i,
-    /// PAL 25 progressive
-    Pal25p,
     /// NTSC 59.94/60 progressive
     Ntsc60p,
     /// NTSC 59.94/60 interlaced (≈29.97 fps, 60 polja)
@@ -39,7 +37,6 @@ impl TvSourceClass {
         match self {
             Self::Pal50p => "pal_50p",
             Self::Pal50i => "pal_50i",
-            Self::Pal25p => "pal_25p",
             Self::Ntsc60p => "ntsc_60p",
             Self::Ntsc60i => "ntsc_60i",
             Self::Ntsc30p => "ntsc_30p",
@@ -49,7 +46,7 @@ impl TvSourceClass {
 
     pub fn region(self) -> Option<TvRegion> {
         match self {
-            Self::Pal50p | Self::Pal50i | Self::Pal25p => Some(TvRegion::Pal),
+            Self::Pal50p | Self::Pal50i => Some(TvRegion::Pal),
             Self::Ntsc60p | Self::Ntsc60i | Self::Ntsc30p => Some(TvRegion::Ntsc),
             Self::Other => None,
         }
@@ -119,8 +116,8 @@ pub fn recipe_for_source(class: TvSourceClass) -> ProxyRecipe {
             scale: ProxyScale::Native,
             keep_interlace: true,
         },
-        // 25p / 30p → XDCAM HD422 progressive.
-        TvSourceClass::Pal25p | TvSourceClass::Ntsc30p => ProxyRecipe {
+        // NTSC progressive single-rate → XDCAM HD422 progressive.
+        TvSourceClass::Ntsc30p => ProxyRecipe {
             codec: ProxyCodec::XdcamHd422,
             scale: ProxyScale::Native,
             keep_interlace: false,
@@ -154,9 +151,6 @@ pub fn classify_tv_source(probe: &MediaProbe) -> TvSourceClass {
     }
     if near(fps, 59.94, 1.0) || near(fps, 60.0, 1.0) {
         return TvSourceClass::Ntsc60p;
-    }
-    if near(fps, 25.0, 0.6) || near(fps, 24.0, 0.6) || near(fps, 23.976, 0.6) {
-        return TvSourceClass::Pal25p;
     }
     if near(fps, 29.97, 0.6) || near(fps, 30.0, 0.6) {
         return TvSourceClass::Ntsc30p;
@@ -201,7 +195,7 @@ mod tests {
         );
         assert_eq!(
             classify_tv_source(&probe(25.0, false)),
-            TvSourceClass::Pal25p
+            TvSourceClass::Other
         );
         assert_eq!(
             classify_tv_source(&probe(59.94, false)),

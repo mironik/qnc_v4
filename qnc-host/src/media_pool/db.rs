@@ -29,7 +29,7 @@ pub(crate) fn open_db(paths: &ProjectPaths, project_id: &str) -> Result<Connecti
             playhead_frame INTEGER NOT NULL DEFAULT 0,
             playhead_sec REAL NOT NULL DEFAULT 0,
             playhead_tc TEXT NOT NULL DEFAULT '',
-            playhead_fps REAL NOT NULL DEFAULT 25,
+            playhead_fps REAL NOT NULL DEFAULT 0,
             mark_in_sec REAL,
             mark_out_sec REAL,
             active_virtual_shot_id TEXT NOT NULL DEFAULT '',
@@ -103,7 +103,7 @@ fn migrate_media_pool_schema(conn: &Connection) -> Result<(), String> {
         ("playhead_frame", "INTEGER NOT NULL DEFAULT 0"),
         ("playhead_sec", "REAL NOT NULL DEFAULT 0"),
         ("playhead_tc", "TEXT NOT NULL DEFAULT ''"),
-        ("playhead_fps", "REAL NOT NULL DEFAULT 25"),
+        ("playhead_fps", "REAL NOT NULL DEFAULT 0"),
     ] {
         if !column_exists(conn, "media_pool_workflow", column) {
             let _ = conn.execute(
@@ -150,7 +150,7 @@ fn migrate_workflow_json(conn: &Connection) -> Result<(), String> {
     let playhead_fps = normalize_fps(
         obj.get("playhead_fps")
             .and_then(|v| v.as_f64())
-            .unwrap_or(25.0),
+            .unwrap_or(0.0),
     );
     let playhead_frame = obj
         .get("playhead_frame")

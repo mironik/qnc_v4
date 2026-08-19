@@ -170,6 +170,75 @@ fn backfill_story_part_duration_colors(conn: &Connection) -> rusqlite::Result<()
     Ok(())
 }
 
+pub(crate) fn sync_story_part_source_fps(
+    paths: &ProjectPaths,
+    project_id: &str,
+    conn: &Connection,
+) -> Result<(), String> {
+    ensure_schema(conn).map_err(|e| e.to_string())?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT part_id, clip_id, in_frame, out_frame, fps
+             FROM story_parts
+             WHERE TRIM(clip_id) != ''",
+        )
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, i64>(2)?,
+                r.get::<_, i64>(3)?,
+                r.get::<_, f64>(4)?,
+            ))
+        })
+        .map_err(|e| e.to_string())?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(|e| e.to_string())?;
+    for (part_id, clip_id, in_frame, out_frame, stored_fps) in rows {
+        let Ok(fps) = crate::media_pool::resolve_clip_fps(paths, project_id, &clip_id) else {
+            continue;
+        };
+        if !is_valid_fps(fps) || (stored_fps - fps).abs() <= 0.01 {
+            continue;
+        }
+        let in_frame = in_frame.max(0);
+        let out_frame = out_frame.max(in_frame + 1);
+        let duration_frames = (out_frame - in_frame).max(0);
+        let in_sec = round3(frame_to_seconds(in_frame, fps));
+        let out_sec = round3(frame_to_seconds(out_frame, fps));
+        let in_tc = seconds_to_timecode(in_sec, fps);
+        let out_tc = seconds_to_timecode(out_sec, fps);
+        let duration_label = seconds_frames_label_from_frames(duration_frames, fps);
+        let duration_color_key = duration_color_key_from_frames(duration_frames, fps).to_string();
+        conn.execute(
+            "UPDATE story_parts
+             SET fps = ?2, in_seconds = ?3, out_seconds = ?4,
+                 in_tc = ?5, out_tc = ?6,
+                 out_frame = ?7, duration_frames = ?8,
+                 duration_label = ?9, duration_color_key = ?10,
+                 updated_at = ?11
+             WHERE part_id = ?1",
+            params![
+                part_id,
+                fps,
+                in_sec,
+                out_sec,
+                in_tc,
+                out_tc,
+                out_frame,
+                duration_frames,
+                duration_label,
+                duration_color_key,
+                now_str(),
+            ],
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
 fn story_program_source_fps(parts: &[StoryPartRow]) -> Option<f64> {
     parts
         .iter()
@@ -261,6 +330,10 @@ fn validate_kind(kind: &str) -> Result<&str, String> {
     }
 }
 
+fn round3(value: f64) -> f64 {
+    (value * 1000.0).round() / 1000.0
+}
+
 pub(crate) fn list_parts(conn: &Connection) -> rusqlite::Result<Vec<StoryPartRow>> {
     ensure_schema(conn)?;
     let mut stmt = conn.prepare(
@@ -298,11 +371,29 @@ pub(crate) fn list_parts(conn: &Connection) -> rusqlite::Result<Vec<StoryPartRow
 }
 
 fn part_json(row: &StoryPartRow) -> Value {
+    let source_class = "segment";
+    let root_shot_id = if !row.virtual_shot_id.trim().is_empty() {
+        row.virtual_shot_id.trim().to_string()
+    } else if !row.clip_id.trim().is_empty() {
+        root_shot_id_for_clip(&row.clip_id)
+    } else {
+        String::new()
+    };
+    let duration_sec = match (row.in_seconds, row.out_seconds) {
+        (Some(inn), Some(out)) => (out - inn).max(0.0),
+        _ => 0.0,
+    };
     json!({
+        "id": row.part_id,
+        "shot_id": row.part_id,
+        "root_shot_id": root_shot_id,
+        "source_class": source_class,
         "part_id": row.part_id,
         "kind": row.kind,
         "sort_index": row.sort_index,
         "title": row.title,
+        "name": row.title,
+        "virtual_name": row.title,
         "text": row.text,
         "clip_id": row.clip_id,
         "virtual_shot_id": row.virtual_shot_id,
@@ -310,6 +401,8 @@ fn part_json(row: &StoryPartRow) -> Value {
         "out_tc": row.out_tc,
         "in_seconds": optional_f64(row.in_seconds),
         "out_seconds": optional_f64(row.out_seconds),
+        "duration_sec": duration_sec,
+        "duration_seconds": duration_sec,
         "fps": row.fps,
         "in_frame": row.in_frame,
         "out_frame": row.out_frame,
@@ -880,7 +973,7 @@ fn snapshot_json(
     // All/source catalog = imported project media enriched with import_root identity.
     let all_clips =
         build_all_clips_snapshot(paths, project_id, &all_virtual_shots, archive_original)?;
-    // Virtual tab = samo derived (kreirani iz source virtual).
+    // Virtual tab = virtual cuts (everything except import_root source identities).
     let virtual_shots: Vec<Value> = all_virtual_shots
         .into_iter()
         .filter(|shot| shot.get("kind").and_then(Value::as_str) != Some("import_root"))
@@ -1195,20 +1288,27 @@ fn get_virtual_shot_for_cover(
         .ok_or_else(|| "odaberi virtualni kadar za pokrivanje".to_string())
 }
 
-fn trim_cover_source_to_slot(
-    shot: &StoryShotForPart,
-    slot_duration_sec: f64,
-) -> Result<(f64, f64, String, String), String> {
+struct CoverSourceTrim {
+    in_frame: i64,
+    out_frame: i64,
+    fps: f64,
+    in_seconds: f64,
+    out_seconds: f64,
+    in_tc: String,
+    out_tc: String,
+}
+
+fn trim_cover_source_to_slot(shot: &StoryShotForPart) -> Result<CoverSourceTrim, String> {
     let fps = crate::frame_time::require_fps(shot.fps, "cover source")?;
     let in_frame = shot.in_frame.max(0);
-    let shot_frames = if shot.duration_frames > 0 {
-        shot.duration_frames
+    let out_frame = if shot.out_frame > in_frame {
+        shot.out_frame
+    } else if shot.duration_frames > 0 {
+        in_frame + shot.duration_frames
     } else {
-        (shot.out_frame - shot.in_frame).max(1)
+        in_frame + 1
     };
-    let slot_frames = seconds_to_frame(slot_duration_sec.max(0.0), fps).max(1);
-    let use_frames = shot_frames.min(slot_frames).max(1);
-    let out_frame = in_frame + use_frames;
+    let out_frame = out_frame.max(in_frame + 1);
     let in_seconds = frame_to_seconds(in_frame, fps);
     let out_seconds = frame_to_seconds(out_frame, fps);
     let in_tc = if shot.in_tc.trim().is_empty() {
@@ -1216,12 +1316,20 @@ fn trim_cover_source_to_slot(
     } else {
         shot.in_tc.clone()
     };
-    let out_tc = if use_frames < shot_frames || shot.out_tc.trim().is_empty() {
+    let out_tc = if shot.out_tc.trim().is_empty() {
         seconds_to_timecode(out_seconds, fps)
     } else {
         shot.out_tc.clone()
     };
-    Ok((in_seconds, out_seconds, in_tc, out_tc))
+    Ok(CoverSourceTrim {
+        in_frame,
+        out_frame,
+        fps,
+        in_seconds,
+        out_seconds,
+        in_tc,
+        out_tc,
+    })
 }
 
 fn load_snapshot(
@@ -1230,6 +1338,7 @@ fn load_snapshot(
     project_id: &str,
 ) -> rusqlite::Result<Value> {
     let row = read_row(conn)?;
+    let _ = sync_story_part_source_fps(paths, project_id, conn);
     let parts = list_parts(conn)?;
     let timeline_fps = story_program_source_fps(&parts).unwrap_or(0.0);
     if !parts.is_empty() && is_valid_fps(timeline_fps) {
@@ -1294,11 +1403,11 @@ fn resolve_selection_after_delete(
     Ok(neighbor.unwrap_or_default())
 }
 
-/// Create a Segment-tab virtual segment (`story_parts`).
+/// Create a Segment-tab virtual shot (`story_parts`).
 ///
 /// - `virtual_shot_id`: copy range from an existing Virtual-tab shot (no new Virtual row).
 /// - or `clip_id` + IN/OUT: write segment directly from source marks (Talking Head /
-///   Voice over) — **never** inserts into `virtual_shots` / Virtual tab.
+///   Voice over) — stored as Segment-tab virtual identity, not in the Virtual/All tab list.
 pub fn create_part(
     paths: &ProjectPaths,
     project_id: &str,
@@ -1435,7 +1544,7 @@ fn resolve_segment_source(
     get_virtual_shot_for_part(conn, None)
 }
 
-/// Build part trim from source-file frame IN/OUT. Does not write `virtual_shots`.
+/// Build Segment-tab virtual shot trim from source-file frame IN/OUT.
 fn segment_source_from_clip_frames(
     paths: &ProjectPaths,
     project_id: &str,
@@ -1967,15 +2076,48 @@ pub fn create_cover(
     virtual_shot_id: Option<&str>,
     title: Option<&str>,
     note: Option<&str>,
+    range: SegmentRangeInput,
 ) -> Result<Value, String> {
     let pid = project_id.trim();
     let conn = open_project(paths, pid).map_err(|e| e.to_string())?;
     let timeline_fps = require_current_story_program_source_fps(&conn)?;
     ensure_materialized_slots(&conn, timeline_fps).map_err(|e| e.to_string())?;
-    let shot = get_virtual_shot_for_cover(&conn, virtual_shot_id)?;
-    let slot = super::markers::get_slot_by_id(&conn, slot_id)?;
-    let (cover_in_seconds, cover_out_seconds, cover_in_tc, cover_out_tc) =
-        trim_cover_source_to_slot(&shot, slot.duration_sec)?;
+    let _slot = super::markers::get_slot_by_id(&conn, slot_id)?;
+    let shot = if virtual_shot_id
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .is_some()
+        || (range.in_frame.is_none() && range.out_frame.is_none())
+    {
+        get_virtual_shot_for_cover(&conn, virtual_shot_id)?
+    } else {
+        let clip_id = clip_id
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+            .ok_or_else(|| "Pokrivalica iz source frameova treba clip_id".to_string())?;
+        let in_frame = range
+            .in_frame
+            .ok_or_else(|| "Pokrivalica frame IN nedostaje".to_string())?;
+        let out_frame = range
+            .out_frame
+            .ok_or_else(|| "Pokrivalica frame OUT nedostaje".to_string())?;
+        let created = crate::virtual_shots::add_virtual_shot_from_frames(
+            paths, pid, clip_id, in_frame, out_frame,
+        )?;
+        let shot_id = created
+            .get("shot_id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "virtual-shot bez shot_id".to_string())?
+            .to_string();
+        ensure_row(&conn).map_err(|e| e.to_string())?;
+        conn.execute(
+            "UPDATE story_state SET selected_shot_id = ?1 WHERE id = 1",
+            params![shot_id],
+        )
+        .map_err(|e| e.to_string())?;
+        get_virtual_shot_for_cover(&conn, Some(shot_id.as_str()))?
+    };
+    let cover_trim = trim_cover_source_to_slot(&shot)?;
     let clip_id = clip_id
         .filter(|v| !v.trim().is_empty())
         .unwrap_or(shot.clip_id.as_str());
@@ -1984,10 +2126,13 @@ pub fn create_cover(
         slot_id,
         Some(clip_id),
         Some(shot.shot_id.as_str()),
-        Some(cover_in_tc.as_str()),
-        Some(cover_out_tc.as_str()),
-        Some(cover_in_seconds),
-        Some(cover_out_seconds),
+        Some(cover_trim.in_tc.as_str()),
+        Some(cover_trim.out_tc.as_str()),
+        Some(cover_trim.in_seconds),
+        Some(cover_trim.out_seconds),
+        Some(cover_trim.in_frame),
+        Some(cover_trim.out_frame),
+        Some(cover_trim.fps),
         title,
         note,
     )?;
@@ -2120,17 +2265,29 @@ pub fn cover_stream_frames(
     let pid = project_id.trim();
     let conn = open_project(paths, pid).map_err(|e| e.to_string())?;
     ensure_cover_schema(&conn).map_err(|e| e.to_string())?;
-    let (clip_id, virtual_shot_id, in_seconds, out_seconds): (
+    let (clip_id, virtual_shot_id, in_seconds, out_seconds, source_in_frame, source_out_frame): (
         String,
         String,
         Option<f64>,
         Option<f64>,
+        i64,
+        i64,
     ) = conn
         .query_row(
-            "SELECT clip_id, virtual_shot_id, in_seconds, out_seconds
+            "SELECT clip_id, virtual_shot_id, in_seconds, out_seconds,
+                    source_in_frame, source_out_frame
              FROM story_covers WHERE cover_id = ?1",
             params![cover_id.trim()],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                ))
+            },
         )
         .map_err(|_| format!("Pokrivanje '{}' nije pronađeno", cover_id.trim()))?;
     let shot_id = virtual_shot_id.trim();
@@ -2157,10 +2314,17 @@ pub fn cover_stream_frames(
         let fps = crate::media_pool::resolve_clip_fps(paths, pid, &clip_id)?;
         (clip_id, fps)
     };
-    let in_sec = in_seconds.unwrap_or(0.0).max(0.0);
-    let out_sec = out_seconds.unwrap_or(0.0).max(0.0);
-    let in_frame = ((in_sec * fps).round() as i64).max(0);
-    let out_frame = ((out_sec * fps).round() as i64).max(in_frame + 1);
+    let in_frame = source_in_frame.max(0);
+    let out_frame = source_out_frame.max(in_frame + 1);
+    let (in_frame, out_frame) = if source_out_frame > source_in_frame {
+        (in_frame, out_frame)
+    } else {
+        let in_sec = in_seconds.unwrap_or(0.0).max(0.0);
+        let out_sec = out_seconds.unwrap_or(0.0).max(0.0);
+        let in_frame = seconds_to_frame(in_sec, fps).max(0);
+        let out_frame = seconds_to_frame(out_sec, fps).max(in_frame + 1);
+        (in_frame, out_frame)
+    };
     Ok((clip_id, in_frame, out_frame, fps))
 }
 
@@ -2183,6 +2347,34 @@ mod tests {
                 (source_id, clip_id, name, duration_sec, fps, import_status)
              VALUES ('src_a', ?1, ?1, 10.0, ?2, 'imported')",
             params![clip_id, fps],
+        )
+        .unwrap();
+    }
+
+    fn seed_materialized_clip(paths: &ProjectPaths, project_id: &str, clip_id: &str, fps: f64) {
+        let proxy_path = paths
+            .project_dir(project_id)
+            .join("proxy")
+            .join(format!("{clip_id}.mp4"));
+        std::fs::create_dir_all(proxy_path.parent().unwrap()).unwrap();
+        let ffmpeg =
+            crate::ingest::thumb::resolve_ffmpeg().expect("ffmpeg required for video test");
+        let status = std::process::Command::new(ffmpeg)
+            .args(["-y", "-v", "error", "-f", "lavfi"])
+            .args(["-i", &format!("color=c=black:s=64x64:d=4:r={fps}")])
+            .args(["-an", "-pix_fmt", "yuv420p"])
+            .arg(&proxy_path)
+            .status()
+            .expect("ffmpeg test video");
+        assert!(status.success(), "ffmpeg test video failed");
+        let proxy_path = proxy_path.to_string_lossy().to_string();
+        let conn = crate::ingest::db::open_ingest(paths, project_id).unwrap();
+        conn.execute(
+            "INSERT INTO ingest_assets
+                (source_id, clip_id, name, duration_sec, fps, status, import_status,
+                 project_proxy_path)
+             VALUES (?1, ?1, ?1, 10.0, ?2, 'active', 'imported', ?3)",
+            params![clip_id, fps, proxy_path],
         )
         .unwrap();
     }
@@ -2475,7 +2667,7 @@ mod tests {
     }
 
     #[test]
-    fn segment_from_source_frames_is_durable_part_not_virtual_shot() {
+    fn segment_from_source_frames_is_segment_tab_virtual_shot_not_virtual_tab_row() {
         let base = std::env::temp_dir().join(format!(
             "qnc_story_segment_frames_test_{}",
             std::process::id()
@@ -2507,6 +2699,16 @@ mod tests {
             .and_then(Value::as_array)
             .and_then(|parts| parts.first())
             .unwrap();
+        let part_id = part.get("part_id").and_then(Value::as_str).unwrap();
+        assert_eq!(part.get("shot_id").and_then(Value::as_str), Some(part_id));
+        assert_eq!(
+            part.get("root_shot_id").and_then(Value::as_str),
+            Some("clip_a_root")
+        );
+        assert_eq!(
+            part.get("source_class").and_then(Value::as_str),
+            Some("segment")
+        );
         assert_eq!(part.get("clip_id").and_then(Value::as_str), Some("clip_a"));
         assert_eq!(
             part.get("virtual_shot_id").and_then(Value::as_str),
@@ -2523,8 +2725,203 @@ mod tests {
                 .and_then(Value::as_array)
                 .map(Vec::len),
             Some(0),
-            "Segment-tab virtual segment must not create a derived Virtual-tab shot"
+            "Segment-tab virtual segment must not create a Virtual-tab shot"
         );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn cover_from_source_frames_creates_virtual_shot_then_cover() {
+        let base = std::env::temp_dir().join(format!(
+            "qnc_story_cover_source_frames_test_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let paths = test_paths(&base);
+        let project_id = "story_cover_source_frames";
+        let conn = open_project(&paths, project_id).unwrap();
+        ensure_schema(&conn).unwrap();
+        drop(conn);
+        seed_materialized_clip(&paths, project_id, "clip_a", 25.0);
+
+        create_part_with_range(
+            &paths,
+            project_id,
+            "tonovi",
+            None,
+            Some("clip_a"),
+            SegmentRangeInput {
+                in_frame: Some(0),
+                out_frame: Some(100),
+                ..SegmentRangeInput::default()
+            },
+        )
+        .unwrap();
+        let marked =
+            create_marker(&paths, project_id, Some(2.0), None, Some("slot-end"), None).unwrap();
+        let slot_id = marked
+            .get("marker_slots")
+            .and_then(Value::as_array)
+            .and_then(|slots| slots.first())
+            .and_then(|slot| slot.get("slot_id"))
+            .and_then(Value::as_str)
+            .unwrap()
+            .to_string();
+
+        let state = create_cover(
+            &paths,
+            project_id,
+            &slot_id,
+            Some("clip_a"),
+            None,
+            None,
+            None,
+            SegmentRangeInput {
+                in_frame: Some(25),
+                out_frame: Some(75),
+                ..SegmentRangeInput::default()
+            },
+        )
+        .unwrap();
+        let cover = state
+            .get("covers")
+            .and_then(Value::as_array)
+            .and_then(|covers| covers.first())
+            .unwrap();
+        let virtual_shot_id = cover
+            .get("virtual_shot_id")
+            .and_then(Value::as_str)
+            .unwrap();
+
+        assert!(!virtual_shot_id.is_empty());
+        assert_eq!(cover.get("clip_id").and_then(Value::as_str), Some("clip_a"));
+        assert_eq!(
+            cover.get("source_in_frame").and_then(Value::as_i64),
+            Some(25)
+        );
+        assert_eq!(
+            cover.get("source_out_frame").and_then(Value::as_i64),
+            Some(75)
+        );
+        let virtual_shot = state
+            .get("virtual_shots")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .find(|shot| shot.get("shot_id").and_then(Value::as_str) == Some(virtual_shot_id))
+            .expect("cover must reference a materialized virtual shot");
+        assert_eq!(
+            virtual_shot.get("kind").and_then(Value::as_str),
+            Some("virtual")
+        );
+        assert_eq!(
+            state.get("selected_shot_id").and_then(Value::as_str),
+            Some(virtual_shot_id)
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn cover_from_source_frames_accepts_multiple_empty_slots() {
+        let base = std::env::temp_dir().join(format!(
+            "qnc_story_cover_multiple_slots_test_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let paths = test_paths(&base);
+        let project_id = "story_cover_multiple_slots";
+        let conn = open_project(&paths, project_id).unwrap();
+        ensure_schema(&conn).unwrap();
+        drop(conn);
+        seed_materialized_clip(&paths, project_id, "clip_a", 25.0);
+
+        create_part_with_range(
+            &paths,
+            project_id,
+            "tonovi",
+            None,
+            Some("clip_a"),
+            SegmentRangeInput {
+                in_frame: Some(0),
+                out_frame: Some(100),
+                ..SegmentRangeInput::default()
+            },
+        )
+        .unwrap();
+        create_marker(&paths, project_id, Some(1.0), None, Some("m1"), None).unwrap();
+        let marked = create_marker(&paths, project_id, Some(2.0), None, Some("m2"), None).unwrap();
+        let slots = marked
+            .get("marker_slots")
+            .and_then(Value::as_array)
+            .expect("marker slots");
+        assert!(slots.len() >= 3);
+        let first_slot = slots[0]
+            .get("slot_id")
+            .and_then(Value::as_str)
+            .unwrap()
+            .to_string();
+        let second_slot = slots[1]
+            .get("slot_id")
+            .and_then(Value::as_str)
+            .unwrap()
+            .to_string();
+
+        create_cover(
+            &paths,
+            project_id,
+            &first_slot,
+            Some("clip_a"),
+            None,
+            None,
+            None,
+            SegmentRangeInput {
+                in_frame: Some(0),
+                out_frame: Some(25),
+                ..SegmentRangeInput::default()
+            },
+        )
+        .unwrap();
+        let state = create_cover(
+            &paths,
+            project_id,
+            &second_slot,
+            Some("clip_a"),
+            None,
+            None,
+            None,
+            SegmentRangeInput {
+                in_frame: Some(25),
+                out_frame: Some(50),
+                ..SegmentRangeInput::default()
+            },
+        )
+        .unwrap();
+
+        let covers = state
+            .get("covers")
+            .and_then(Value::as_array)
+            .expect("covers");
+        assert_eq!(covers.len(), 2);
+        let marker_slots = state
+            .get("marker_slots")
+            .and_then(Value::as_array)
+            .expect("marker slots");
+        assert_eq!(
+            marker_slots[0].get("has_cover").and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            marker_slots[1].get("has_cover").and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            marker_slots[2].get("has_cover").and_then(Value::as_bool),
+            Some(false)
+        );
+
         let _ = std::fs::remove_dir_all(&base);
     }
 
@@ -2757,8 +3154,17 @@ mod tests {
             .and_then(|v| v.as_str())
             .unwrap()
             .to_string();
-        let with_cover =
-            create_cover(&paths, project_id, &slot_id, None, None, None, None).unwrap();
+        let with_cover = create_cover(
+            &paths,
+            project_id,
+            &slot_id,
+            None,
+            None,
+            None,
+            None,
+            SegmentRangeInput::default(),
+        )
+        .unwrap();
         let cover = with_cover
             .get("covers")
             .and_then(|v| v.as_array())
@@ -2774,6 +3180,15 @@ mod tests {
         );
         assert_eq!(cover.get("in_seconds").and_then(|v| v.as_f64()), Some(1.0));
         assert_eq!(cover.get("out_seconds").and_then(|v| v.as_f64()), Some(3.0));
+        assert_eq!(
+            cover.get("source_in_frame").and_then(|v| v.as_i64()),
+            Some(25)
+        );
+        assert_eq!(
+            cover.get("source_out_frame").and_then(|v| v.as_i64()),
+            Some(75)
+        );
+        assert_eq!(cover.get("source_fps").and_then(|v| v.as_f64()), Some(25.0));
         assert_eq!(
             cover.get("in_tc").and_then(|v| v.as_str()),
             Some("00:00:01:00")

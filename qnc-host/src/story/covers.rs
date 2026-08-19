@@ -21,6 +21,9 @@ pub struct StoryCoverRow {
     pub out_tc: String,
     pub in_seconds: Option<f64>,
     pub out_seconds: Option<f64>,
+    pub source_in_frame: i64,
+    pub source_out_frame: i64,
+    pub source_fps: f64,
     pub sort_index: i64,
     pub created_at: String,
     pub updated_at: String,
@@ -44,6 +47,9 @@ pub fn ensure_cover_schema(conn: &Connection) -> rusqlite::Result<()> {
             out_tc TEXT NOT NULL DEFAULT '',
             in_seconds REAL,
             out_seconds REAL,
+            source_in_frame INTEGER NOT NULL DEFAULT 0,
+            source_out_frame INTEGER NOT NULL DEFAULT 0,
+            source_fps REAL NOT NULL DEFAULT 0,
             sort_index INTEGER NOT NULL DEFAULT 0,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL
@@ -70,13 +76,24 @@ fn column_exists(conn: &Connection, table: &str, column: &str) -> rusqlite::Resu
 }
 
 fn migrate_cover_frame_columns(conn: &Connection) -> rusqlite::Result<()> {
-    for column in ["timeline_start_frame", "timeline_end_frame"] {
+    for column in [
+        "timeline_start_frame",
+        "timeline_end_frame",
+        "source_in_frame",
+        "source_out_frame",
+    ] {
         if !column_exists(conn, "story_covers", column)? {
             conn.execute(
                 &format!("ALTER TABLE story_covers ADD COLUMN {column} INTEGER NOT NULL DEFAULT 0"),
                 [],
             )?;
         }
+    }
+    if !column_exists(conn, "story_covers", "source_fps")? {
+        conn.execute(
+            "ALTER TABLE story_covers ADD COLUMN source_fps REAL NOT NULL DEFAULT 0",
+            [],
+        )?;
     }
     Ok(())
 }
@@ -110,7 +127,9 @@ pub fn list_covers(conn: &Connection) -> rusqlite::Result<Vec<StoryCoverRow>> {
         "SELECT cover_id, timeline_start_frame, timeline_end_frame,
                 timeline_start_sec, timeline_end_sec, slot_signature, slot_index,
                 clip_id, virtual_shot_id, title, note,
-                in_tc, out_tc, in_seconds, out_seconds, sort_index, created_at, updated_at
+                in_tc, out_tc, in_seconds, out_seconds,
+                source_in_frame, source_out_frame, source_fps,
+                sort_index, created_at, updated_at
          FROM story_covers
          ORDER BY timeline_start_frame ASC, sort_index ASC, cover_id ASC",
     )?;
@@ -131,9 +150,12 @@ pub fn list_covers(conn: &Connection) -> rusqlite::Result<Vec<StoryCoverRow>> {
             out_tc: r.get(12)?,
             in_seconds: r.get(13)?,
             out_seconds: r.get(14)?,
-            sort_index: r.get(15)?,
-            created_at: r.get(16)?,
-            updated_at: r.get(17)?,
+            source_in_frame: r.get(15)?,
+            source_out_frame: r.get(16)?,
+            source_fps: r.get(17)?,
+            sort_index: r.get(18)?,
+            created_at: r.get(19)?,
+            updated_at: r.get(20)?,
         })
     })?;
     rows.collect()
@@ -163,6 +185,9 @@ pub fn cover_json(row: &StoryCoverRow) -> Value {
         "out_tc": row.out_tc,
         "in_seconds": optional_f64(row.in_seconds),
         "out_seconds": optional_f64(row.out_seconds),
+        "source_in_frame": row.source_in_frame,
+        "source_out_frame": row.source_out_frame,
+        "source_fps": row.source_fps,
         "sort_index": row.sort_index,
         "created_at": row.created_at,
         "updated_at": row.updated_at,
@@ -271,6 +296,9 @@ pub fn create_cover(
     out_tc: Option<&str>,
     in_seconds: Option<f64>,
     out_seconds: Option<f64>,
+    source_in_frame: Option<i64>,
+    source_out_frame: Option<i64>,
+    source_fps: Option<f64>,
     title: Option<&str>,
     note: Option<&str>,
 ) -> Result<(), String> {
@@ -289,6 +317,13 @@ pub fn create_cover(
         .unwrap_or_default();
     let in_tc = in_tc.unwrap_or("").trim();
     let out_tc = out_tc.unwrap_or("").trim();
+    let source_in_frame = source_in_frame.unwrap_or(0).max(0);
+    let source_out_frame = source_out_frame
+        .unwrap_or(source_in_frame + 1)
+        .max(source_in_frame + 1);
+    let source_fps = source_fps
+        .filter(|fps| fps.is_finite() && *fps > 0.0)
+        .unwrap_or(0.0);
     let title = title.unwrap_or("").trim();
     let note = note.unwrap_or("").trim();
     let cover_id = new_cover_id();
@@ -305,8 +340,11 @@ pub fn create_cover(
             (cover_id, timeline_start_frame, timeline_end_frame,
              timeline_start_sec, timeline_end_sec, slot_signature, slot_index,
              clip_id, virtual_shot_id, title, note,
-             in_tc, out_tc, in_seconds, out_seconds, sort_index, created_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?17)",
+             in_tc, out_tc, in_seconds, out_seconds,
+             source_in_frame, source_out_frame, source_fps,
+             sort_index, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11,
+                 ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?20)",
         params![
             cover_id,
             slot.start_frame,
@@ -323,6 +361,9 @@ pub fn create_cover(
             out_tc,
             in_seconds,
             out_seconds,
+            source_in_frame,
+            source_out_frame,
+            source_fps,
             sort_index,
             now,
         ],
