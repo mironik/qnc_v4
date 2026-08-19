@@ -275,7 +275,7 @@ where
             let frame = scheduled.frame.min(range.end_frame);
             if !self.playout_ready(frame)? {
                 self.playout.reset_for_frame(frame);
-                events.extend(self.refill_playout_buffer(frame, 1)?);
+                events.extend(self.refill_playout_buffer(frame, self.underrun_recover_frames())?);
                 if !self.playout_ready(frame)? {
                     return Ok(events);
                 }
@@ -508,6 +508,12 @@ where
             .max(MIN_PLAYOUT_BUFFER_FRAMES)
     }
 
+    fn underrun_recover_frames(&self) -> usize {
+        self.state
+            .decode_burst_frames
+            .max(MIN_PLAYOUT_BUFFER_FRAMES)
+    }
+
     fn position_event(&self) -> BroadcastEvent {
         let source = self.state.source.as_ref();
         BroadcastEvent::CarrierPositionChanged {
@@ -677,9 +683,11 @@ mod tests {
                 peak_dbfs_x100: -900
             } if track_id == "monitor"
         )));
-        assert!(events
-            .iter()
-            .any(|event| matches!(event, BroadcastEvent::FramePresented { frame: 0 })));
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, BroadcastEvent::FramePresented { frame: 0 }))
+        );
     }
 
     #[test]
@@ -719,6 +727,21 @@ mod tests {
     }
 
     #[test]
+    fn underrun_recovery_refills_cushion_instead_of_single_frame() {
+        let mut engine = fake_engine().with_decode_burst_frames(1);
+        engine.load_source(&source_runtime(), Some(1)).unwrap();
+        engine.play(0).unwrap();
+
+        engine.tick(0).unwrap();
+
+        assert_eq!(engine.state().carrier_frame, 0);
+        assert!(engine.playout.video.contains_key(&1));
+        assert!(engine.playout.video.contains_key(&3));
+        assert!(engine.playout.audio.contains_key(&1));
+        assert!(engine.playout.audio.contains_key(&3));
+    }
+
+    #[test]
     fn video_only_source_does_not_call_audio_output() {
         let mut engine = video_only_engine();
         engine
@@ -732,9 +755,11 @@ mod tests {
         assert!(events.iter().any(|event| {
             matches!(event, BroadcastEvent::FramePresented { frame } if *frame == 0)
         }));
-        assert!(events
-            .iter()
-            .all(|event| !matches!(event, BroadcastEvent::AudioLevelChanged { .. })));
+        assert!(
+            events
+                .iter()
+                .all(|event| !matches!(event, BroadcastEvent::AudioLevelChanged { .. }))
+        );
     }
 
     #[test]
@@ -755,9 +780,11 @@ mod tests {
                 peak_dbfs_x100: -900
             } if track_id == "monitor"
         )));
-        assert!(events
-            .iter()
-            .all(|event| !matches!(event, BroadcastEvent::FramePresented { .. })));
+        assert!(
+            events
+                .iter()
+                .all(|event| !matches!(event, BroadcastEvent::FramePresented { .. }))
+        );
     }
 
     #[test]
@@ -988,8 +1015,8 @@ mod tests {
         }
     }
 
-    fn fake_engine(
-    ) -> TransportEngine<FakeSourceOpen, FakeVideoDecode, FakeAudioOutput, FakePresenter> {
+    fn fake_engine()
+    -> TransportEngine<FakeSourceOpen, FakeVideoDecode, FakeAudioOutput, FakePresenter> {
         TransportEngine::new(
             FakeSourceOpen,
             FakeVideoDecode,
@@ -998,8 +1025,8 @@ mod tests {
         )
     }
 
-    fn video_only_engine(
-    ) -> TransportEngine<FakeSourceOpen, FakeVideoDecode, RejectingAudioOutput, FakePresenter> {
+    fn video_only_engine()
+    -> TransportEngine<FakeSourceOpen, FakeVideoDecode, RejectingAudioOutput, FakePresenter> {
         TransportEngine::new(
             FakeSourceOpen,
             FakeVideoDecode,
@@ -1008,8 +1035,8 @@ mod tests {
         )
     }
 
-    fn audio_only_engine(
-    ) -> TransportEngine<FakeSourceOpen, RejectingVideoDecode, FakeAudioOutput, RejectingPresenter>
+    fn audio_only_engine()
+    -> TransportEngine<FakeSourceOpen, RejectingVideoDecode, FakeAudioOutput, RejectingPresenter>
     {
         TransportEngine::new(
             FakeSourceOpen,
@@ -1019,8 +1046,8 @@ mod tests {
         )
     }
 
-    fn rejecting_open_engine(
-    ) -> TransportEngine<RejectBadSourceOpen, FakeVideoDecode, FakeAudioOutput, FakePresenter> {
+    fn rejecting_open_engine()
+    -> TransportEngine<RejectBadSourceOpen, FakeVideoDecode, FakeAudioOutput, FakePresenter> {
         TransportEngine::new(
             RejectBadSourceOpen,
             FakeVideoDecode,

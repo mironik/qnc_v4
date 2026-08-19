@@ -3,7 +3,7 @@ use std::env;
 use std::io::{ErrorKind, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdout, Command, Stdio};
-use std::sync::mpsc::{sync_channel, Receiver, RecvTimeoutError, SyncSender, TryRecvError};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, TryRecvError, sync_channel};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -59,6 +59,7 @@ struct FfmpegVideoStreamRequest<'a> {
     hardware_decode: &'a FfmpegHardwareDecode,
     timebase: Timebase,
     field_mode: FieldMode,
+    output_filter_format: Option<&'a VideoFormat>,
     frame_byte_len: usize,
     read_ahead_frames: usize,
     read_timeout: Duration,
@@ -301,6 +302,7 @@ pub struct FfmpegDecodeOptions {
     pub toolchain: FfmpegToolchain,
     pub hardware_decode: FfmpegHardwareDecode,
     pub decode_policy: FfmpegDecodePolicy,
+    pub video_output_format: Option<VideoFormat>,
     pub video_prefetch_frames: u16,
     pub video_cache_frames: usize,
     pub video_cache_bytes: usize,
@@ -319,6 +321,7 @@ impl FfmpegDecodeOptions {
             toolchain: FfmpegToolchain::default(),
             hardware_decode: FfmpegHardwareDecode::Software,
             decode_policy: FfmpegDecodePolicy::default(),
+            video_output_format: None,
             video_prefetch_frames: DEFAULT_VIDEO_PREFETCH_FRAMES,
             video_cache_frames: DEFAULT_VIDEO_CACHE_FRAMES,
             video_cache_bytes: DEFAULT_VIDEO_CACHE_BYTES,
@@ -338,6 +341,11 @@ impl FfmpegDecodeOptions {
 
     pub fn with_decode_policy(mut self, decode_policy: FfmpegDecodePolicy) -> Self {
         self.decode_policy = decode_policy;
+        self
+    }
+
+    pub fn with_video_output_format(mut self, video_output_format: VideoFormat) -> Self {
+        self.video_output_format = Some(video_output_format);
         self
     }
 
@@ -490,11 +498,7 @@ fn normalized_label(value: impl AsRef<str>) -> String {
 
 fn normalized_rule_value(value: impl AsRef<str>) -> Option<String> {
     let value = normalized_label(value);
-    if value.is_empty() {
-        None
-    } else {
-        Some(value)
-    }
+    if value.is_empty() { None } else { Some(value) }
 }
 
 fn rule_contains_matches(rule_value: &Option<String>, profile_value: Option<&str>) -> bool {
@@ -514,6 +518,8 @@ fn rule_exact_matches(rule_value: &Option<String>, profile_value: Option<&str>) 
 #[derive(Debug)]
 struct FfmpegVideoSession {
     video_format: VideoFormat,
+    source_field_mode: FieldMode,
+    output_filter_format: Option<VideoFormat>,
     duration_frames: u64,
     decode_profile: FfmpegVideoDecodeProfile,
     cache: BTreeMap<u64, FfmpegVideoPayload>,
@@ -524,16 +530,21 @@ impl FfmpegVideoSession {
     fn new(
         source: &EngineSourceHandle,
         decode_profile: FfmpegVideoDecodeProfile,
+        output_video_format: Option<VideoFormat>,
     ) -> Result<Self, BroadcastEngineError> {
-        let video_format = source.video_format.clone().ok_or_else(|| {
+        let source_video_format = source.video_format.clone().ok_or_else(|| {
             BroadcastEngineError::new(
                 BroadcastEngineErrorKind::Contract,
                 "video format is required for FFmpeg video session",
             )
             .with_source_id(source.source_id.clone())
         })?;
+        let source_field_mode = source_video_format.field_mode;
+        let video_format = output_video_format.clone().unwrap_or(source_video_format);
         Ok(Self {
             video_format,
+            source_field_mode,
+            output_filter_format: output_video_format,
             duration_frames: source.duration_frames,
             decode_profile,
             cache: BTreeMap::new(),
@@ -680,7 +691,8 @@ impl FfmpegVideoSession {
             toolchain: request.toolchain,
             hardware_decode: request.hardware_decode,
             timebase: request.timebase,
-            field_mode: self.video_format.field_mode,
+            field_mode: self.source_field_mode,
+            output_filter_format: self.output_filter_format.as_ref(),
             frame_byte_len,
             read_ahead_frames,
             read_timeout: request.cache_config.read_timeout,
@@ -774,7 +786,11 @@ impl FfmpegVideoStream {
             request.timebase,
             BroadcastEngineErrorKind::VideoDecode,
         )?;
-        let filter = video_decode_filter(seek.relative_start_frame, request.field_mode);
+        let filter = video_decode_filter(
+            seek.relative_start_frame,
+            request.field_mode,
+            request.output_filter_format,
+        );
         let mut command = Command::new(request.toolchain.ffmpeg());
         command.args(["-hide_banner", "-nostdin", "-loglevel", "error"]);
         for arg in request.hardware_decode.ffmpeg_input_args() {
@@ -1310,7 +1326,11 @@ impl VideoDecodeAdapter for FfmpegVideoDecode {
             probe_video_decode_profile(&path, &source.source_id, &self.options.toolchain);
         self.sessions.insert(
             source.source_id.clone(),
-            FfmpegVideoSession::new(source, decode_profile)?,
+            FfmpegVideoSession::new(
+                source,
+                decode_profile,
+                self.options.video_output_format.clone(),
+            )?,
         );
         Ok(Vec::new())
     }
@@ -2757,17 +2777,32 @@ fn parse_field_mode(value: Option<&String>) -> FieldMode {
 
 /// Build `-vf` chain from probed field mode + frame select.
 /// Interlaced sources are bobbed to progressive frames (same frame count).
-fn video_decode_filter(relative_start_frame: u64, field_mode: FieldMode) -> String {
-    let select = format!("select=gte(n\\,{relative_start_frame})");
+fn video_decode_filter(
+    relative_start_frame: u64,
+    field_mode: FieldMode,
+    output_format: Option<&VideoFormat>,
+) -> String {
+    let mut filters = Vec::new();
     match field_mode {
-        FieldMode::Progressive => select,
+        FieldMode::Progressive => {}
         FieldMode::InterlacedUpperFirst => {
-            format!("yadif=mode=send_frame:parity=tff:deint=all,{select}")
+            filters.push("yadif=mode=send_frame:parity=tff:deint=all".to_string());
         }
         FieldMode::InterlacedLowerFirst => {
-            format!("yadif=mode=send_frame:parity=bff:deint=all,{select}")
+            filters.push("yadif=mode=send_frame:parity=bff:deint=all".to_string());
         }
     }
+    filters.push(format!("select=gte(n\\,{relative_start_frame})"));
+    if let Some(output_format) = output_format {
+        let width = output_format.width.max(1);
+        let height = output_format.height.max(1);
+        filters.push(format!(
+            "scale={width}:{height}:force_original_aspect_ratio=decrease"
+        ));
+        filters.push(format!("pad={width}:{height}:(ow-iw)/2:(oh-ih)/2"));
+        filters.push("setsar=1".to_string());
+    }
+    filters.join(",")
 }
 
 fn parse_color_space(value: Option<&String>) -> ColorSpace {
@@ -3567,7 +3602,7 @@ mod tests {
             ),
             audio_format: None,
         };
-        FfmpegVideoSession::new(&source, FfmpegVideoDecodeProfile::default()).unwrap()
+        FfmpegVideoSession::new(&source, FfmpegVideoDecodeProfile::default(), None).unwrap()
     }
 
     fn assert_contiguous_audio_sample_spans(timebase: Timebase, sample_rate_hz: u32, frames: u64) {
@@ -3618,11 +3653,30 @@ mod tests {
     #[test]
     fn video_decode_filter_adds_yadif_for_interlace() {
         assert_eq!(
-            video_decode_filter(10, FieldMode::Progressive),
+            video_decode_filter(10, FieldMode::Progressive, None),
             "select=gte(n\\,10)"
         );
-        assert!(video_decode_filter(0, FieldMode::InterlacedUpperFirst).starts_with("yadif="));
-        assert!(video_decode_filter(0, FieldMode::InterlacedUpperFirst).contains("parity=tff"));
-        assert!(video_decode_filter(0, FieldMode::InterlacedLowerFirst).contains("parity=bff"));
+        assert!(
+            video_decode_filter(0, FieldMode::InterlacedUpperFirst, None).starts_with("yadif=")
+        );
+        assert!(
+            video_decode_filter(0, FieldMode::InterlacedUpperFirst, None).contains("parity=tff")
+        );
+        assert!(
+            video_decode_filter(0, FieldMode::InterlacedLowerFirst, None).contains("parity=bff")
+        );
+    }
+
+    #[test]
+    fn video_decode_filter_scales_to_requested_output_format() {
+        let output_format =
+            VideoFormat::new(640, 360, FieldMode::Progressive, ColorSpace::Rec709).unwrap();
+
+        let filter = video_decode_filter(10, FieldMode::Progressive, Some(&output_format));
+
+        assert_eq!(
+            filter,
+            "select=gte(n\\,10),scale=640:360:force_original_aspect_ratio=decrease,pad=640:360:(ow-iw)/2:(oh-ih)/2,setsar=1"
+        );
     }
 }

@@ -292,7 +292,7 @@ struct PlaybackFrameQuery {
 
 #[allow(dead_code)]
 pub fn router() -> Router<AppState> {
-    Router::new()
+    let router = Router::new()
         .route("/api/story/state", get(api_state))
         .route("/api/story/playlist", get(api_playlist))
         .route("/api/story/timeline-model", get(api_timeline_model))
@@ -300,13 +300,6 @@ pub fn router() -> Router<AppState> {
             "/api/story/timeline-model/source",
             get(api_source_timeline_model),
         )
-        .route("/api/story/playback/start", post(api_playback_start))
-        .route("/api/story/playback/stop", post(api_playback_stop))
-        .route("/api/story/playback/seek", post(api_playback_seek))
-        .route("/api/story/playback/pause", post(api_playback_pause))
-        .route("/api/story/playback/state", get(api_playback_state))
-        .route("/api/story/playback/audio", get(api_playback_audio))
-        .route("/api/story/playback/frame", get(api_playback_frame))
         .route("/api/story/part/create", post(api_part_create))
         .route("/api/story/part/update", post(api_part_update))
         .route("/api/story/part/delete", post(api_part_delete))
@@ -330,7 +323,37 @@ pub fn router() -> Router<AppState> {
         .route("/api/story/commit", post(api_commit))
         .route("/api/story/native/launch", post(api_native_launch))
         .route("/api/story/play-media", get(api_play_media))
-        .merge(crate::editor_assets::router("/api/story"))
+        .merge(crate::editor_assets::router("/api/story"));
+
+    if legacy_story_playback_enabled() {
+        router.merge(legacy_story_playback_router())
+    } else {
+        router
+    }
+}
+
+fn legacy_story_playback_enabled() -> bool {
+    std::env::var("QNC_LEGACY_STORY_PLAYBACK")
+        .map(legacy_story_playback_value_enabled)
+        .unwrap_or(false)
+}
+
+fn legacy_story_playback_value_enabled(value: impl AsRef<str>) -> bool {
+    matches!(
+        value.as_ref().trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
+fn legacy_story_playback_router() -> Router<AppState> {
+    Router::new()
+        .route("/api/story/playback/start", post(api_playback_start))
+        .route("/api/story/playback/stop", post(api_playback_stop))
+        .route("/api/story/playback/seek", post(api_playback_seek))
+        .route("/api/story/playback/pause", post(api_playback_pause))
+        .route("/api/story/playback/state", get(api_playback_state))
+        .route("/api/story/playback/audio", get(api_playback_audio))
+        .route("/api/story/playback/frame", get(api_playback_frame))
 }
 
 async fn api_playlist(
@@ -967,7 +990,7 @@ fn is_story_client_error(message: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_story_client_error, map_bad_request};
+    use super::{is_story_client_error, legacy_story_playback_value_enabled, map_bad_request};
     use axum::http::StatusCode;
 
     #[test]
@@ -985,5 +1008,16 @@ mod tests {
     fn map_bad_request_keeps_unknown_errors_internal() {
         let (status, _) = map_bad_request("database is locked".into());
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[test]
+    fn legacy_story_playback_is_explicit_opt_in() {
+        assert!(!legacy_story_playback_value_enabled(""));
+        assert!(!legacy_story_playback_value_enabled("0"));
+        assert!(!legacy_story_playback_value_enabled("false"));
+        assert!(legacy_story_playback_value_enabled("1"));
+        assert!(legacy_story_playback_value_enabled("true"));
+        assert!(legacy_story_playback_value_enabled(" yes "));
+        assert!(legacy_story_playback_value_enabled("ON"));
     }
 }

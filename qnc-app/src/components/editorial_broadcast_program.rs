@@ -149,7 +149,7 @@ impl ItemBuilder {
                     source_fps,
                     source_duration_frames,
                     &media_input,
-                    false,
+                    !is_off,
                     true,
                     Some(PROGRAM_AUDIO_OUTPUT_CH1),
                     cover_start,
@@ -543,6 +543,7 @@ mod tests {
     fn video_source(item: &BroadcastProgramItem) -> &BroadcastProgramSource {
         item.sources
             .iter()
+            .rev()
             .find(|source| source.has_video)
             .expect("video source")
     }
@@ -783,6 +784,8 @@ mod tests {
         assert_eq!(cover_a1.source_ref.clip_id, "clip_a");
         assert_eq!(cover_a1.source_ref.in_frame, Some(FrameNumber(110)));
         assert_eq!(cover_a1.source_ref.out_frame, Some(FrameNumber(120)));
+        assert!(cover_a1.has_video);
+        assert!(cover_a1.has_audio);
         assert_eq!(
             cover_a1.audio_output_channel,
             Some(PROGRAM_AUDIO_OUTPUT_CH1)
@@ -888,6 +891,7 @@ mod tests {
         assert_eq!(a1.source_ref.clip_id, "clip_a");
         assert_eq!(a1.source_ref.in_frame, Some(FrameNumber(140)));
         assert_eq!(a1.source_ref.out_frame, Some(FrameNumber(160)));
+        assert!(a1.has_video);
         assert_eq!(a2.source_ref.clip_id, "clip_b");
         assert_eq!(a2.source_ref.in_frame, Some(FrameNumber(10)));
         assert_eq!(a2.source_ref.out_frame, Some(FrameNumber(30)));

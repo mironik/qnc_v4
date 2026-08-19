@@ -5,6 +5,7 @@
 
 mod focus;
 pub(crate) mod playback_controls;
+mod playback_transport;
 mod source_editor;
 mod story_edit;
 mod story_selection;
@@ -23,10 +24,7 @@ use serde_json::Value;
 
 use crate::api::{EditorialPlaylist, EditorialPlaylistSegment, HostClient, TimelineModel};
 use crate::component_runtime::ComponentBackendCommand;
-use crate::components::{
-    EditorialEditComponent, EditorialEditData, EditorialEditKind,
-    EditorialProgramPlaybackComponent, EditorialProgramPlaybackInput,
-};
+use crate::components::{EditorialEditComponent, EditorialEditData, EditorialEditKind};
 use crate::composition::EditorialRole;
 use crate::editorial::common::{shot_id, truncate};
 use crate::editorial::segment_program::SegmentProgramModel;
@@ -44,6 +42,7 @@ use crate::qnc_timeline::{ExpandedAudio, TimelineFocusPaint};
 use crate::shortcuts::{StoryBindings, STORYBOARD_SHORTCUT_SCOPE as STORY_SHORTCUT_SCOPE};
 
 use self::focus::{FocusTarget, TimelineFocus};
+use self::playback_transport::{StoryPlaybackView, StoryTogglePlayInput, StoryTogglePlayOutcome};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ViewMode {
@@ -1650,65 +1649,56 @@ impl StoryScreen {
         }
     }
 
+    fn story_playback_view(&self) -> StoryPlaybackView {
+        match self.view_mode {
+            ViewMode::Source => StoryPlaybackView::Source,
+            ViewMode::Wrap => StoryPlaybackView::Wrap,
+        }
+    }
+
+    fn apply_story_toggle_play_outcome(
+        &mut self,
+        outcome: StoryTogglePlayOutcome,
+    ) -> PlaybackTransportIntent {
+        if let Some(view_mode) = outcome.view_mode {
+            self.view_mode = match view_mode {
+                StoryPlaybackView::Source => ViewMode::Source,
+                StoryPlaybackView::Wrap => ViewMode::Wrap,
+            };
+        }
+        if let Some(playing) = outcome.playing {
+            self.playing = playing;
+        }
+        if let Some(status) = outcome.status {
+            self.status = status;
+        }
+        if let Some(part_id) = outcome.selected_part_id {
+            self.selected_part_id = part_id;
+        }
+        outcome.intent
+    }
+
     fn toggle_play_intent_for_input(
         &mut self,
         playlist_input_active: bool,
         playlist_input_playing: bool,
     ) -> PlaybackTransportIntent {
-        if self.source_dock_keyboard_focus {
-            if self.view_mode != ViewMode::Source {
-                self.view_mode = ViewMode::Source;
-            }
-            return PlaybackTransportIntent::TogglePlay;
-        }
-        if self.view_mode != ViewMode::Wrap {
-            return PlaybackTransportIntent::TogglePlay;
-        }
-        if self.playing || playlist_input_playing {
-            self.playing = false;
-            self.status = "Pauza playlist inputa".into();
-            return if playlist_input_active {
-                PlaybackTransportIntent::Pause
-            } else {
-                PlaybackTransportIntent::None
-            };
-        }
-        if playlist_input_active {
-            self.playing = true;
-            self.status = "Playlist input play".into();
-            return PlaybackTransportIntent::PlayLoadedInput;
-        }
         let program = self.segment_program_model();
-        let clips = self
-            .all_clips
-            .iter()
-            .chain(self.virtual_shots.iter())
-            .cloned()
-            .collect::<Vec<_>>();
-        let request =
-            EditorialProgramPlaybackComponent::build_program(EditorialProgramPlaybackInput {
-                project_id: &self.project_id,
-                program_id: self.edit_instance_id(),
-                start_program_frame: self.wrap_playhead_frame,
-                program: &program,
-                covers: &self.covers,
-                clips: &clips,
-            });
-        match request {
-            Ok(request) => {
-                if let Some(segment) = self.playlist_segment_at_frame(self.wrap_playhead_frame) {
-                    self.selected_part_id = segment.part_id.clone();
-                }
-                self.playing = true;
-                self.status = "Playlist input play".into();
-                PlaybackTransportIntent::PlayProgram(request)
-            }
-            Err(error) => {
-                self.playing = false;
-                self.status = error;
-                PlaybackTransportIntent::None
-            }
-        }
+        let outcome = playback_transport::toggle_play(StoryTogglePlayInput {
+            source_dock_keyboard_focus: self.source_dock_keyboard_focus,
+            view_mode: self.story_playback_view(),
+            story_playing: self.playing,
+            playlist_input_active,
+            playlist_input_playing,
+            project_id: &self.project_id,
+            program_id: self.edit_instance_id(),
+            start_program_frame: self.wrap_playhead_frame,
+            program: &program,
+            covers: &self.covers,
+            all_clips: &self.all_clips,
+            virtual_shots: &self.virtual_shots,
+        });
+        self.apply_story_toggle_play_outcome(outcome)
     }
 
     fn ui_source_editor(
