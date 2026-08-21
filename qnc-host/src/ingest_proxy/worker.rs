@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 use rusqlite::params;
 use tracing::{info, warn};
 
+use crate::background_work::BackgroundWorkGate;
 use crate::filmstrip::{FilmstripWorker, DEFAULT_FILMSTRIP_FRAMES};
 use crate::ingest::asset_row::IngestAssetRow;
 use crate::ingest::db::{
@@ -34,6 +35,7 @@ pub struct ProxyGenerateWorker {
     paths: ProjectPaths,
     filmstrip: Arc<FilmstripWorker>,
     posters: Arc<PosterWorker>,
+    background: BackgroundWorkGate,
     pending: Arc<Mutex<HashSet<ProxyClipJob>>>,
     blocked: Arc<Mutex<HashSet<String>>>,
 }
@@ -43,11 +45,13 @@ impl ProxyGenerateWorker {
         paths: ProjectPaths,
         filmstrip: Arc<FilmstripWorker>,
         posters: Arc<PosterWorker>,
+        background: BackgroundWorkGate,
     ) -> Self {
         Self {
             paths,
             filmstrip,
             posters,
+            background,
             pending: Arc::new(Mutex::new(HashSet::new())),
             blocked: Arc::new(Mutex::new(HashSet::new())),
         }
@@ -123,6 +127,10 @@ impl ProxyGenerateWorker {
             // Wake hint in memory; recoverable work comes from SQLite generating_proxy.
             let mut last_recover = Instant::now();
             loop {
+                if self.background.playback_active() {
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                    continue;
+                }
                 let batch: Vec<ProxyClipJob> = {
                     let mut set = self.pending.lock().expect("proxy queue");
                     set.drain().collect()

@@ -278,6 +278,106 @@ impl AsyncSourceMediaAssetLoader {
     }
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct WaveformAsset {
+    pub a1_peaks: Vec<f32>,
+    pub a2_peaks: Vec<f32>,
+}
+
+pub(crate) struct WaveformAssetResult {
+    pub project_id: String,
+    pub clip_id: String,
+    pub waveform: Result<WaveformAsset, String>,
+}
+
+struct WaveformAssetRequest {
+    host: HostClient,
+    project_id: String,
+    clip_id: String,
+    repaint: Option<egui::Context>,
+}
+
+pub(crate) struct AsyncWaveformAssetLoader {
+    tx: Sender<WaveformAssetRequest>,
+    rx: Receiver<WaveformAssetResult>,
+    in_flight: HashSet<String>,
+}
+
+impl Default for AsyncWaveformAssetLoader {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl AsyncWaveformAssetLoader {
+    pub fn new() -> Self {
+        let (tx_req, rx_req) = mpsc::channel::<WaveformAssetRequest>();
+        let (tx_res, rx_res) = mpsc::channel::<WaveformAssetResult>();
+
+        let _ = thread::Builder::new()
+            .name("qnc-waveform-assets".into())
+            .spawn(move || {
+                while let Ok(req) = rx_req.recv() {
+                    let waveform = load_waveform_asset(&req.host, &req.project_id, &req.clip_id);
+                    let _ = tx_res.send(WaveformAssetResult {
+                        project_id: req.project_id,
+                        clip_id: req.clip_id,
+                        waveform,
+                    });
+                    if let Some(ctx) = req.repaint {
+                        ctx.request_repaint();
+                    }
+                }
+            });
+
+        Self {
+            tx: tx_req,
+            rx: rx_res,
+            in_flight: HashSet::new(),
+        }
+    }
+
+    pub fn request(
+        &mut self,
+        host: &HostClient,
+        project_id: String,
+        clip_id: String,
+        repaint: Option<egui::Context>,
+    ) -> bool {
+        if project_id.trim().is_empty() || clip_id.trim().is_empty() {
+            return false;
+        }
+        let key = source_media_key(&project_id, &clip_id);
+        if self.in_flight.contains(&key) {
+            return false;
+        }
+        if self
+            .tx
+            .send(WaveformAssetRequest {
+                host: host.clone(),
+                project_id,
+                clip_id,
+                repaint,
+            })
+            .is_err()
+        {
+            return false;
+        }
+        self.in_flight.insert(key);
+        true
+    }
+
+    pub fn poll(&mut self) -> Vec<WaveformAssetResult> {
+        let mut out = Vec::new();
+        while let Ok(result) = self.rx.try_recv() {
+            self.in_flight
+                .remove(&source_media_key(&result.project_id, &result.clip_id));
+            out.push(result);
+        }
+        out
+    }
+}
+
 pub(crate) fn ingest_thumbnail_url(host: &HostClient, project_id: &str, clip_id: &str) -> String {
     host.absolute(&format!(
         "/api/ingest/thumbnail?project_id={}&clip_id={}",
@@ -320,6 +420,19 @@ fn load_source_media(
         a2_peaks: waveform_peaks(host, project_id, clip_id, 2).unwrap_or_default(),
         film_frames: filmstrip_frames(host, project_id, clip_id).unwrap_or_default(),
     })
+}
+
+fn load_waveform_asset(
+    host: &HostClient,
+    project_id: &str,
+    clip_id: &str,
+) -> Result<WaveformAsset, String> {
+    let a1_peaks = waveform_peaks(host, project_id, clip_id, 1).unwrap_or_default();
+    let a2_peaks = waveform_peaks(host, project_id, clip_id, 2).unwrap_or_default();
+    if a1_peaks.is_empty() && a2_peaks.is_empty() {
+        return Err(format!("waveform nije spreman · {clip_id}"));
+    }
+    Ok(WaveformAsset { a1_peaks, a2_peaks })
 }
 
 fn waveform_peaks(

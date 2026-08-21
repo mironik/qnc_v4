@@ -63,7 +63,7 @@ Workspace: `C:\Users\miron\Projects\qnc_v4` (native track).
 qnc_v4/
   qnc-app/       native UI
   qnc-host/      API
-  qnc-client/    client crate
+  qnc-client/    legacy F4 client, excluded from workspace/product build
   seed/          host-owned JSON
   data/          runtime SQLite
   archive/       read-only historical reference
@@ -81,6 +81,29 @@ Test: `.\test.ps1` (API + qnc-app unit smoke, bez web asset testova).
 ## DB-first
 
 Workflow stanje živi u SQLite preko Rust API-ja. UI je projekcija — nikad vlasnik.
+
+## Deployment i mediji
+
+- Prvo se stabilizira lokalni workstation mode: `qnc-app` + `qnc-host` +
+  SQLite + lokalni/intranet medijski artefakti. Novi intranet/internet slojevi
+  ne uvode se dok osnovni lokalni tok nije stabilan.
+- Cilj nije više različitih aplikacija, nego jedna workstation aplikacija koja
+  zna raditi u različitim okruženjima: lokalni laptop/radna stanica,
+  TV intranet s centralnim ingestom/NAS-om, i kasnije internet/tester mode.
+- Mediji nikad nisu na internetu. Internet/tester mode smije prenositi projekt,
+  bazu/metapodatke, edit decision, korisničko stanje i lake snapshote, ali
+  originalni media, proxy, filmstrip i waveform ostaju lokalno kod korisnika
+  ili u intranet storageu koji vidi lokalna radna stanica/media resolver.
+- Fizička lokacija medija nije workflow istina. UI, Story, timeline, export i
+  player ne smiju pretpostavljati lokalni Windows path kao poslovno pravilo.
+  Do medija se dolazi kroz neutralni resolver/host contract.
+- Montaža se bazira na virtualnim kadrovima: `clip_id`/source identity +
+  `source_in`/`source_out` frameovi + source FPS/timebase. To mora ostati isto
+  bez obzira je li fizički fajl na laptopu, intranet serveru/NAS-u ili iza
+  budućeg lokalnog media agenta.
+- Intranet security/auth je svjesno odgođen kao poseban neutralni modul. Ne
+  miješati auth/security u Project, Ingest, Story, player, timeline ili worker
+  popravke dok se osnovni funkcionalni tok stabilizira.
 
 ## Jedinstveni model
 

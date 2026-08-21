@@ -1,4 +1,4 @@
-use serde_json::Value;
+use serde_json::{json, Value};
 
 use crate::api::{self, Health, Workspace};
 use crate::component_runtime::{ComponentBackendCommand, ComponentBackendEvent};
@@ -6,10 +6,12 @@ use crate::qnc_theme::ThemeId;
 
 const COMPONENT_ID: &str = "shell.state";
 const OP_LOAD: &str = "load";
+const OP_SET: &str = "set";
 const PORT_HEALTH: &str = "health";
 const PORT_RUNTIME: &str = "runtime";
 const PORT_APPEARANCE: &str = "appearance";
 const PORT_WORKSPACE: &str = "workspace";
+const PORT_BACKGROUND_PLAYBACK: &str = "background_playback";
 const REQUEST_GLOBAL: &str = "global";
 
 #[derive(Debug, Clone)]
@@ -69,6 +71,17 @@ impl ShellStateComponent {
         )
     }
 
+    pub fn background_playback(active: bool) -> ComponentBackendCommand {
+        ComponentBackendCommand::post(
+            COMPONENT_ID,
+            PORT_BACKGROUND_PLAYBACK,
+            OP_SET,
+            REQUEST_GLOBAL,
+            "/api/shell/background/playback",
+            json!({ "active": active }),
+        )
+    }
+
     pub fn accepts_event(event: &ComponentBackendEvent) -> bool {
         event.component_id == COMPONENT_ID
             && event.operation_id == OP_LOAD
@@ -76,6 +89,19 @@ impl ShellStateComponent {
                 event.port_id.as_str(),
                 PORT_HEALTH | PORT_RUNTIME | PORT_APPEARANCE | PORT_WORKSPACE
             )
+    }
+
+    pub fn accepts_background_event(event: &ComponentBackendEvent) -> bool {
+        event.component_id == COMPONENT_ID
+            && event.operation_id == OP_SET
+            && event.port_id == PORT_BACKGROUND_PLAYBACK
+    }
+
+    pub fn into_background_result(event: ComponentBackendEvent) -> Option<Result<(), String>> {
+        if !Self::accepts_background_event(&event) {
+            return None;
+        }
+        Some(event.result.map(|_| ()))
     }
 
     pub fn into_data(event: ComponentBackendEvent) -> Option<Result<ShellStateData, String>> {

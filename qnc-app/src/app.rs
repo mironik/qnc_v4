@@ -1,5 +1,7 @@
 //! Native shell — Project + Ingest + Media Assist + Story.
 
+use std::time::{Duration, Instant};
+
 use eframe::egui::{self, Color32, RichText};
 use serde_json::Value;
 
@@ -34,6 +36,7 @@ const EDITORIAL_INSTANCE_MEDIA_ASSIST: &str = "media_assist";
 const EDITORIAL_INSTANCE_IMPORT_STATUS: &str = "source_import_status";
 const SHORTCUT_INSTANCE_INGEST: &str = "ingest";
 const SHORTCUT_INSTANCE_PROJECT: &str = "project";
+const BACKGROUND_PLAYBACK_HEARTBEAT: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Phase {
@@ -94,6 +97,8 @@ pub struct QncApp {
     component_errors: ComponentErrorBoundary,
     source_import_status: SourceImportStatusComponent,
     theme_picker: ThemePickerComponent,
+    background_playback_active_sent: Option<bool>,
+    background_playback_last_submit: Option<Instant>,
     next_project_request_id: u64,
     pending_workspace_go: Option<WorkspaceGo>,
 }
@@ -144,6 +149,8 @@ impl QncApp {
             component_errors: ComponentErrorBoundary::default(),
             source_import_status: SourceImportStatusComponent::default(),
             theme_picker: ThemePickerComponent::default(),
+            background_playback_active_sent: None,
+            background_playback_last_submit: None,
             next_project_request_id: 1,
             pending_workspace_go: None,
         }
@@ -166,6 +173,8 @@ impl QncApp {
     fn connect_and_load(&mut self, ctx: Option<egui::Context>) {
         self.error = None;
         self.host.set_base_url(&self.host_url_edit);
+        self.background_playback_active_sent = None;
+        self.background_playback_last_submit = None;
         self.status = "Connecting…".into();
         self.submit_shell_state_command(ShellStateComponent::health(), ctx);
     }
@@ -264,6 +273,34 @@ impl QncApp {
     ) {
         if let Err(e) = self.submit_component_backend_command(command, ctx) {
             self.error = Some(e);
+        }
+    }
+
+    fn sync_background_playback_gate(&mut self, ctx: Option<egui::Context>) {
+        if !self.health_ok {
+            return;
+        }
+        let active = self.phase == Phase::Workspace && self.playback.playing();
+        let heartbeat_due = active
+            && self.background_playback_active_sent == Some(active)
+            && self
+                .background_playback_last_submit
+                .map(|last| last.elapsed() >= BACKGROUND_PLAYBACK_HEARTBEAT)
+                .unwrap_or(true);
+        if self.background_playback_active_sent == Some(active) && !heartbeat_due {
+            return;
+        }
+        let command = ShellStateComponent::background_playback(active);
+        let submitted_at = Instant::now();
+        match self.submit_component_backend_command(command, ctx) {
+            Ok(_) => {
+                self.background_playback_active_sent = Some(active);
+                self.background_playback_last_submit = Some(submitted_at);
+            }
+            Err(_) => {
+                self.background_playback_active_sent = None;
+                self.background_playback_last_submit = None;
+            }
         }
     }
 
@@ -1655,6 +1692,18 @@ impl QncApp {
                         self.set_shell_state_error(&port_id, e);
                     }
                 }
+            } else if ShellStateComponent::accepts_background_event(&event) {
+                let Some(result) = ShellStateComponent::into_background_result(event) else {
+                    continue;
+                };
+                match result {
+                    Ok(()) => self.clear_component_error(&error_key),
+                    Err(e) => {
+                        let _ = self.record_component_error(error_key, e);
+                        self.background_playback_active_sent = None;
+                        self.background_playback_last_submit = None;
+                    }
+                }
             } else if ProjectCommandComponent::accepts_event(&event) {
                 let Some((kind, detail, result)) = ProjectCommandComponent::into_data(event) else {
                     continue;
@@ -2102,6 +2151,7 @@ impl QncApp {
             }
             self.flush_playback_transport(ctx);
         }
+        self.sync_background_playback_gate(Some(ctx.clone()));
     }
 
     /// Process transport commands emitted during event application in the same tick.

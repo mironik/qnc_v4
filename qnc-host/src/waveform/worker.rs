@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 
 use tracing::{info, warn};
 
+use crate::background_work::BackgroundWorkGate;
 use crate::media::imported_clip_media_rows;
 use crate::project::db::{open_global, ProjectPaths};
 use crate::project::list_project_ids;
@@ -22,15 +23,17 @@ struct WaveformJob {
 #[derive(Clone)]
 pub struct WaveformWorker {
     paths: ProjectPaths,
+    background: BackgroundWorkGate,
     pending: Arc<Mutex<Vec<WaveformJob>>>,
     blocked: Arc<Mutex<HashSet<String>>>,
     in_flight: Arc<AtomicUsize>,
 }
 
 impl WaveformWorker {
-    pub fn new(paths: ProjectPaths) -> Self {
+    pub fn new(paths: ProjectPaths, background: BackgroundWorkGate) -> Self {
         Self {
             paths,
+            background,
             pending: Arc::new(Mutex::new(Vec::new())),
             blocked: Arc::new(Mutex::new(HashSet::new())),
             in_flight: Arc::new(AtomicUsize::new(0)),
@@ -114,6 +117,10 @@ impl WaveformWorker {
         tokio::spawn(async move {
             let mut last_recover = Instant::now();
             loop {
+                if self.background.playback_active() {
+                    tokio::time::sleep(Duration::from_millis(400)).await;
+                    continue;
+                }
                 let job: Option<WaveformJob> = {
                     let mut q = self.pending.lock().expect("waveform queue");
                     if q.is_empty() {

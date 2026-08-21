@@ -1,8 +1,8 @@
 [workspace]
 resolver = "2"
+exclude = ["qnc-client"]
 members = [
     "qnc-host",
-    "qnc-client",
     "qnc-app",
     "qnc-broadcast-player",
     "qnc-media-ffmpeg",

@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 
+use crate::background_work::BackgroundWorkGate;
 use crate::config::AppConfig;
 use crate::filmstrip::FilmstripWorker;
 use crate::ingest_audio_wrap::AudioWrapWorker;
@@ -11,13 +12,13 @@ use crate::ingest_posters::PosterWorker;
 use crate::ingest_proxy::ProxyGenerateWorker;
 use crate::modules::ModuleStore;
 use crate::project::ProjectState;
-use crate::story::PlaybackStore;
 use crate::waveform::WaveformWorker;
 
 #[derive(Clone)]
 pub struct AppState {
     pub root: PathBuf,
     pub config: AppConfig,
+    pub background_work: BackgroundWorkGate,
     pub modules: Arc<RwLock<ModuleStore>>,
     pub project: ProjectState,
     pub ingest_card_thumbs: Arc<CardThumbWorker>,
@@ -28,5 +29,4 @@ pub struct AppState {
     pub ingest_audio_wrap: Arc<AudioWrapWorker>,
     pub filmstrip: Arc<FilmstripWorker>,
     pub waveform: Arc<WaveformWorker>,
-    pub story_playback: PlaybackStore,
 }

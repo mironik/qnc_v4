@@ -8,6 +8,7 @@ use rusqlite::params;
 use serde_json::json;
 use tracing::{info, warn};
 
+use crate::background_work::BackgroundWorkGate;
 use crate::filmstrip::{FilmstripWorker, DEFAULT_FILMSTRIP_FRAMES};
 use crate::ingest::asset_row::IngestAssetRow;
 use crate::ingest::audio_wrap::{audio_copy_dest, audio_project_dir, complete_imported_audio_clip};
@@ -39,6 +40,7 @@ pub struct ImportWorker {
     filmstrip: Arc<FilmstripWorker>,
     posters: Arc<PosterWorker>,
     audio_wrap: Arc<AudioWrapWorker>,
+    background: BackgroundWorkGate,
     pending: Arc<Mutex<HashSet<String>>>,
     blocked: Arc<Mutex<HashSet<String>>>,
 }
@@ -50,6 +52,7 @@ impl ImportWorker {
         filmstrip: Arc<FilmstripWorker>,
         posters: Arc<PosterWorker>,
         audio_wrap: Arc<AudioWrapWorker>,
+        background: BackgroundWorkGate,
     ) -> Self {
         Self {
             paths,
@@ -57,6 +60,7 @@ impl ImportWorker {
             filmstrip,
             posters,
             audio_wrap,
+            background,
             pending: Arc::new(Mutex::new(HashSet::new())),
             blocked: Arc::new(Mutex::new(HashSet::new())),
         }
@@ -122,6 +126,10 @@ impl ImportWorker {
             // Memory queue is only a wake hint — SQLite import_status is the truth.
             let mut last_recover = Instant::now();
             loop {
+                if self.background.playback_active() {
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                    continue;
+                }
                 let batch: Vec<String> = {
                     let mut set = self.pending.lock().expect("import queue");
                     set.drain().collect()

@@ -1,8 +1,14 @@
 # QNC DB-first architecture contract
 
-**Status:** ratificirano (Phase 0)  
-**Obvezno za:** sve izmjene u `QNC_v2/quick_news_cutter`  
-**Supersedes:** implicitne “ephemeral/local state” iznimke u plugin JS-u
+**Status:** active `qnc_v4` contract  
+**Obvezno za:** sve izmjene u `C:\Users\miron\Projects\qnc_v4`  
+**Supersedes:** stare web/plugin i client-local state modele
+
+Current `qnc_v4` product path is native Rust/egui: `qnc-app` + `qnc-host`.
+Sections that mention plugin JS, `ctx.store`, root `app/`, or root `plugins/`
+are historical migration context only. For new work, translate that rule to the
+native component model: component command -> Rust API -> SQLite -> fresh
+snapshot/projection. Do not recreate web/plugin architecture.
 
 ---
 

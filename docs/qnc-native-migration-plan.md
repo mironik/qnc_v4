@@ -187,13 +187,14 @@ POST /api/ingest/browse | discover | import
 
 GET  /api/story/state
 GET  /api/story/timeline-model
-POST /api/story/playback/start | stop | seek | pause
-GET  /api/story/playback/state | frame | audio
+Legacy /api/story/playback/* routes were removed from qnc_v4 product API.
+Story playback is owned by qnc-app PlaybackStack + broadcast-player runtime.
 
 GET  /api/media/resolve | probe | frame | waveform
 ```
 
-Playback rute moraju biti na **živom** Story (ili neutralnom `/api/playback`) mountu — ne mrtvi orphan qstory-only path.
+Playback transport is native/runtime-owned; host story routes provide DB snapshots
+and playlist/timeline data, not the active playback clock.
 
 ---
 

@@ -43,11 +43,15 @@ pub mod css {
     pub const WAVE_A3: Color32 = Color32::from_rgb(75, 85, 99);
     pub const WAVE_A4: Color32 = Color32::from_rgb(55, 65, 81);
     pub const FOCUS: Color32 = Color32::from_rgb(255, 180, 60);
+    pub const SLOT_SELECTED: Color32 = Color32::from_rgb(0x0f, 0x76, 0x6e);
     pub const PLAYHEAD: Color32 = Color32::from_rgb(0x4e, 0xc9, 0xb0);
     pub const MUTED: Color32 = Color32::from_rgb(0x9c, 0xa3, 0xaf);
     pub const IO_HANDLE: Color32 = Color32::WHITE;
     pub fn io_dim() -> Color32 {
         Color32::from_black_alpha(133)
+    }
+    pub fn slot_selected_overlay() -> Color32 {
+        Color32::from_rgba_unmultiplied(8, 96, 88, 96)
     }
 }
 
@@ -551,6 +555,14 @@ impl QncTimeline<'_> {
 
             if covers_active {
                 paint_covers(painter, track_rect, duration_frames, self.covers);
+                if self.layers.marker_slots {
+                    paint_selected_marker_slots(
+                        painter,
+                        track_rect,
+                        duration_frames,
+                        self.marker_slots,
+                    );
+                }
                 if self.layers.markers {
                     paint_markers(painter, track_rect, duration_frames, self.markers);
                 }
@@ -727,10 +739,10 @@ fn paint_marker_slots(
             egui::pos2(x0, area.top() + 2.0),
             egui::pos2(x1.max(x0 + 3.0), area.bottom() - 2.0),
         );
-        let color = if slot.has_cover {
+        let color = if slot.selected {
+            css::SLOT_SELECTED
+        } else if slot.has_cover {
             Color32::from_rgb(250, 204, 21)
-        } else if slot.selected {
-            css::PLAYHEAD
         } else {
             Color32::from_rgb(45, 212, 191)
         };
@@ -739,6 +751,32 @@ fn paint_marker_slots(
             slot_rect,
             1.0,
             egui::Stroke::new(if slot.selected { 2.0 } else { 1.0 }, color),
+            egui::StrokeKind::Inside,
+        );
+    }
+}
+
+fn paint_selected_marker_slots(
+    painter: &egui::Painter,
+    area: egui::Rect,
+    duration_frames: i64,
+    slots: &[TimelineSlotSpan<'_>],
+) {
+    for slot in slots.iter().filter(|slot| slot.selected) {
+        if slot.end_frame <= slot.start_frame {
+            continue;
+        }
+        let x0 = x_for_frame(area, duration_frames, slot.start_frame);
+        let x1 = x_for_frame(area, duration_frames, slot.end_frame);
+        let slot_rect = egui::Rect::from_min_max(
+            egui::pos2(x0, area.top() + 2.0),
+            egui::pos2(x1.max(x0 + 3.0), area.bottom() - 2.0),
+        );
+        painter.rect_filled(slot_rect, 1.0, css::slot_selected_overlay());
+        painter.rect_stroke(
+            slot_rect,
+            1.0,
+            egui::Stroke::new(2.0, css::SLOT_SELECTED),
             egui::StrokeKind::Inside,
         );
     }

@@ -2,6 +2,10 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
+// Legacy host-side Story playback state helper. It is not mounted as product
+// API; active playback is owned by qnc-app PlaybackStack and the broadcast
+// player runtime.
+
 use serde::{Deserialize, Serialize};
 
 use crate::editor_assets::ensure_virtual_stream_cached;
@@ -520,16 +524,8 @@ fn state_from_session(session: &PlaybackSession) -> PlaybackState {
         session_timebase_fps(session).unwrap_or(session.playlist.timeline_fps.max(1.0));
     let virtual_sec = frame_to_seconds(virtual_frame, timebase_fps);
     let mut active = resolve_active_layer_frozen(session, virtual_frame);
-    let sid = session.session_id.clone();
-    active.mixed_audio_url = format!(
-        "/api/story/playback/audio?session_id={}&duration_frames={}",
-        url_encode_query_value(&sid),
-        seconds_to_frame(30.0, timebase_fps).max(1)
-    );
-    active.preview_frame_url = format!(
-        "/api/story/playback/frame?session_id={}&virtual_frame={virtual_frame}",
-        url_encode_query_value(&sid)
-    );
+    active.mixed_audio_url.clear();
+    active.preview_frame_url.clear();
     let cover_preload = session.preload.values().cloned().collect::<Vec<_>>();
     PlaybackState {
         session_id: session.session_id.clone(),
@@ -1318,14 +1314,8 @@ mod tests {
         assert_eq!(state.active.audio_channels, 2);
         assert!(state.active.stream_url.is_empty());
         assert!(state.active.a1_stream_url.contains("audio_only=1"));
-        assert!(state
-            .active
-            .mixed_audio_url
-            .contains("/api/story/playback/audio"));
-        assert!(state
-            .active
-            .preview_frame_url
-            .contains("/api/story/playback/frame"));
+        assert!(state.active.mixed_audio_url.is_empty());
+        assert!(state.active.preview_frame_url.is_empty());
     }
 
     #[test]

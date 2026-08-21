@@ -5,6 +5,7 @@ use std::time::{Duration, Instant};
 
 use tracing::{info, warn};
 
+use crate::background_work::BackgroundWorkGate;
 use crate::ingest::db::{open_ingest, queue_ingest_job, reset_processing_ingest_jobs_for_type};
 use crate::ingest::thumb_process::generate_thumbs_from_proxy;
 use crate::project::db::{open_global, ProjectPaths};
@@ -19,15 +20,17 @@ struct ProxyThumbJob {
 #[derive(Clone)]
 pub struct PosterWorker {
     paths: ProjectPaths,
+    background: BackgroundWorkGate,
     pending: Arc<Mutex<Vec<ProxyThumbJob>>>,
     blocked: Arc<Mutex<HashSet<String>>>,
     in_flight: Arc<AtomicUsize>,
 }
 
 impl PosterWorker {
-    pub fn new(paths: ProjectPaths) -> Self {
+    pub fn new(paths: ProjectPaths, background: BackgroundWorkGate) -> Self {
         Self {
             paths,
+            background,
             pending: Arc::new(Mutex::new(Vec::new())),
             blocked: Arc::new(Mutex::new(HashSet::new())),
             in_flight: Arc::new(AtomicUsize::new(0)),
@@ -126,6 +129,10 @@ impl PosterWorker {
         tokio::spawn(async move {
             let mut last_recover = Instant::now();
             loop {
+                if self.background.playback_active() {
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                    continue;
+                }
                 let batch: Vec<ProxyThumbJob> = {
                     let mut q = self.pending.lock().expect("proxy thumb queue");
                     if q.is_empty() {

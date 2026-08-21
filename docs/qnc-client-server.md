@@ -1,7 +1,10 @@
 # QNC — klijent / server (plan)
 
-**Status:** dogovoreno (2026-07-16) · **implementacija parkiranа** dok se riješi drugi prioritet  
-**Kanonski doc za deployment profile**  
+**Status:** historical deployment plan (2026-07-16), not current product architecture.  
+`qnc-client` is parked legacy code and is excluded from the `qnc_v4` workspace.
+Current product UI is `qnc-app`; current playback goes through the broadcast
+player stack. Use this document only for deployment-background context, not as a
+source for UI, timeline, fps, or playback implementation.
 **Povezano:** [qnc-step-plan.md](qnc-step-plan.md), [qnc-playback-engine.md](qnc-playback-engine.md), [architecture-db-first.md](architecture-db-first.md)
 
 ---

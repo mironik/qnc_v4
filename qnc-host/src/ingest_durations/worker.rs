@@ -4,6 +4,7 @@ use std::time::{Duration, Instant};
 
 use tracing::{info, warn};
 
+use crate::background_work::BackgroundWorkGate;
 use crate::ingest::db::{open_ingest, set_meta};
 use crate::ingest::store::{needs_duration_probe, probe_missing_durations};
 use crate::project::db::{open_global, ProjectPaths};
@@ -13,14 +14,16 @@ use crate::project::list_project_ids;
 #[derive(Clone)]
 pub struct DurationWorker {
     paths: ProjectPaths,
+    background: BackgroundWorkGate,
     pending: Arc<Mutex<HashSet<String>>>,
     blocked: Arc<Mutex<HashSet<String>>>,
 }
 
 impl DurationWorker {
-    pub fn new(paths: ProjectPaths) -> Self {
+    pub fn new(paths: ProjectPaths, background: BackgroundWorkGate) -> Self {
         Self {
             paths,
+            background,
             pending: Arc::new(Mutex::new(HashSet::new())),
             blocked: Arc::new(Mutex::new(HashSet::new())),
         }
@@ -79,6 +82,10 @@ impl DurationWorker {
             // Probe missing durations from SQLite — memory queue is only a wake hint.
             let mut last_recover = Instant::now();
             loop {
+                if self.background.playback_active() {
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                    continue;
+                }
                 let batch: Vec<String> = {
                     let mut set = self.pending.lock().expect("duration queue");
                     set.drain().collect()

@@ -17,8 +17,6 @@ use super::db::{
     set_part_mark_out, set_part_mark_out_frame, update_cover, update_marker, update_marker_frame,
     update_part, SegmentRangeInput,
 };
-use super::playback::{PlaybackState, PlaybackStore};
-use super::playback_render;
 use super::playlist::{build_editorial_playlist, EditorialPlaylist};
 use super::timeline_model::{build_source_timeline_model, build_wrap_timeline_model};
 
@@ -217,82 +215,9 @@ struct SourceTimelineQuery {
     timeline_fps: Option<f64>,
 }
 
-#[derive(serde::Deserialize)]
-struct PlaybackStartBody {
-    #[serde(default)]
-    project_id: String,
-    /// Source mode: durable DB-first playback unit.
-    #[serde(default)]
-    virtual_shot_id: String,
-    /// All/source mode: play one source clip through the neutral frame/audio path.
-    #[serde(default)]
-    clip_id: String,
-    #[serde(default)]
-    in_sec: Option<f64>,
-    #[serde(default)]
-    out_sec: Option<f64>,
-    #[serde(default)]
-    in_frame: Option<i64>,
-    #[serde(default)]
-    out_frame: Option<i64>,
-}
-
-#[derive(serde::Deserialize)]
-struct PlaybackSessionBody {
-    #[serde(default)]
-    session_id: String,
-}
-
-#[derive(serde::Deserialize)]
-struct PlaybackSeekBody {
-    #[serde(default)]
-    session_id: String,
-    #[serde(default)]
-    virtual_frame: Option<i64>,
-    #[serde(default)]
-    virtual_sec: Option<f64>,
-}
-
-#[derive(serde::Deserialize)]
-struct PlaybackPauseBody {
-    #[serde(default)]
-    session_id: String,
-    paused: bool,
-}
-
-#[derive(serde::Deserialize)]
-struct PlaybackStateQuery {
-    #[serde(default)]
-    session_id: String,
-}
-
-#[derive(serde::Deserialize)]
-struct PlaybackAudioQuery {
-    #[serde(default)]
-    session_id: String,
-    #[serde(default)]
-    from_frame: Option<i64>,
-    #[serde(default)]
-    from_sec: Option<f64>,
-    #[serde(default)]
-    duration_frames: Option<i64>,
-    #[serde(default)]
-    duration_sec: Option<f64>,
-}
-
-#[derive(serde::Deserialize)]
-struct PlaybackFrameQuery {
-    #[serde(default)]
-    session_id: String,
-    #[serde(default)]
-    virtual_frame: Option<i64>,
-    #[serde(default)]
-    virtual_sec: Option<f64>,
-}
-
 #[allow(dead_code)]
 pub fn router() -> Router<AppState> {
-    let router = Router::new()
+    Router::new()
         .route("/api/story/state", get(api_state))
         .route("/api/story/playlist", get(api_playlist))
         .route("/api/story/timeline-model", get(api_timeline_model))
@@ -323,37 +248,7 @@ pub fn router() -> Router<AppState> {
         .route("/api/story/commit", post(api_commit))
         .route("/api/story/native/launch", post(api_native_launch))
         .route("/api/story/play-media", get(api_play_media))
-        .merge(crate::editor_assets::router("/api/story"));
-
-    if legacy_story_playback_enabled() {
-        router.merge(legacy_story_playback_router())
-    } else {
-        router
-    }
-}
-
-fn legacy_story_playback_enabled() -> bool {
-    std::env::var("QNC_LEGACY_STORY_PLAYBACK")
-        .map(legacy_story_playback_value_enabled)
-        .unwrap_or(false)
-}
-
-fn legacy_story_playback_value_enabled(value: impl AsRef<str>) -> bool {
-    matches!(
-        value.as_ref().trim().to_ascii_lowercase().as_str(),
-        "1" | "true" | "yes" | "on"
-    )
-}
-
-fn legacy_story_playback_router() -> Router<AppState> {
-    Router::new()
-        .route("/api/story/playback/start", post(api_playback_start))
-        .route("/api/story/playback/stop", post(api_playback_stop))
-        .route("/api/story/playback/seek", post(api_playback_seek))
-        .route("/api/story/playback/pause", post(api_playback_pause))
-        .route("/api/story/playback/state", get(api_playback_state))
-        .route("/api/story/playback/audio", get(api_playback_audio))
-        .route("/api/story/playback/frame", get(api_playback_frame))
+        .merge(crate::editor_assets::router("/api/story"))
 }
 
 async fn api_playlist(
@@ -363,159 +258,6 @@ async fn api_playlist(
     let pid = resolve_project_id(&app, &q.project_id)?;
     let playlist = build_editorial_playlist(&app.project.paths, &pid).map_err(map_bad_request)?;
     Ok(Json(playlist))
-}
-
-async fn api_playback_start(
-    State(app): State<AppState>,
-    Json(body): Json<PlaybackStartBody>,
-) -> Result<Json<PlaybackState>, (StatusCode, String)> {
-    let pid = resolve_project_id(&app, &body.project_id)?;
-    let playback: &PlaybackStore = &app.story_playback;
-    let shot_id = body.virtual_shot_id.trim();
-    let clip = body.clip_id.trim();
-    let state = if !shot_id.is_empty() {
-        playback
-            .start_virtual_shot(&app.project.paths, &pid, shot_id)
-            .map_err(map_bad_request)?
-    } else if clip.is_empty() {
-        playback
-            .start(&app.project.paths, &pid)
-            .map_err(map_bad_request)?
-    } else {
-        match (body.in_frame, body.out_frame) {
-            (Some(in_frame), Some(out_frame)) => playback
-                .start_source_frames(&app.project.paths, &pid, clip, in_frame, out_frame)
-                .map_err(map_bad_request)?,
-            _ => playback
-                .start_source(&app.project.paths, &pid, clip, body.in_sec, body.out_sec)
-                .map_err(map_bad_request)?,
-        }
-    };
-    Ok(Json(state))
-}
-
-async fn api_playback_stop(
-    State(app): State<AppState>,
-    Json(body): Json<PlaybackSessionBody>,
-) -> Result<Json<Value>, (StatusCode, String)> {
-    app.story_playback
-        .stop(&body.session_id)
-        .map_err(map_bad_request)?;
-    Ok(Json(serde_json::json!({ "status": "ok" })))
-}
-
-async fn api_playback_seek(
-    State(app): State<AppState>,
-    Json(body): Json<PlaybackSeekBody>,
-) -> Result<Json<Value>, (StatusCode, String)> {
-    let Some(frame) = body.virtual_frame else {
-        let msg = if body.virtual_sec.is_some() {
-            "playback seek je frame-only; pošalji virtual_frame umjesto virtual_sec"
-        } else {
-            "playback seek traži virtual_frame"
-        };
-        return Err((StatusCode::BAD_REQUEST, msg.into()));
-    };
-    app.story_playback
-        .seek_frame(&body.session_id, frame)
-        .map_err(map_bad_request)?;
-    Ok(Json(serde_json::json!({ "status": "ok" })))
-}
-
-async fn api_playback_pause(
-    State(app): State<AppState>,
-    Json(body): Json<PlaybackPauseBody>,
-) -> Result<Json<Value>, (StatusCode, String)> {
-    app.story_playback
-        .pause(&body.session_id, body.paused)
-        .map_err(map_bad_request)?;
-    Ok(Json(serde_json::json!({ "status": "ok" })))
-}
-
-async fn api_playback_state(
-    State(app): State<AppState>,
-    Query(q): Query<PlaybackStateQuery>,
-) -> Result<Json<PlaybackState>, (StatusCode, String)> {
-    let state = app
-        .story_playback
-        .state(&app.project.paths, &q.session_id)
-        .map_err(map_bad_request)?;
-    Ok(Json(state))
-}
-
-async fn api_playback_audio(
-    State(app): State<AppState>,
-    Query(q): Query<PlaybackAudioQuery>,
-    headers: axum::http::HeaderMap,
-) -> Result<axum::response::Response, (StatusCode, String)> {
-    let sid = q.session_id.trim();
-    if sid.is_empty() {
-        return Err((StatusCode::BAD_REQUEST, "session_id required".into()));
-    }
-    let session = app.story_playback.session(sid).map_err(map_bad_request)?;
-    let fps = session
-        .source_clip
-        .as_ref()
-        .map(|src| src.fps)
-        .unwrap_or(session.playlist.timeline_fps)
-        .max(1.0);
-    if q.from_sec.is_some() || q.duration_sec.is_some() {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "playback audio je frame-only; pošalji from_frame/duration_frames umjesto sekundi"
-                .into(),
-        ));
-    }
-    let from = q
-        .from_frame
-        .map(|frame| frame_to_seconds(frame.max(0), fps))
-        .unwrap_or_else(|| frame_to_seconds(session.clock.virtual_frame, fps))
-        .max(0.0);
-    let duration = q
-        .duration_frames
-        .map(|frames| frame_to_seconds(frames.max(1), fps))
-        .unwrap_or_else(|| frame_to_seconds((30.0 * fps).round() as i64, fps))
-        .max(0.25)
-        .min(120.0);
-    let path = playback_render::render_mixed_audio(&app.project.paths, &session, from, duration)
-        .await
-        .map_err(map_bad_request)?;
-    let meta = tokio::fs::metadata(&path)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    let chunk = crate::editor_assets::media_chunk_bytes(meta.len(), duration, 10.0);
-    crate::editor_assets::serve_media_path(
-        path,
-        headers.get(axum::http::header::RANGE),
-        Some(chunk),
-    )
-    .await
-}
-
-async fn api_playback_frame(
-    State(app): State<AppState>,
-    Query(q): Query<PlaybackFrameQuery>,
-) -> Result<axum::response::Response, (StatusCode, String)> {
-    let sid = q.session_id.trim();
-    if sid.is_empty() {
-        return Err((StatusCode::BAD_REQUEST, "session_id required".into()));
-    }
-    let session = app.story_playback.session(sid).map_err(map_bad_request)?;
-    if q.virtual_frame.is_none() && q.virtual_sec.is_some() {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "playback frame render je frame-only; pošalji virtual_frame umjesto virtual_sec".into(),
-        ));
-    }
-    let virtual_frame = q
-        .virtual_frame
-        .unwrap_or(session.clock.virtual_frame)
-        .max(0);
-    let path =
-        playback_render::render_preview_frame_at_frame(&app.project.paths, &session, virtual_frame)
-            .await
-            .map_err(map_bad_request)?;
-    crate::editor_assets::serve_media_path(path, None, None).await
 }
 
 async fn api_timeline_model(
@@ -990,7 +732,7 @@ fn is_story_client_error(message: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_story_client_error, legacy_story_playback_value_enabled, map_bad_request};
+    use super::{is_story_client_error, map_bad_request};
     use axum::http::StatusCode;
 
     #[test]
@@ -1008,16 +750,5 @@ mod tests {
     fn map_bad_request_keeps_unknown_errors_internal() {
         let (status, _) = map_bad_request("database is locked".into());
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
-    }
-
-    #[test]
-    fn legacy_story_playback_is_explicit_opt_in() {
-        assert!(!legacy_story_playback_value_enabled(""));
-        assert!(!legacy_story_playback_value_enabled("0"));
-        assert!(!legacy_story_playback_value_enabled("false"));
-        assert!(legacy_story_playback_value_enabled("1"));
-        assert!(legacy_story_playback_value_enabled("true"));
-        assert!(legacy_story_playback_value_enabled(" yes "));
-        assert!(legacy_story_playback_value_enabled("ON"));
     }
 }

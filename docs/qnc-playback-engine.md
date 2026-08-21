@@ -1,6 +1,6 @@
 # QNC Playback Engine
 
-Status: v0.4.6, aktivni modularni broadcast player.
+Status: v0.4.7.2, aktivni modularni broadcast player.
 
 ## Aktivni Put
 

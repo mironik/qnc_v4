@@ -252,21 +252,15 @@ fn ffmpeg_err(output: &std::process::Output) -> String {
     }
 }
 
-/// Raspored seek pozicija za filmstrip (Jetson: `timeline_seek_seconds`).
+/// Raspored seek pozicija za filmstrip: pocetak svake od N vremenskih cjelina.
 pub fn timeline_seek_seconds(duration_sec: f64, frames: u32) -> Vec<f64> {
     let n = frames.clamp(2, 24) as usize;
-    let dur = duration_sec.max(1.0);
-    let margin = (dur * 0.05).min(2.0);
-    let start = margin;
-    let end = (dur - margin).max(start + 0.5);
-    if n == 1 {
-        return vec![(start * 100.0).round() / 100.0];
-    }
-    let step = (end - start) / (n - 1) as f64;
+    let dur = duration_sec.max(0.01);
+    let step = dur / n as f64;
     (0..n)
-        .map(|i| {
-            let v = start + i as f64 * step;
-            (v * 100.0).round() / 100.0
+        .map(|index| {
+            let sec = index as f64 * step;
+            (sec * 100.0).round() / 100.0
         })
         .collect()
 }

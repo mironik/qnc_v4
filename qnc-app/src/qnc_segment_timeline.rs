@@ -40,6 +40,18 @@ pub enum SegmentAudioExpansion {
     A2,
 }
 
+impl SegmentAudioExpansion {
+    pub fn toggle(self, lane: Self) -> Self {
+        if matches!(lane, Self::None) {
+            Self::None
+        } else if self == lane {
+            Self::None
+        } else {
+            lane
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SegmentLayerFlags {
     pub carrier: bool,
@@ -194,6 +206,9 @@ pub struct SegmentTimelineProgramInput<'a> {
     pub covers: &'a [SegmentTimelineProgramCover<'a>],
     pub marker_slots: &'a [SegmentTimelineProgramMarkerSlot<'a>],
     pub markers: &'a [SegmentTimelineProgramMarker<'a>],
+    pub waveform_duration_frames: i64,
+    pub a1_peaks: &'a [f32],
+    pub a2_peaks: &'a [f32],
     pub expanded_audio: SegmentAudioExpansion,
     pub show_lane_labels: bool,
 }
@@ -240,6 +255,7 @@ pub fn show_program(
         return out;
     }
     let rows = program_segment_rows(input.segments);
+    let waveform_duration = input.waveform_duration_frames.max(1);
     let count = rows.len();
 
     let width = ui.available_width();
@@ -262,6 +278,9 @@ pub fn show_program(
                     input.covers,
                     input.marker_slots,
                     input.markers,
+                    waveform_duration,
+                    input.a1_peaks,
+                    input.a2_peaks,
                     input.expanded_audio,
                     row.index == 0 && input.show_lane_labels,
                 );
@@ -286,7 +305,9 @@ pub fn show_program_overview(
     if input.segments.is_empty() {
         return out;
     }
-    let rows = program_visual_rows(program_duration_frames(&input));
+    let program_duration = program_duration_frames(&input);
+    let waveform_duration = input.waveform_duration_frames.max(1);
+    let rows = program_visual_rows(program_duration);
     let count = rows.len();
 
     let width = ui.available_width();
@@ -309,6 +330,9 @@ pub fn show_program_overview(
                     input.covers,
                     input.marker_slots,
                     input.markers,
+                    waveform_duration,
+                    input.a1_peaks,
+                    input.a2_peaks,
                     input.expanded_audio,
                     row.index == 0 && input.show_lane_labels,
                 );
@@ -331,6 +355,9 @@ fn paint_program_row(
     covers: &[SegmentTimelineProgramCover<'_>],
     marker_slots: &[SegmentTimelineProgramMarkerSlot<'_>],
     markers: &[SegmentTimelineProgramMarker<'_>],
+    program_duration_frames: i64,
+    program_a1_peaks: &[f32],
+    program_a2_peaks: &[f32],
     expanded_audio: SegmentAudioExpansion,
     show_lane_labels: bool,
 ) -> SegmentTimelineProgramIntent {
@@ -345,6 +372,8 @@ fn paint_program_row(
     let slot_spans = timeline_slot_spans(&local_slots);
     let marker_pins = timeline_marker_pins(&local_markers);
     let timeline_layers = timeline_layers_for_row(layers, local_playhead);
+    let a1_peaks = local_peaks_for_row(row, program_duration_frames, program_a1_peaks);
+    let a2_peaks = local_peaks_for_row(row, program_duration_frames, program_a2_peaks);
 
     let interact = QncTimeline {
         layers: timeline_layers,
@@ -358,8 +387,8 @@ fn paint_program_row(
         focus: TimelineFocusPaint::Playhead,
         show_lane_labels,
         expanded_audio: timeline_expanded_audio(expanded_audio),
-        a1_peaks: &[],
-        a2_peaks: &[],
+        a1_peaks: &a1_peaks,
+        a2_peaks: &a2_peaks,
         a3_peaks: &[],
         a4_peaks: &[],
         virtual_spans: &virtual_spans,
@@ -371,6 +400,51 @@ fn paint_program_row(
     .show(ui);
 
     program_intent_from_timeline_interact(interact, row, markers)
+}
+
+fn local_peaks_for_row(
+    row: SegmentTimelineProgramRow,
+    program_duration_frames: i64,
+    program_peaks: &[f32],
+) -> Vec<f32> {
+    if program_peaks.is_empty() {
+        return Vec::new();
+    }
+    let row_duration = row.duration_frames().max(1) as usize;
+    let bucket_count = row_duration.clamp(24, program_peaks.len().max(24));
+    let mut out = vec![0.0; bucket_count];
+    let program_duration = program_duration_frames.max(1);
+    let row_start = row.start_frame();
+    let row_end = row.end_frame();
+    for bucket in 0..bucket_count {
+        let local_start = bucket as f64 * row.duration_frames() as f64 / bucket_count as f64;
+        let local_end = (bucket + 1) as f64 * row.duration_frames() as f64 / bucket_count as f64;
+        let program_start = row_start as f64 + local_start;
+        let program_end = (row_start as f64 + local_end).min(row_end as f64);
+        out[bucket] = max_program_peak(program_peaks, program_duration, program_start, program_end);
+    }
+    out
+}
+
+fn max_program_peak(
+    program_peaks: &[f32],
+    program_duration_frames: i64,
+    program_start_frame: f64,
+    program_end_frame: f64,
+) -> f32 {
+    let duration = program_duration_frames.max(1) as f64;
+    let peak_len = program_peaks.len();
+    let start = ((program_start_frame.max(0.0) / duration) * peak_len as f64)
+        .floor()
+        .clamp(0.0, peak_len as f64) as usize;
+    let end = ((program_end_frame.max(program_start_frame + 1.0) / duration) * peak_len as f64)
+        .ceil()
+        .clamp(0.0, peak_len as f64) as usize;
+    let end = end.max(start + 1).min(peak_len);
+    program_peaks[start..end]
+        .iter()
+        .copied()
+        .fold(0.0, f32::max)
 }
 
 fn program_duration_frames(input: &SegmentTimelineProgramInput<'_>) -> i64 {
@@ -705,6 +779,22 @@ mod tests {
     }
 
     #[test]
+    fn segment_audio_expansion_toggles_like_shared_timeline() {
+        assert_eq!(
+            SegmentAudioExpansion::None.toggle(SegmentAudioExpansion::A1),
+            SegmentAudioExpansion::A1
+        );
+        assert_eq!(
+            SegmentAudioExpansion::A1.toggle(SegmentAudioExpansion::A1),
+            SegmentAudioExpansion::None
+        );
+        assert_eq!(
+            SegmentAudioExpansion::A1.toggle(SegmentAudioExpansion::A2),
+            SegmentAudioExpansion::A2
+        );
+    }
+
+    #[test]
     fn row_adapter_draws_playhead_only_on_active_projection() {
         let layers = segment_layers();
 
@@ -782,6 +872,9 @@ mod tests {
             covers: &[],
             marker_slots: &[],
             markers: &[],
+            waveform_duration_frames: 90,
+            a1_peaks: &[],
+            a2_peaks: &[],
             expanded_audio: SegmentAudioExpansion::None,
             show_lane_labels: true,
         };

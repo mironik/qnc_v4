@@ -165,6 +165,10 @@ impl PlaybackStack {
         self.playlist_input_active && (self.player.snapshot().playing || self.carrier.playing())
     }
 
+    pub fn playing(&self) -> bool {
+        self.player.snapshot().playing || self.carrier.playing()
+    }
+
     /// Live playlist/program frame for passive Program/Segment UI projections.
     ///
     /// The playlist input is loaded as one broadcast-player input, so the

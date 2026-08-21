@@ -12,6 +12,7 @@ use axum::{
 use tracing::{info, warn};
 
 mod app_state;
+mod background_work;
 mod components;
 mod config;
 mod db_first;
@@ -72,18 +73,28 @@ async fn main() {
     }
     let modules = Arc::new(RwLock::new(ModuleStore::load(&root.join("data"))));
     let project_state = project::ProjectState::new(&root, &config);
+    let background_work = background_work::BackgroundWorkGate::new();
     let ingest_posters = Arc::new(ingest_posters::PosterWorker::new(
         project_state.paths.clone(),
+        background_work.clone(),
     ));
-    let filmstrip = Arc::new(filmstrip::FilmstripWorker::new(project_state.paths.clone()));
-    let waveform = Arc::new(waveform::WaveformWorker::new(project_state.paths.clone()));
+    let filmstrip = Arc::new(filmstrip::FilmstripWorker::new(
+        project_state.paths.clone(),
+        background_work.clone(),
+    ));
+    let waveform = Arc::new(waveform::WaveformWorker::new(
+        project_state.paths.clone(),
+        background_work.clone(),
+    ));
     let ingest_audio_wrap = Arc::new(ingest_audio_wrap::AudioWrapWorker::new(
         project_state.paths.clone(),
+        background_work.clone(),
     ));
     let ingest_proxy = Arc::new(ingest_proxy::ProxyGenerateWorker::new(
         project_state.paths.clone(),
         filmstrip.clone(),
         ingest_posters.clone(),
+        background_work.clone(),
     ));
     let ingest_import = Arc::new(ingest_import::ImportWorker::new(
         project_state.paths.clone(),
@@ -91,6 +102,7 @@ async fn main() {
         filmstrip.clone(),
         ingest_posters.clone(),
         ingest_audio_wrap.clone(),
+        background_work.clone(),
     ));
     let ingest_card_thumbs = Arc::new(ingest_card_thumbs::CardThumbWorker::new(
         project_state.paths.clone(),
@@ -98,6 +110,7 @@ async fn main() {
     ));
     let ingest_durations = Arc::new(ingest_durations::DurationWorker::new(
         project_state.paths.clone(),
+        background_work.clone(),
     ));
     match ingest_import.enqueue_recoverable_projects() {
         Ok(count) if count > 0 => info!("ingest import recovery queued projects={count}"),
@@ -160,6 +173,7 @@ async fn main() {
     let state = AppState {
         root: root.clone(),
         config: config.clone(),
+        background_work,
         modules,
         project: project_state,
         ingest_card_thumbs,
@@ -170,12 +184,15 @@ async fn main() {
         ingest_audio_wrap,
         filmstrip,
         waveform,
-        story_playback: story::PlaybackStore::default(),
     };
 
     let app = Router::new()
         .route("/api/health", get(api_health))
         .route("/api/shell/runtime", get(api_shell_runtime))
+        .route(
+            "/api/shell/background/playback",
+            post(api_shell_background_playback),
+        )
         .route("/api/shell/diagnostics", get(api_shell_diagnostics))
         .route("/api/shell/db-first", get(api_shell_db_first))
         .route("/api/shell/tabs", get(api_shell_tabs))
@@ -257,6 +274,21 @@ async fn api_health() -> Json<serde_json::Value> {
 
 async fn api_shell_runtime(State(state): State<AppState>) -> Json<serde_json::Value> {
     Json(platform::runtime_info(&state.root, &state.config))
+}
+
+async fn api_shell_background_playback(
+    State(state): State<AppState>,
+    Json(body): Json<serde_json::Value>,
+) -> Json<serde_json::Value> {
+    let active = body
+        .get("active")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    state.background_work.set_playback_active(active);
+    Json(serde_json::json!({
+        "status": "ok",
+        "playback_active": active,
+    }))
 }
 
 async fn api_shell_diagnostics(State(state): State<AppState>) -> Json<serde_json::Value> {

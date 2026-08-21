@@ -27,6 +27,7 @@ use crate::component_runtime::ComponentBackendCommand;
 use crate::components::{EditorialEditComponent, EditorialEditData, EditorialEditKind};
 use crate::composition::EditorialRole;
 use crate::editorial::common::{shot_id, truncate};
+use crate::editorial::program_waveform::{self, ProgramWaveformAssets};
 use crate::editorial::segment_program::SegmentProgramModel;
 use crate::editorial::{marker_cover_panel, media_pool, segment_panel};
 use crate::frame_time::{frame_to_seconds, normalize_fps, seconds_to_frame, seconds_to_timecode};
@@ -120,6 +121,7 @@ pub struct StoryScreen {
     waveform_clip_id: String,
     image_loader: AsyncImageAssetLoader,
     source_media_loader: AsyncSourceMediaAssetLoader,
+    program_waveforms: ProgramWaveformAssets,
     repaint_ctx: Option<egui::Context>,
     source_media_retry_at: Option<Instant>,
     source_media_retry_clip_id: String,
@@ -216,6 +218,7 @@ impl StoryScreen {
             waveform_clip_id: String::new(),
             image_loader: AsyncImageAssetLoader::new(),
             source_media_loader: AsyncSourceMediaAssetLoader::new(),
+            program_waveforms: ProgramWaveformAssets::new(),
             repaint_ctx: None,
             source_media_retry_at: None,
             source_media_retry_clip_id: String::new(),
@@ -1232,6 +1235,8 @@ impl StoryScreen {
     }
 
     fn poll_media_assets(&mut self, _host: &HostClient, ctx: &egui::Context) {
+        self.program_waveforms.poll(&self.loaded_project_id, ctx);
+
         for result in self.image_loader.poll() {
             match result.key.scope.as_str() {
                 "editorial.thumb" => {
@@ -1753,6 +1758,15 @@ impl StoryScreen {
         height: f32,
     ) -> PlaybackTransportIntent {
         let program = self.segment_program_model();
+        self.program_waveforms.request_for_program(
+            host,
+            &self.loaded_project_id,
+            &program,
+            ui.ctx(),
+        );
+        let source_durations =
+            program_waveform::source_duration_frames(&self.all_clips, &self.virtual_shots);
+        let program_waveform = self.program_waveforms.compose(&program, &source_durations);
         let display_frame =
             playback.playlist_display_frame(self.wrap_playhead_frame, program.duration_frames());
         let tc = |sec| self.tc(sec);
@@ -1766,6 +1780,8 @@ impl StoryScreen {
                 program: &program,
                 covers: &self.covers,
                 markers: &self.markers,
+                a1_peaks: &program_waveform.a1_peaks,
+                a2_peaks: &program_waveform.a2_peaks,
                 selected_slot_id: &self.selected_slot_id,
                 selected_cover_id: &self.selected_cover_id,
                 tc: &tc,

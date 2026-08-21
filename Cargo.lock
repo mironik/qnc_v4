@@ -3224,20 +3224,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "qnc-client"
-version = "0.4.7"
-dependencies = [
- "clap",
- "eframe",
- "egui",
- "image",
- "rodio 0.20.1",
- "serde",
- "serde_json",
- "ureq",
-]
-
-[[package]]
 name = "qnc-host"
 version = "0.4.7"
 dependencies = [

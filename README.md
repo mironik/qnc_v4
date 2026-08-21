@@ -1,4 +1,4 @@
-# QNC — native (v0.4.6)
+# QNC — native (v0.4.7.2)
 
 Aktivna radna kopija: **`qnc-app` + `qnc-host`**. Web UI nije dio `qnc_v4`
 produkta i legacy `web-arhive/` folder nije prisutan u ovom treeu.
@@ -21,7 +21,7 @@ LAN: `QNC_BIND_HOST=0.0.0.0` zahtijeva `QNC_TRUSTED_LAN=1`. Internet bez auth/pr
 |-----|--------|
 | `qnc-app/` | Native egui UI |
 | `qnc-host/` | Rust API + SQLite |
-| `qnc-client/` | Native client crate |
+| `qnc-client/` | Legacy F4 client, excluded from workspace/product build |
 | `qnc-broadcast-player/` | Neutral frame-based player core |
 | `qnc-media-ffmpeg/` | FFmpeg media adapter |
 | `qnc-player-output/` | Monitor/audio output and telemetry |
@@ -40,12 +40,25 @@ LAN: `QNC_BIND_HOST=0.0.0.0` zahtijeva `QNC_TRUSTED_LAN=1`. Internet bez auth/pr
 | `media_pool` (Rust) | shared helperi za Ingest/Story |
 | design-tools HTTP | API only (nema web UI) |
 
-## v0.4.6 — PlaybackStack + carrier timeline
+## v0.4.7.2 — Story stability / background throttle snapshot
+
+- Broadcast/media adapter diff is cleared; `qnc-media-ffmpeg` remains at the locked snapshot.
+- Host background workers pause new heavy work while playback is active.
+- Filmstrip uses 13 segment-start frames without a synthetic 60s duration fallback.
+- Selected marker slots are visibly highlighted in the shared timeline component.
+
+## v0.4.7 — Current native/product model
+
+- Product UI is `qnc-app`; host is API + SQLite only.
+- `qnc-client` is legacy F4 code and is excluded from the workspace/product build.
+- Story playback goes through the native `PlaybackStack` / broadcast-player path, not legacy host `/api/story/playback/*` routes.
+
+## v0.4.6 — PlaybackStack + carrier timeline checkpoint
 
 - One `PlaybackStack`: timeline is progress-bar projection (`CarrierSync`); click/`step_*` = `CueFrame`; Space = toggle only.
 - Probe-authoritative fps/field + yadif; large forward cues respawn (`-ss`) to avoid RGB OOM; stale monitor frames rejected.
 - Transport shortcuts (`play_pause`, `step_back_frame`, `step_forward_frame`) only from `seed/keyboard-shortcuts.json`.
-- Tag `v0.4.6` is the current playback reference point.
+- Tag `v0.4.6` is a historical playback checkpoint, not the current version.
 
 ## v0.4.5 — runtime protocol path
 

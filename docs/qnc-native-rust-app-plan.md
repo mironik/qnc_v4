@@ -207,9 +207,8 @@ POST /api/ingest/import
 
 GET  /api/story/state?project_id=...
 GET  /api/story/timeline-model?project_id=...
-POST /api/story/playback/start
-POST /api/story/playback/stop
-POST /api/story/playback/seek
+Legacy /api/story/playback/* routes were removed from qnc_v4 product API.
+Playback transport is owned by qnc-app PlaybackStack + broadcast-player runtime.
 
 GET  /api/media/resolve
 GET  /api/media/probe

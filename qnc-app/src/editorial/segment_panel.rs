@@ -27,6 +27,8 @@ pub(crate) struct SegmentPanelInput<'a> {
     pub program: &'a SegmentProgramModel,
     pub covers: &'a [StoryCover],
     pub markers: &'a [StoryMarker],
+    pub a1_peaks: &'a [f32],
+    pub a2_peaks: &'a [f32],
     pub selected_slot_id: &'a str,
     pub selected_cover_id: &'a str,
     pub tc: &'a dyn Fn(f64) -> String,
@@ -45,6 +47,8 @@ pub(crate) enum SegmentPanelAction {
 pub(crate) fn show(ui: &mut egui::Ui, input: SegmentPanelInput<'_>) -> SegmentPanelAction {
     let mut action = SegmentPanelAction::None;
     let t = current(ui);
+    let stack_audio_expansion_id = egui::Id::new("story_segment_stack_audio_expansion");
+    let playlist_audio_expansion_id = egui::Id::new("story_playlist_input_audio_expansion");
     let panel_size = Vec2::new(
         ui.available_width(),
         input.height.min(ui.available_height()).max(0.0),
@@ -130,14 +134,24 @@ pub(crate) fn show(ui: &mut egui::Ui, input: SegmentPanelInput<'_>) -> SegmentPa
                                             covers: &timeline_covers,
                                             marker_slots: &timeline_slots,
                                             markers: &timeline_markers,
-                                            expanded_audio: SegmentAudioExpansion::None,
+                                            waveform_duration_frames: input
+                                                .program
+                                                .duration_frames(),
+                                            a1_peaks: input.a1_peaks,
+                                            a2_peaks: input.a2_peaks,
+                                            expanded_audio: audio_expansion(
+                                                ui.ctx(),
+                                                stack_audio_expansion_id,
+                                            ),
                                             show_lane_labels: true,
                                         },
                                     );
-                                    if matches!(action, SegmentPanelAction::None) {
-                                        action =
-                                            segment_action_from_timeline_intent(timeline_intent);
-                                    }
+                                    apply_timeline_intent(
+                                        ui.ctx(),
+                                        stack_audio_expansion_id,
+                                        timeline_intent,
+                                        &mut action,
+                                    );
                                 });
                         },
                     );
@@ -177,13 +191,22 @@ pub(crate) fn show(ui: &mut egui::Ui, input: SegmentPanelInput<'_>) -> SegmentPa
                                     covers: &timeline_covers,
                                     marker_slots: &timeline_slots,
                                     markers: &timeline_markers,
-                                    expanded_audio: SegmentAudioExpansion::None,
+                                    waveform_duration_frames: input.program.duration_frames(),
+                                    a1_peaks: input.a1_peaks,
+                                    a2_peaks: input.a2_peaks,
+                                    expanded_audio: audio_expansion(
+                                        ui.ctx(),
+                                        playlist_audio_expansion_id,
+                                    ),
                                     show_lane_labels: true,
                                 },
                             );
-                            if matches!(action, SegmentPanelAction::None) {
-                                action = segment_action_from_timeline_intent(overview_intent);
-                            }
+                            apply_timeline_intent(
+                                ui.ctx(),
+                                playlist_audio_expansion_id,
+                                overview_intent,
+                                &mut action,
+                            );
                         },
                     );
                 }
@@ -192,6 +215,33 @@ pub(crate) fn show(ui: &mut egui::Ui, input: SegmentPanelInput<'_>) -> SegmentPa
     }
 
     action
+}
+
+fn audio_expansion(ctx: &egui::Context, id: egui::Id) -> SegmentAudioExpansion {
+    ctx.data_mut(|data| {
+        data.get_persisted::<SegmentAudioExpansion>(id)
+            .unwrap_or_default()
+    })
+}
+
+fn set_audio_expansion(ctx: &egui::Context, id: egui::Id, expanded: SegmentAudioExpansion) {
+    ctx.data_mut(|data| data.insert_persisted(id, expanded));
+}
+
+fn apply_timeline_intent(
+    ctx: &egui::Context,
+    expanded_id: egui::Id,
+    intent: SegmentTimelineProgramIntent,
+    action: &mut SegmentPanelAction,
+) {
+    if let SegmentTimelineProgramIntent::ToggleAudioExpand(lane) = intent {
+        let expanded = audio_expansion(ctx, expanded_id).toggle(lane);
+        set_audio_expansion(ctx, expanded_id, expanded);
+        return;
+    }
+    if matches!(action, SegmentPanelAction::None) {
+        *action = segment_action_from_timeline_intent(intent);
+    }
 }
 
 fn segment_timeline_covers<'a>(

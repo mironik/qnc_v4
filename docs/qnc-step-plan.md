@@ -1,10 +1,14 @@
 # QNC — plan razvoja (step by step)
 
-**Status:** dogovoreni smjer (2026-07)  
-**Cilj:** stabilan QNC-timeline, native klijent + Rust server, virtual-source, bez web playback kompromisa.
+**Status:** historical 2026-07 plan, not current `qnc_v4` implementation guide.
+Current product architecture is native `qnc-app` + `qnc-host` + broadcast
+player stack. Root web `app/`, root `plugins/`, custom elements and `qnc-client`
+are not active product targets.
+
+**Original cilj:** stabilan QNC-timeline, native klijent + Rust server, virtual-source, bez web playback kompromisa.
 
 **Povezano:**  
-- [qnc-client-server.md](qnc-client-server.md) — **kanonski deployment plan** (workstation / online_test, no-upload)  
+- [qnc-client-server.md](qnc-client-server.md) — historical deployment background
 - [qnc-elements.md](qnc-elements.md) — `<qnc-av-player>`, `<qnc-timeline>`, paneli  
 - [architecture-db-first.md](architecture-db-first.md), [qstory-editorial-playlist.md](abandoned/qstory-editorial-playlist.md) (ABANDONED)
 

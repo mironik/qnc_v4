@@ -6,6 +6,8 @@ use std::time::{Duration, Instant};
 
 use tracing::{info, warn};
 
+use crate::background_work::BackgroundWorkGate;
+use crate::ingest::thumb::timeline_seek_seconds;
 use crate::media::imported_clip_media_rows;
 use crate::project::db::{open_global, ProjectPaths};
 use crate::project::list_project_ids;
@@ -24,15 +26,17 @@ struct FilmstripJob {
 #[derive(Clone)]
 pub struct FilmstripWorker {
     paths: ProjectPaths,
+    background: BackgroundWorkGate,
     pending: Arc<Mutex<Vec<FilmstripJob>>>,
     blocked: Arc<Mutex<HashSet<String>>>,
     in_flight: Arc<AtomicUsize>,
 }
 
 impl FilmstripWorker {
-    pub fn new(paths: ProjectPaths) -> Self {
+    pub fn new(paths: ProjectPaths, background: BackgroundWorkGate) -> Self {
         Self {
             paths,
+            background,
             pending: Arc::new(Mutex::new(Vec::new())),
             blocked: Arc::new(Mutex::new(HashSet::new())),
             in_flight: Arc::new(AtomicUsize::new(0)),
@@ -115,8 +119,12 @@ impl FilmstripWorker {
     pub fn spawn(self: Arc<Self>) {
         tokio::spawn(async move {
             let mut last_recover = Instant::now();
-            let frames = 10u32;
+            let frames = super::DEFAULT_FILMSTRIP_FRAMES;
             loop {
+                if self.background.playback_active() {
+                    tokio::time::sleep(Duration::from_millis(400)).await;
+                    continue;
+                }
                 let job: Option<FilmstripJob> = {
                     let mut q = self.pending.lock().expect("filmstrip queue");
                     if q.is_empty() {
@@ -182,14 +190,14 @@ pub(crate) fn filmstrip_ready(paths: &ProjectPaths, project_id: &str, clip_id: &
     let Ok(frames) = list_frames_for_clip(paths, project_id, clip_id) else {
         return false;
     };
-    let want = super::DEFAULT_FILMSTRIP_FRAMES as usize;
-    frames.len() >= want
-        && frames.iter().all(|frame| {
-            frame
-                .get("path")
-                .and_then(|v| v.as_str())
-                .map(Path::new)
-                .map(|path| path.is_file())
-                .unwrap_or(false)
-        })
+    let duration = fs
+        .get("duration_sec")
+        .and_then(|v| v.as_f64())
+        .filter(|v| *v > 0.0)
+        .unwrap_or(0.0);
+    if duration <= 0.0 {
+        return false;
+    }
+    let seeks = timeline_seek_seconds(duration, super::DEFAULT_FILMSTRIP_FRAMES);
+    super::build::stored_frames_match_seeks(&frames, &seeks)
 }
