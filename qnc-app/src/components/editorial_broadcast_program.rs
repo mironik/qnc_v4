@@ -149,7 +149,7 @@ impl ItemBuilder {
                     source_fps,
                     source_duration_frames,
                     &media_input,
-                    !is_off,
+                    false,
                     true,
                     Some(PROGRAM_AUDIO_OUTPUT_CH1),
                     cover_start,
@@ -202,22 +202,40 @@ impl ItemBuilder {
         record_in_frame: i64,
         record_out_frame: i64,
     ) -> Self {
-        Self {
-            item_id: item_id_for_range(record_in_frame, record_out_frame),
-            record_in_frame,
-            record_out_frame,
-            sources: vec![MediaBuilder::from_segment_chunk(
+        let mut sources = Vec::new();
+        if !is_off {
+            sources.push(MediaBuilder::from_segment_chunk(
                 segment,
                 clip,
                 source_fps,
                 source_duration_frames,
                 media_input,
-                !is_off,
-                has_base_audio,
-                has_base_audio.then_some(PROGRAM_AUDIO_OUTPUT_CH1),
+                true,
+                false,
+                None,
                 record_in_frame,
                 record_out_frame,
-            )],
+            ));
+        }
+        if has_base_audio {
+            sources.push(MediaBuilder::from_segment_chunk(
+                segment,
+                clip,
+                source_fps,
+                source_duration_frames,
+                media_input,
+                false,
+                true,
+                Some(PROGRAM_AUDIO_OUTPUT_CH1),
+                record_in_frame,
+                record_out_frame,
+            ));
+        }
+        Self {
+            item_id: item_id_for_range(record_in_frame, record_out_frame),
+            record_in_frame,
+            record_out_frame,
+            sources,
         }
     }
 
@@ -602,13 +620,19 @@ mod tests {
         let item = &request.items[1];
         assert_eq!(item.record_in_frame, FrameNumber(50));
         assert_eq!(item.record_out_frame, FrameNumber(100));
-        assert_eq!(item.sources.len(), 1);
-        let source = &item.sources[0];
-        assert_eq!(source.source_ref.in_frame, Some(FrameNumber(200)));
-        assert_eq!(source.source_ref.out_frame, Some(FrameNumber(250)));
-        assert!(source.has_video);
-        assert!(source.has_audio);
-        assert_eq!(source.audio_output_channel, Some(PROGRAM_AUDIO_OUTPUT_CH1));
+        assert_eq!(item.sources.len(), 2);
+        let video = video_source(item);
+        assert_eq!(video.source_ref.in_frame, Some(FrameNumber(200)));
+        assert_eq!(video.source_ref.out_frame, Some(FrameNumber(250)));
+        assert!(video.has_video);
+        assert!(!video.has_audio);
+        assert_eq!(video.audio_output_channel, None);
+        let audio = audio_source(item, PROGRAM_AUDIO_OUTPUT_CH1);
+        assert_eq!(audio.source_ref.in_frame, Some(FrameNumber(200)));
+        assert_eq!(audio.source_ref.out_frame, Some(FrameNumber(250)));
+        assert!(!audio.has_video);
+        assert!(audio.has_audio);
+        assert_eq!(audio.audio_output_channel, Some(PROGRAM_AUDIO_OUTPUT_CH1));
     }
 
     #[test]
@@ -670,13 +694,19 @@ mod tests {
         let item = &request.items[0];
         assert_eq!(item.record_in_frame, FrameNumber(0));
         assert_eq!(item.record_out_frame, FrameNumber(150));
-        assert_eq!(item.sources.len(), 1);
-        let source = &item.sources[0];
-        assert_eq!(source.source_ref.in_frame, Some(FrameNumber(100)));
-        assert_eq!(source.source_ref.out_frame, Some(FrameNumber(250)));
-        assert!(source.has_video);
-        assert!(source.has_audio);
-        assert_eq!(source.audio_output_channel, Some(PROGRAM_AUDIO_OUTPUT_CH1));
+        assert_eq!(item.sources.len(), 2);
+        let video = video_source(item);
+        assert_eq!(video.source_ref.in_frame, Some(FrameNumber(100)));
+        assert_eq!(video.source_ref.out_frame, Some(FrameNumber(250)));
+        assert!(video.has_video);
+        assert!(!video.has_audio);
+        assert_eq!(video.audio_output_channel, None);
+        let audio = audio_source(item, PROGRAM_AUDIO_OUTPUT_CH1);
+        assert_eq!(audio.source_ref.in_frame, Some(FrameNumber(100)));
+        assert_eq!(audio.source_ref.out_frame, Some(FrameNumber(250)));
+        assert!(!audio.has_video);
+        assert!(audio.has_audio);
+        assert_eq!(audio.audio_output_channel, Some(PROGRAM_AUDIO_OUTPUT_CH1));
     }
 
     #[test]
@@ -715,7 +745,7 @@ mod tests {
     }
 
     #[test]
-    fn cover_range_is_one_playlist_item_with_video_a1_a2() {
+    fn cover_range_is_one_playlist_item_with_cover_video_a1_a2() {
         let program = program(vec![EditorialPlaylistSegment {
             part_id: "part_a".into(),
             kind: "tonovi".into(),
@@ -757,15 +787,21 @@ mod tests {
         let pre = &request.items[0];
         assert_eq!(pre.record_in_frame, FrameNumber(0));
         assert_eq!(pre.record_out_frame, FrameNumber(10));
-        assert_eq!(pre.sources.len(), 1);
-        let pre_source = &pre.sources[0];
-        assert_eq!(pre_source.source_ref.clip_id, "clip_a");
-        assert_eq!(pre_source.source_ref.in_frame, Some(FrameNumber(100)));
-        assert_eq!(pre_source.source_ref.out_frame, Some(FrameNumber(110)));
-        assert!(pre_source.has_video);
-        assert!(pre_source.has_audio);
+        assert_eq!(pre.sources.len(), 2);
+        let pre_video = video_source(pre);
+        let pre_audio = audio_source(pre, PROGRAM_AUDIO_OUTPUT_CH1);
+        assert_eq!(pre_video.source_ref.clip_id, "clip_a");
+        assert_eq!(pre_video.source_ref.in_frame, Some(FrameNumber(100)));
+        assert_eq!(pre_video.source_ref.out_frame, Some(FrameNumber(110)));
+        assert!(pre_video.has_video);
+        assert!(!pre_video.has_audio);
+        assert_eq!(pre_audio.source_ref.clip_id, "clip_a");
+        assert_eq!(pre_audio.source_ref.in_frame, Some(FrameNumber(100)));
+        assert_eq!(pre_audio.source_ref.out_frame, Some(FrameNumber(110)));
+        assert!(!pre_audio.has_video);
+        assert!(pre_audio.has_audio);
         assert_eq!(
-            pre_source.audio_output_channel,
+            pre_audio.audio_output_channel,
             Some(PROGRAM_AUDIO_OUTPUT_CH1)
         );
 
@@ -776,6 +812,14 @@ mod tests {
         let cover_video = video_source(cover);
         let cover_a1 = audio_source(cover, PROGRAM_AUDIO_OUTPUT_CH1);
         let cover_a2 = audio_source(cover, PROGRAM_AUDIO_OUTPUT_CH2);
+        assert_eq!(
+            cover
+                .sources
+                .iter()
+                .filter(|source| source.has_video)
+                .count(),
+            1
+        );
         assert_eq!(cover_video.source_ref.clip_id, "clip_b");
         assert_eq!(cover_video.source_ref.in_frame, Some(FrameNumber(40)));
         assert_eq!(cover_video.source_ref.out_frame, Some(FrameNumber(50)));
@@ -784,7 +828,7 @@ mod tests {
         assert_eq!(cover_a1.source_ref.clip_id, "clip_a");
         assert_eq!(cover_a1.source_ref.in_frame, Some(FrameNumber(110)));
         assert_eq!(cover_a1.source_ref.out_frame, Some(FrameNumber(120)));
-        assert!(cover_a1.has_video);
+        assert!(!cover_a1.has_video);
         assert!(cover_a1.has_audio);
         assert_eq!(
             cover_a1.audio_output_channel,
@@ -801,15 +845,21 @@ mod tests {
         let post = &request.items[2];
         assert_eq!(post.record_in_frame, FrameNumber(20));
         assert_eq!(post.record_out_frame, FrameNumber(50));
-        assert_eq!(post.sources.len(), 1);
-        let post_source = &post.sources[0];
-        assert_eq!(post_source.source_ref.clip_id, "clip_a");
-        assert_eq!(post_source.source_ref.in_frame, Some(FrameNumber(120)));
-        assert_eq!(post_source.source_ref.out_frame, Some(FrameNumber(150)));
-        assert!(post_source.has_video);
-        assert!(post_source.has_audio);
+        assert_eq!(post.sources.len(), 2);
+        let post_video = video_source(post);
+        let post_audio = audio_source(post, PROGRAM_AUDIO_OUTPUT_CH1);
+        assert_eq!(post_video.source_ref.clip_id, "clip_a");
+        assert_eq!(post_video.source_ref.in_frame, Some(FrameNumber(120)));
+        assert_eq!(post_video.source_ref.out_frame, Some(FrameNumber(150)));
+        assert!(post_video.has_video);
+        assert!(!post_video.has_audio);
+        assert_eq!(post_audio.source_ref.clip_id, "clip_a");
+        assert_eq!(post_audio.source_ref.in_frame, Some(FrameNumber(120)));
+        assert_eq!(post_audio.source_ref.out_frame, Some(FrameNumber(150)));
+        assert!(!post_audio.has_video);
+        assert!(post_audio.has_audio);
         assert_eq!(
-            post_source.audio_output_channel,
+            post_audio.audio_output_channel,
             Some(PROGRAM_AUDIO_OUTPUT_CH1)
         );
     }
@@ -888,10 +938,18 @@ mod tests {
         let a1 = audio_source(cover, PROGRAM_AUDIO_OUTPUT_CH1);
         let a2 = audio_source(cover, PROGRAM_AUDIO_OUTPUT_CH2);
         let video = video_source(cover);
+        assert_eq!(
+            cover
+                .sources
+                .iter()
+                .filter(|source| source.has_video)
+                .count(),
+            1
+        );
         assert_eq!(a1.source_ref.clip_id, "clip_a");
         assert_eq!(a1.source_ref.in_frame, Some(FrameNumber(140)));
         assert_eq!(a1.source_ref.out_frame, Some(FrameNumber(160)));
-        assert!(a1.has_video);
+        assert!(!a1.has_video);
         assert_eq!(a2.source_ref.clip_id, "clip_b");
         assert_eq!(a2.source_ref.in_frame, Some(FrameNumber(10)));
         assert_eq!(a2.source_ref.out_frame, Some(FrameNumber(30)));

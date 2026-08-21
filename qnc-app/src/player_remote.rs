@@ -7,6 +7,8 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
+use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use eframe::egui::{self, ColorImage};
@@ -62,6 +64,8 @@ const PLAYLIST_VIDEO_CACHE_FRAMES: usize = 48;
 const PLAYLIST_AUDIO_PREFETCH_FRAMES: u16 = 16;
 const PLAYLIST_AUDIO_CACHE_FRAMES: usize = 96;
 const PLAYLIST_DECODE_BURST_FRAMES: usize = 4;
+const PLAYLIST_SOURCE_WARMUP_LOOKAHEAD_FRAMES: CoreFrameNumber = 120;
+const PLAYLIST_SOURCE_WARMUP_MAX_SOURCES: usize = 2;
 const PLAYLIST_PREVIEW_WIDTH: u32 = 640;
 const PLAYLIST_PREVIEW_HEIGHT: u32 = 360;
 
@@ -114,6 +118,7 @@ pub const PROGRAM_AUDIO_OUTPUT_CH2: u8 = 1;
 #[allow(dead_code)]
 pub enum PlayerCommand {
     Open(BroadcastPlayerOpenRequest),
+    PrepareProgram(BroadcastProgramOpenRequest),
     OpenProgram(BroadcastProgramOpenRequest),
     Play,
     Pause,
@@ -152,6 +157,13 @@ pub enum PlayerEvent {
     },
     BoundaryReached {
         source_frame: FrameNumber,
+    },
+    ProgramPrepared {
+        request: BroadcastProgramOpenRequest,
+    },
+    ProgramPrepareFailed {
+        request: BroadcastProgramOpenRequest,
+        error: String,
     },
     Error(String),
     Stopped,
@@ -422,7 +434,6 @@ struct PlaylistInputVideoDecode {
     source_id: String,
     video_format: VideoFormat,
     program: PlayerProgramState,
-    start_program_frame: CoreFrameNumber,
     prepared_sources: BTreeSet<String>,
     inner: FfmpegVideoDecode,
 }
@@ -435,12 +446,14 @@ impl VideoDecodeAdapter for PlaylistInputVideoDecode {
         source: &EngineSourceHandle,
     ) -> Result<Vec<BroadcastEvent>, BroadcastEngineError> {
         self.require_playlist_source(source.source_id.as_str())?;
-        for point in playlist_preroll_points(
-            &self.program,
-            self.start_program_frame,
-            PlayerProgramSource::has_video,
-        ) {
-            self.prime_video_source(&point.source, point.program_frame)?;
+        let program_sources = self
+            .program
+            .media_sources_matching(PlayerProgramSource::has_video)
+            .into_iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        for program_source in program_sources {
+            let _ = self.ensure_video_source_prepared(&program_source)?;
         }
         Ok(Vec::new())
     }
@@ -454,6 +467,7 @@ impl VideoDecodeAdapter for PlaylistInputVideoDecode {
         if plan.visible_video_layer().is_none() {
             return self.black_frame(request.frame);
         };
+        self.request_upcoming_video_warmups(request.frame, &plan)?;
 
         let mut visible_frame = None;
         for program_source in &plan.video_layers {
@@ -491,15 +505,33 @@ impl PlaylistInputVideoDecode {
         Ok(events)
     }
 
-    fn prime_video_source(
+    fn request_upcoming_video_warmups(
         &mut self,
-        source: &PlayerProgramSource,
         program_frame: CoreFrameNumber,
+        plan: &ProgramFramePlan,
     ) -> Result<(), BroadcastEngineError> {
-        let _ = self.ensure_video_source_prepared(source)?;
-        let source_frame = source.source_frame_for_program_frame(program_frame);
-        let request = EngineFrameRequest::new(&source_handle(source), source_frame)?;
-        let _ = self.inner.decode_video_frame(request)?;
+        let active_sources = plan
+            .video_layers
+            .iter()
+            .map(|source| source.source.source_id.clone())
+            .collect::<BTreeSet<_>>();
+        for point in playlist_upcoming_start_points(
+            &self.program,
+            program_frame,
+            PLAYLIST_SOURCE_WARMUP_LOOKAHEAD_FRAMES,
+            PLAYLIST_SOURCE_WARMUP_MAX_SOURCES,
+            PlayerProgramSource::has_video,
+        ) {
+            if active_sources.contains(&point.source.source.source_id) {
+                continue;
+            }
+            let _ = self.ensure_video_source_prepared(&point.source)?;
+            let source_frame = point
+                .source
+                .source_frame_for_program_frame(point.program_frame);
+            let request = EngineFrameRequest::new(&source_handle(&point.source), source_frame)?;
+            self.inner.request_stream_warmup(request)?;
+        }
         Ok(())
     }
 
@@ -536,7 +568,6 @@ struct PlaylistInputAudioOutput {
     timebase: CoreTimebase,
     audio_format: AudioFormat,
     program: PlayerProgramState,
-    start_program_frame: CoreFrameNumber,
     prepared_sources: BTreeSet<String>,
     inner: FfmpegPlayerAudioOutput,
 }
@@ -549,12 +580,14 @@ impl AudioOutputAdapter for PlaylistInputAudioOutput {
         source: &EngineSourceHandle,
     ) -> Result<Vec<BroadcastEvent>, BroadcastEngineError> {
         self.require_playlist_source(source.source_id.as_str())?;
-        for point in playlist_preroll_points(
-            &self.program,
-            self.start_program_frame,
-            PlayerProgramSource::has_audio,
-        ) {
-            self.prime_audio_source(&point.source, point.program_frame)?;
+        let program_sources = self
+            .program
+            .media_sources_matching(PlayerProgramSource::has_audio)
+            .into_iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        for program_source in program_sources {
+            let _ = self.ensure_audio_source_prepared(&program_source)?;
         }
         Ok(Vec::new())
     }
@@ -568,6 +601,7 @@ impl AudioOutputAdapter for PlaylistInputAudioOutput {
         if plan.audio_buses.is_empty() {
             return self.silence_packet(request.frame);
         }
+        self.request_upcoming_audio_warmups(request.frame, &plan)?;
         let mut packet = self.silence_packet(request.frame)?;
         if let Some(program_source) = plan.audio_bus(PROGRAM_AUDIO_OUTPUT_CH1) {
             let _ = self.ensure_audio_source_prepared(program_source)?;
@@ -615,15 +649,33 @@ impl PlaylistInputAudioOutput {
         Ok(events)
     }
 
-    fn prime_audio_source(
+    fn request_upcoming_audio_warmups(
         &mut self,
-        source: &PlayerProgramSource,
         program_frame: CoreFrameNumber,
+        plan: &ProgramFramePlan,
     ) -> Result<(), BroadcastEngineError> {
-        let _ = self.ensure_audio_source_prepared(source)?;
-        let source_frame = source.source_frame_for_program_frame(program_frame);
-        let request = EngineFrameRequest::new(&source_handle(source), source_frame)?;
-        let _ = self.inner.render_audio_for_frame(request)?;
+        let active_sources = plan
+            .audio_buses
+            .iter()
+            .map(|bus| bus.source.source.source_id.clone())
+            .collect::<BTreeSet<_>>();
+        for point in playlist_upcoming_start_points(
+            &self.program,
+            program_frame,
+            PLAYLIST_SOURCE_WARMUP_LOOKAHEAD_FRAMES,
+            PLAYLIST_SOURCE_WARMUP_MAX_SOURCES,
+            PlayerProgramSource::has_audio,
+        ) {
+            if active_sources.contains(&point.source.source.source_id) {
+                continue;
+            }
+            let _ = self.ensure_audio_source_prepared(&point.source)?;
+            let source_frame = point
+                .source
+                .source_frame_for_program_frame(point.program_frame);
+            let request = EngineFrameRequest::new(&source_handle(&point.source), source_frame)?;
+            self.inner.inner_mut().request_stream_warmup(request)?;
+        }
         Ok(())
     }
 
@@ -718,6 +770,11 @@ impl PlayerDecodePolicy {
 pub struct PlayerRemote {
     runtime: Option<PlayerRuntimeSession>,
     program: Option<PlayerProgramState>,
+    active_program_request: Option<BroadcastProgramOpenRequest>,
+    prepared_program: Option<PreparedProgram>,
+    pending_program_open: Option<PendingProgramOpen>,
+    next_program_open_sequence: u64,
+    pending_program_play: bool,
     last_request: Option<BroadcastPlayerOpenRequest>,
     identity: Option<LoadedSourceIdentity>,
     decode_policy: PlayerDecodePolicy,
@@ -733,6 +790,27 @@ pub struct PlayerRemote {
     started_at: Instant,
     loaded_program: Option<SourceReadyBounds>,
     source_ready_sent: bool,
+}
+
+type ProgramOpenResult = Result<ProgramRuntimeBuild, String>;
+
+struct PreparedProgram {
+    request: BroadcastProgramOpenRequest,
+    build: ProgramRuntimeBuild,
+}
+
+struct PendingProgramOpen {
+    sequence: u64,
+    mode: PendingProgramMode,
+    request: BroadcastProgramOpenRequest,
+    rx: Receiver<ProgramOpenResult>,
+    started_at: Instant,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PendingProgramMode {
+    Prepare,
+    Open,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -758,6 +836,11 @@ impl PlayerRemote {
         Self {
             runtime: None,
             program: None,
+            active_program_request: None,
+            prepared_program: None,
+            pending_program_open: None,
+            next_program_open_sequence: 0,
+            pending_program_play: false,
             last_request: None,
             identity: None,
             decode_policy: PlayerDecodePolicy::default(),
@@ -850,11 +933,16 @@ impl PlayerRemote {
     pub fn dispatch(&mut self, command: PlayerCommand, ctx: &egui::Context) {
         match command {
             PlayerCommand::Open(request) => self.open(request, ctx),
+            PlayerCommand::PrepareProgram(request) => self.prepare_program(request, ctx),
             PlayerCommand::OpenProgram(request) => self.open_program(request, ctx),
             PlayerCommand::Play => self.play(ctx),
             PlayerCommand::Pause => self.pause(),
             PlayerCommand::TogglePlay => {
-                if self.playing {
+                if self.pending_program_open.is_some() && self.pending_program_play {
+                    self.pending_program_play = false;
+                    self.status = "Opening program".into();
+                    ctx.request_repaint();
+                } else if self.playing {
                     self.pause();
                 } else {
                     self.play(ctx);
@@ -873,6 +961,7 @@ impl PlayerRemote {
     }
 
     pub fn tick(&mut self, ctx: &egui::Context) -> Vec<PlayerEvent> {
+        self.poll_pending_program_open(ctx);
         self.flush_still(ctx);
         let mut out = self.drain_pending_player_events();
 
@@ -892,6 +981,7 @@ impl PlayerRemote {
     }
 
     pub fn poll(&mut self, ctx: &egui::Context) -> Vec<PlayerEvent> {
+        self.poll_pending_program_open(ctx);
         self.flush_still(ctx);
         let mut out = self.drain_pending_player_events();
         out.extend(self.drain_runtime_events());
@@ -913,6 +1003,8 @@ impl PlayerRemote {
 
     pub fn stop(&mut self) {
         self.pending_still = None;
+        self.pending_program_open = None;
+        self.pending_program_play = false;
         if self.runtime.is_some() {
             let events = self.dispatch_runtime_command(
                 "app-stop",
@@ -923,6 +1015,8 @@ impl PlayerRemote {
         }
         self.runtime = None;
         self.program = None;
+        self.active_program_request = None;
+        self.prepared_program = None;
         self.identity = None;
         self.last_request = None;
         self.loaded_program = None;
@@ -959,7 +1053,11 @@ impl PlayerRemote {
             return;
         }
 
+        self.pending_program_open = None;
+        self.pending_program_play = false;
+        self.prepared_program = None;
         self.program = None;
+        self.active_program_request = None;
         self.pending_still = None;
         self.last_still_frame = None;
         self.playing = false;
@@ -1029,79 +1127,270 @@ impl PlayerRemote {
         ctx.request_repaint();
     }
 
+    fn prepare_program(&mut self, request: BroadcastProgramOpenRequest, ctx: &egui::Context) {
+        if self.program_matches(&request)
+            || self.prepared_program_matches(&request)
+            || self.pending_program_matches(&request)
+        {
+            return;
+        }
+        self.start_program_build(request, PendingProgramMode::Prepare, ctx);
+    }
+
     fn open_program(&mut self, request: BroadcastProgramOpenRequest, ctx: &egui::Context) {
+        if self.program_matches(&request) && self.runtime.is_some() {
+            self.active = true;
+            self.status = "Ready".into();
+            ctx.request_repaint();
+            return;
+        }
+        if self.prepared_program_matches(&request) {
+            let Some(prepared) = self.prepared_program.take() else {
+                return;
+            };
+            crate::player_log::log_info("program-open", "open from prepared program");
+            let _ = self.finish_program_open(request, prepared.build, ctx);
+            return;
+        }
+        if let Some(pending) = self.pending_program_open.as_mut() {
+            if same_program_request(&pending.request, &request) {
+                pending.mode = PendingProgramMode::Open;
+                pending.request = request;
+                crate::player_log::log_info("program-open", "open waits for pending prepare");
+                ctx.request_repaint_after(Duration::from_millis(16));
+                return;
+            }
+        }
+        self.start_program_build(request, PendingProgramMode::Open, ctx);
+    }
+
+    fn start_program_build(
+        &mut self,
+        request: BroadcastProgramOpenRequest,
+        mode: PendingProgramMode,
+        ctx: &egui::Context,
+    ) {
         self.pending_still = None;
         self.last_still_frame = None;
-        self.playing = false;
-        self.active = false;
-        self.status = "Open program".into();
+        self.pending_error = None;
+        self.prepared_program = None;
+        self.status = match mode {
+            PendingProgramMode::Prepare => "Preparing program".into(),
+            PendingProgramMode::Open => "Opening program".into(),
+        };
+        crate::player_log::log_info(
+            "program-open",
+            format!(
+                "{mode:?} start items={} start_frame={}",
+                request.items.len(),
+                request.start_program_frame.0
+            ),
+        );
+        if mode == PendingProgramMode::Open {
+            self.playing = false;
+            self.active = false;
+            self.runtime = None;
+            self.program = None;
+            self.active_program_request = None;
+            self.identity = None;
+            self.last_request = None;
+            self.loaded_program = None;
+            self.source_ready_sent = false;
+            self.pending_program_play = false;
+        }
 
-        match build_program_runtime_session(&request, &self.decode_policy) {
-            Ok(build) => {
-                let start_frame = old_to_core_frame(request.start_program_frame)
-                    .min(build.program.duration_frames.saturating_sub(1));
-                let startup_warnings = build.session.startup_warnings.clone();
-                let playback_request = playback_request_from_source(
-                    format!("app-program-open-{}", build.session.source.source_id),
-                    build.session.source.clone(),
-                    build.session.range,
-                    start_frame,
-                );
-                self.loaded_program = Some(source_ready_bounds_from_program(&build.program));
-                self.source_ready_sent = false;
-                self.identity = Some(identity_from_program_request(&request));
-                self.runtime = Some(build.session);
-                self.program = Some(build.program);
-                self.last_request = None;
-                self.active = true;
-                self.set_display_program_frame(start_frame);
-                match playback_request {
-                    Ok(playback_request) => {
-                        let mut events = self.dispatch_runtime_command(
-                            "app-program-set-playlist-input",
-                            BroadcastPlayerProtocolCommand::SetPlaybackRequest {
-                                request: Box::new(playback_request),
-                            },
-                            self.now_tick(),
-                        );
-                        events.extend(
-                            self.apply_protocol_events(
-                                startup_warnings
-                                    .into_iter()
-                                    .map(|message| BroadcastPlayerProtocolEvent::DecodeWarning {
-                                        message,
-                                    })
-                                    .collect(),
-                            ),
-                        );
-                        self.pending_events.extend(events);
-                    }
-                    Err(err) => {
-                        self.runtime = None;
-                        self.program = None;
-                        self.identity = None;
-                        self.playing = false;
-                        self.active = false;
-                        self.status = err.clone();
-                        self.pending_error = Some(err);
-                    }
-                }
+        let sequence = self.next_program_open_sequence;
+        self.next_program_open_sequence = self.next_program_open_sequence.wrapping_add(1);
+        let (tx, rx) = mpsc::channel();
+        let worker_request = request.clone();
+        let decode_policy = self.decode_policy.clone();
+        let spawn_result = thread::Builder::new()
+            .name(format!("qnc-program-open-{sequence}"))
+            .spawn(move || {
+                let result = build_program_runtime_session(&worker_request, &decode_policy);
+                let _ = tx.send(result);
+            });
+
+        match spawn_result {
+            Ok(_) => {
+                self.pending_program_open = Some(PendingProgramOpen {
+                    sequence,
+                    mode,
+                    request,
+                    rx,
+                    started_at: Instant::now(),
+                });
+                ctx.request_repaint_after(Duration::from_millis(16));
             }
             Err(err) => {
-                self.runtime = None;
-                self.program = None;
-                self.identity = None;
-                self.last_request = None;
-                self.playing = false;
-                self.active = false;
-                self.status = err.clone();
-                self.pending_error = Some(err);
+                self.fail_program_open(format!("Ne mogu otvoriti program worker: {err}"));
             }
         }
         ctx.request_repaint();
     }
 
+    fn poll_pending_program_open(&mut self, ctx: &egui::Context) {
+        let Some((sequence, result)) =
+            self.pending_program_open
+                .as_ref()
+                .and_then(|pending| match pending.rx.try_recv() {
+                    Ok(result) => Some((pending.sequence, result)),
+                    Err(TryRecvError::Empty) => {
+                        ctx.request_repaint_after(Duration::from_millis(16));
+                        None
+                    }
+                    Err(TryRecvError::Disconnected) => Some((
+                        pending.sequence,
+                        Err("Program open worker je prekinut".to_string()),
+                    )),
+                })
+        else {
+            return;
+        };
+        let Some(pending) = self.pending_program_open.take() else {
+            return;
+        };
+        if pending.sequence != sequence {
+            return;
+        }
+
+        let should_play = self.pending_program_play;
+        self.pending_program_play = false;
+        let elapsed_ms = pending.started_at.elapsed().as_millis();
+        crate::player_log::log_info(
+            "program-open",
+            format!("{:?} ready in {elapsed_ms} ms", pending.mode),
+        );
+        match result {
+            Ok(build) => match pending.mode {
+                PendingProgramMode::Prepare => {
+                    let request = pending.request.clone();
+                    self.prepared_program = Some(PreparedProgram {
+                        request: request.clone(),
+                        build,
+                    });
+                    if self.status == "Preparing program" {
+                        self.status = "Program prepared".into();
+                    }
+                    self.pending_events
+                        .push(PlayerEvent::ProgramPrepared { request });
+                }
+                PendingProgramMode::Open => {
+                    if self
+                        .finish_program_open(pending.request, build, ctx)
+                        .is_ok()
+                        && should_play
+                    {
+                        self.play(ctx);
+                    }
+                }
+            },
+            Err(err) => match pending.mode {
+                PendingProgramMode::Prepare => self.fail_program_prepare(pending.request, err),
+                PendingProgramMode::Open => self.fail_program_open(err),
+            },
+        }
+        ctx.request_repaint();
+    }
+
+    fn finish_program_open(
+        &mut self,
+        request: BroadcastProgramOpenRequest,
+        build: ProgramRuntimeBuild,
+        ctx: &egui::Context,
+    ) -> Result<(), String> {
+        let start_frame =
+            old_to_core_frame(request.start_program_frame).min(build.program.duration_frames - 1);
+        let configured_start_frame = build.configured_start_frame;
+        let startup_warnings = build.session.startup_warnings.clone();
+
+        self.loaded_program = Some(source_ready_bounds_from_program(&build.program));
+        self.source_ready_sent = false;
+        self.identity = Some(identity_from_program_request(&request));
+        self.runtime = Some(build.session);
+        self.program = Some(build.program);
+        self.active_program_request = Some(request);
+        self.last_request = None;
+        self.active = true;
+        self.status = "Ready".into();
+        self.set_display_program_frame(start_frame);
+        let mut events = self.drain_runtime_events();
+        if configured_start_frame != start_frame {
+            events.extend(self.dispatch_runtime_command(
+                "app-program-cue-frame",
+                BroadcastPlayerProtocolCommand::CueFrame {
+                    frame: start_frame,
+                    present_frame: true,
+                },
+                self.now_tick(),
+            ));
+        }
+        events.extend(
+            self.apply_protocol_events(
+                startup_warnings
+                    .into_iter()
+                    .map(|message| BroadcastPlayerProtocolEvent::DecodeWarning { message })
+                    .collect(),
+            ),
+        );
+        self.pending_events.extend(events);
+        ctx.request_repaint();
+        Ok(())
+    }
+
+    fn fail_program_open(&mut self, err: String) {
+        self.runtime = None;
+        self.program = None;
+        self.active_program_request = None;
+        self.identity = None;
+        self.last_request = None;
+        self.loaded_program = None;
+        self.source_ready_sent = false;
+        self.playing = false;
+        self.active = false;
+        self.status = err.clone();
+        self.pending_error = Some(err);
+    }
+
+    fn fail_program_prepare(&mut self, request: BroadcastProgramOpenRequest, err: String) {
+        self.prepared_program = None;
+        self.pending_program_play = false;
+        self.status = err.clone();
+        crate::player_log::log_error("player-prepare", &err);
+        self.pending_events.push(PlayerEvent::ProgramPrepareFailed {
+            request,
+            error: err,
+        });
+    }
+
+    fn program_matches(&self, request: &BroadcastProgramOpenRequest) -> bool {
+        self.runtime.is_some()
+            && self.program.is_some()
+            && self
+                .active_program_request
+                .as_ref()
+                .is_some_and(|active| same_program_request(active, request))
+    }
+
+    fn prepared_program_matches(&self, request: &BroadcastProgramOpenRequest) -> bool {
+        self.prepared_program
+            .as_ref()
+            .is_some_and(|prepared| same_program_request(&prepared.request, request))
+    }
+
+    fn pending_program_matches(&self, request: &BroadcastProgramOpenRequest) -> bool {
+        self.pending_program_open
+            .as_ref()
+            .is_some_and(|pending| same_program_request(&pending.request, request))
+    }
+
     fn play(&mut self, ctx: &egui::Context) {
+        if self.pending_program_open.is_some() {
+            self.pending_program_play = true;
+            self.status = "Opening program".into();
+            ctx.request_repaint_after(Duration::from_millis(16));
+            return;
+        }
         self.commit_pending_still_before_play(ctx);
         if self.runtime.is_none() {
             let Some(request) = self.last_request.clone() else {
@@ -1141,6 +1430,11 @@ impl PlayerRemote {
 
     fn pause(&mut self) {
         self.pending_still = None;
+        self.pending_program_play = false;
+        if self.pending_program_open.is_some() {
+            self.status = "Opening program".into();
+            return;
+        }
         if self.runtime.is_some() {
             let events = self.dispatch_runtime_command(
                 "app-pause",
@@ -1558,6 +1852,7 @@ fn build_runtime_session(
 struct ProgramRuntimeBuild {
     session: PlayerRuntimeSession,
     program: PlayerProgramState,
+    configured_start_frame: CoreFrameNumber,
 }
 
 fn build_program_runtime_session(
@@ -1573,6 +1868,7 @@ fn build_program_runtime_session(
 
     let toolchain = FfmpegToolchain::default();
     let mut registry_paths = BTreeMap::new();
+    let mut probe_cache = BTreeMap::new();
     let mut items = Vec::new();
     let mut startup_warnings = Vec::new();
     let mut source_ids = ProgramSourceIdAllocator::default();
@@ -1588,6 +1884,7 @@ fn build_program_runtime_session(
                 source_id,
                 &toolchain,
                 &mut registry_paths,
+                &mut probe_cache,
             )?);
         }
         if sources.is_empty() {
@@ -1665,7 +1962,6 @@ fn build_program_runtime_session(
             source_id: playlist_source_id.clone(),
             video_format: playlist_video_format,
             program: program.clone(),
-            start_program_frame,
             prepared_sources: BTreeSet::new(),
             inner: video_decode,
         }),
@@ -1674,7 +1970,6 @@ fn build_program_runtime_session(
             timebase,
             audio_format: playlist_audio_format,
             program: program.clone(),
-            start_program_frame,
             prepared_sources: BTreeSet::new(),
             inner: audio,
         }),
@@ -1682,18 +1977,44 @@ fn build_program_runtime_session(
     )
     .with_decode_burst_frames(PLAYLIST_DECODE_BURST_FRAMES);
 
+    let mut session = PlayerRuntimeSession {
+        runtime: BroadcastPlayerRuntime::new(transport),
+        monitor,
+        event_bridge,
+        source: playlist_input,
+        range,
+        startup_warnings,
+        last_frame_revision: 0,
+    };
+    configure_program_runtime_session(&mut session, start_program_frame)?;
+
     Ok(ProgramRuntimeBuild {
-        session: PlayerRuntimeSession {
-            runtime: BroadcastPlayerRuntime::new(transport),
-            monitor,
-            event_bridge,
-            source: playlist_input,
-            range,
-            startup_warnings,
-            last_frame_revision: 0,
-        },
+        session,
         program,
+        configured_start_frame: start_program_frame,
     })
+}
+
+fn configure_program_runtime_session(
+    session: &mut PlayerRuntimeSession,
+    start_frame: CoreFrameNumber,
+) -> Result<(), String> {
+    let playback_request = playback_request_from_source(
+        format!("app-program-open-{}", session.source.source_id),
+        session.source.clone(),
+        session.range,
+        start_frame,
+    )?;
+    session.runtime.dispatch_at(
+        PlayerRuntimeCommand::new(
+            "app-program-set-playlist-input",
+            BroadcastPlayerProtocolCommand::SetPlaybackRequest {
+                request: Box::new(playback_request),
+            },
+        ),
+        0,
+    );
+    Ok(())
 }
 
 fn build_program_source_runtime(
@@ -1703,13 +2024,14 @@ fn build_program_source_runtime(
     source_id: String,
     toolchain: &FfmpegToolchain,
     registry_paths: &mut BTreeMap<String, PathBuf>,
+    probe_cache: &mut BTreeMap<String, qnc_media_ffmpeg::FfmpegProbeReport>,
 ) -> Result<PlayerProgramSource, String> {
     let media_path = PathBuf::from(source_spec.media_input.trim());
     if media_path.as_os_str().is_empty() {
         return Err(format!("Program media nema path · {}", item.item_id));
     }
     let mut source =
-        probe_program_source_runtime(source_spec, source_id.clone(), &media_path, toolchain)?
+        probe_program_source_runtime(source_id.clone(), &media_path, toolchain, probe_cache)?
             .source;
     if !source_spec.has_video {
         source.video_format = None;
@@ -2017,13 +2339,21 @@ fn video_prefetch_rule_from_json(value: &Value) -> Option<FfmpegVideoPrefetchRul
 }
 
 fn probe_program_source_runtime(
-    _source: &BroadcastProgramSource,
     source_id: String,
     media_path: &std::path::Path,
     toolchain: &FfmpegToolchain,
+    probe_cache: &mut BTreeMap<String, qnc_media_ffmpeg::FfmpegProbeReport>,
 ) -> Result<qnc_media_ffmpeg::FfmpegProbeReport, String> {
-    probe_source_runtime_with_toolchain(media_path, source_id, toolchain)
-        .map_err(|error| error.to_string())
+    let cache_key = media_input_identity(media_path.to_string_lossy().as_ref());
+    if let Some(cached) = probe_cache.get(&cache_key) {
+        let mut report = cached.clone();
+        report.source.source_id = source_id;
+        return Ok(report);
+    }
+    let report = probe_source_runtime_with_toolchain(media_path, source_id.clone(), toolchain)
+        .map_err(|error| error.to_string())?;
+    probe_cache.insert(cache_key, report.clone());
+    Ok(report)
 }
 
 fn source_ready_bounds_from_session(session: &PlayerRuntimeSession) -> SourceReadyBounds {
@@ -2142,6 +2472,17 @@ fn identity_from_program_request(request: &BroadcastProgramOpenRequest) -> Loade
             BroadcastSourceKind::AudioOnly
         },
     }
+}
+
+fn same_program_request(
+    left: &BroadcastProgramOpenRequest,
+    right: &BroadcastProgramOpenRequest,
+) -> bool {
+    left.program_id == right.program_id
+        && left.project_id == right.project_id
+        && (left.timeline_fps - right.timeline_fps).abs() < 0.01
+        && left.duration_frames == right.duration_frames
+        && left.items == right.items
 }
 
 fn source_kind(has_audio: bool) -> BroadcastSourceKind {
@@ -2331,6 +2672,7 @@ impl PlayerProgramState {
         }
     }
 
+    #[cfg(test)]
     fn video_source_at_program_frame(
         &self,
         program_frame: CoreFrameNumber,
@@ -2354,6 +2696,7 @@ impl PlayerProgramState {
             .unwrap_or_default()
     }
 
+    #[cfg(test)]
     fn audio_source_at_program_frame(
         &self,
         program_frame: CoreFrameNumber,
@@ -2387,6 +2730,7 @@ impl PlayerProgramState {
         buses
     }
 
+    #[cfg(test)]
     fn source_at_program_frame_matching(
         &self,
         program_frame: CoreFrameNumber,
@@ -2418,40 +2762,35 @@ impl PlayerProgramState {
 }
 
 #[derive(Clone)]
-struct PlaylistPrerollPoint {
+struct PlaylistStartPoint {
     source: PlayerProgramSource,
     program_frame: CoreFrameNumber,
 }
 
-fn playlist_preroll_points(
+fn playlist_upcoming_start_points(
     program: &PlayerProgramState,
-    start_program_frame: CoreFrameNumber,
+    after_frame: CoreFrameNumber,
+    lookahead_frames: CoreFrameNumber,
+    max_sources: usize,
     has_track: fn(&PlayerProgramSource) -> bool,
-) -> Vec<PlaylistPrerollPoint> {
+) -> Vec<PlaylistStartPoint> {
+    let horizon = after_frame.saturating_add(lookahead_frames);
     let mut seen_sources = BTreeSet::new();
     let mut points = Vec::new();
-
-    if let Some(source) = program.source_at_program_frame_matching(start_program_frame, has_track) {
-        seen_sources.insert(source.source.source_id.clone());
-        points.push(PlaylistPrerollPoint {
-            source: source.clone(),
-            program_frame: start_program_frame,
-        });
-    }
-
     for source in program.media_sources_matching(has_track) {
-        if source.record_out_frame <= start_program_frame {
+        if source.record_in_frame <= after_frame || source.record_in_frame > horizon {
             continue;
         }
         if !seen_sources.insert(source.source.source_id.clone()) {
             continue;
         }
-        points.push(PlaylistPrerollPoint {
-            program_frame: source.record_in_frame,
+        points.push(PlaylistStartPoint {
             source: source.clone(),
+            program_frame: source.record_in_frame,
         });
     }
-
+    points.sort_by_key(|point| (point.program_frame, point.source.source.source_id.clone()));
+    points.truncate(max_sources.max(1));
     points
 }
 
@@ -2703,6 +3042,49 @@ mod tests {
         }
     }
 
+    fn program_open_request() -> BroadcastProgramOpenRequest {
+        BroadcastProgramOpenRequest {
+            program_id: "story_a".into(),
+            project_id: "project".into(),
+            timeline_fps: 50.0,
+            duration_frames: 100,
+            start_program_frame: FrameNumber(0),
+            items: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn program_source_probe_cache_reuses_probe_with_requested_source_id() {
+        let path = "C:/MEDIA/CLIP.MP4";
+        let source = SourceRuntime::new("cached-source", 100, CoreTimebase::new(50, 1).unwrap())
+            .unwrap()
+            .with_video_format(
+                VideoFormat::new(1920, 1080, FieldMode::Progressive, ColorSpace::Rec709).unwrap(),
+            )
+            .with_audio_format(AudioFormat::new(48_000, 2).unwrap());
+        let mut cache = BTreeMap::from([(
+            media_input_identity(path),
+            qnc_media_ffmpeg::FfmpegProbeReport {
+                source,
+                has_video: true,
+                has_audio: true,
+            },
+        )]);
+        let toolchain = FfmpegToolchain::new("ffmpeg", "ffprobe").unwrap();
+
+        let report = probe_program_source_runtime(
+            "playlist-source".into(),
+            std::path::Path::new(path),
+            &toolchain,
+            &mut cache,
+        )
+        .unwrap();
+
+        assert_eq!(report.source.source_id, "playlist-source");
+        assert!(report.has_video);
+        assert!(report.has_audio);
+    }
+
     #[test]
     fn app_adapter_uses_contract_frames_for_runtime_range() {
         let source = SourceRuntime::new("src", 100, CoreTimebase::new(50, 1).unwrap()).unwrap();
@@ -2782,6 +3164,45 @@ mod tests {
 
         assert_eq!(remote.take_pending_still_for_play(), Some(37));
         assert!(remote.pending_still.is_none());
+    }
+
+    #[test]
+    fn play_defers_while_program_open_is_pending() {
+        let mut remote = PlayerRemote::new();
+        let (_tx, rx) = std::sync::mpsc::channel();
+        remote.pending_program_open = Some(PendingProgramOpen {
+            sequence: 7,
+            mode: PendingProgramMode::Open,
+            request: program_open_request(),
+            rx,
+            started_at: Instant::now(),
+        });
+
+        remote.play(&egui::Context::default());
+
+        assert!(remote.pending_program_play);
+        assert!(!remote.playing);
+        assert!(remote.pending_error.is_none());
+        assert_eq!(remote.status, "Opening program");
+    }
+
+    #[test]
+    fn toggle_play_cancels_pending_program_autoplay() {
+        let mut remote = PlayerRemote::new();
+        let (_tx, rx) = std::sync::mpsc::channel();
+        remote.pending_program_open = Some(PendingProgramOpen {
+            sequence: 7,
+            mode: PendingProgramMode::Open,
+            request: program_open_request(),
+            rx,
+            started_at: Instant::now(),
+        });
+        remote.pending_program_play = true;
+
+        remote.dispatch(PlayerCommand::TogglePlay, &egui::Context::default());
+
+        assert!(!remote.pending_program_play);
+        assert_eq!(remote.status, "Opening program");
     }
 
     #[test]
@@ -3506,7 +3927,7 @@ mod tests {
     }
 
     #[test]
-    fn playlist_preroll_points_start_at_active_frame_and_dedupe_sources() {
+    fn playlist_upcoming_start_points_are_lookahead_bounded() {
         let mut program = two_take_program_state();
         program.items.push(program_item(
             "item_c",
@@ -3514,13 +3935,16 @@ mod tests {
             150,
             vec![program_source("part_c", 100, 150, 20, 70, "clip_b")],
         ));
-        let points = playlist_preroll_points(&program, 60, PlayerProgramSource::has_video);
 
-        assert_eq!(points.len(), 2);
-        assert_eq!(points[0].source.spec.source_ref.virtual_shot_id, "part_b");
-        assert_eq!(points[0].program_frame, 60);
-        assert_eq!(points[1].source.spec.source_ref.virtual_shot_id, "part_c");
-        assert_eq!(points[1].program_frame, 100);
+        let too_early =
+            playlist_upcoming_start_points(&program, 60, 39, 2, PlayerProgramSource::has_video);
+        assert!(too_early.is_empty());
+
+        let points =
+            playlist_upcoming_start_points(&program, 60, 40, 2, PlayerProgramSource::has_video);
+        assert_eq!(points.len(), 1);
+        assert_eq!(points[0].source.spec.source_ref.virtual_shot_id, "part_c");
+        assert_eq!(points[0].program_frame, 100);
     }
 
     #[test]

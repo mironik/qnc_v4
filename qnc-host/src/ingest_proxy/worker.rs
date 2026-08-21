@@ -9,8 +9,8 @@ use tracing::{info, warn};
 use crate::filmstrip::{FilmstripWorker, DEFAULT_FILMSTRIP_FRAMES};
 use crate::ingest::asset_row::IngestAssetRow;
 use crate::ingest::db::{
-    ingest_asset_meta, mark_ingest_job_error, mark_ingest_job_processing, open_ingest,
-    queue_ingest_job,
+    ingest_asset_meta, mark_ingest_job_done, mark_ingest_job_error, mark_ingest_job_processing,
+    open_ingest, queue_ingest_job,
 };
 use crate::ingest::import_finish::complete_imported_clip;
 use crate::ingest::proxy_generate::{generate_field_proxy, proxy_dest_for_source};
@@ -233,6 +233,8 @@ impl ProxyGenerateWorker {
                     plan.card_locked,
                     &original_path,
                 )?;
+                mark_ingest_job_done(&conn, "proxy_generate", &job.source_id, &job.clip_id)
+                    .map_err(|e| e.to_string())?;
                 // Fallback: ako CPU filmstrip nije krenuo/gotov — dodaj s project proxyja.
                 if dest.is_file()
                     && !crate::filmstrip::filmstrip_ready(

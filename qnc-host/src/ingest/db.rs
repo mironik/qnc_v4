@@ -226,10 +226,15 @@ pub fn mark_ingest_job_error(
     Ok(())
 }
 
-pub fn reset_processing_ingest_jobs(conn: &Connection) -> rusqlite::Result<usize> {
+pub fn reset_processing_ingest_jobs_for_type(
+    conn: &Connection,
+    job_type: &str,
+) -> rusqlite::Result<usize> {
     let changed = conn.execute(
-        "UPDATE ingest_jobs SET status = 'queued', updated_at = ?1 WHERE status = 'processing'",
-        params![now_str()],
+        "UPDATE ingest_jobs
+         SET status = 'queued', updated_at = ?1
+         WHERE status = 'processing' AND job_type = ?2",
+        params![now_str(), job_type.trim()],
     )?;
     Ok(changed)
 }
@@ -693,6 +698,46 @@ mod tests {
             )
             .unwrap();
         assert_eq!(status, "queued");
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn reset_processing_ingest_jobs_for_type_only_resets_matching_worker() {
+        let base = std::env::temp_dir().join(format!(
+            "qnc_ingest_jobs_typed_reset_test_{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+        let paths = test_paths(&base);
+        let conn = open_ingest(&paths, "job_proj").unwrap();
+
+        queue_ingest_job(&conn, "import", "local", "clip_a").unwrap();
+        mark_ingest_job_processing(&conn, "import", "local", "clip_a").unwrap();
+        queue_ingest_job(&conn, "proxy_generate", "local", "clip_a").unwrap();
+        mark_ingest_job_processing(&conn, "proxy_generate", "local", "clip_a").unwrap();
+
+        let changed = reset_processing_ingest_jobs_for_type(&conn, "import").unwrap();
+        assert_eq!(changed, 1);
+
+        let import_status: String = conn
+            .query_row(
+                "SELECT status FROM ingest_jobs WHERE job_id = ?1",
+                params![ingest_job_id("import", "local", "clip_a")],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let proxy_status: String = conn
+            .query_row(
+                "SELECT status FROM ingest_jobs WHERE job_id = ?1",
+                params![ingest_job_id("proxy_generate", "local", "clip_a")],
+                |r| r.get(0),
+            )
+            .unwrap();
+
+        assert_eq!(import_status, "queued");
+        assert_eq!(proxy_status, "processing");
 
         let _ = fs::remove_dir_all(&base);
     }

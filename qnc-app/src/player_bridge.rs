@@ -83,6 +83,7 @@ pub fn apply_player_events(
                 client.set_player_preview_active(false);
                 client.apply_playback_command_state(false, "Stopped");
             }
+            PlayerEvent::ProgramPrepared { .. } | PlayerEvent::ProgramPrepareFailed { .. } => {}
             PlayerEvent::SourceReady { .. } => {}
         }
     }

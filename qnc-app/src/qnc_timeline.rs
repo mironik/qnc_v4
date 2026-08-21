@@ -217,6 +217,7 @@ pub struct QncTimeline<'a> {
 #[derive(Debug, Clone, Default)]
 pub struct TimelineInteract {
     pub seek_frame: Option<i64>,
+    pub row_start_click: bool,
     pub expand_click: Option<ExpandedAudio>,
     pub select_virtual: Option<String>,
     pub select_cover: Option<String>,
@@ -226,6 +227,7 @@ pub struct TimelineInteract {
 
 struct AudioRowInteract {
     expand_click: bool,
+    row_start_click: bool,
     seek_frame: Option<i64>,
 }
 
@@ -367,8 +369,7 @@ impl QncTimeline<'_> {
     }
 
     fn paint_label(ui: &mut egui::Ui, row: egui::Rect, label: &str, expanded: bool) {
-        let label_rect =
-            egui::Rect::from_min_size(row.min, Vec2::new(css::LABEL_COL_W, row.height()));
+        let label_rect = Self::label_rect(row);
         let painter = ui.painter();
         painter.rect_filled(label_rect, 0.0, css::LABEL_BG);
         painter.vline(
@@ -385,6 +386,10 @@ impl QncTimeline<'_> {
         );
     }
 
+    fn label_rect(row: egui::Rect) -> egui::Rect {
+        egui::Rect::from_min_size(row.min, Vec2::new(css::LABEL_COL_W, row.height()))
+    }
+
     fn paint_audio_row(
         &self,
         ui: &mut egui::Ui,
@@ -399,11 +404,10 @@ impl QncTimeline<'_> {
         let width = ui.available_width();
         let (row, response) =
             ui.allocate_exact_size(Vec2::new(width, height), egui::Sense::click_and_drag());
-        let label_rect =
-            egui::Rect::from_min_size(row.min, Vec2::new(css::LABEL_COL_W, row.height()));
+        let label_rect = Self::label_rect(row);
         let label_resp = ui.interact(
             label_rect,
-            ui.id().with(("audio_label", label)),
+            response.id.with(("audio_label", label)),
             egui::Sense::click(),
         );
         if label_resp.hovered() {
@@ -459,11 +463,13 @@ impl QncTimeline<'_> {
         if self.show_lane_labels && label_resp.clicked() {
             return AudioRowInteract {
                 expand_click: true,
+                row_start_click: true,
                 seek_frame: None,
             };
         }
         AudioRowInteract {
             expand_click: false,
+            row_start_click: false,
             seek_frame: seek_from_pointer(&response, inner, duration_frames),
         }
     }
@@ -475,6 +481,15 @@ impl QncTimeline<'_> {
             Vec2::new(width, self.video_stack_h()),
             egui::Sense::click_and_drag(),
         );
+        let label_rect = Self::label_rect(row);
+        let label_resp = ui.interact(
+            label_rect,
+            response.id.with("video_label"),
+            egui::Sense::click(),
+        );
+        if label_resp.hovered() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
         Self::paint_label(
             ui,
             row,
@@ -568,6 +583,13 @@ impl QncTimeline<'_> {
             }
         }
 
+        if self.show_lane_labels && label_resp.clicked() {
+            return TimelineInteract {
+                row_start_click: true,
+                ..TimelineInteract::default()
+            };
+        }
+
         pointer_interact(
             &response,
             inner,
@@ -581,6 +603,7 @@ impl QncTimeline<'_> {
 }
 
 fn merge_interact(out: &mut TimelineInteract, update: TimelineInteract) {
+    out.row_start_click |= update.row_start_click;
     if out.expand_click.is_none() {
         out.expand_click = update.expand_click;
     }
@@ -602,6 +625,7 @@ fn merge_interact(out: &mut TimelineInteract, update: TimelineInteract) {
 }
 
 fn merge_audio(out: &mut TimelineInteract, lane: ExpandedAudio, a: AudioRowInteract) {
+    out.row_start_click |= a.row_start_click;
     if a.expand_click {
         out.expand_click = Some(lane);
     } else if out.seek_frame.is_none() {

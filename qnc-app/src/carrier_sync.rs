@@ -159,6 +159,7 @@ impl CarrierSync {
                 }
             }
             PlayerEvent::Stopped => self.clear(),
+            PlayerEvent::ProgramPrepared { .. } | PlayerEvent::ProgramPrepareFailed { .. } => {}
             PlayerEvent::Error(_) => {}
         }
     }

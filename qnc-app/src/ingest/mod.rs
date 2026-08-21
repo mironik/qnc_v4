@@ -22,6 +22,7 @@ use crate::qnc_filmstrip_background::FilmFrame;
 use crate::qnc_location_browser::clean_location_path;
 use crate::qnc_source_dock::{self, SourceDockAction, SourceDockInput};
 use crate::qnc_timeline::{ExpandedAudio, TimelineFocusPaint};
+use crate::qnc_timeline_progress::TimelineProgressModel;
 use crate::qnc_ui;
 use crate::shortcuts::{StoryBindings, STORYBOARD_SHORTCUT_SCOPE};
 use crate::story::playback_controls::{self, PlaybackAction};
@@ -72,6 +73,7 @@ pub struct IngestScreen {
     shortcuts_loaded: bool,
     shortcut_catalog: Option<Value>,
     shortcut_user: Option<Value>,
+    selection_revision: u64,
 }
 
 pub enum IngestAction {
@@ -140,6 +142,7 @@ impl Default for IngestScreen {
             shortcuts_loaded: false,
             shortcut_catalog: None,
             shortcut_user: None,
+            selection_revision: 0,
         }
     }
 }
@@ -298,6 +301,23 @@ impl IngestScreen {
         self.state_busy = false;
     }
 
+    pub fn apply_status_state(&mut self, st: IngestState) {
+        let incoming_project = st.project_id.trim().to_string();
+        if !self.project_id.trim().is_empty()
+            && !incoming_project.is_empty()
+            && self.project_id != incoming_project
+        {
+            return;
+        }
+        let path_keep = self.path_edit.clone();
+        if !incoming_project.is_empty() {
+            self.project_id = incoming_project.clone();
+            self.loaded_for_project = incoming_project;
+        }
+        self.apply(st);
+        self.path_edit = path_keep;
+    }
+
     pub fn begin_import_command(&mut self, project_id: &str) {
         self.project_id = project_id.to_string();
         self.loaded_for_project = project_id.to_string();
@@ -329,6 +349,7 @@ impl IngestScreen {
         let previous = clip.selected;
         clip.selected = !clip.selected;
         rebuild_selected_clip_ids(st);
+        self.bump_selection_revision();
         self.last_poll = Some(Instant::now());
         Some(previous)
     }
@@ -349,6 +370,7 @@ impl IngestScreen {
         }
         clip.selected = selected;
         rebuild_selected_clip_ids(st);
+        self.bump_selection_revision();
         self.last_poll = Some(Instant::now());
         true
     }
@@ -363,6 +385,7 @@ impl IngestScreen {
             clip.selected = true;
         }
         rebuild_selected_clip_ids(st);
+        self.bump_selection_revision();
         self.last_poll = Some(Instant::now());
         Some(previous)
     }
@@ -377,6 +400,7 @@ impl IngestScreen {
             clip.selected = false;
         }
         rebuild_selected_clip_ids(st);
+        self.bump_selection_revision();
         self.last_poll = Some(Instant::now());
         Some(previous)
     }
@@ -395,8 +419,17 @@ impl IngestScreen {
             }
         }
         rebuild_selected_clip_ids(st);
+        self.bump_selection_revision();
         self.last_poll = Some(Instant::now());
         true
+    }
+
+    fn bump_selection_revision(&mut self) {
+        self.selection_revision = self.selection_revision.saturating_add(1);
+    }
+
+    pub fn selection_revision(&self) -> u64 {
+        self.selection_revision
     }
 
     pub fn apply_archive_option_state(&mut self, st: IngestState, message: impl Into<String>) {
@@ -448,10 +481,6 @@ impl IngestScreen {
             .map(|t| t.elapsed() >= POLL_INTERVAL)
             .unwrap_or(true);
         due && self.needs_poll()
-    }
-
-    pub fn selected_clip_count(&self) -> usize {
-        self.selected_clip_ids().len()
     }
 
     pub fn confirm_dir_path(&mut self) -> Result<String, String> {
@@ -543,6 +572,9 @@ impl IngestScreen {
         let Some(st) = &self.state else {
             return;
         };
+        if self.image_asset_loader.is_saturated() {
+            return;
+        }
         let mut requested = false;
         if !self.preview_clip_id.trim().is_empty() {
             if let Some(c) = st.clips.iter().find(|c| c.clip_id == self.preview_clip_id) {
@@ -592,9 +624,10 @@ impl IngestScreen {
             ctx.request_repaint();
         }
         if self.state.as_ref().is_some_and(|st| {
-            st.clips.iter().any(|c| {
-                !c.thumb_url.trim().is_empty() && !self.poster_textures.contains_key(&c.clip_id)
-            })
+            !self.image_asset_loader.is_saturated()
+                && st.clips.iter().any(|c| {
+                    !c.thumb_url.trim().is_empty() && !self.poster_textures.contains_key(&c.clip_id)
+                })
         }) {
             ctx.request_repaint_after(Duration::from_millis(80));
         }
@@ -767,8 +800,12 @@ impl IngestScreen {
             .as_ref()
             .map(|s| s.selected_clip_ids.len())
             .unwrap_or(0);
-        let (sel, total, imp, _) = self.summary();
-        let status = format!("{imp} uvezeno · {sel}/{total}");
+        let (sel, total, imp, pending) = self.summary();
+        let status = if pending > 0 {
+            format!("{imp} uvezeno · {pending} u tijeku · {sel}/{total}")
+        } else {
+            format!("{imp} uvezeno · {sel}/{total}")
+        };
         let mut frames: Vec<FilmFrame> = Vec::new();
         if let Some(tex) = self.poster_textures.get(&self.preview_clip_id) {
             let n = 12i64;
@@ -783,24 +820,34 @@ impl IngestScreen {
                     seek_sec: seek,
                     url: String::new(),
                     texture: Some(tex.clone()),
+                    load_attempts: 0,
                 });
             }
         }
         let empty: &[f32] = &[];
-        let Some(fps) = clip
+        let fps = clip
             .and_then(|clip| (clip.fps.is_finite() && clip.fps > 0.0).then_some(clip.fps))
             .or_else(|| {
                 (self.selected_source_fps.is_finite() && self.selected_source_fps > 0.0)
                     .then_some(self.selected_source_fps)
-            })
-        else {
-            ui.label("Source FPS nije potvrđen");
-            return IngestAction::None;
+            });
+        let fps_confirmed = fps.is_some();
+        let fps = fps.unwrap_or(0.0);
+        let tc_frame = |frame: i64| {
+            if fps_confirmed {
+                format_tc(frame_to_seconds(frame.max(0), fps), fps)
+            } else {
+                "--:--:--:--".into()
+            }
         };
-        let tc_frame = |frame: i64| format_tc(frame_to_seconds(frame.max(0), fps), fps);
-        let duration_frames = seconds_to_frame(dur, fps).max(1);
+        let duration_frames = if fps_confirmed {
+            seconds_to_frame(dur, fps).max(1)
+        } else {
+            1
+        };
         let live_source_ref = self.selected_source_ref.as_ref();
-        if live_source_ref.is_some_and(|source_ref| playback.active_source_matches(source_ref))
+        if fps_confirmed
+            && live_source_ref.is_some_and(|source_ref| playback.active_source_matches(source_ref))
             && playback.carrier().is_active()
         {
             self.virtual_frame = playback
@@ -811,16 +858,20 @@ impl IngestScreen {
         } else {
             self.virtual_frame = self.virtual_frame.clamp(0, duration_frames);
         }
-        let timeline_model = playback.timeline_model_for_source_ref(
-            live_source_ref,
-            fps,
-            duration_frames,
-            0,
-            duration_frames,
-            0,
-            duration_frames,
-            self.virtual_frame,
-        );
+        let timeline_model = if fps_confirmed {
+            playback.timeline_model_for_source_ref(
+                live_source_ref,
+                fps,
+                duration_frames,
+                0,
+                duration_frames,
+                0,
+                duration_frames,
+                self.virtual_frame,
+            )
+        } else {
+            TimelineProgressModel::from_ranges(0.0, 1, 0, 0, 1, 0, 1)
+        };
         let dock = qnc_source_dock::show(
             ui,
             SourceDockInput {
@@ -1019,6 +1070,7 @@ mod tests {
             screen.selected_clip_ids(),
             vec!["a".to_string(), "b".to_string()]
         );
+        assert_eq!(screen.selection_revision(), 1);
     }
 
     #[test]
@@ -1070,6 +1122,74 @@ mod tests {
         assert_eq!(
             screen.selected_clip_ids(),
             vec!["a".to_string(), "b".to_string()]
+        );
+    }
+
+    #[test]
+    fn apply_status_state_preserves_browse_path_and_project_scope() {
+        let mut screen = IngestScreen {
+            path_edit: "C:\\card".into(),
+            project_id: "p1".into(),
+            loaded_for_project: "p1".into(),
+            ..Default::default()
+        };
+
+        screen.apply_status_state(IngestState {
+            project_id: "p2".into(),
+            clips: vec![clip("foreign", false)],
+            ..Default::default()
+        });
+        assert!(screen.state.is_none());
+
+        screen.apply_status_state(IngestState {
+            project_id: "p1".into(),
+            browse_path: "C:\\other".into(),
+            clips: vec![clip("local", false)],
+            ..Default::default()
+        });
+        assert_eq!(screen.path_edit, "C:\\card");
+        assert_eq!(
+            screen
+                .state
+                .as_ref()
+                .and_then(|state| state.clips.first())
+                .map(|clip| clip.clip_id.as_str()),
+            Some("local")
+        );
+    }
+
+    #[test]
+    fn poster_pump_does_not_grow_image_backlog_when_loader_is_saturated() {
+        let mut screen = IngestScreen {
+            state: Some(IngestState {
+                clips: (0..8)
+                    .map(|i| IngestClip {
+                        clip_id: format!("clip_{i}"),
+                        thumb_url: "/thumb.jpg".into(),
+                        ..Default::default()
+                    })
+                    .collect(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        for i in 0..media_assets::IMAGE_ASSET_MAX_IN_FLIGHT {
+            assert!(screen.image_asset_loader.request(
+                ImageAssetKey::new("stress", format!("queued_{i}"), "poster"),
+                format!("http://203.0.113.1/{i}.jpg"),
+                None,
+            ));
+        }
+
+        screen.pump_posters(
+            &HostClient::new("http://127.0.0.1:8001"),
+            "p",
+            &egui::Context::default(),
+        );
+
+        assert_eq!(
+            screen.image_asset_loader.in_flight_len(),
+            media_assets::IMAGE_ASSET_MAX_IN_FLIGHT
         );
     }
 }

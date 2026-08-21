@@ -5,7 +5,9 @@ use crate::component_runtime::{ComponentBackendCommand, ComponentBackendEvent};
 
 const COMPONENT_ID: &str = "editorial.state";
 const OP_LOAD: &str = "load";
+const OP_REFRESH: &str = "refresh";
 const PORT_STORY_STATE: &str = "story.state";
+const PORT_STORY_STATUS: &str = "story.status";
 const PORT_TIMELINE_MODEL: &str = "timeline.model";
 const PORT_PLAYLIST: &str = "playlist";
 const REQUEST_SEP: char = '\u{1f}';
@@ -16,6 +18,7 @@ pub(crate) enum EditorialStateData {
         instance_id: String,
         project_id: String,
         state: Value,
+        refresh_only: bool,
     },
     TimelineModel {
         instance_id: String,
@@ -37,6 +40,19 @@ impl EditorialStateComponent {
             COMPONENT_ID,
             PORT_STORY_STATE,
             OP_LOAD,
+            request_key(instance_id, project_id),
+            format!(
+                "/api/story/state?project_id={}",
+                api::encode_query_value(project_id)
+            ),
+        )
+    }
+
+    pub fn refresh_story_status(instance_id: &str, project_id: &str) -> ComponentBackendCommand {
+        ComponentBackendCommand::get(
+            COMPONENT_ID,
+            PORT_STORY_STATUS,
+            OP_REFRESH,
             request_key(instance_id, project_id),
             format!(
                 "/api/story/state?project_id={}",
@@ -73,10 +89,12 @@ impl EditorialStateComponent {
 
     pub fn accepts_event(event: &ComponentBackendEvent) -> bool {
         event.component_id == COMPONENT_ID
-            && event.operation_id == OP_LOAD
             && matches!(
-                event.port_id.as_str(),
-                PORT_STORY_STATE | PORT_TIMELINE_MODEL | PORT_PLAYLIST
+                (event.operation_id.as_str(), event.port_id.as_str()),
+                (OP_LOAD, PORT_STORY_STATE)
+                    | (OP_LOAD, PORT_TIMELINE_MODEL)
+                    | (OP_LOAD, PORT_PLAYLIST)
+                    | (OP_REFRESH, PORT_STORY_STATUS)
             )
     }
 
@@ -103,10 +121,11 @@ fn parse_data(
     value: Value,
 ) -> Result<EditorialStateData, String> {
     match port_id {
-        PORT_STORY_STATE => Ok(EditorialStateData::StoryState {
+        PORT_STORY_STATE | PORT_STORY_STATUS => Ok(EditorialStateData::StoryState {
             instance_id: instance_id.to_string(),
             project_id: project_id.to_string(),
             state: value,
+            refresh_only: port_id == PORT_STORY_STATUS,
         }),
         PORT_TIMELINE_MODEL => {
             let timeline: TimelineModel =
@@ -148,6 +167,7 @@ mod tests {
     fn state_projection_commands_use_independent_ports_for_latest_wins() {
         let commands = [
             EditorialStateComponent::load_story_state("story", "p1"),
+            EditorialStateComponent::refresh_story_status("story", "p1"),
             EditorialStateComponent::load_timeline_model("story", "p1"),
             EditorialStateComponent::load_playlist("story", "p1"),
         ];
@@ -155,14 +175,15 @@ mod tests {
             .iter()
             .map(|command| command.port_id.as_str())
             .collect();
-        assert_eq!(commands.len(), 3);
-        assert_eq!(ports.len(), 3);
+        assert_eq!(commands.len(), 4);
+        assert_eq!(ports.len(), 4);
         assert!(commands.iter().all(|command| {
             command.component_id == COMPONENT_ID
-                && command.operation_id == OP_LOAD
                 && command.request_key == request_key("story", "p1")
                 && command.method == HostRequestMethod::Get
         }));
+        assert_eq!(commands[0].operation_id, OP_LOAD);
+        assert_eq!(commands[1].operation_id, OP_REFRESH);
     }
 
     #[test]

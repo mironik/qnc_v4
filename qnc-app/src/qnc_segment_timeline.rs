@@ -630,6 +630,9 @@ fn program_intent_from_timeline_interact(
     row: SegmentTimelineProgramRow,
     markers: &[SegmentTimelineProgramMarker<'_>],
 ) -> SegmentTimelineProgramIntent {
+    if interact.row_start_click {
+        return SegmentTimelineProgramIntent::CueProgramFrame(row.start_frame());
+    }
     if let Some(lane) = interact.expand_click {
         return SegmentTimelineProgramIntent::ToggleAudioExpand(segment_expanded_audio(lane));
     }
@@ -969,6 +972,17 @@ mod tests {
                 &markers,
             ),
             SegmentTimelineProgramIntent::CueProgramFrame(62)
+        );
+        assert_eq!(
+            program_intent_from_timeline_interact(
+                TimelineInteract {
+                    row_start_click: true,
+                    ..TimelineInteract::default()
+                },
+                row,
+                &markers,
+            ),
+            SegmentTimelineProgramIntent::CueProgramFrame(50)
         );
         assert_eq!(
             program_intent_from_timeline_interact(

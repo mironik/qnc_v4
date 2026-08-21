@@ -1,4 +1,4 @@
-use std::fs::{create_dir_all, File};
+use std::fs::{File, create_dir_all};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -481,6 +481,10 @@ impl<A, S> AudioOutputWithSink<A, S> {
     pub fn new(inner: A, sink: S) -> Self {
         Self { inner, sink }
     }
+
+    pub fn inner_mut(&mut self) -> &mut A {
+        &mut self.inner
+    }
 }
 
 impl<A, S> AudioOutputAdapter for AudioOutputWithSink<A, S>
@@ -738,9 +742,11 @@ mod tests {
         sink.accept_audio_packet(&audio_packet(4, 1)).unwrap();
         let events = sink.accept_audio_packet(&audio_packet(6, 1)).unwrap();
 
-        assert!(events
-            .iter()
-            .any(|event| matches!(event, BroadcastEvent::DroppedFrame { expected_frame: 5 })));
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, BroadcastEvent::DroppedFrame { expected_frame: 5 }))
+        );
         assert!(events.iter().any(|event| matches!(
             event,
             BroadcastEvent::BufferStateChanged { buffered_frames: 1 }
@@ -763,9 +769,11 @@ mod tests {
             event,
             BroadcastEvent::BufferStateChanged { buffered_frames: 0 }
         )));
-        assert!(events
-            .iter()
-            .all(|event| !matches!(event, BroadcastEvent::DroppedFrame { .. })));
+        assert!(
+            events
+                .iter()
+                .all(|event| !matches!(event, BroadcastEvent::DroppedFrame { .. }))
+        );
     }
 
     #[test]
@@ -780,9 +788,11 @@ mod tests {
         assert!(events.iter().any(|event| {
             matches!(event, BroadcastEvent::FramePresented { frame } if *frame == 7)
         }));
-        assert!(events
-            .iter()
-            .all(|event| !matches!(event, BroadcastEvent::AVSyncWarning { .. })));
+        assert!(
+            events
+                .iter()
+                .all(|event| !matches!(event, BroadcastEvent::AVSyncWarning { .. }))
+        );
     }
 
     #[test]
@@ -813,9 +823,11 @@ mod tests {
             .unwrap();
         let events = presenter.present_frame(decoded_frame(9)).unwrap();
 
-        assert!(events
-            .iter()
-            .all(|event| !matches!(event, BroadcastEvent::AVSyncWarning { .. })));
+        assert!(
+            events
+                .iter()
+                .all(|event| !matches!(event, BroadcastEvent::AVSyncWarning { .. }))
+        );
     }
 
     fn decoded_frame(frame: u64) -> DecodedVideoFrame<FfmpegVideoPayload> {

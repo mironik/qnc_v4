@@ -107,6 +107,8 @@ struct IngestSelectionBody {
     project_id: String,
     #[serde(default)]
     selected_clip_ids: Vec<String>,
+    #[serde(default)]
+    selection_revision: Option<u64>,
 }
 
 async fn api_ingest_selection(
@@ -114,9 +116,14 @@ async fn api_ingest_selection(
     Json(body): Json<IngestSelectionBody>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let pid = resolve_project_id(&app, &body.project_id)?;
-    save_selection(&app.project.paths, &pid, &body.selected_clip_ids)
-        .map(Json)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
+    save_selection(
+        &app.project.paths,
+        &pid,
+        &body.selected_clip_ids,
+        body.selection_revision,
+    )
+    .map(Json)
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
 }
 
 #[derive(serde::Deserialize)]

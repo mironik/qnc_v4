@@ -12,6 +12,7 @@ mod shortcut_bindings;
 mod source_import_command;
 mod source_import_selection;
 mod source_import_state;
+mod source_import_status;
 mod theme_picker;
 
 pub(crate) use editorial_broadcast_program::{
@@ -28,4 +29,5 @@ pub(crate) use shortcut_bindings::{ShortcutBindingsComponent, ShortcutBindingsDa
 pub(crate) use source_import_command::{SourceImportCommandComponent, SourceImportCommandKind};
 pub(crate) use source_import_selection::SourceImportSelectionComponent;
 pub(crate) use source_import_state::{SourceImportStateComponent, SourceImportStateKind};
+pub(crate) use source_import_status::SourceImportStatusComponent;
 pub(crate) use theme_picker::ThemePickerComponent;

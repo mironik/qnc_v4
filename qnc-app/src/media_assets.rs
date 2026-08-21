@@ -21,6 +21,7 @@ use crate::api::{self, HostClient, HostRequestMethod, HostRequestTimeout};
 
 const DOWNLOAD_CONNECT_TIMEOUT: Duration = Duration::from_secs(8);
 const DOWNLOAD_READ_TIMEOUT: Duration = Duration::from_secs(120);
+pub(crate) const IMAGE_ASSET_MAX_IN_FLIGHT: usize = 64;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct ImageAssetKey {
@@ -113,6 +114,9 @@ impl AsyncImageAssetLoader {
         if url.trim().is_empty() || self.in_flight.contains(&key) {
             return false;
         }
+        if self.is_saturated() {
+            return false;
+        }
         if self
             .tx
             .send(ImageAssetRequest {
@@ -127,6 +131,15 @@ impl AsyncImageAssetLoader {
         }
         self.in_flight.insert(key);
         true
+    }
+
+    pub fn is_saturated(&self) -> bool {
+        self.in_flight.len() >= IMAGE_ASSET_MAX_IN_FLIGHT
+    }
+
+    #[cfg(test)]
+    pub fn in_flight_len(&self) -> usize {
+        self.in_flight.len()
     }
 
     pub fn poll(&mut self) -> Vec<ImageAssetResult> {
@@ -424,5 +437,46 @@ mod tests {
             url,
             "http://127.0.0.1:8001/api/ingest/thumbnail?project_id=p%201&clip_id=c%2F2"
         );
+    }
+
+    #[test]
+    fn image_loader_caps_in_flight_backlog() {
+        let mut loader = AsyncImageAssetLoader::new();
+        let mut accepted = 0;
+        for i in 0..(IMAGE_ASSET_MAX_IN_FLIGHT + 16) {
+            if loader.request(
+                ImageAssetKey::new("stress", format!("clip_{i}"), "poster"),
+                format!("http://127.0.0.1:9/{i}.jpg"),
+                None,
+            ) {
+                accepted += 1;
+            }
+        }
+
+        assert_eq!(accepted, IMAGE_ASSET_MAX_IN_FLIGHT);
+        assert_eq!(loader.in_flight_len(), IMAGE_ASSET_MAX_IN_FLIGHT);
+        assert!(loader.is_saturated());
+    }
+
+    #[test]
+    fn image_loader_cancel_pending_releases_backlog() {
+        let mut loader = AsyncImageAssetLoader::new();
+        for i in 0..IMAGE_ASSET_MAX_IN_FLIGHT {
+            assert!(loader.request(
+                ImageAssetKey::new("stress", format!("clip_{i}"), "poster"),
+                format!("http://127.0.0.1:9/{i}.jpg"),
+                None,
+            ));
+        }
+
+        loader.cancel_pending();
+
+        assert_eq!(loader.in_flight_len(), 0);
+        assert!(!loader.is_saturated());
+        assert!(loader.request(
+            ImageAssetKey::new("stress", "after_cancel", "poster"),
+            "http://127.0.0.1:9/after_cancel.jpg".into(),
+            None,
+        ));
     }
 }

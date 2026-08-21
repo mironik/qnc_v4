@@ -281,6 +281,7 @@ pub struct FfmpegVideoDecode {
     registry: FfmpegSourceRegistry,
     options: FfmpegDecodeOptions,
     sessions: BTreeMap<String, FfmpegVideoSession>,
+    warmups: BTreeMap<String, FfmpegVideoWarmup>,
 }
 
 impl FfmpegVideoDecode {
@@ -293,8 +294,15 @@ impl FfmpegVideoDecode {
             registry,
             options,
             sessions: BTreeMap::new(),
+            warmups: BTreeMap::new(),
         }
     }
+}
+
+#[derive(Debug)]
+struct FfmpegVideoWarmup {
+    start_frame: u64,
+    rx: Receiver<Result<FfmpegVideoStream, BroadcastEngineError>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1222,6 +1230,102 @@ pub struct FfmpegVideoPayload {
 }
 
 impl FfmpegVideoDecode {
+    pub fn request_stream_warmup(
+        &mut self,
+        request: EngineFrameRequest,
+    ) -> Result<(), BroadcastEngineError> {
+        self.poll_stream_warmups();
+        if self
+            .cached_payload(&request.source_id, request.frame)
+            .is_some()
+        {
+            return Ok(());
+        }
+        let path = self.registry.source_path(&request.source_id)?.to_path_buf();
+        let (start_frame, read_ahead_frames, field_mode, output_filter_format, frame_byte_len) = {
+            let session = self.video_session(&request.source_id)?;
+            let start_frame = session.decode_frame_for_request(request.frame);
+            if session.can_reuse_stream_for(start_frame) {
+                return Ok(());
+            }
+            let prefetch_frames = self
+                .options
+                .effective_video_prefetch_frames(&session.decode_profile);
+            let end_frame = session.prefetch_end_frame(start_frame, prefetch_frames);
+            (
+                start_frame,
+                frame_span_len(start_frame, end_frame)?,
+                session.source_field_mode,
+                session.output_filter_format.clone(),
+                session.frame_byte_len()?,
+            )
+        };
+        if self
+            .warmups
+            .get(&request.source_id)
+            .is_some_and(|warmup| warmup.start_frame == start_frame)
+        {
+            return Ok(());
+        }
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let toolchain = self.options.toolchain.clone();
+        let hardware_decode = self.options.hardware_decode.clone();
+        let timebase = request.timebase;
+        let read_timeout = self.options.read_timeout;
+        let source_id = request.source_id.clone();
+        thread::Builder::new()
+            .name(format!("qnc-ffmpeg-video-warmup-{source_id}"))
+            .spawn(move || {
+                let stream_request = FfmpegVideoStreamRequest {
+                    toolchain: &toolchain,
+                    hardware_decode: &hardware_decode,
+                    timebase,
+                    field_mode,
+                    output_filter_format: output_filter_format.as_ref(),
+                    frame_byte_len,
+                    read_ahead_frames,
+                    read_timeout,
+                };
+                let result = FfmpegVideoStream::spawn(&path, start_frame, stream_request);
+                let _ = tx.send(result);
+            })
+            .map_err(|err| engine_error(BroadcastEngineErrorKind::VideoDecode, err))?;
+        self.warmups
+            .insert(source_id, FfmpegVideoWarmup { start_frame, rx });
+        Ok(())
+    }
+
+    fn poll_stream_warmups(&mut self) {
+        let source_ids = self.warmups.keys().cloned().collect::<Vec<_>>();
+        for source_id in source_ids {
+            let result = match self.warmups.get(&source_id) {
+                Some(warmup) => match warmup.rx.try_recv() {
+                    Ok(result) => Some(result),
+                    Err(TryRecvError::Empty) => None,
+                    Err(TryRecvError::Disconnected) => Some(Err(BroadcastEngineError::new(
+                        BroadcastEngineErrorKind::VideoDecode,
+                        "ffmpeg video warmup stopped before returning stream",
+                    )
+                    .with_source_id(source_id.clone()))),
+                },
+                None => None,
+            };
+            let Some(result) = result else {
+                continue;
+            };
+            self.warmups.remove(&source_id);
+            let Ok(stream) = result else {
+                continue;
+            };
+            if let Some(session) = self.sessions.get_mut(&source_id) {
+                if session.stream.is_none() {
+                    session.stream = Some(stream);
+                }
+            }
+        }
+    }
+
     fn cached_payload(&self, source_id: &str, frame: u64) -> Option<FfmpegVideoPayload> {
         self.sessions
             .get(source_id)
@@ -1339,6 +1443,7 @@ impl VideoDecodeAdapter for FfmpegVideoDecode {
         &mut self,
         request: EngineFrameRequest,
     ) -> Result<DecodedVideoFrame<Self::VideoFrame>, BroadcastEngineError> {
+        self.poll_stream_warmups();
         self.cache_ready_streamed_payload(&request)?;
         if let Some(payload) = self.cached_payload(&request.source_id, request.frame) {
             return Ok(decoded_video_frame(request, payload));
@@ -1366,6 +1471,7 @@ pub struct FfmpegAudioOutput {
     registry: FfmpegSourceRegistry,
     options: FfmpegAudioDecodeOptions,
     sessions: BTreeMap<String, FfmpegAudioSession>,
+    warmups: BTreeMap<String, FfmpegAudioWarmup>,
 }
 
 impl FfmpegAudioOutput {
@@ -1378,6 +1484,104 @@ impl FfmpegAudioOutput {
             registry,
             options,
             sessions: BTreeMap::new(),
+            warmups: BTreeMap::new(),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct FfmpegAudioWarmup {
+    start_frame: u64,
+    rx: Receiver<Result<FfmpegAudioStream, BroadcastEngineError>>,
+}
+
+impl FfmpegAudioOutput {
+    pub fn request_stream_warmup(
+        &mut self,
+        request: EngineFrameRequest,
+    ) -> Result<(), BroadcastEngineError> {
+        self.poll_stream_warmups();
+        if self
+            .cached_packet(&request.source_id, request.frame)
+            .is_some()
+        {
+            return Ok(());
+        }
+        let path = self.registry.source_path(&request.source_id)?.to_path_buf();
+        let (start_frame, read_ahead_packets, audio_format) = {
+            let session = self.audio_session(&request.source_id)?;
+            let start_frame = session.decode_frame_for_request(request.frame);
+            if session.can_reuse_stream_for(start_frame) {
+                return Ok(());
+            }
+            let end_frame =
+                session.prefetch_end_frame(start_frame, self.options.audio_prefetch_frames);
+            (
+                start_frame,
+                audio_frame_span_len(start_frame, end_frame)?,
+                session.audio_format.clone(),
+            )
+        };
+        if self
+            .warmups
+            .get(&request.source_id)
+            .is_some_and(|warmup| warmup.start_frame == start_frame)
+        {
+            return Ok(());
+        }
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let toolchain = self.options.toolchain.clone();
+        let timebase = request.timebase;
+        let read_timeout = self.options.read_timeout;
+        let source_id = request.source_id.clone();
+        thread::Builder::new()
+            .name(format!("qnc-ffmpeg-audio-warmup-{source_id}"))
+            .spawn(move || {
+                let result = FfmpegAudioStream::spawn(
+                    &path,
+                    &toolchain,
+                    &audio_format,
+                    timebase,
+                    start_frame,
+                    read_ahead_packets,
+                    read_timeout,
+                );
+                let _ = tx.send(result);
+            })
+            .map_err(|err| engine_error(BroadcastEngineErrorKind::AudioOutput, err))?;
+        self.warmups
+            .insert(source_id, FfmpegAudioWarmup { start_frame, rx });
+        Ok(())
+    }
+
+    fn poll_stream_warmups(&mut self) {
+        let source_ids = self.warmups.keys().cloned().collect::<Vec<_>>();
+        for source_id in source_ids {
+            let result = match self.warmups.get(&source_id) {
+                Some(warmup) => match warmup.rx.try_recv() {
+                    Ok(result) => Some(result),
+                    Err(TryRecvError::Empty) => None,
+                    Err(TryRecvError::Disconnected) => Some(Err(BroadcastEngineError::new(
+                        BroadcastEngineErrorKind::AudioOutput,
+                        "ffmpeg audio warmup stopped before returning stream",
+                    )
+                    .with_source_id(source_id.clone()))),
+                },
+                None => None,
+            };
+            let Some(result) = result else {
+                continue;
+            };
+            self.warmups.remove(&source_id);
+            let Ok(stream) = result else {
+                continue;
+            };
+            if let Some(session) = self.sessions.get_mut(&source_id) {
+                if session.stream.is_none() {
+                    session.stream = Some(stream);
+                }
+            }
         }
     }
 
@@ -2235,6 +2439,7 @@ impl AudioOutputAdapter for FfmpegAudioOutput {
         &mut self,
         request: EngineFrameRequest,
     ) -> Result<AudioFramePacket<Self::AudioPacket>, BroadcastEngineError> {
+        self.poll_stream_warmups();
         self.cache_ready_streamed_packet(&request)?;
         if let Some(payload) = self.cached_packet(&request.source_id, request.frame) {
             let audio_format = self.audio_session(&request.source_id)?.audio_format.clone();

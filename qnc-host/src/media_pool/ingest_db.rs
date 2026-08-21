@@ -132,7 +132,7 @@ pub fn pending_import_count(paths: &ProjectPaths, project_id: &str) -> Result<i6
     }
     conn.query_row(
         "SELECT COUNT(*) FROM ingest_assets
-         WHERE import_status IN ('queued', 'processing')",
+         WHERE import_status IN ('queued', 'processing', 'original_ready', 'generating_proxy')",
         [],
         |row| row.get(0),
     )
@@ -426,7 +426,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn pending_import_count_reads_queued_and_processing_assets() {
+    fn pending_import_count_reads_active_import_pipeline_assets() {
         let root = std::env::temp_dir().join(format!(
             "qnc_media_pool_pending_import_test_{}",
             std::process::id()
@@ -442,6 +442,8 @@ mod tests {
         for (clip_id, status) in [
             ("clip_queued", "queued"),
             ("clip_processing", "processing"),
+            ("clip_original_ready", "original_ready"),
+            ("clip_generating_proxy", "generating_proxy"),
             ("clip_imported", "imported"),
             ("clip_error", "error"),
         ] {
@@ -454,7 +456,7 @@ mod tests {
         }
         drop(conn);
 
-        assert_eq!(pending_import_count(&paths, project_id).unwrap(), 2);
+        assert_eq!(pending_import_count(&paths, project_id).unwrap(), 4);
         let _ = std::fs::remove_dir_all(&root);
     }
 

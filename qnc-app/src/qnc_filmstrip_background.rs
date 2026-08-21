@@ -17,6 +17,7 @@ pub struct FilmFrame {
     pub seek_sec: f64,
     pub url: String,
     pub texture: Option<TextureHandle>,
+    pub load_attempts: u8,
 }
 
 pub fn merge_frames(existing: &mut Vec<FilmFrame>, frames: impl IntoIterator<Item = FilmFrame>) {
@@ -28,6 +29,11 @@ pub fn merge_frames(existing: &mut Vec<FilmFrame>, frames: impl IntoIterator<Ite
                 .iter()
                 .find(|existing| existing.index == frame.index && existing.url == frame.url)
                 .and_then(|existing| existing.texture.clone());
+            frame.load_attempts = old
+                .iter()
+                .find(|existing| existing.index == frame.index && existing.url == frame.url)
+                .map(|existing| existing.load_attempts)
+                .unwrap_or(0);
             frame
         })
         .collect();
@@ -94,6 +100,7 @@ mod tests {
             seek_sec: 0.0,
             url: "/old.jpg".into(),
             texture: None,
+            load_attempts: 0,
         }];
 
         merge_frames(
@@ -104,12 +111,14 @@ mod tests {
                     seek_sec: 1.0,
                     url: "/b.jpg".into(),
                     texture: None,
+                    load_attempts: 0,
                 },
                 FilmFrame {
                     index: 0,
                     seek_sec: 0.0,
                     url: "/a.jpg".into(),
                     texture: None,
+                    load_attempts: 0,
                 },
             ],
         );

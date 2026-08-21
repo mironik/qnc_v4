@@ -13,7 +13,7 @@ use crate::ingest::asset_row::IngestAssetRow;
 use crate::ingest::audio_wrap::{audio_copy_dest, audio_project_dir, complete_imported_audio_clip};
 use crate::ingest::db::{
     ingest_asset_meta, mark_ingest_job_error, mark_ingest_job_processing, open_ingest,
-    queue_ingest_job, reset_processing_ingest_jobs,
+    queue_ingest_job, reset_processing_ingest_jobs_for_type,
 };
 use crate::ingest::import_finish::complete_imported_clip;
 use crate::ingest::store::{ingest_archive_original_enabled, row_import_error};
@@ -100,7 +100,7 @@ impl ImportWorker {
                 continue;
             }
             let conn = open_ingest(&self.paths, &project_id).map_err(|e| e.to_string())?;
-            reset_processing_ingest_jobs(&conn).map_err(|e| e.to_string())?;
+            reset_processing_ingest_jobs_for_type(&conn, "import").map_err(|e| e.to_string())?;
             let count: i64 = conn
                 .query_row(
                     "SELECT COUNT(*) FROM ingest_assets

@@ -105,6 +105,10 @@ impl BroadcastPlayerTx {
         self.send(PlayerCommand::Open(request))
     }
 
+    pub fn prepare_program(&self, request: BroadcastProgramOpenRequest) -> Result<(), String> {
+        self.send(PlayerCommand::PrepareProgram(request))
+    }
+
     pub fn open_program(&self, request: BroadcastProgramOpenRequest) -> Result<(), String> {
         self.send(PlayerCommand::OpenProgram(request))
     }
@@ -305,6 +309,12 @@ impl QncBroadcastPlayer {
                 }
                 PlayerEvent::BoundaryReached { source_frame } => {
                     crate::player_log::log_state("player", "Boundary", false, source_frame.0, 0.0);
+                }
+                PlayerEvent::ProgramPrepared { .. } => {
+                    crate::player_log::log_info("player", "Program prepared");
+                }
+                PlayerEvent::ProgramPrepareFailed { error, .. } => {
+                    crate::player_log::log_error("player-prepare", error);
                 }
                 PlayerEvent::SourceReady { .. } => {}
             }

@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 use tracing::{info, warn};
 
-use crate::ingest::db::{open_ingest, queue_ingest_job, reset_processing_ingest_jobs};
+use crate::ingest::db::{open_ingest, queue_ingest_job, reset_processing_ingest_jobs_for_type};
 use crate::ingest::thumb_process::generate_thumbs_from_proxy;
 use crate::project::db::{open_global, ProjectPaths};
 use crate::project::list_project_ids;
@@ -98,7 +98,8 @@ impl PosterWorker {
                 continue;
             }
             let conn = open_ingest(&self.paths, &project_id).map_err(|e| e.to_string())?;
-            reset_processing_ingest_jobs(&conn).map_err(|e| e.to_string())?;
+            reset_processing_ingest_jobs_for_type(&conn, "thumb_proxy")
+                .map_err(|e| e.to_string())?;
             let count: i64 = conn
                 .query_row(
                     "SELECT COUNT(*) FROM ingest_assets

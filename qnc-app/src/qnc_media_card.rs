@@ -20,8 +20,8 @@ pub enum StatusDotsMode {
     Off,
     /// Story / MA: proxy + original (ready/pending/error colours) once import started.
     Pipeline,
-    /// Ingest: one green “imported” dot next to the name — only when DB says imported/done.
-    /// No red/yellow pending dots.
+    /// Ingest: one green imported dot next to the name when DB says imported/done.
+    /// Pending/original pipeline belongs to Story / MA.
     ImportedOnly,
 }
 
@@ -193,7 +193,7 @@ pub fn selection_check_hit_rect(card_rect: Rect) -> Rect {
     selection_check_rect(thumb_rect(card_rect)).expand(4.0)
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum StatusDotsLayout {
     None,
     One,
@@ -303,4 +303,65 @@ fn import_started(import_status: &str) -> bool {
             | "done"
             | "error"
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tc(_: f64) -> String {
+        String::new()
+    }
+
+    fn card_input(
+        import_status: &'static str,
+        features: MediaCardFeatures,
+    ) -> MediaCardInput<'static> {
+        MediaCardInput {
+            title: "clip",
+            duration_sec: 0.0,
+            duration_label: "",
+            import_status,
+            status_proxy: "pending",
+            status_original: "pending",
+            focused: false,
+            checked: false,
+            features,
+            thumb: None,
+            tc: &tc,
+        }
+    }
+
+    #[test]
+    fn ingest_features_hide_pending_and_show_imported_status() {
+        assert_eq!(
+            status_dots_layout(&card_input("queued", MediaCardFeatures::INGEST)),
+            StatusDotsLayout::None
+        );
+        assert_eq!(
+            status_dots_layout(&card_input("processing", MediaCardFeatures::INGEST)),
+            StatusDotsLayout::None
+        );
+        assert_eq!(
+            status_dots_layout(&card_input("imported", MediaCardFeatures::INGEST)),
+            StatusDotsLayout::One
+        );
+    }
+
+    #[test]
+    fn imported_only_mode_still_hides_pending_status() {
+        let features = MediaCardFeatures {
+            selection_check: true,
+            status_dots: StatusDotsMode::ImportedOnly,
+        };
+
+        assert_eq!(
+            status_dots_layout(&card_input("queued", features)),
+            StatusDotsLayout::None
+        );
+        assert_eq!(
+            status_dots_layout(&card_input("imported", features)),
+            StatusDotsLayout::One
+        );
+    }
 }

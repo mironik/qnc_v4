@@ -23,6 +23,7 @@ use super::scanner;
 use super::thumb::probe_media;
 
 const META_ARCHIVE_ORIGINAL: &str = "archive_original";
+const META_SELECTION_REVISION: &str = "selection_revision";
 
 pub fn ingest_archive_original_default(_project: &Value) -> bool {
     // Default: isključeno — korisnik ručno uključuje „Kopiraj original u projekt”.
@@ -741,18 +742,44 @@ pub fn save_selection(
     paths: &ProjectPaths,
     project_id: &str,
     selected_clip_ids: &[String],
+    selection_revision: Option<u64>,
 ) -> rusqlite::Result<Value> {
-    let conn = open_ingest(paths, project_id)?;
+    let mut conn = open_ingest(paths, project_id)?;
     let active_source = get_meta(&conn, "active_source_id", "local")?;
-    conn.execute(
-        "UPDATE ingest_assets SET selected = 0 WHERE source_id = ?1",
-        params![active_source],
-    )?;
-    for clip_id in selected_clip_ids {
-        conn.execute(
-            "UPDATE ingest_assets SET selected = 1 WHERE source_id = ?1 AND clip_id = ?2",
-            params![active_source, clip_id.trim()],
+    if let Some(incoming_revision) = selection_revision {
+        let current_revision = get_meta(&conn, META_SELECTION_REVISION, "0")?
+            .trim()
+            .parse::<u64>()
+            .unwrap_or(0);
+        if incoming_revision < current_revision {
+            return load_state(paths, project_id);
+        }
+    }
+
+    {
+        let tx = conn.transaction()?;
+        tx.execute(
+            "UPDATE ingest_assets SET selected = 0 WHERE source_id = ?1",
+            params![active_source],
         )?;
+        for clip_id in selected_clip_ids {
+            let clip_id = clip_id.trim();
+            if clip_id.is_empty() {
+                continue;
+            }
+            tx.execute(
+                "UPDATE ingest_assets SET selected = 1 WHERE source_id = ?1 AND clip_id = ?2",
+                params![active_source, clip_id],
+            )?;
+        }
+        if let Some(incoming_revision) = selection_revision {
+            tx.execute(
+                "INSERT INTO ingest_meta (key, value) VALUES (?1, ?2)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                params![META_SELECTION_REVISION, incoming_revision.to_string()],
+            )?;
+        }
+        tx.commit()?;
     }
     sync_selected_virtual_identity(paths, project_id, &conn);
     load_state(paths, project_id)
@@ -1121,7 +1148,7 @@ pub fn queue_import(
 #[cfg(test)]
 mod archive_original_tests {
     use super::*;
-    use crate::ingest::db::open_ingest;
+    use crate::ingest::db::{get_meta, open_ingest};
     use crate::project::db::ProjectPaths;
     use serde_json::json;
     use std::path::Path;
@@ -1167,6 +1194,58 @@ mod archive_original_tests {
         set_ingest_archive_original(&paths, project_id, true).expect("set on");
         let conn = open_ingest(&paths, project_id).expect("ingest db");
         assert!(ingest_archive_original_enabled(&conn, &field_project()).expect("enabled"));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn save_selection_revision_rejects_stale_async_write() {
+        let base =
+            std::env::temp_dir().join(format!("qnc_selection_revision_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let paths = test_paths(&base);
+        let project_id = "proj_selection_revision";
+        let conn = open_ingest(&paths, project_id).expect("ingest db");
+        for clip_id in ["clip_a", "clip_b"] {
+            let proxy = base.join(format!("{clip_id}.MP4"));
+            std::fs::write(&proxy, b"proxy").unwrap();
+            conn.execute(
+                "INSERT INTO ingest_assets
+                    (source_id, clip_id, name, import_status, selected, source_path, proxy_path)
+                 VALUES ('local', ?1, ?1, 'detected', 0, ?2, ?2)",
+                rusqlite::params![clip_id, proxy.to_string_lossy().to_string()],
+            )
+            .unwrap();
+        }
+        drop(conn);
+
+        save_selection(
+            &paths,
+            project_id,
+            &["clip_a".to_string(), "clip_b".to_string()],
+            Some(2),
+        )
+        .expect("newer selection");
+        save_selection(&paths, project_id, &["clip_a".to_string()], Some(1))
+            .expect("stale selection ignored");
+
+        let conn = open_ingest(&paths, project_id).expect("ingest db");
+        let selected: Vec<String> = conn
+            .prepare(
+                "SELECT clip_id FROM ingest_assets
+                 WHERE source_id = 'local' AND selected != 0
+                 ORDER BY clip_id",
+            )
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(selected, vec!["clip_a".to_string(), "clip_b".to_string()]);
+        assert_eq!(
+            get_meta(&conn, META_SELECTION_REVISION, "0").unwrap(),
+            "2".to_string()
+        );
         let _ = std::fs::remove_dir_all(&base);
     }
 }

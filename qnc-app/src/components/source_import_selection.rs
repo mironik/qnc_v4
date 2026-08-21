@@ -8,7 +8,11 @@ const OP_SET: &str = "set";
 pub(crate) struct SourceImportSelectionComponent;
 
 impl SourceImportSelectionComponent {
-    pub fn set(project_id: &str, selected_clip_ids: &[String]) -> ComponentBackendCommand {
+    pub fn set(
+        project_id: &str,
+        selected_clip_ids: &[String],
+        selection_revision: u64,
+    ) -> ComponentBackendCommand {
         ComponentBackendCommand::post(
             COMPONENT_ID,
             PORT_SELECTION,
@@ -18,6 +22,7 @@ impl SourceImportSelectionComponent {
             serde_json::json!({
                 "project_id": project_id,
                 "selected_clip_ids": selected_clip_ids,
+                "selection_revision": selection_revision,
             }),
         )
         .with_timeout(HostRequestTimeout::Long)
@@ -52,6 +57,7 @@ mod tests {
         let command = SourceImportSelectionComponent::set(
             "p1",
             &["clip-a".to_string(), "clip-b".to_string()],
+            7,
         );
         assert_eq!(command.component_id, COMPONENT_ID);
         assert_eq!(command.port_id, PORT_SELECTION);
@@ -66,6 +72,7 @@ mod tests {
         assert_eq!(ids.len(), 2);
         assert_eq!(ids[0], "clip-a");
         assert_eq!(ids[1], "clip-b");
+        assert_eq!(payload["selection_revision"], 7);
         assert_eq!(command.result_policy, ComponentResultPolicy::LatestWins);
         assert_eq!(command.timeout, HostRequestTimeout::Long);
     }

@@ -30,6 +30,8 @@ pub struct PlaybackStack {
     active_source_ref: Option<BroadcastHostSourceRef>,
     playlist_input_active: bool,
     playlist_program_request: Option<BroadcastProgramOpenRequest>,
+    playlist_program_preparing: bool,
+    playlist_program_ready: bool,
     pending_seek: Option<PendingSeek>,
 }
 
@@ -47,6 +49,8 @@ impl PlaybackStack {
             active_source_ref: None,
             playlist_input_active: false,
             playlist_program_request: None,
+            playlist_program_preparing: false,
+            playlist_program_ready: false,
             pending_seek: None,
         }
     }
@@ -90,7 +94,35 @@ impl PlaybackStack {
             self.active_source_ref = None;
             self.playlist_input_active = false;
             self.playlist_program_request = None;
+            self.playlist_program_preparing = false;
+            self.playlist_program_ready = false;
             self.pending_seek = None;
+        }
+        for event in events {
+            match event {
+                PlayerEvent::ProgramPrepared { request } => {
+                    if self.playlist_program_request_matches(request) {
+                        self.playlist_program_preparing = false;
+                        self.playlist_program_ready = true;
+                    }
+                }
+                PlayerEvent::ProgramPrepareFailed { request, .. } => {
+                    if self.playlist_program_request_matches(request) {
+                        self.playlist_program_request = None;
+                        self.playlist_program_preparing = false;
+                        self.playlist_program_ready = false;
+                    }
+                }
+                PlayerEvent::SourceReady { .. }
+                    if self.playlist_program_request.is_some()
+                        && self.active_source_ref.is_none() =>
+                {
+                    self.playlist_input_active = true;
+                    self.playlist_program_preparing = false;
+                    self.playlist_program_ready = true;
+                }
+                _ => {}
+            }
         }
         self.carrier.ingest_player_events(events);
         self.flush_pending_seek();
@@ -109,6 +141,8 @@ impl PlaybackStack {
         self.active_source_ref = None;
         self.playlist_input_active = false;
         self.playlist_program_request = None;
+        self.playlist_program_preparing = false;
+        self.playlist_program_ready = false;
         self.pending_seek = None;
     }
 
@@ -246,6 +280,8 @@ impl PlaybackStack {
             self.active_source_ref = Some(request.source_ref);
             self.playlist_input_active = false;
             self.playlist_program_request = None;
+            self.playlist_program_preparing = false;
+            self.playlist_program_ready = false;
             return Ok(());
         }
         let source_ref = request.source_ref.clone();
@@ -253,6 +289,8 @@ impl PlaybackStack {
         self.active_source_ref = None;
         self.playlist_input_active = false;
         self.playlist_program_request = None;
+        self.playlist_program_preparing = false;
+        self.playlist_program_ready = false;
         self.pending_seek = None;
         let _ = self.player.tx().stop();
         self.player.tx().open(request)?;
@@ -308,35 +346,46 @@ impl PlaybackStack {
             self.cue_frame(request.start_program_frame.0);
             return self.play_loaded_input();
         }
-        let loaded_request = request.clone();
         crate::player_log::log_info("bridge", "OpenProgram + Play");
-        self.carrier.clear();
-        self.active_source_ref = None;
-        self.playlist_input_active = false;
-        self.playlist_program_request = None;
-        self.pending_seek = None;
-        self.player.tx().open_program(request)?;
-        self.playlist_input_active = true;
-        self.playlist_program_request = Some(loaded_request);
+        self.open_program(request)?;
         self.player.tx().play()
     }
 
-    /// Prepare one playlist input without starting transport.
-    pub fn preload_program(&mut self, request: BroadcastProgramOpenRequest) -> Result<(), String> {
+    /// Open one playlist input without starting transport.
+    pub fn open_program(&mut self, request: BroadcastProgramOpenRequest) -> Result<(), String> {
         if self.playlist_program_matches(&request) {
             self.playlist_input_active = true;
             self.cue_frame(request.start_program_frame.0);
             return Ok(());
         }
-        crate::player_log::log_info("bridge", "PreloadProgram");
+        let loaded_request = request.clone();
         self.carrier.clear();
         self.active_source_ref = None;
         self.playlist_input_active = false;
         self.playlist_program_request = None;
+        self.playlist_program_preparing = false;
+        self.playlist_program_ready = false;
         self.pending_seek = None;
-        self.player.tx().open_program(request.clone())?;
+        self.player.tx().open_program(request)?;
         self.playlist_input_active = true;
+        self.playlist_program_request = Some(loaded_request);
+        Ok(())
+    }
+
+    /// Prepare one playlist input without starting transport.
+    pub fn preload_program(&mut self, request: BroadcastProgramOpenRequest) -> Result<(), String> {
+        if self.playlist_program_request_matches(&request)
+            && (self.playlist_input_active
+                || self.playlist_program_preparing
+                || self.playlist_program_ready)
+        {
+            return Ok(());
+        }
+        crate::player_log::log_info("bridge", "PreloadProgram");
+        self.player.tx().prepare_program(request.clone())?;
         self.playlist_program_request = Some(request);
+        self.playlist_program_preparing = true;
+        self.playlist_program_ready = false;
         Ok(())
     }
 
@@ -348,6 +397,8 @@ impl PlaybackStack {
         self.active_source_ref = None;
         self.playlist_input_active = false;
         self.playlist_program_request = None;
+        self.playlist_program_preparing = false;
+        self.playlist_program_ready = false;
         self.pending_seek = None;
     }
 
@@ -364,11 +415,13 @@ impl PlaybackStack {
     }
 
     fn playlist_program_matches(&self, request: &BroadcastProgramOpenRequest) -> bool {
-        self.playlist_input_active
-            && self
-                .playlist_program_request
-                .as_ref()
-                .is_some_and(|loaded| same_playlist_program(loaded, request))
+        self.playlist_input_active && self.playlist_program_request_matches(request)
+    }
+
+    fn playlist_program_request_matches(&self, request: &BroadcastProgramOpenRequest) -> bool {
+        self.playlist_program_request
+            .as_ref()
+            .is_some_and(|loaded| same_playlist_program(loaded, request))
     }
 
     pub fn cue_frame(&mut self, frame: i64) -> bool {
@@ -628,10 +681,47 @@ mod tests {
     }
 
     #[test]
-    fn preloaded_program_makes_playlist_input_active_without_playing() {
+    fn preloaded_program_prepares_playlist_without_stealing_active_player() {
         let mut stack = PlaybackStack::new();
 
         stack.preload_program(program_request(25)).unwrap();
+
+        assert!(!stack.playlist_input_active());
+        assert!(!stack.playlist_input_playing());
+        assert!(stack.playlist_program_request_matches(&program_request(60)));
+        assert!(stack.playlist_program_preparing);
+        assert!(!stack.playlist_program_ready);
+    }
+
+    #[test]
+    fn program_prepare_events_drive_preload_readiness() {
+        let mut stack = PlaybackStack::new();
+        let request = program_request(25);
+
+        stack.preload_program(request.clone()).unwrap();
+        stack.ingest_events(&[PlayerEvent::ProgramPrepared {
+            request: request.clone(),
+        }]);
+
+        assert!(!stack.playlist_program_preparing);
+        assert!(stack.playlist_program_ready);
+        assert!(stack.playlist_program_request_matches(&program_request(60)));
+
+        stack.ingest_events(&[PlayerEvent::ProgramPrepareFailed {
+            request,
+            error: "fail".into(),
+        }]);
+
+        assert!(!stack.playlist_program_preparing);
+        assert!(!stack.playlist_program_ready);
+        assert!(!stack.playlist_program_request_matches(&program_request(60)));
+    }
+
+    #[test]
+    fn open_program_makes_playlist_input_active_without_playing() {
+        let mut stack = PlaybackStack::new();
+
+        stack.open_program(program_request(25)).unwrap();
 
         assert!(stack.playlist_input_active());
         assert!(!stack.playlist_input_playing());

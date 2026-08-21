@@ -1573,8 +1573,8 @@ fn source_runtime_from_args(
 ) -> Result<SourceRuntime, String> {
     let mut source = if args.probe_source_runtime {
         probe_source_runtime_with_toolchain(&args.path, args.source_id.clone(), toolchain)
-        .map_err(|err| err.to_string())?
-        .source
+            .map_err(|err| err.to_string())?
+            .source
     } else {
         SourceRuntime::new(
             args.source_id.clone(),

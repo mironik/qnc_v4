@@ -12,7 +12,7 @@ use crate::components::{
     ProjectCommandData, ProjectCommandKind, ProjectRegistryComponent, ShellStateComponent,
     ShellStateData, ShortcutBindingsComponent, ShortcutBindingsData, SourceImportCommandComponent,
     SourceImportCommandKind, SourceImportSelectionComponent, SourceImportStateComponent,
-    SourceImportStateKind, ThemePickerComponent,
+    SourceImportStateKind, SourceImportStatusComponent, ThemePickerComponent,
 };
 use crate::composition::{ScreenComposition, WorkflowScreen};
 use crate::ingest::IngestScreen;
@@ -31,6 +31,7 @@ const FS_INSTANCE_EXPORT_DIR: &str = "settings.export.directory";
 const FS_INSTANCE_IMPORT_SOURCE: &str = "source.import.location";
 const EDITORIAL_INSTANCE_STORY: &str = "story";
 const EDITORIAL_INSTANCE_MEDIA_ASSIST: &str = "media_assist";
+const EDITORIAL_INSTANCE_IMPORT_STATUS: &str = "source_import_status";
 const SHORTCUT_INSTANCE_INGEST: &str = "ingest";
 const SHORTCUT_INSTANCE_PROJECT: &str = "project";
 
@@ -91,6 +92,7 @@ pub struct QncApp {
     playback_rx: BroadcastPlayerRx,
     component_backend: ComponentBackendRuntime,
     component_errors: ComponentErrorBoundary,
+    source_import_status: SourceImportStatusComponent,
     theme_picker: ThemePickerComponent,
     next_project_request_id: u64,
     pending_workspace_go: Option<WorkspaceGo>,
@@ -140,6 +142,7 @@ impl QncApp {
             playback_rx,
             component_backend: ComponentBackendRuntime::new(),
             component_errors: ComponentErrorBoundary::default(),
+            source_import_status: SourceImportStatusComponent::default(),
             theme_picker: ThemePickerComponent::default(),
             next_project_request_id: 1,
             pending_workspace_go: None,
@@ -301,6 +304,8 @@ impl QncApp {
         self.open_project = Some(project);
         self.workspace = None;
         self.ingest = IngestScreen::default();
+        self.source_import_status.reset();
+        self.source_import_status.watch_project(&project_id);
         self.story.reset_session(&self.host);
         self.story = StoryScreen::story();
         self.media_assist.reset_session(&self.host);
@@ -336,6 +341,7 @@ impl QncApp {
         self.open_project = None;
         self.workspace = None;
         self.ingest = IngestScreen::default();
+        self.source_import_status.reset();
         self.story = StoryScreen::story();
         self.media_assist = StoryScreen::media_assist();
         self.phase = if self.health_ok {
@@ -460,9 +466,13 @@ impl QncApp {
                 }
                 if let Some(previous) = previous {
                     let selected_clip_ids = self.ingest.selected_clip_ids();
-                    if let Err(e) =
-                        self.save_import_selection(pid, &selected_clip_ids, Some(ctx.clone()))
-                    {
+                    let revision = self.ingest.selection_revision();
+                    if let Err(e) = self.save_import_selection(
+                        pid,
+                        &selected_clip_ids,
+                        revision,
+                        Some(ctx.clone()),
+                    ) {
                         self.ingest.restore_clip_selection_local(previous);
                         self.error = Some(e);
                     }
@@ -476,9 +486,13 @@ impl QncApp {
                 }
                 if let Some(previous) = previous {
                     let selected_clip_ids = self.ingest.selected_clip_ids();
-                    if let Err(e) =
-                        self.save_import_selection(pid, &selected_clip_ids, Some(ctx.clone()))
-                    {
+                    let revision = self.ingest.selection_revision();
+                    if let Err(e) = self.save_import_selection(
+                        pid,
+                        &selected_clip_ids,
+                        revision,
+                        Some(ctx.clone()),
+                    ) {
                         self.ingest.restore_clip_selection_local(previous);
                         self.error = Some(e);
                     }
@@ -495,13 +509,22 @@ impl QncApp {
                 return;
             }
             crate::ingest::IngestAction::ImportSelected => {
-                if self.ingest.selected_clip_count() == 0 {
+                let selected_clip_ids = self.ingest.selected_clip_ids();
+                if selected_clip_ids.is_empty() {
                     self.error = Some("Nema odabranih klipova.".into());
                     return;
                 }
+                let revision = self.ingest.selection_revision();
+                if let Err(e) =
+                    self.save_import_selection(pid, &selected_clip_ids, revision, Some(ctx.clone()))
+                {
+                    self.error = Some(e);
+                    return;
+                }
+                self.source_import_status.mark_possible_work(pid);
                 self.submit_source_import_command(
                     pid,
-                    SourceImportCommandComponent::import_selected(pid, &[]),
+                    SourceImportCommandComponent::import_selected(pid, &selected_clip_ids),
                     Some(ctx.clone()),
                 );
                 return;
@@ -513,9 +536,13 @@ impl QncApp {
                 }
                 if let Some(previous) = previous {
                     let selected_clip_ids = self.ingest.selected_clip_ids();
-                    if let Err(e) =
-                        self.save_import_selection(pid, &selected_clip_ids, Some(ctx.clone()))
-                    {
+                    let revision = self.ingest.selection_revision();
+                    if let Err(e) = self.save_import_selection(
+                        pid,
+                        &selected_clip_ids,
+                        revision,
+                        Some(ctx.clone()),
+                    ) {
                         self.ingest.set_clip_selection_local(&clip_id, previous);
                         self.error = Some(e);
                     }
@@ -858,16 +885,73 @@ impl QncApp {
         }
     }
 
+    fn poll_source_import_status(&mut self, project_id: &str, ctx: Option<egui::Context>) {
+        if project_id.trim().is_empty() {
+            return;
+        }
+        self.source_import_status.begin_poll(project_id);
+        let command = SourceImportStatusComponent::poll(project_id);
+        if let Err(e) = self.submit_component_backend_command(command, ctx) {
+            self.source_import_status.set_error();
+            self.error = Some(e);
+        }
+    }
+
+    fn refresh_editorial_status_indicators(
+        &mut self,
+        project_id: &str,
+        ctx: Option<egui::Context>,
+    ) {
+        let story_ready = self.story.meta_ready() && self.story.has_editorial_project(project_id);
+        let media_assist_ready =
+            self.media_assist.meta_ready() && self.media_assist.has_editorial_project(project_id);
+        if !story_ready && !media_assist_ready {
+            return;
+        }
+        let command = EditorialStateComponent::refresh_story_status(
+            EDITORIAL_INSTANCE_IMPORT_STATUS,
+            project_id,
+        );
+        if let Err(e) = self.submit_component_backend_command(command, ctx) {
+            self.error = Some(e);
+        }
+    }
+
+    fn apply_source_import_status_snapshot(
+        &mut self,
+        state: &crate::api::IngestState,
+        ctx: Option<egui::Context>,
+    ) {
+        let update = self.source_import_status.apply_state(state);
+        if update.changed {
+            self.refresh_editorial_status_indicators(&update.project_id, ctx);
+        }
+        if update.completed() {
+            self.status = format!("Uvoz gotov: {} klip(ova).", update.imported_count);
+        }
+    }
+
+    fn apply_source_import_status_state(
+        &mut self,
+        state: crate::api::IngestState,
+        ctx: Option<egui::Context>,
+    ) {
+        self.ingest.apply_status_state(state.clone());
+        self.apply_source_import_status_snapshot(&state, ctx);
+    }
+
     fn save_import_selection(
         &mut self,
         project_id: &str,
         selected_clip_ids: &[String],
+        selection_revision: u64,
         ctx: Option<egui::Context>,
     ) -> Result<(), String> {
         if project_id.trim().is_empty() {
             return Ok(());
         }
-        let command = SourceImportSelectionComponent::set(project_id, selected_clip_ids);
+        let command =
+            SourceImportSelectionComponent::set(project_id, selected_clip_ids, selection_revision);
         self.submit_component_backend_command(command, ctx)
             .map(|_| ())
     }
@@ -1716,9 +1800,8 @@ impl QncApp {
                     continue;
                 };
                 match result {
-                    Ok(state) => {
+                    Ok(_state) => {
                         self.clear_component_error(&error_key);
-                        self.ingest.apply(state);
                     }
                     Err(e) => {
                         let e = self.record_component_error(error_key, e);
@@ -1732,11 +1815,26 @@ impl QncApp {
                 match result {
                     Ok(state) => {
                         self.clear_component_error(&error_key);
-                        self.apply_source_import_command_result(kind, state);
+                        self.apply_source_import_command_result(kind, state, ctx.clone());
                     }
                     Err(e) => {
                         let e = self.record_component_error(error_key, e);
                         self.ingest.set_import_command_error(e);
+                    }
+                }
+            } else if SourceImportStatusComponent::accepts_event(&event) {
+                let Some(result) = SourceImportStatusComponent::into_state(event) else {
+                    continue;
+                };
+                match result {
+                    Ok(state) => {
+                        self.clear_component_error(&error_key);
+                        self.apply_source_import_status_state(state, ctx.clone());
+                    }
+                    Err(e) => {
+                        let e = self.record_component_error(error_key, e);
+                        self.source_import_status.set_error();
+                        self.error = Some(e);
                     }
                 }
             } else if SourceImportStateComponent::accepts_event(&event) {
@@ -1746,10 +1844,12 @@ impl QncApp {
                 match (kind, result) {
                     (SourceImportStateKind::Load, Ok(state)) => {
                         self.clear_component_error(&error_key);
+                        self.apply_source_import_status_snapshot(&state, ctx.clone());
                         self.ingest.apply_loaded_state(state)
                     }
                     (SourceImportStateKind::Poll, Ok(state)) => {
                         self.clear_component_error(&error_key);
+                        self.apply_source_import_status_snapshot(&state, ctx.clone());
                         self.ingest.apply_polled_state(state)
                     }
                     (_, Err(e)) => {
@@ -1767,7 +1867,12 @@ impl QncApp {
                 instance_id,
                 project_id,
                 state,
+                refresh_only,
             } => {
+                if refresh_only {
+                    self.apply_editorial_story_status_refresh(&project_id, state);
+                    return;
+                }
                 let peer_state = state.clone();
                 match instance_id.as_str() {
                     EDITORIAL_INSTANCE_STORY => {
@@ -1857,6 +1962,17 @@ impl QncApp {
         }
     }
 
+    fn apply_editorial_story_status_refresh(&mut self, project_id: &str, state: Value) {
+        if self.story.meta_ready() && self.story.has_editorial_project(project_id) {
+            self.story
+                .apply_editorial_story_state(project_id, state.clone());
+        }
+        if self.media_assist.meta_ready() && self.media_assist.has_editorial_project(project_id) {
+            self.media_assist
+                .apply_editorial_story_state(project_id, state);
+        }
+    }
+
     fn apply_editorial_edit_data(&mut self, data: EditorialEditData, ctx: Option<egui::Context>) {
         let instance_id = data.instance_id.clone();
         let project_id = data.project_id.clone();
@@ -1914,12 +2030,15 @@ impl QncApp {
         &mut self,
         kind: SourceImportCommandKind,
         state: crate::api::IngestState,
+        ctx: Option<egui::Context>,
     ) {
         if kind == SourceImportCommandKind::SetArchive {
+            self.apply_source_import_status_snapshot(&state, ctx);
             self.ingest
                 .apply_archive_option_state(state, "Import opcije spremljene.");
             return;
         }
+        let status_state = state.clone();
         let message = match kind {
             SourceImportCommandKind::Browse => {
                 if state.browse_path.trim().is_empty() {
@@ -1938,7 +2057,10 @@ impl QncApp {
             }
         };
         self.ingest.apply_import_command_state(state, message);
+        self.apply_source_import_status_snapshot(&status_state, ctx);
         if kind == SourceImportCommandKind::ImportSelected {
+            self.source_import_status
+                .mark_possible_work(&status_state.project_id);
             if let Some(next) = self.go_workflow(WorkflowGo::Next { from: "ingest" }) {
                 self.status = format!("Uvoz pokrenut → {next}");
             }
@@ -2039,13 +2161,23 @@ impl eframe::App for QncApp {
         self.poll_component_backend(Some(ctx.clone()));
         self.apply_theme(ctx);
 
-        if self.phase == Phase::Workspace && self.screen == Screen::Ingest {
+        if self.phase == Phase::Workspace {
             if let Some(p) = self.open_project.clone() {
-                if self.ingest.should_request_poll() {
-                    self.poll_ingest_state(&p.project_id, Some(ctx.clone()));
-                }
-                if self.ingest.needs_poll() {
-                    ctx.request_repaint_after(std::time::Duration::from_millis(500));
+                self.source_import_status.watch_project(&p.project_id);
+                if self.screen == Screen::Ingest {
+                    if self.ingest.should_request_poll() {
+                        self.poll_ingest_state(&p.project_id, Some(ctx.clone()));
+                    }
+                    if self.ingest.needs_poll() {
+                        ctx.request_repaint_after(std::time::Duration::from_millis(500));
+                    }
+                } else {
+                    if self.source_import_status.should_request_poll() {
+                        self.poll_source_import_status(&p.project_id, Some(ctx.clone()));
+                    }
+                    if self.source_import_status.needs_repaint() {
+                        ctx.request_repaint_after(std::time::Duration::from_millis(500));
+                    }
                 }
             }
         }
@@ -2087,6 +2219,10 @@ impl eframe::App for QncApp {
         self.pump_active_player(ctx);
 
         if story_active {
+            if self.story.meta_ready() {
+                let intent = self.story.playlist_input_preload_intent();
+                self.playback_transport_intent(intent);
+            }
             if self.story.meta_ready() && self.story.shortcuts_ready() {
                 let intents = self.story.handle_shortcuts(ctx, &self.host, &self.playback);
                 self.playback_transport_intents(intents);
