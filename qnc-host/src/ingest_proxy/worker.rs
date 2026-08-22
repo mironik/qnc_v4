@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use rusqlite::params;
 use tracing::{info, warn};
@@ -10,8 +10,8 @@ use crate::background_work::BackgroundWorkGate;
 use crate::filmstrip::{FilmstripWorker, DEFAULT_FILMSTRIP_FRAMES};
 use crate::ingest::asset_row::IngestAssetRow;
 use crate::ingest::db::{
-    ingest_asset_meta, mark_ingest_job_done, mark_ingest_job_error, mark_ingest_job_processing,
-    open_ingest, queue_ingest_job,
+    ingest_asset_meta, ingest_job_has_active_external_lease, mark_ingest_job_done,
+    mark_ingest_job_error, mark_ingest_job_processing, open_ingest, queue_ingest_job,
 };
 use crate::ingest::import_finish::{complete_imported_clip, probe_import_media};
 use crate::ingest::proxy_generate::proxy_dest_for_source;
@@ -384,6 +384,17 @@ impl ProxyGenerateWorker {
                 if row.status != "generating_proxy" {
                     return Ok(None);
                 }
+                if ingest_job_has_active_external_lease(
+                    &conn,
+                    "proxy_generate",
+                    &job.source_id,
+                    &job.clip_id,
+                    now_unix_ms() as i64,
+                )
+                .map_err(|e| e.to_string())?
+                {
+                    return Ok(None);
+                }
                 queue_ingest_job(&conn, "proxy_generate", &job.source_id, &job.clip_id)
                     .map_err(|e| e.to_string())?;
                 mark_ingest_job_processing(&conn, "proxy_generate", &job.source_id, &job.clip_id)
@@ -530,6 +541,13 @@ fn original_path_for_row(row: &IngestAssetRow, fallback: &Path) -> String {
 
 fn service_error_message(error: ServiceError) -> String {
     format!("{}: {}", error.code, error.message)
+}
+
+fn now_unix_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
+        .unwrap_or(0)
 }
 
 #[cfg(test)]

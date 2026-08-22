@@ -93,6 +93,7 @@ fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
     )?;
     migrate_thumb_columns(conn)?;
     migrate_ingest_metadata_columns(conn)?;
+    migrate_ingest_job_lease_columns(conn)?;
     Ok(())
 }
 
@@ -239,6 +240,38 @@ pub fn reset_processing_ingest_jobs_for_type(
     Ok(changed)
 }
 
+pub fn ingest_job_has_active_external_lease(
+    conn: &Connection,
+    job_type: &str,
+    source_id: &str,
+    clip_id: &str,
+    now_ms: i64,
+) -> rusqlite::Result<bool> {
+    let job_id = ingest_job_id(job_type, source_id, clip_id);
+    let row = conn.query_row(
+        "SELECT status, COALESCE(worker_id, ''), COALESCE(lease_id, ''), COALESCE(lease_until_ms, 0)
+         FROM ingest_jobs
+         WHERE job_id = ?1",
+        params![job_id],
+        |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+            ))
+        },
+    );
+    match row {
+        Ok((status, worker_id, lease_id, lease_until_ms)) => Ok(status == "processing"
+            && !worker_id.trim().is_empty()
+            && !lease_id.trim().is_empty()
+            && lease_until_ms > now_ms),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
 fn column_exists(conn: &Connection, table: &str, column: &str) -> bool {
     conn.prepare(&format!("PRAGMA table_info({table})"))
         .and_then(|mut stmt| {
@@ -246,6 +279,45 @@ fn column_exists(conn: &Connection, table: &str, column: &str) -> bool {
                 .map(|rows| rows.filter_map(Result::ok).any(|name| name == column))
         })
         .unwrap_or(false)
+}
+
+pub fn migrate_ingest_job_lease_columns(conn: &Connection) -> rusqlite::Result<()> {
+    if !column_exists(conn, "ingest_jobs", "worker_id") {
+        conn.execute(
+            "ALTER TABLE ingest_jobs ADD COLUMN worker_id TEXT NOT NULL DEFAULT ''",
+            [],
+        )?;
+    }
+    if !column_exists(conn, "ingest_jobs", "lease_id") {
+        conn.execute(
+            "ALTER TABLE ingest_jobs ADD COLUMN lease_id TEXT NOT NULL DEFAULT ''",
+            [],
+        )?;
+    }
+    if !column_exists(conn, "ingest_jobs", "lease_until_ms") {
+        conn.execute(
+            "ALTER TABLE ingest_jobs ADD COLUMN lease_until_ms INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+    }
+    if !column_exists(conn, "ingest_jobs", "heartbeat_ms") {
+        conn.execute(
+            "ALTER TABLE ingest_jobs ADD COLUMN heartbeat_ms INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+    }
+    if !column_exists(conn, "ingest_jobs", "result_json") {
+        conn.execute(
+            "ALTER TABLE ingest_jobs ADD COLUMN result_json TEXT NOT NULL DEFAULT '{}'",
+            [],
+        )?;
+    }
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_ingest_jobs_external_lease
+         ON ingest_jobs(status, lease_until_ms, worker_id)",
+        [],
+    )?;
+    Ok(())
 }
 
 fn migrate_ingest_metadata_columns(conn: &Connection) -> rusqlite::Result<()> {
@@ -743,6 +815,80 @@ mod tests {
             )
             .unwrap();
         assert_eq!(status, "queued");
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn ingest_job_lease_columns_are_ready_on_open() {
+        let base =
+            std::env::temp_dir().join(format!("qnc_ingest_job_lease_test_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+        let paths = test_paths(&base);
+        let conn = open_ingest(&paths, "job_lease_proj").unwrap();
+
+        for column in [
+            "worker_id",
+            "lease_id",
+            "lease_until_ms",
+            "heartbeat_ms",
+            "result_json",
+        ] {
+            assert!(column_exists(&conn, "ingest_jobs", column));
+        }
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn ingest_job_active_external_lease_requires_live_worker_lease() {
+        let base = std::env::temp_dir().join(format!(
+            "qnc_ingest_job_active_lease_test_{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+        let paths = test_paths(&base);
+        let conn = open_ingest(&paths, "job_active_lease_proj").unwrap();
+        queue_ingest_job(&conn, "proxy_generate", "card", "clip_a").unwrap();
+
+        assert!(!ingest_job_has_active_external_lease(
+            &conn,
+            "proxy_generate",
+            "card",
+            "clip_a",
+            100
+        )
+        .unwrap());
+
+        conn.execute(
+            "UPDATE ingest_jobs
+             SET status = 'processing',
+                 worker_id = 'worker_a',
+                 lease_id = 'lease_a',
+                 lease_until_ms = 200
+             WHERE job_id = ?1",
+            params![ingest_job_id("proxy_generate", "card", "clip_a")],
+        )
+        .unwrap();
+
+        assert!(ingest_job_has_active_external_lease(
+            &conn,
+            "proxy_generate",
+            "card",
+            "clip_a",
+            100
+        )
+        .unwrap());
+        assert!(!ingest_job_has_active_external_lease(
+            &conn,
+            "proxy_generate",
+            "card",
+            "clip_a",
+            201
+        )
+        .unwrap());
 
         let _ = fs::remove_dir_all(&base);
     }

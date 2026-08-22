@@ -14,7 +14,9 @@ use uuid::Uuid;
 
 use crate::app_state::AppState;
 use crate::ingest::asset_row::IngestAssetRow;
-use crate::ingest::db::{ingest_asset_meta, mark_ingest_job_done, open_ingest};
+use crate::ingest::db::{
+    ingest_asset_meta, mark_ingest_job_done, migrate_ingest_job_lease_columns, open_ingest,
+};
 use crate::ingest::import_finish::complete_imported_clip;
 use crate::ingest::proxy_generate::proxy_dest_for_source;
 use crate::ingest::store::{ingest_probe_from_service, row_import_error};
@@ -31,13 +33,7 @@ const MIN_LEASE_MS: u64 = 5_000;
 const MAX_LEASE_MS: u64 = 300_000;
 const SMOKE_JOB_TYPE: &str = "qnc_worker_smoke";
 const PROXY_GENERATE_JOB_TYPE: &str = "proxy_generate";
-const EXTERNAL_CLAIMABLE_JOB_TYPES: &[&str] = &[
-    // Protocol canary only. Product artifact jobs are added here only after
-    // they have both an external worker handler and a host-side result applier.
-    // Proxy generation also requires host preflight that proves no camera/NAS
-    // proxy exists; existing camera artefacts are copied/linked before fallback.
-    SMOKE_JOB_TYPE,
-];
+const EXTERNAL_CLAIMABLE_JOB_TYPES: &[&str] = &[SMOKE_JOB_TYPE, PROXY_GENERATE_JOB_TYPE];
 
 pub fn router() -> Router<AppState> {
     Router::new()
@@ -279,7 +275,10 @@ fn payload_for_proxy_generate_claim(
     conn: &Connection,
     row: &QueuedJobRow,
 ) -> Result<Option<Value>, String> {
-    let asset = read_ingest_asset_row(conn, &row.source_id, &row.clip_id)?;
+    let asset = match read_ingest_asset_row(conn, &row.source_id, &row.clip_id) {
+        Ok(asset) => asset,
+        Err(_) => return Ok(None),
+    };
     let project = project_settings_snapshot(paths, project_id).unwrap_or_else(|_| json!({}));
     match proxy_generate_preflight_from_row(paths, project_id, &asset, &project)? {
         ProxyGeneratePreflight::Generate(payload) => serde_json::to_value(payload)
@@ -798,65 +797,7 @@ fn queued_jobs_for_type(
 }
 
 fn ensure_job_service_schema(conn: &Connection) -> rusqlite::Result<()> {
-    ensure_column(
-        conn,
-        "ingest_jobs",
-        "worker_id",
-        "ALTER TABLE ingest_jobs ADD COLUMN worker_id TEXT NOT NULL DEFAULT ''",
-    )?;
-    ensure_column(
-        conn,
-        "ingest_jobs",
-        "lease_id",
-        "ALTER TABLE ingest_jobs ADD COLUMN lease_id TEXT NOT NULL DEFAULT ''",
-    )?;
-    ensure_column(
-        conn,
-        "ingest_jobs",
-        "lease_until_ms",
-        "ALTER TABLE ingest_jobs ADD COLUMN lease_until_ms INTEGER NOT NULL DEFAULT 0",
-    )?;
-    ensure_column(
-        conn,
-        "ingest_jobs",
-        "heartbeat_ms",
-        "ALTER TABLE ingest_jobs ADD COLUMN heartbeat_ms INTEGER NOT NULL DEFAULT 0",
-    )?;
-    ensure_column(
-        conn,
-        "ingest_jobs",
-        "result_json",
-        "ALTER TABLE ingest_jobs ADD COLUMN result_json TEXT NOT NULL DEFAULT '{}'",
-    )?;
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_ingest_jobs_external_lease
-         ON ingest_jobs(status, lease_until_ms, worker_id)",
-        [],
-    )?;
-    Ok(())
-}
-
-fn ensure_column(
-    conn: &Connection,
-    table: &str,
-    column: &str,
-    alter_sql: &str,
-) -> rusqlite::Result<()> {
-    if !column_exists(conn, table, column)? {
-        conn.execute_batch(alter_sql)?;
-    }
-    Ok(())
-}
-
-fn column_exists(conn: &Connection, table: &str, column: &str) -> rusqlite::Result<bool> {
-    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
-    let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
-    for row in rows {
-        if row? == column {
-            return Ok(true);
-        }
-    }
-    Ok(false)
+    migrate_ingest_job_lease_columns(conn)
 }
 
 fn requeue_expired_leases(conn: &Connection, now_ms: u64) -> rusqlite::Result<usize> {
@@ -1211,7 +1152,12 @@ mod tests {
     }
 
     #[test]
-    fn claim_does_not_expose_proxy_generate_without_card_preflight_and_applier() {
+    fn proxy_generate_is_external_claimable_after_handler_and_applier() {
+        assert!(is_external_claimable_job_type(PROXY_GENERATE_JOB_TYPE));
+    }
+
+    #[test]
+    fn claim_skips_unprepared_proxy_generate_and_continues() {
         let paths = test_paths("claim");
         let broker = ProjectDbBroker::new(paths.clone());
         let conn = open_ingest(&paths, "project_a").unwrap();
