@@ -6,3 +6,5 @@ publish = false
 
 [dependencies]
 qnc-broadcast-player = { path = "../qnc-broadcast-player" }
+qnc-service-contracts = { path = "../qnc-service-contracts" }
+serde_json = "1"

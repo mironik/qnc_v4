@@ -1,3 +1,5 @@
+pub mod proxy;
+
 use std::collections::BTreeMap;
 use std::env;
 use std::io::{ErrorKind, Read};
