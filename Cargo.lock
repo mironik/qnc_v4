@@ -3222,6 +3222,7 @@ dependencies = [
  "axum",
  "cpal 0.15.3",
  "hostname",
+ "qnc-media-ffmpeg",
  "qnc-service-contracts",
  "rfd",
  "rusqlite",

@@ -1,165 +1,75 @@
-//! Klasifikacija TV izvora (PAL / NTSC) i recept za terenski proxy.
-//!
-//! Playback cilj = native Rust player. Interlace / NTSC progressive → XDCAM HD422 MXF
-//! (isti profil kao `video.timeline_codec = xdcam_hd_422` / `mpeg2_422_50mbit`).
-//! H.264 editorial proxy zadržava **raster izvora** (ffprobe) — bez hardcodirane 720/1080 skale.
+//! Host adapter for shared TV source classification and proxy recipes.
+
+use qnc_service_contracts::{FrameTimebase, MediaProbe as ContractMediaProbe, ScanMode};
 
 use crate::ingest::thumb::MediaProbe;
 
-/// TV regija po frame-rate obitelji.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum TvRegion {
-    /// 25 / 50
-    Pal,
-    /// 29.97 / 30 / 59.94 / 60
-    Ntsc,
-}
-
-/// Tipični broadcast / XAVC načini snimanja.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum TvSourceClass {
-    /// PAL 50 progressive (npr. XAVC 1080p50)
-    Pal50p,
-    /// PAL 50 interlaced (25 fps, 50 polja)
-    Pal50i,
-    /// NTSC 59.94/60 progressive
-    Ntsc60p,
-    /// NTSC 59.94/60 interlaced (≈29.97 fps, 60 polja)
-    Ntsc60i,
-    /// NTSC 29.97/30 progressive
-    Ntsc30p,
-    /// Nepoznato — H.264 native raster
-    Other,
-}
-
-impl TvSourceClass {
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Pal50p => "pal_50p",
-            Self::Pal50i => "pal_50i",
-            Self::Ntsc60p => "ntsc_60p",
-            Self::Ntsc60i => "ntsc_60i",
-            Self::Ntsc30p => "ntsc_30p",
-            Self::Other => "other",
-        }
-    }
-
-    pub fn region(self) -> Option<TvRegion> {
-        match self {
-            Self::Pal50p | Self::Pal50i => Some(TvRegion::Pal),
-            Self::Ntsc60p | Self::Ntsc60i | Self::Ntsc30p => Some(TvRegion::Ntsc),
-            Self::Other => None,
-        }
-    }
-
-    pub fn region_label(self) -> &'static str {
-        match self.region() {
-            Some(TvRegion::Pal) => "PAL",
-            Some(TvRegion::Ntsc) => "NTSC",
-            None => "other",
-        }
-    }
-}
-
-/// Recept encodea.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ProxyCodec {
-    /// Editorial H.264 — raster = ffprobe izvora (bez forced downscale).
-    H264,
-    /// Sony XDCAM HD422 — MPEG-2 4:2:2 50 Mbit u MXF OP1a.
-    XdcamHd422,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ProxyScale {
-    /// Zadrži width×height iz ffprobea (H.264 editorial).
-    Native,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ProxyRecipe {
-    pub codec: ProxyCodec,
-    pub scale: ProxyScale,
-    /// Zadrži interlace (50i/60i XDCAM).
-    pub keep_interlace: bool,
-}
-
-impl ProxyRecipe {
-    pub fn id(self) -> &'static str {
-        match (self.codec, self.keep_interlace) {
-            (ProxyCodec::H264, _) => "h264_native",
-            (ProxyCodec::XdcamHd422, true) => "xdcam_hd422_i",
-            (ProxyCodec::XdcamHd422, false) => "xdcam_hd422_p",
-        }
-    }
-
-    pub fn extension(self) -> &'static str {
-        match self.codec {
-            ProxyCodec::H264 => "mp4",
-            ProxyCodec::XdcamHd422 => "mxf",
-        }
-    }
-}
-
-/// Mapiranje izvora → proxy recept.
-pub fn recipe_for_source(class: TvSourceClass) -> ProxyRecipe {
-    match class {
-        // Progressive H.264: codec change only — resolution from source probe.
-        TvSourceClass::Pal50p | TvSourceClass::Ntsc60p | TvSourceClass::Other => ProxyRecipe {
-            codec: ProxyCodec::H264,
-            scale: ProxyScale::Native,
-            keep_interlace: false,
-        },
-        // Interlace → XDCAM HD422, zadrži polja (profil traži 1920 kad treba).
-        TvSourceClass::Pal50i | TvSourceClass::Ntsc60i => ProxyRecipe {
-            codec: ProxyCodec::XdcamHd422,
-            scale: ProxyScale::Native,
-            keep_interlace: true,
-        },
-        // NTSC progressive single-rate → XDCAM HD422 progressive.
-        TvSourceClass::Ntsc30p => ProxyRecipe {
-            codec: ProxyCodec::XdcamHd422,
-            scale: ProxyScale::Native,
-            keep_interlace: false,
-        },
-    }
-}
+pub use qnc_media_ffmpeg::proxy::{recipe_for_source, TvSourceClass};
 
 pub fn classify_tv_source(probe: &MediaProbe) -> TvSourceClass {
-    let fps = probe.fps;
-    let interlaced = probe.interlaced;
-
-    if interlaced {
-        if near(fps, 25.0, 0.6) || near(fps, 50.0, 1.0) {
-            return TvSourceClass::Pal50i;
-        }
-        if near(fps, 29.97, 0.6)
-            || near(fps, 30.0, 0.6)
-            || near(fps, 59.94, 1.0)
-            || near(fps, 60.0, 1.0)
-        {
-            return TvSourceClass::Ntsc60i;
-        }
-        if fps < 40.0 {
-            return TvSourceClass::Pal50i;
-        }
-        return TvSourceClass::Ntsc60i;
-    }
-
-    if near(fps, 50.0, 1.0) {
-        return TvSourceClass::Pal50p;
-    }
-    if near(fps, 59.94, 1.0) || near(fps, 60.0, 1.0) {
-        return TvSourceClass::Ntsc60p;
-    }
-    if near(fps, 29.97, 0.6) || near(fps, 30.0, 0.6) {
-        return TvSourceClass::Ntsc30p;
-    }
-    TvSourceClass::Other
+    let Some(timebase) = source_timebase(probe.fps) else {
+        return TvSourceClass::Other;
+    };
+    let (width, height) = parse_resolution(&probe.resolution);
+    let contract_probe = ContractMediaProbe {
+        width,
+        height,
+        duration_sec: Some(probe.duration_sec),
+        timebase,
+        scan_mode: scan_mode(probe),
+        codec: probe.codec.clone(),
+        field_order: probe.field_order.clone(),
+        frame_count: None,
+        duration_frames: None,
+        has_video: width > 0 && height > 0,
+        has_audio: probe.has_audio,
+        audio_channels: probe.audio_channels as u16,
+    };
+    qnc_media_ffmpeg::proxy::classify_tv_source(&contract_probe)
 }
 
-fn near(value: f64, target: f64, tol: f64) -> bool {
-    (value - target).abs() <= tol
+fn source_timebase(fps: f64) -> Option<FrameTimebase> {
+    let (fps_num, fps_den) = rational_fps(fps)?;
+    FrameTimebase::new(fps_num, fps_den).ok()
+}
+
+fn rational_fps(fps: f64) -> Option<(u32, u32)> {
+    if !fps.is_finite() || fps <= 0.0 {
+        return None;
+    }
+    const NTSC: [(u32, u32); 4] = [(24000, 1001), (30000, 1001), (48000, 1001), (60000, 1001)];
+    for (num, den) in NTSC {
+        if (fps - (num as f64 / den as f64)).abs() < 0.01 {
+            return Some((num, den));
+        }
+    }
+    let rounded = fps.round();
+    if (fps - rounded).abs() < 0.001 && rounded >= 1.0 {
+        return Some((rounded as u32, 1));
+    }
+    Some(((fps * 1000.0).round() as u32, 1000))
+}
+
+fn parse_resolution(value: &str) -> (u32, u32) {
+    let Some((width, height)) = value.trim().split_once('x') else {
+        return (0, 0);
+    };
+    (
+        width.trim().parse().unwrap_or(0),
+        height.trim().parse().unwrap_or(0),
+    )
+}
+
+fn scan_mode(probe: &MediaProbe) -> ScanMode {
+    let order = probe.field_order.trim().to_ascii_lowercase();
+    if !probe.interlaced || order == "progressive" {
+        return ScanMode::Progressive;
+    }
+    match order.as_str() {
+        "bb" | "bt" => ScanMode::InterlacedBottomFieldFirst,
+        "tt" | "tb" => ScanMode::InterlacedTopFieldFirst,
+        _ => ScanMode::Unknown,
+    }
 }
 
 #[cfg(test)]
@@ -184,7 +94,7 @@ mod tests {
     }
 
     #[test]
-    fn classify_common_rates() {
+    fn classify_common_rates_without_progressive_pal_profile() {
         assert_eq!(
             classify_tv_source(&probe(50.0, false)),
             TvSourceClass::Pal50p
@@ -216,7 +126,7 @@ mod tests {
         assert_eq!(recipe_for_source(TvSourceClass::Pal50p).id(), "h264_native");
         assert_eq!(
             recipe_for_source(TvSourceClass::Other).scale,
-            ProxyScale::Native
+            qnc_media_ffmpeg::proxy::ProxyScale::Native
         );
     }
 }

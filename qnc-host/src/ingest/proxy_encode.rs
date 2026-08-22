@@ -8,12 +8,6 @@ use super::proxy_encoder_kind::{
     parse_forced_encoder, platform_encoder_priority, ProxyVideoEncoder,
 };
 
-/// Editorial proxy encode knobs (bitrate/CRF). Raster = ffprobe source (no forced height).
-pub const PROXY_MAXRATE: &str = "8M";
-pub const PROXY_BUFSIZE: &str = "16M";
-pub const PROXY_PRESET: &str = "ultrafast";
-pub const PROXY_CRF: &str = "23";
-
 static ENCODER_CACHE: OnceLock<ProxyVideoEncoder> = OnceLock::new();
 
 /// Najbrži dostupan enkoder — iz shell profila (`data/shell.db` → `hardware.profile`).
@@ -91,127 +85,6 @@ fn parse_encoder_list(text: &str) -> std::collections::HashSet<String> {
     set
 }
 
-pub fn append_proxy_video_encode_args(
-    cmd: &mut Command,
-    encoder: ProxyVideoEncoder,
-    scale_filter: &str,
-    fps_arg: &str,
-) {
-    if !scale_filter.is_empty() {
-        cmd.args(["-vf", scale_filter]);
-    }
-    match encoder {
-        ProxyVideoEncoder::Nvenc => {
-            cmd.args([
-                "-c:v",
-                "h264_nvenc",
-                "-preset",
-                "p1",
-                "-tune",
-                "ll",
-                "-rc",
-                "vbr",
-                "-cq",
-                "28",
-                "-bf",
-                "0",
-                "-maxrate",
-                PROXY_MAXRATE,
-                "-bufsize",
-                PROXY_BUFSIZE,
-            ]);
-        }
-        ProxyVideoEncoder::Amf => {
-            cmd.args([
-                "-c:v",
-                "h264_amf",
-                "-quality",
-                "speed",
-                "-rc",
-                "vbr_latency",
-                "-qv",
-                "28",
-                "-maxrate",
-                PROXY_MAXRATE,
-                "-bufsize",
-                PROXY_BUFSIZE,
-                "-pix_fmt",
-                "yuv420p",
-            ]);
-        }
-        ProxyVideoEncoder::Qsv => {
-            // look_ahead=0 + bf=0 → throughput, ne kvalitet studio mastera.
-            cmd.args([
-                "-c:v",
-                "h264_qsv",
-                "-preset",
-                "veryfast",
-                "-look_ahead",
-                "0",
-                "-bf",
-                "0",
-                "-async_depth",
-                "4",
-                "-global_quality",
-                "28",
-                "-maxrate",
-                PROXY_MAXRATE,
-                "-bufsize",
-                PROXY_BUFSIZE,
-            ]);
-        }
-        ProxyVideoEncoder::VideoToolbox => {
-            cmd.args([
-                "-c:v",
-                "h264_videotoolbox",
-                "-b:v",
-                PROXY_MAXRATE,
-                "-maxrate",
-                PROXY_MAXRATE,
-                "-bufsize",
-                PROXY_BUFSIZE,
-                "-pix_fmt",
-                "yuv420p",
-            ]);
-        }
-        ProxyVideoEncoder::Vaapi => {
-            cmd.args([
-                "-c:v",
-                "h264_vaapi",
-                "-qp",
-                "28",
-                "-maxrate",
-                PROXY_MAXRATE,
-                "-bufsize",
-                PROXY_BUFSIZE,
-            ]);
-        }
-        ProxyVideoEncoder::Libx264 => {
-            cmd.args([
-                "-c:v",
-                "libx264",
-                "-preset",
-                PROXY_PRESET,
-                "-tune",
-                "fastdecode",
-                "-crf",
-                PROXY_CRF,
-                "-bf",
-                "0",
-                "-threads",
-                "0",
-                "-maxrate",
-                PROXY_MAXRATE,
-                "-bufsize",
-                PROXY_BUFSIZE,
-                "-pix_fmt",
-                "yuv420p",
-            ]);
-        }
-    }
-    cmd.args(["-r", fps_arg, "-fps_mode", "cfr"]);
-}
-
 /// GPU scale (brzo) — ostaje na uređaju; SW scale samo kao fallback.
 pub fn proxy_scale_filter_hw(encoder: ProxyVideoEncoder, height: u32) -> Option<String> {
     match encoder {
@@ -287,11 +160,6 @@ pub fn append_decode_hwaccel_mode(
         }
         ProxyVideoEncoder::Libx264 => {}
     }
-}
-
-/// Aktivni proxy enkoder iz shell profila (baza), inače fallback detect.
-pub fn active_encoder_from_profile(ffmpeg: &Path) -> ProxyVideoEncoder {
-    resolve_proxy_encoder(ffmpeg)
 }
 
 #[cfg(test)]

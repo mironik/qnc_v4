@@ -177,7 +177,7 @@ fn ffprobe_candidates() -> Vec<PathBuf> {
     out
 }
 
-fn resolve_ffprobe() -> Option<PathBuf> {
+pub(crate) fn resolve_ffprobe() -> Option<PathBuf> {
     static CACHE: OnceLock<Option<PathBuf>> = OnceLock::new();
     CACHE
         .get_or_init(|| {

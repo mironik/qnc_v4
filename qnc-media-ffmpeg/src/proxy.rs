@@ -1063,7 +1063,7 @@ mod tests {
     }
 
     #[test]
-    fn classify_common_rates_without_p25_profile() {
+    fn classify_common_rates_without_progressive_pal_profile() {
         assert_eq!(
             classify_tv_source(&probe(50, 1, ScanMode::Progressive)),
             TvSourceClass::Pal50p

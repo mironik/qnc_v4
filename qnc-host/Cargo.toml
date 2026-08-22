@@ -22,6 +22,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 hostname = "0.4"
 cpal = "0.15"
+qnc-media-ffmpeg = { path = "../qnc-media-ffmpeg" }
 qnc-service-contracts = { path = "../qnc-service-contracts" }
 toml = "0.8"
 
