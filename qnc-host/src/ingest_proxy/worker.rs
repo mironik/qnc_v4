@@ -1,5 +1,5 @@
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -18,7 +18,9 @@ use crate::ingest::proxy_generate::proxy_dest_for_source;
 use crate::ingest::store::row_import_error;
 use crate::ingest::thumb::MediaProbe;
 use crate::ingest_posters::PosterWorker;
-use crate::media::resolve_import_plan;
+use crate::media::{
+    find_card_proxy_for_media_path, is_proxy_media_path, resolve_import_plan, ImportMediaMode,
+};
 use crate::project::db::{project_settings_snapshot, ProjectPaths};
 use crate::project::{list_project_ids, ProjectDbBroker};
 use qnc_service_contracts::{
@@ -40,6 +42,7 @@ struct PreparedProxyClip {
     asset_status: String,
     card_locked: bool,
     original_path: String,
+    encode: bool,
 }
 
 /// Samostalan worker — ffmpeg proxy generate (GPU/CPU). Ne dijeli proces s importom.
@@ -211,23 +214,37 @@ impl ProxyGenerateWorker {
     async fn process_clip(self: Arc<Self>, job: ProxyClipJob) -> Result<(), String> {
         let prepared = {
             let worker = self.clone();
-            let job = job.clone();
-            tokio::task::spawn_blocking(move || worker.prepare_clip(&job))
-                .await
-                .map_err(|error| format!("proxy prepare join err={error}"))??
+            let prepare_job = job.clone();
+            match tokio::task::spawn_blocking(move || worker.prepare_clip(&prepare_job)).await {
+                Ok(Ok(prepared)) => prepared,
+                Ok(Err(error)) => {
+                    self.mark_clip_error(&job, &error)?;
+                    return Err(error);
+                }
+                Err(error) => return Err(format!("proxy prepare join err={error}")),
+            }
         };
         let Some(prepared) = prepared else {
             return Ok(());
         };
 
-        let media_result = self
-            .media_processor
-            .build_proxy(ProxyBuildRequest {
-                input: media_ref(&job.clip_id, &prepared.source),
-                output_path: prepared.dest.clone(),
-            })
-            .await
-            .map(|_| ());
+        let media_result = if prepared.encode {
+            self.media_processor
+                .build_proxy(ProxyBuildRequest {
+                    input: media_ref(&job.clip_id, &prepared.source),
+                    output_path: prepared.dest.clone(),
+                })
+                .await
+                .map(|_| ())
+        } else {
+            info!(
+                "ingest proxy generate: using existing proxy clip={} src={} dest={}",
+                job.clip_id,
+                prepared.source.display(),
+                prepared.dest.display()
+            );
+            Ok(())
+        };
 
         match media_result {
             Ok(()) => {
@@ -272,6 +289,53 @@ impl ProxyGenerateWorker {
         let plan = resolve_import_plan(&meta, &project).map_err(|e| e.to_string())?;
         let proxy_dir = self.paths.project_dir(&job.project_id).join("proxy");
         std::fs::create_dir_all(&proxy_dir).map_err(|e| e.to_string())?;
+
+        if let Some(project_proxy) = existing_text_path(&row.project_proxy_path) {
+            let original_path = original_path_for_row(&row, &project_proxy);
+            return Ok(Some(PreparedProxyClip {
+                source: project_proxy.clone(),
+                dest: project_proxy,
+                asset_status: plan.asset_status.to_string(),
+                card_locked: false,
+                original_path,
+                encode: false,
+            }));
+        }
+
+        let existing_proxy = existing_card_proxy_for_row(&row).or_else(|| {
+            if plan.mode != ImportMediaMode::GenerateProxy
+                && is_proxy_media_path(&plan.source)
+                && plan.source.is_file()
+            {
+                Some(plan.source.clone())
+            } else {
+                None
+            }
+        });
+        if let Some(proxy) = existing_proxy {
+            let dest = crate::ingest::project_media::copy_into_project_dir(
+                &proxy_dir,
+                &job.clip_id,
+                &proxy,
+            )?;
+            let original_path = original_path_for_row(&row, &proxy);
+            return Ok(Some(PreparedProxyClip {
+                source: proxy,
+                dest,
+                asset_status: plan.asset_status.to_string(),
+                card_locked: false,
+                original_path,
+                encode: false,
+            }));
+        }
+
+        if plan.mode != ImportMediaMode::GenerateProxy {
+            return Err(format!(
+                "proxy_generate job nije valjan za resolved import mode: {:?}",
+                plan.mode
+            ));
+        }
+
         let source = if row.original_path.trim().is_empty() {
             plan.source
         } else {
@@ -295,6 +359,7 @@ impl ProxyGenerateWorker {
             asset_status: plan.asset_status.to_string(),
             card_locked: plan.card_locked,
             original_path,
+            encode: true,
         }))
     }
 
@@ -438,6 +503,79 @@ fn media_ref(clip_id: &str, source: &std::path::Path) -> MediaRef {
     }
 }
 
+fn existing_card_proxy_for_row(row: &IngestAssetRow) -> Option<PathBuf> {
+    existing_text_path(&row.proxy_path).or_else(|| {
+        existing_text_path(&row.original_path)
+            .or_else(|| existing_text_path(&row.source_path))
+            .and_then(|source| find_card_proxy_for_media_path(&source))
+    })
+}
+
+fn existing_text_path(raw: &str) -> Option<PathBuf> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let path = PathBuf::from(raw);
+    path.is_file().then_some(path)
+}
+
+fn original_path_for_row(row: &IngestAssetRow, fallback: &Path) -> String {
+    existing_text_path(&row.original_path)
+        .or_else(|| existing_text_path(&row.source_path))
+        .unwrap_or_else(|| fallback.to_path_buf())
+        .to_string_lossy()
+        .to_string()
+}
+
 fn service_error_message(error: ServiceError) -> String {
     format!("{}: {}", error.code, error.message)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    fn touch(path: PathBuf) -> PathBuf {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, b"media").unwrap();
+        path
+    }
+
+    fn row_with_paths(original: &Path, proxy_path: &Path) -> IngestAssetRow {
+        IngestAssetRow {
+            source_id: "card".into(),
+            clip_id: "clip_a".into(),
+            source_path: original.to_string_lossy().to_string(),
+            original_path: original.to_string_lossy().to_string(),
+            proxy_path: proxy_path.to_string_lossy().to_string(),
+            project_proxy_path: String::new(),
+            card_thumb_path: String::new(),
+            file_extension: "mxf".into(),
+            read_from_card: 0,
+            card_locked: 0,
+            poster_source: String::new(),
+            status: "generating_proxy".into(),
+        }
+    }
+
+    #[test]
+    fn existing_card_proxy_path_wins_before_generate() {
+        let base = std::env::temp_dir().join(format!(
+            "qnc_proxy_existing_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = fs::remove_dir_all(&base);
+        let original = touch(base.join("card").join("Clip0001.MXF"));
+        let proxy = touch(base.join("card").join("Sub").join("Clip0001S03.MP4"));
+        let row = row_with_paths(&original, &proxy);
+
+        assert_eq!(existing_card_proxy_for_row(&row), Some(proxy));
+        let _ = fs::remove_dir_all(&base);
+    }
 }
