@@ -134,6 +134,7 @@ impl HandlerRegistry {
     pub fn with_builtin_handlers() -> Self {
         let mut registry = Self::empty();
         registry.register(SmokeJobHandler);
+        registry.register(ProxyGenerateJobHandler::new(LocalFfmpegProxyBuilder));
         registry
     }
 
@@ -380,6 +381,26 @@ where
     }
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+pub struct LocalFfmpegProxyBuilder;
+
+impl ProxyBuilder for LocalFfmpegProxyBuilder {
+    fn build_proxy(
+        &self,
+        payload: ProxyGenerateJobPayload,
+    ) -> Result<ProxyGenerateJobResult, JobHandlerError> {
+        let probe = qnc_media_ffmpeg::proxy::generate_field_proxy(
+            &payload.source_path,
+            &payload.output_path,
+        )
+        .map_err(JobHandlerError::retryable)?;
+        Ok(ProxyGenerateJobResult {
+            output_path: payload.output_path,
+            probe: Some(probe),
+        })
+    }
+}
+
 fn normalize_job_type(value: &str) -> String {
     value.trim().to_ascii_lowercase()
 }
@@ -489,14 +510,20 @@ mod tests {
             DEFAULT_LEASE_MS,
         );
         let caps = config.claim_capabilities(&HandlerRegistry::with_builtin_handlers());
-        assert_eq!(caps, vec![SMOKE_JOB_TYPE.to_string()]);
+        assert_eq!(
+            caps,
+            vec![
+                PROXY_GENERATE_JOB_TYPE.to_string(),
+                SMOKE_JOB_TYPE.to_string()
+            ]
+        );
     }
 
     #[test]
     fn run_once_does_not_call_host_without_executable_capability() {
         let config = WorkerConfig::new(
             "worker_a",
-            vec!["proxy_generate".into()],
+            vec!["unknown_job_type".into()],
             DEFAULT_POLL_MS,
             DEFAULT_LEASE_MS,
         );

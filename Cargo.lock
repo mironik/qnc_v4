@@ -3302,6 +3302,7 @@ name = "qnc-worker"
 version = "0.5.0"
 dependencies = [
  "clap",
+ "qnc-media-ffmpeg",
  "qnc-service-contracts",
  "serde",
  "serde_json",
