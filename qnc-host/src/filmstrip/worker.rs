@@ -11,6 +11,7 @@ use crate::ingest::thumb::timeline_seek_seconds;
 use crate::media::imported_clip_media_rows;
 use crate::project::db::{open_global, ProjectPaths};
 use crate::project::list_project_ids;
+use qnc_service_contracts::MediaProcessor;
 
 use super::build::build_for_clip;
 use super::store::{get_filmstrip, list_frames_for_clip};
@@ -27,16 +28,22 @@ struct FilmstripJob {
 pub struct FilmstripWorker {
     paths: ProjectPaths,
     background: BackgroundWorkGate,
+    media_processor: Arc<dyn MediaProcessor>,
     pending: Arc<Mutex<Vec<FilmstripJob>>>,
     blocked: Arc<Mutex<HashSet<String>>>,
     in_flight: Arc<AtomicUsize>,
 }
 
 impl FilmstripWorker {
-    pub fn new(paths: ProjectPaths, background: BackgroundWorkGate) -> Self {
+    pub fn new(
+        paths: ProjectPaths,
+        background: BackgroundWorkGate,
+        media_processor: Arc<dyn MediaProcessor>,
+    ) -> Self {
         Self {
             paths,
             background,
+            media_processor,
             pending: Arc::new(Mutex::new(Vec::new())),
             blocked: Arc::new(Mutex::new(HashSet::new())),
             in_flight: Arc::new(AtomicUsize::new(0)),
@@ -160,20 +167,21 @@ impl FilmstripWorker {
                 let media = job.media_path;
                 let frames = job.frames;
                 in_flight.fetch_add(1, Ordering::AcqRel);
-                let result = tokio::task::spawn_blocking(move || {
-                    build_for_clip(&worker.paths, &pid, &cid, &media, frames)
-                })
+                let result = build_for_clip(
+                    &worker.paths,
+                    worker.media_processor.clone(),
+                    &pid,
+                    &cid,
+                    &media,
+                    frames,
+                )
                 .await;
                 in_flight.fetch_sub(1, Ordering::AcqRel);
                 match result {
-                    Ok(Ok(())) => info!("filmstrip: project={} clip={}", pid_log, cid_log),
-                    Ok(Err(e)) => {
+                    Ok(()) => info!("filmstrip: project={} clip={}", pid_log, cid_log),
+                    Err(e) => {
                         warn!("filmstrip: project={} clip={} err={}", pid_log, cid_log, e)
                     }
-                    Err(e) => warn!(
-                        "filmstrip: project={} clip={} task err={}",
-                        pid_log, cid_log, e
-                    ),
                 }
             }
         });

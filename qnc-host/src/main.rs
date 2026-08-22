@@ -35,6 +35,7 @@ mod modules;
 mod platform;
 mod project;
 mod routes;
+mod services;
 mod shell_dialog;
 mod shell_fs;
 mod shell_store;
@@ -72,6 +73,7 @@ async fn main() {
         }
     }
     let modules = Arc::new(RwLock::new(ModuleStore::load(&root.join("data"))));
+    let services = services::build_registry(&config.runtime);
     let project_state = project::ProjectState::new(&root, &config);
     let background_work = background_work::BackgroundWorkGate::new();
     let ingest_posters = Arc::new(ingest_posters::PosterWorker::new(
@@ -81,10 +83,12 @@ async fn main() {
     let filmstrip = Arc::new(filmstrip::FilmstripWorker::new(
         project_state.paths.clone(),
         background_work.clone(),
+        services.media.clone(),
     ));
     let waveform = Arc::new(waveform::WaveformWorker::new(
         project_state.paths.clone(),
         background_work.clone(),
+        services.media.clone(),
     ));
     let ingest_audio_wrap = Arc::new(ingest_audio_wrap::AudioWrapWorker::new(
         project_state.paths.clone(),
@@ -95,6 +99,7 @@ async fn main() {
         filmstrip.clone(),
         ingest_posters.clone(),
         background_work.clone(),
+        services.media.clone(),
     ));
     let ingest_import = Arc::new(ingest_import::ImportWorker::new(
         project_state.paths.clone(),
@@ -111,6 +116,7 @@ async fn main() {
     let ingest_durations = Arc::new(ingest_durations::DurationWorker::new(
         project_state.paths.clone(),
         background_work.clone(),
+        services.media.clone(),
     ));
     match ingest_import.enqueue_recoverable_projects() {
         Ok(count) if count > 0 => info!("ingest import recovery queued projects={count}"),
@@ -175,6 +181,7 @@ async fn main() {
         config: config.clone(),
         background_work,
         modules,
+        services,
         project: project_state,
         ingest_card_thumbs,
         ingest_durations,

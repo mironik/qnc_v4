@@ -10,6 +10,7 @@ use crate::background_work::BackgroundWorkGate;
 use crate::media::imported_clip_media_rows;
 use crate::project::db::{open_global, ProjectPaths};
 use crate::project::list_project_ids;
+use qnc_service_contracts::MediaProcessor;
 
 use super::store::{build_for_clip, ready as waveform_ready};
 
@@ -24,16 +25,22 @@ struct WaveformJob {
 pub struct WaveformWorker {
     paths: ProjectPaths,
     background: BackgroundWorkGate,
+    media_processor: Arc<dyn MediaProcessor>,
     pending: Arc<Mutex<Vec<WaveformJob>>>,
     blocked: Arc<Mutex<HashSet<String>>>,
     in_flight: Arc<AtomicUsize>,
 }
 
 impl WaveformWorker {
-    pub fn new(paths: ProjectPaths, background: BackgroundWorkGate) -> Self {
+    pub fn new(
+        paths: ProjectPaths,
+        background: BackgroundWorkGate,
+        media_processor: Arc<dyn MediaProcessor>,
+    ) -> Self {
         Self {
             paths,
             background,
+            media_processor,
             pending: Arc::new(Mutex::new(Vec::new())),
             blocked: Arc::new(Mutex::new(HashSet::new())),
             in_flight: Arc::new(AtomicUsize::new(0)),
@@ -155,20 +162,20 @@ impl WaveformWorker {
                 let cid = job.clip_id;
                 let media = job.media_path;
                 in_flight.fetch_add(1, Ordering::AcqRel);
-                let result = tokio::task::spawn_blocking(move || {
-                    build_for_clip(&worker.paths, &pid, &cid, &media)
-                })
+                let result = build_for_clip(
+                    &worker.paths,
+                    worker.media_processor.clone(),
+                    &pid,
+                    &cid,
+                    &media,
+                )
                 .await;
                 in_flight.fetch_sub(1, Ordering::AcqRel);
                 match result {
-                    Ok(Ok(())) => info!("waveform: project={} clip={}", pid_log, cid_log),
-                    Ok(Err(e)) => {
+                    Ok(()) => info!("waveform: project={} clip={}", pid_log, cid_log),
+                    Err(e) => {
                         warn!("waveform: project={} clip={} err={}", pid_log, cid_log, e)
                     }
-                    Err(e) => warn!(
-                        "waveform: project={} clip={} task err={}",
-                        pid_log, cid_log, e
-                    ),
                 }
             }
         });

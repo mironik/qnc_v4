@@ -9,21 +9,28 @@ use crate::ingest::db::{open_ingest, set_meta};
 use crate::ingest::store::{needs_duration_probe, probe_missing_durations};
 use crate::project::db::{open_global, ProjectPaths};
 use crate::project::list_project_ids;
+use qnc_service_contracts::MediaProcessor;
 
 /// Samostalan worker — ffprobe trajanja u pozadini (ne blokira discover/import).
 #[derive(Clone)]
 pub struct DurationWorker {
     paths: ProjectPaths,
     background: BackgroundWorkGate,
+    media_processor: Arc<dyn MediaProcessor>,
     pending: Arc<Mutex<HashSet<String>>>,
     blocked: Arc<Mutex<HashSet<String>>>,
 }
 
 impl DurationWorker {
-    pub fn new(paths: ProjectPaths, background: BackgroundWorkGate) -> Self {
+    pub fn new(
+        paths: ProjectPaths,
+        background: BackgroundWorkGate,
+        media_processor: Arc<dyn MediaProcessor>,
+    ) -> Self {
         Self {
             paths,
             background,
+            media_processor,
             pending: Arc::new(Mutex::new(HashSet::new())),
             blocked: Arc::new(Mutex::new(HashSet::new())),
         }
@@ -101,26 +108,25 @@ impl DurationWorker {
                 for project_id in batch {
                     let worker = self.clone();
                     let pid_log = project_id.clone();
-                    let result =
-                        tokio::task::spawn_blocking(move || worker.process_project(&project_id))
-                            .await;
+                    let result = worker.process_project(&project_id).await;
                     match result {
-                        Ok(Ok(n)) if n > 0 => {
+                        Ok(n) if n > 0 => {
                             info!("ingest durations: project={} filled={}", pid_log, n);
                         }
-                        Ok(Ok(_)) => {}
-                        Ok(Err(e)) => warn!("ingest durations: project={} err={}", pid_log, e),
-                        Err(e) => warn!("ingest durations: project={} task err={}", pid_log, e),
+                        Ok(_) => {}
+                        Err(e) => warn!("ingest durations: project={} err={}", pid_log, e),
                     }
                 }
             }
         });
     }
 
-    fn process_project(&self, project_id: &str) -> Result<usize, String> {
+    async fn process_project(&self, project_id: &str) -> Result<usize, String> {
         if self.is_blocked(project_id) {
             return Ok(0);
         }
-        probe_missing_durations(&self.paths, project_id).map_err(|e| e.to_string())
+        probe_missing_durations(&self.paths, self.media_processor.clone(), project_id)
+            .await
+            .map_err(|e| e.to_string())
     }
 }

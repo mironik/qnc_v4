@@ -14,12 +14,15 @@ use crate::ingest::db::{
     open_ingest, queue_ingest_job,
 };
 use crate::ingest::import_finish::complete_imported_clip;
-use crate::ingest::proxy_generate::{generate_field_proxy, proxy_dest_for_source};
+use crate::ingest::proxy_generate::proxy_dest_for_source;
 use crate::ingest::store::row_import_error;
 use crate::ingest_posters::PosterWorker;
 use crate::media::resolve_import_plan;
 use crate::project::db::{open_global, project_settings_snapshot, ProjectPaths};
 use crate::project::list_project_ids;
+use qnc_service_contracts::{
+    MediaLocator, MediaProcessor, MediaRef, ProxyBuildRequest, ServiceError,
+};
 use serde_json::json;
 
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
@@ -29,6 +32,15 @@ struct ProxyClipJob {
     clip_id: String,
 }
 
+#[derive(Clone, Debug)]
+struct PreparedProxyClip {
+    source: PathBuf,
+    dest: PathBuf,
+    asset_status: String,
+    card_locked: bool,
+    original_path: String,
+}
+
 /// Samostalan worker — ffmpeg proxy generate (GPU/CPU). Ne dijeli proces s importom.
 #[derive(Clone)]
 pub struct ProxyGenerateWorker {
@@ -36,6 +48,7 @@ pub struct ProxyGenerateWorker {
     filmstrip: Arc<FilmstripWorker>,
     posters: Arc<PosterWorker>,
     background: BackgroundWorkGate,
+    media_processor: Arc<dyn MediaProcessor>,
     pending: Arc<Mutex<HashSet<ProxyClipJob>>>,
     blocked: Arc<Mutex<HashSet<String>>>,
 }
@@ -46,12 +59,14 @@ impl ProxyGenerateWorker {
         filmstrip: Arc<FilmstripWorker>,
         posters: Arc<PosterWorker>,
         background: BackgroundWorkGate,
+        media_processor: Arc<dyn MediaProcessor>,
     ) -> Self {
         Self {
             paths,
             filmstrip,
             posters,
             background,
+            media_processor,
             pending: Arc::new(Mutex::new(HashSet::new())),
             blocked: Arc::new(Mutex::new(HashSet::new())),
         }
@@ -157,9 +172,9 @@ impl ProxyGenerateWorker {
                     for job in chunk {
                         let worker = self.clone();
                         let job = job.clone();
-                        handles.push(tokio::task::spawn_blocking(move || {
+                        handles.push(tokio::spawn(async move {
                             crate::ingest_proxy::proxy_job_begin();
-                            let result = worker.process_clip(&job);
+                            let result = worker.process_clip(job).await;
                             crate::ingest_proxy::proxy_job_end();
                             crate::ingest_proxy::proxy_job_queued(-1);
                             result
@@ -177,9 +192,55 @@ impl ProxyGenerateWorker {
         });
     }
 
-    fn process_clip(&self, job: &ProxyClipJob) -> Result<(), String> {
-        if self.is_blocked(&job.project_id) {
+    async fn process_clip(self: Arc<Self>, job: ProxyClipJob) -> Result<(), String> {
+        let prepared = {
+            let worker = self.clone();
+            let job = job.clone();
+            tokio::task::spawn_blocking(move || worker.prepare_clip(&job))
+                .await
+                .map_err(|error| format!("proxy prepare join err={error}"))??
+        };
+        let Some(prepared) = prepared else {
             return Ok(());
+        };
+
+        let media_result = self
+            .media_processor
+            .build_proxy(ProxyBuildRequest {
+                input: media_ref(&job.clip_id, &prepared.source),
+                output_path: prepared.dest.clone(),
+            })
+            .await
+            .map(|_| ());
+
+        match media_result {
+            Ok(()) => {
+                let worker = self.clone();
+                let job = job.clone();
+                tokio::task::spawn_blocking(move || worker.finish_clip(&job, &prepared))
+                    .await
+                    .map_err(|error| format!("proxy finish join err={error}"))?
+            }
+            Err(error) => {
+                let err = service_error_message(error);
+                let worker = self.clone();
+                let job = job.clone();
+                let mark_err = err.clone();
+                let mark_result =
+                    tokio::task::spawn_blocking(move || worker.mark_clip_error(&job, &mark_err))
+                        .await;
+                match mark_result {
+                    Ok(Ok(())) => Err(err),
+                    Ok(Err(mark_err)) => Err(mark_err),
+                    Err(join_err) => Err(format!("proxy error mark join err={join_err}")),
+                }
+            }
+        }
+    }
+
+    fn prepare_clip(&self, job: &ProxyClipJob) -> Result<Option<PreparedProxyClip>, String> {
+        if self.is_blocked(&job.project_id) {
+            return Ok(None);
         }
         let conn = open_ingest(&self.paths, &job.project_id).map_err(|e| e.to_string())?;
         let row: IngestAssetRow = conn
@@ -194,10 +255,10 @@ impl ProxyGenerateWorker {
             )
             .map_err(|e| e.to_string())?;
         if row.status == "imported" || row.status == "done" {
-            return Ok(());
+            return Ok(None);
         }
         if row.status != "generating_proxy" {
-            return Ok(());
+            return Ok(None);
         }
         queue_ingest_job(&conn, "proxy_generate", &job.source_id, &job.clip_id)
             .map_err(|e| e.to_string())?;
@@ -221,68 +282,85 @@ impl ProxyGenerateWorker {
             }
         };
         let dest = proxy_dest_for_source(&proxy_dir, &job.clip_id, &source)?;
-        // Proxy generate prema tipu izvora (PAL/NTSC broadcast klase).
-        let result = generate_field_proxy(&source, &dest);
-        match result {
-            Ok(()) => {
-                let original_path = if row.original_path.trim().is_empty() {
-                    source.to_string_lossy().to_string()
-                } else {
-                    row.original_path.clone()
-                };
-                complete_imported_clip(
-                    &self.paths,
-                    &job.project_id,
-                    &job.source_id,
-                    &job.clip_id,
-                    &dest,
-                    plan.asset_status,
-                    false,
-                    plan.card_locked,
-                    &original_path,
-                )?;
-                mark_ingest_job_done(&conn, "proxy_generate", &job.source_id, &job.clip_id)
-                    .map_err(|e| e.to_string())?;
-                // Fallback: ako CPU filmstrip nije krenuo/gotov — dodaj s project proxyja.
-                if dest.is_file()
-                    && !crate::filmstrip::filmstrip_ready(
-                        &self.paths,
-                        &job.project_id,
-                        &job.clip_id,
-                    )
-                {
-                    self.filmstrip.enqueue(
-                        &job.project_id,
-                        &job.clip_id,
-                        &dest,
-                        DEFAULT_FILMSTRIP_FRAMES,
-                    );
-                }
-                // No card THM/JPG → generate poster from project proxy now that it exists.
-                let needs_poster = conn
-                    .query_row(
-                        "SELECT thumb_status FROM ingest_assets
-                         WHERE source_id = ?1 AND clip_id = ?2",
-                        params![job.source_id, job.clip_id],
-                        |r| r.get::<_, String>(0),
-                    )
-                    .map(|s| matches!(s.as_str(), "no_card_thumb" | "pending" | "error"))
-                    .unwrap_or(false);
-                if needs_poster {
-                    self.posters
-                        .enqueue_proxy_generate(&job.project_id, &[job.clip_id.clone()]);
-                }
-                let _ =
-                    crate::virtual_shots::ensure_root_virtual_shots(&self.paths, &job.project_id);
-                Ok(())
-            }
-            Err(err) => {
-                row_import_error(&conn, &job.source_id, &job.clip_id, &err)
-                    .map_err(|e| e.to_string())?;
-                mark_ingest_job_error(&conn, "proxy_generate", &job.source_id, &job.clip_id, &err)
-                    .map_err(|e| e.to_string())?;
-                Err(err)
-            }
-        }
+        let original_path = if row.original_path.trim().is_empty() {
+            source.to_string_lossy().to_string()
+        } else {
+            row.original_path.clone()
+        };
+
+        Ok(Some(PreparedProxyClip {
+            source,
+            dest,
+            asset_status: plan.asset_status.to_string(),
+            card_locked: plan.card_locked,
+            original_path,
+        }))
     }
+
+    fn finish_clip(&self, job: &ProxyClipJob, prepared: &PreparedProxyClip) -> Result<(), String> {
+        if self.is_blocked(&job.project_id) {
+            return Ok(());
+        }
+        let conn = open_ingest(&self.paths, &job.project_id).map_err(|e| e.to_string())?;
+        complete_imported_clip(
+            &self.paths,
+            &job.project_id,
+            &job.source_id,
+            &job.clip_id,
+            &prepared.dest,
+            &prepared.asset_status,
+            false,
+            prepared.card_locked,
+            &prepared.original_path,
+        )?;
+        mark_ingest_job_done(&conn, "proxy_generate", &job.source_id, &job.clip_id)
+            .map_err(|e| e.to_string())?;
+        // Fallback: ako CPU filmstrip nije krenuo/gotov — dodaj s project proxyja.
+        if prepared.dest.is_file()
+            && !crate::filmstrip::filmstrip_ready(&self.paths, &job.project_id, &job.clip_id)
+        {
+            self.filmstrip.enqueue(
+                &job.project_id,
+                &job.clip_id,
+                &prepared.dest,
+                DEFAULT_FILMSTRIP_FRAMES,
+            );
+        }
+        // No card THM/JPG → generate poster from project proxy now that it exists.
+        let needs_poster = conn
+            .query_row(
+                "SELECT thumb_status FROM ingest_assets
+                 WHERE source_id = ?1 AND clip_id = ?2",
+                params![job.source_id, job.clip_id],
+                |r| r.get::<_, String>(0),
+            )
+            .map(|s| matches!(s.as_str(), "no_card_thumb" | "pending" | "error"))
+            .unwrap_or(false);
+        if needs_poster {
+            self.posters
+                .enqueue_proxy_generate(&job.project_id, &[job.clip_id.clone()]);
+        }
+        let _ = crate::virtual_shots::ensure_root_virtual_shots(&self.paths, &job.project_id);
+        Ok(())
+    }
+
+    fn mark_clip_error(&self, job: &ProxyClipJob, err: &str) -> Result<(), String> {
+        let conn = open_ingest(&self.paths, &job.project_id).map_err(|e| e.to_string())?;
+        row_import_error(&conn, &job.source_id, &job.clip_id, err).map_err(|e| e.to_string())?;
+        mark_ingest_job_error(&conn, "proxy_generate", &job.source_id, &job.clip_id, err)
+            .map_err(|e| e.to_string())
+    }
+}
+
+fn media_ref(clip_id: &str, source: &std::path::Path) -> MediaRef {
+    MediaRef {
+        clip_id: clip_id.to_string(),
+        locator: MediaLocator::LocalPath {
+            path: source.to_path_buf(),
+        },
+    }
+}
+
+fn service_error_message(error: ServiceError) -> String {
+    format!("{}: {}", error.code, error.message)
 }

@@ -1,4 +1,4 @@
-# QNC — native (v0.4.7.2)
+# QNC — native (v0.5.0)
 
 Aktivna radna kopija: **`qnc-app` + `qnc-host`**. Web UI nije dio `qnc_v4`
 produkta i legacy `web-arhive/` folder nije prisutan u ovom treeu.
@@ -39,6 +39,12 @@ LAN: `QNC_BIND_HOST=0.0.0.0` zahtijeva `QNC_TRUSTED_LAN=1`. Internet bez auth/pr
 | `project`, `ingest`, `story` | produkt API |
 | `media_pool` (Rust) | shared helperi za Ingest/Story |
 | design-tools HTTP | API only (nema web UI) |
+
+## v0.5.0 — Service adapter checkpoint
+
+- Media service contracts are introduced as the neutral boundary for media, ASR, search and AI adapters.
+- Filmstrip, proxy generation, waveform and duration/probe background paths use the configured media processor boundary.
+- Local workstation remains the active target; intranet/internet modes stay future adapter targets.
 
 ## v0.4.7.2 — Story stability / background throttle snapshot
 

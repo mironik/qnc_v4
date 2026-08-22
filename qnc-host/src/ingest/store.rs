@@ -1,6 +1,10 @@
 use std::collections::HashSet;
 use std::path::PathBuf;
+use std::sync::Arc;
 
+use qnc_service_contracts::{
+    MediaLocator, MediaProbe as ServiceMediaProbe, MediaProcessor, MediaRef, ScanMode,
+};
 use rusqlite::params;
 use serde_json::{json, Value};
 
@@ -20,7 +24,6 @@ use super::db::{
 };
 use super::proxy_source::{classify_tv_source, recipe_for_source};
 use super::scanner;
-use super::thumb::probe_media;
 
 const META_ARCHIVE_ORIGINAL: &str = "archive_original";
 const META_SELECTION_REVISION: &str = "selection_revision";
@@ -345,14 +348,18 @@ pub fn discover(
 
 /// Pozadinski ffprobe trajanje — DB se ne drži otvorenim tijekom ffprobe
 /// (inače load_state / poster response čeka cijeli probe).
-pub fn probe_missing_durations(paths: &ProjectPaths, project_id: &str) -> rusqlite::Result<usize> {
+pub async fn probe_missing_durations(
+    paths: &ProjectPaths,
+    media_processor: Arc<dyn MediaProcessor>,
+    project_id: &str,
+) -> rusqlite::Result<usize> {
     let source_id = {
         let conn = open_ingest(paths, project_id)?;
         let sid = get_meta(&conn, "active_source_id", "local")?;
         set_meta(&conn, "durations_probe", "processing")?;
         sid
     };
-    let filled = fill_missing_media_probe(paths, project_id, &source_id)?;
+    let filled = fill_missing_media_probe(paths, media_processor, project_id, &source_id).await?;
     let conn = open_ingest(paths, project_id)?;
     set_meta(&conn, "durations_probe", "done")?;
     bump_project_data_revision(&conn, "ingest")?;
@@ -389,14 +396,13 @@ pub fn needs_duration_probe(paths: &ProjectPaths, project_id: &str) -> rusqlite:
 }
 
 /// Popuni duration/fps/resolution/codec u ingest_assets — istina samo u SQLite.
-fn fill_missing_media_probe(
+async fn fill_missing_media_probe(
     paths: &ProjectPaths,
+    media_processor: Arc<dyn MediaProcessor>,
     project_id: &str,
     source_id: &str,
 ) -> rusqlite::Result<usize> {
     use super::thumb::MediaProbe;
-    use std::sync::{Arc, Mutex};
-    use std::thread;
 
     let rows: Vec<(String, String, String, String, String)> = {
         let conn = open_ingest(paths, project_id)?;
@@ -428,29 +434,25 @@ fn fill_missing_media_probe(
         )
         .collect();
 
-    // Parallel ffprobe (2–4) — DB writes stay serial below.
+    // Parallel media probe (2-4) through the configured adapter. DB writes stay serial below.
     let parallel = std::thread::available_parallelism()
         .map(|n| n.get().clamp(2, 4))
         .unwrap_or(2);
-    let probed: Arc<Mutex<Vec<(String, MediaProbe, PathBuf)>>> = Arc::new(Mutex::new(Vec::new()));
-    let chunk_len = (work.len() + parallel - 1) / parallel.max(1);
-    let mut handles = Vec::new();
-    if chunk_len == 0 {
+    if work.is_empty() {
         return Ok(0);
     }
-    for chunk in work.chunks(chunk_len.max(1)) {
-        let chunk: Vec<(String, PathBuf)> = chunk.to_vec();
-        let probed = probed.clone();
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(parallel));
+    let mut handles = Vec::with_capacity(work.len());
+    for (clip_id, media) in work {
+        let processor = media_processor.clone();
+        let semaphore = semaphore.clone();
         let project_id = project_id.to_string();
-        handles.push(thread::spawn(move || {
-            for (clip_id, media) in chunk {
-                match probe_media(&media) {
-                    Some(probe) if probe.duration_sec > 0.0 => {
-                        probed
-                            .lock()
-                            .expect("duration probe results")
-                            .push((clip_id, probe, media));
-                    }
+        handles.push(tokio::spawn(async move {
+            let _permit = semaphore.acquire_owned().await.ok()?;
+            let input = media_ref(&clip_id, &media);
+            match processor.probe(&input).await {
+                Ok(probe) => match ingest_probe_from_service(probe) {
+                    Some(probe) if probe.duration_sec > 0.0 => Some((clip_id, probe, media)),
                     _ => {
                         tracing::warn!(
                             "ingest duration probe failed: project={} clip={} path={}",
@@ -458,23 +460,37 @@ fn fill_missing_media_probe(
                             clip_id,
                             media.display()
                         );
+                        None
                     }
+                },
+                Err(error) => {
+                    tracing::warn!(
+                        "ingest duration probe failed: project={} clip={} path={} err={}: {}",
+                        project_id,
+                        clip_id,
+                        media.display(),
+                        error.code,
+                        error.message
+                    );
+                    None
                 }
             }
         }));
     }
+    let mut results: Vec<(String, MediaProbe, PathBuf)> = Vec::new();
     for handle in handles {
-        let _ = handle.join();
+        match handle.await {
+            Ok(Some(result)) => results.push(result),
+            Ok(None) => {}
+            Err(error) => {
+                tracing::warn!(
+                    "ingest duration probe task failed: project={} err={}",
+                    project_id,
+                    error
+                );
+            }
+        }
     }
-
-    let results = Arc::try_unwrap(probed)
-        .unwrap_or_else(|arc| {
-            Mutex::new(std::mem::take(
-                &mut *arc.lock().expect("duration probe results"),
-            ))
-        })
-        .into_inner()
-        .expect("duration probe results");
 
     let mut filled = 0usize;
     let conn = open_ingest(paths, project_id)?;
@@ -512,6 +528,70 @@ fn fill_missing_media_probe(
         filled += 1;
     }
     Ok(filled)
+}
+
+fn media_ref(clip_id: &str, media: &std::path::Path) -> MediaRef {
+    MediaRef {
+        clip_id: clip_id.to_string(),
+        locator: MediaLocator::LocalPath {
+            path: media.to_path_buf(),
+        },
+    }
+}
+
+fn ingest_probe_from_service(probe: ServiceMediaProbe) -> Option<super::thumb::MediaProbe> {
+    let fps = fps_from_service_probe(&probe)?;
+    let duration_sec = duration_from_service_probe(&probe, fps)?;
+    let resolution = if probe.width > 0 && probe.height > 0 {
+        format!("{}x{}", probe.width, probe.height)
+    } else {
+        String::new()
+    };
+    let field_order = field_order_from_service_probe(&probe);
+    let interlaced = matches!(
+        probe.scan_mode,
+        ScanMode::InterlacedTopFieldFirst | ScanMode::InterlacedBottomFieldFirst
+    );
+
+    Some(super::thumb::MediaProbe {
+        duration_sec,
+        fps,
+        resolution,
+        codec: probe.codec,
+        has_audio: probe.has_audio,
+        audio_channels: probe.audio_channels.min(4) as u8,
+        field_order,
+        interlaced,
+    })
+}
+
+fn fps_from_service_probe(probe: &ServiceMediaProbe) -> Option<f64> {
+    let fps = probe.timebase.fps_num as f64 / probe.timebase.fps_den as f64;
+    fps.is_finite().then_some(fps).filter(|value| *value > 0.0)
+}
+
+fn duration_from_service_probe(probe: &ServiceMediaProbe, fps: f64) -> Option<f64> {
+    probe
+        .duration_sec
+        .filter(|value| value.is_finite() && *value > 0.0)
+        .or_else(|| {
+            let frames = probe.duration_frames.or(probe.frame_count)?;
+            (frames > 0).then_some(frames as f64 / fps)
+        })
+}
+
+fn field_order_from_service_probe(probe: &ServiceMediaProbe) -> String {
+    let raw = probe.field_order.trim();
+    if !raw.is_empty() {
+        return raw.to_ascii_lowercase();
+    }
+    match probe.scan_mode {
+        ScanMode::Progressive => "progressive",
+        ScanMode::InterlacedTopFieldFirst => "tt",
+        ScanMode::InterlacedBottomFieldFirst => "bb",
+        ScanMode::Unknown => "unknown",
+    }
+    .into()
 }
 
 /// True if any path is a recognised media file on disk (video or audio).
@@ -1150,8 +1230,16 @@ mod archive_original_tests {
     use super::*;
     use crate::ingest::db::{get_meta, open_ingest};
     use crate::project::db::ProjectPaths;
+    use async_trait::async_trait;
+    use qnc_service_contracts::{
+        ArtifactRef, ExtractRangeRequest, FilmstripFrameArtifact, FilmstripRequest,
+        FrameExtractRequest, FrameTimebase, MediaProbe as ContractMediaProbe, ProxyBuildRequest,
+        ServiceError, ServiceResult, WaveformPeaks, WaveformRequest,
+    };
     use serde_json::json;
     use std::path::Path;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
 
     fn test_paths(base: &Path) -> ProjectPaths {
         ProjectPaths {
@@ -1167,6 +1255,59 @@ mod archive_original_tests {
                 "storage": { "ingest_profile": "field", "proxy_policy": "generate_if_missing" }
             }
         })
+    }
+
+    #[derive(Default)]
+    struct FakeDurationProcessor {
+        probe_calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl MediaProcessor for FakeDurationProcessor {
+        async fn probe(&self, _input: &MediaRef) -> ServiceResult<ContractMediaProbe> {
+            self.probe_calls.fetch_add(1, Ordering::AcqRel);
+            Ok(ContractMediaProbe {
+                width: 1920,
+                height: 1080,
+                duration_sec: Some(12.5),
+                timebase: FrameTimebase::new(50, 1).unwrap(),
+                scan_mode: ScanMode::Progressive,
+                codec: "h264".into(),
+                field_order: "progressive".into(),
+                frame_count: Some(625),
+                duration_frames: Some(625),
+                has_video: true,
+                has_audio: true,
+                audio_channels: 2,
+            })
+        }
+
+        async fn extract_frame(&self, _request: FrameExtractRequest) -> ServiceResult<ArtifactRef> {
+            Err(unused_service_error())
+        }
+
+        async fn build_filmstrip(
+            &self,
+            _request: FilmstripRequest,
+        ) -> ServiceResult<Vec<FilmstripFrameArtifact>> {
+            Err(unused_service_error())
+        }
+
+        async fn build_proxy(&self, _request: ProxyBuildRequest) -> ServiceResult<ArtifactRef> {
+            Err(unused_service_error())
+        }
+
+        async fn build_waveform(&self, _request: WaveformRequest) -> ServiceResult<WaveformPeaks> {
+            Err(unused_service_error())
+        }
+
+        async fn extract_range(&self, _request: ExtractRangeRequest) -> ServiceResult<ArtifactRef> {
+            Err(unused_service_error())
+        }
+    }
+
+    fn unused_service_error() -> ServiceError {
+        ServiceError::new("unused", "unused in this test")
     }
 
     #[test]
@@ -1195,6 +1336,88 @@ mod archive_original_tests {
         let conn = open_ingest(&paths, project_id).expect("ingest db");
         assert!(ingest_archive_original_enabled(&conn, &field_project()).expect("enabled"));
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[tokio::test]
+    async fn probe_missing_durations_uses_media_processor_and_updates_sqlite() {
+        let base = std::env::temp_dir().join(format!(
+            "qnc_duration_probe_adapter_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let paths = test_paths(&base);
+        let project_id = "proj_duration_probe";
+        let media = base.join("clip_a.mp4");
+        std::fs::write(&media, b"fake-video").unwrap();
+        let conn = open_ingest(&paths, project_id).expect("ingest db");
+        conn.execute(
+            "INSERT INTO ingest_assets
+                (source_id, clip_id, name, media_id, duration_sec, source_path)
+             VALUES ('local', 'clip_a', 'clip_a', 'clip_a', 0, ?1)",
+            rusqlite::params![media.to_string_lossy().to_string()],
+        )
+        .unwrap();
+        drop(conn);
+
+        let processor = Arc::new(FakeDurationProcessor::default());
+        let filled = probe_missing_durations(&paths, processor.clone(), project_id)
+            .await
+            .unwrap();
+
+        assert_eq!(filled, 1);
+        assert_eq!(processor.probe_calls.load(Ordering::Acquire), 1);
+        let conn = open_ingest(&paths, project_id).expect("ingest db");
+        let row: (
+            f64,
+            f64,
+            String,
+            String,
+            i64,
+            i64,
+            String,
+            i64,
+            String,
+            String,
+        ) = conn
+            .query_row(
+                "SELECT duration_sec, fps, resolution, codec, has_audio, audio_channels,
+                        field_order, interlaced, source_class, proxy_recipe
+                 FROM ingest_assets
+                 WHERE source_id = 'local' AND clip_id = 'clip_a'",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                        row.get(7)?,
+                        row.get(8)?,
+                        row.get(9)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert!((row.0 - 12.5).abs() < 0.001);
+        assert!((row.1 - 50.0).abs() < 0.001);
+        assert_eq!(row.2, "1920x1080");
+        assert_eq!(row.3, "h264");
+        assert_eq!(row.4, 1);
+        assert_eq!(row.5, 2);
+        assert_eq!(row.6, "progressive");
+        assert_eq!(row.7, 0);
+        assert_eq!(row.8, "pal_50p");
+        assert_eq!(row.9, "h264_native");
+        assert_eq!(get_meta(&conn, "durations_probe", "").unwrap(), "done");
+        let _ = std::fs::remove_dir_all(base);
     }
 
     #[test]

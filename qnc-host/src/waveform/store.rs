@@ -1,16 +1,16 @@
 use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
-use std::process::Command;
 use std::sync::Mutex;
 
+use qnc_service_contracts::{MediaLocator, MediaProcessor, MediaRef, WaveformRequest};
 use rusqlite::params;
 use serde_json::{json, Value};
+use std::sync::Arc;
 
 use tracing::info;
 
 use crate::ingest::db::open_ingest;
-use crate::ingest::thumb::resolve_ffmpeg;
 use crate::project::db::{now_str, open_global, ProjectPaths};
 use crate::project::list_project_ids;
 
@@ -18,7 +18,7 @@ static SCHEMA_READY: Mutex<Option<HashSet<String>>> = Mutex::new(None);
 
 const WAVEFORM_RENDER_VERSION: i64 = 4;
 const PEAK_BUCKETS: usize = 1200;
-const PCM_SAMPLE_RATE: u32 = 8000;
+const WAVEFORM_SAMPLE_RATE_HZ: u32 = 8000;
 
 #[allow(dead_code)]
 pub fn bootstrap_schema(paths: &ProjectPaths, project_id: &str) -> Result<(), String> {
@@ -304,78 +304,9 @@ fn parse_peaks_json(raw: &str) -> Option<Vec<f32>> {
     }
 }
 
-fn decode_pcm_mono(
-    ffmpeg: &Path,
-    media: &Path,
-    stream_index: u8,
-    channel_index: u8,
-) -> Result<Vec<f32>, String> {
-    let pan = format!("pan=mono|c0=c{channel_index}");
-    let map = format!("0:a:{stream_index}");
-    let rate = PCM_SAMPLE_RATE.to_string();
-    let result = Command::new(ffmpeg)
-        .args(["-v", "error", "-i"])
-        .arg(media)
-        .args([
-            "-map", &map, "-af", &pan, "-ac", "1", "-ar", &rate, "-f", "f32le", "-",
-        ])
-        .output()
-        .map_err(|error| format!("waveform ffmpeg: {error}"))?;
-    if !result.status.success() {
-        return Err(String::from_utf8_lossy(&result.stderr).trim().to_string());
-    }
-    let samples = bytes_to_f32_samples(&result.stdout);
-    if samples.is_empty() {
-        return Err("prazan audio uzorak".into());
-    }
-    Ok(samples)
-}
-
-fn bytes_to_f32_samples(bytes: &[u8]) -> Vec<f32> {
-    bytes
-        .chunks_exact(4)
-        .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
-        .filter(|sample| sample.is_finite())
-        .collect()
-}
-
-fn bucket_max_peaks(samples: &[f32], buckets: usize) -> Vec<f32> {
-    if samples.is_empty() || buckets == 0 {
-        return Vec::new();
-    }
-    let mut out = Vec::with_capacity(buckets);
-    let samples_per_bucket = (samples.len() as f64 / buckets as f64).max(1.0);
-    for i in 0..buckets {
-        let start = ((i as f64) * samples_per_bucket) as usize;
-        let end = (((i + 1) as f64) * samples_per_bucket) as usize;
-        let end = end.min(samples.len()).max(start.saturating_add(1));
-        let peak = samples[start..end]
-            .iter()
-            .map(|sample| sample.abs())
-            .fold(0.0f32, f32::max);
-        out.push(peak);
-    }
-    let max = out.iter().copied().fold(0.0f32, f32::max);
-    if max > 0.0 {
-        for value in &mut out {
-            *value /= max;
-        }
-    }
-    out
-}
-
-fn extract_lane_peaks(
-    ffmpeg: &Path,
-    media: &Path,
-    stream_index: u8,
-    channel_index: u8,
-) -> Result<Vec<f32>, String> {
-    let samples = decode_pcm_mono(ffmpeg, media, stream_index, channel_index)?;
-    Ok(bucket_max_peaks(&samples, PEAK_BUCKETS))
-}
-
-pub fn build_for_clip(
+pub async fn build_for_clip(
     paths: &ProjectPaths,
+    media_processor: Arc<dyn MediaProcessor>,
     project_id: &str,
     clip_id: &str,
     media: &Path,
@@ -384,26 +315,48 @@ pub fn build_for_clip(
     if ready(paths, project_id, clip_id) {
         return Ok(());
     }
-    let ffmpeg = resolve_ffmpeg().ok_or_else(|| "ffmpeg nije dostupan".to_string())?;
     mark(paths, project_id, clip_id, "building", &[], &[], "")?;
 
-    let a1 = match extract_lane_peaks(&ffmpeg, media, 0, 0) {
+    let peaks = match media_processor
+        .build_waveform(WaveformRequest {
+            input: media_ref(clip_id, media),
+            range: None,
+            peak_buckets: PEAK_BUCKETS,
+            sample_rate_hz: WAVEFORM_SAMPLE_RATE_HZ,
+        })
+        .await
+    {
         Ok(peaks) => peaks,
         Err(error) => {
-            mark(paths, project_id, clip_id, "failed", &[], &[], &error)?;
-            return Err(error);
+            let message = format!("{}: {}", error.code, error.message);
+            mark(paths, project_id, clip_id, "failed", &[], &[], &message)?;
+            return Err(message);
         }
     };
 
-    let a2 = extract_lane_peaks(&ffmpeg, media, 1, 0)
-        .or_else(|_| extract_lane_peaks(&ffmpeg, media, 0, 1))
-        .unwrap_or_default();
-    let warning = if a2.is_empty() {
-        "A2 nije dostupna".into()
+    let warning = if peaks.a2_peaks.is_empty() {
+        peaks.warning.unwrap_or_else(|| "A2 nije dostupna".into())
     } else {
-        String::new()
+        peaks.warning.unwrap_or_default()
     };
-    mark(paths, project_id, clip_id, "ready", &a1, &a2, &warning)
+    mark(
+        paths,
+        project_id,
+        clip_id,
+        "ready",
+        &peaks.a1_peaks,
+        &peaks.a2_peaks,
+        &warning,
+    )
+}
+
+fn media_ref(clip_id: &str, media: &Path) -> MediaRef {
+    MediaRef {
+        clip_id: clip_id.to_string(),
+        locator: MediaLocator::LocalPath {
+            path: media.to_path_buf(),
+        },
+    }
 }
 
 fn url_encode(raw: &str) -> String {
@@ -420,13 +373,93 @@ fn url_encode(raw: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
+    use qnc_service_contracts::{
+        ArtifactRef, ExtractRangeRequest, FilmstripFrameArtifact, FilmstripRequest,
+        FrameExtractRequest, MediaProbe, ProxyBuildRequest, ServiceError, ServiceResult,
+        WaveformPeaks,
+    };
+    use rusqlite::params;
+    use std::path::Path;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
-    #[test]
-    fn bucket_max_peaks_normalizes() {
-        let samples = vec![0.0f32, 0.5, -1.0, 0.25, 0.75];
-        let peaks = bucket_max_peaks(&samples, 3);
-        assert_eq!(peaks.len(), 3);
-        assert!((peaks.iter().copied().fold(0.0f32, f32::max) - 1.0).abs() < 0.001);
+    use crate::project::db::{
+        ensure_project_dirs_at, open_global, open_project, project_dir_in_root,
+    };
+
+    fn test_paths(base: &Path) -> ProjectPaths {
+        ProjectPaths {
+            data_dir: base.join("data"),
+            projects_root: base.join("projects"),
+            seed_path: base.join("seed.json"),
+        }
+    }
+
+    fn register_project(paths: &ProjectPaths, project_id: &str) {
+        let global = open_global(paths).unwrap();
+        let project_dir = project_dir_in_root(&paths.projects_root, project_id);
+        global
+            .execute(
+                "INSERT INTO projects (project_id, name, project_dir)
+                 VALUES (?1, ?2, ?3)",
+                params![
+                    project_id,
+                    project_id,
+                    project_dir.to_string_lossy().to_string()
+                ],
+            )
+            .unwrap();
+        ensure_project_dirs_at(&project_dir).unwrap();
+        let _ = open_project(paths, project_id).unwrap();
+    }
+
+    #[derive(Default)]
+    struct FakeWaveformProcessor {
+        waveform_calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl MediaProcessor for FakeWaveformProcessor {
+        async fn probe(
+            &self,
+            _input: &qnc_service_contracts::MediaRef,
+        ) -> ServiceResult<MediaProbe> {
+            Err(unused_service_error())
+        }
+
+        async fn extract_frame(&self, _request: FrameExtractRequest) -> ServiceResult<ArtifactRef> {
+            Err(unused_service_error())
+        }
+
+        async fn build_filmstrip(
+            &self,
+            _request: FilmstripRequest,
+        ) -> ServiceResult<Vec<FilmstripFrameArtifact>> {
+            Err(unused_service_error())
+        }
+
+        async fn build_proxy(&self, _request: ProxyBuildRequest) -> ServiceResult<ArtifactRef> {
+            Err(unused_service_error())
+        }
+
+        async fn build_waveform(&self, request: WaveformRequest) -> ServiceResult<WaveformPeaks> {
+            self.waveform_calls.fetch_add(1, Ordering::AcqRel);
+            assert_eq!(request.peak_buckets, PEAK_BUCKETS);
+            assert_eq!(request.sample_rate_hz, WAVEFORM_SAMPLE_RATE_HZ);
+            Ok(WaveformPeaks {
+                a1_peaks: vec![0.25, 1.0],
+                a2_peaks: vec![0.5],
+                warning: None,
+            })
+        }
+
+        async fn extract_range(&self, _request: ExtractRangeRequest) -> ServiceResult<ArtifactRef> {
+            Err(unused_service_error())
+        }
+    }
+
+    fn unused_service_error() -> ServiceError {
+        ServiceError::new("unused", "unused in this test")
     }
 
     #[test]
@@ -434,5 +467,44 @@ mod tests {
         let raw = peaks_to_json(&[0.1, 0.5, 1.0]);
         let parsed = parse_peaks_json(&raw).expect("parse peaks");
         assert_eq!(parsed.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn build_for_clip_uses_media_processor_and_writes_sqlite_peaks() {
+        let base = std::env::temp_dir().join(format!(
+            "qnc_waveform_adapter_test_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+        let paths = test_paths(&base);
+        let project_id = "test_proj";
+        let clip_id = "clip_a";
+        register_project(&paths, project_id);
+
+        let media = base.join("source.mp4");
+        fs::write(&media, b"fake-video").unwrap();
+        let processor = Arc::new(FakeWaveformProcessor::default());
+        build_for_clip(&paths, processor.clone(), project_id, clip_id, &media)
+            .await
+            .unwrap();
+
+        assert_eq!(processor.waveform_calls.load(Ordering::Acquire), 1);
+        assert_eq!(
+            peaks_for_channel(&paths, project_id, clip_id, 1).unwrap(),
+            vec![0.25, 1.0]
+        );
+        assert_eq!(
+            peaks_for_channel(&paths, project_id, clip_id, 2).unwrap(),
+            vec![0.5]
+        );
+        let snap = snapshot(&paths, project_id, clip_id);
+        assert_eq!(snap["status"], "ready");
+        assert_eq!(snap["peak_count"], 2);
+        let _ = fs::remove_dir_all(base);
     }
 }

@@ -94,6 +94,11 @@ Workflow stanje živi u SQLite preko Rust API-ja. UI je projekcija — nikad vla
   bazu/metapodatke, edit decision, korisničko stanje i lake snapshote, ali
   originalni media, proxy, filmstrip i waveform ostaju lokalno kod korisnika
   ili u intranet storageu koji vidi lokalna radna stanica/media resolver.
+- Import ne smije pretpostaviti da kamera uvijek generira iste pomoćne
+  artefakte. Neke kamere daju gotov proxy i thumbnail/THM/JPG, neke daju samo
+  original, a neke djelomičan skup. Import/worker tok mora prvo upisati ono što
+  stvarno postoji na kartici, koristiti postojeći proxy/thumbnail kad su
+  prisutni, i generirati samo artefakte koji nedostaju kroz neutralne workere.
 - Fizička lokacija medija nije workflow istina. UI, Story, timeline, export i
   player ne smiju pretpostavljati lokalni Windows path kao poslovno pravilo.
   Do medija se dolazi kroz neutralni resolver/host contract.

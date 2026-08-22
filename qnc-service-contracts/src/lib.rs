@@ -1,0 +1,259 @@
+#![forbid(unsafe_code)]
+
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
+
+pub type ServiceResult<T> = Result<T, ServiceError>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeProfile {
+    Light,
+    LocalAi,
+    Enterprise,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServiceError {
+    pub code: String,
+    pub message: String,
+}
+
+impl ServiceError {
+    pub fn new(code: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            code: code.into(),
+            message: message.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FrameTimebase {
+    pub fps_num: u32,
+    pub fps_den: u32,
+}
+
+impl FrameTimebase {
+    pub fn new(fps_num: u32, fps_den: u32) -> ServiceResult<Self> {
+        if fps_num == 0 || fps_den == 0 {
+            return Err(ServiceError::new(
+                "invalid_timebase",
+                "Frame timebase must come from probe metadata and cannot be zero.",
+            ));
+        }
+
+        Ok(Self { fps_num, fps_den })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FrameRange {
+    pub source_in: i64,
+    pub source_out: i64,
+    pub timebase: FrameTimebase,
+}
+
+impl FrameRange {
+    pub fn frame_len(&self) -> i64 {
+        (self.source_out - self.source_in).max(0)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.source_out <= self.source_in
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScanMode {
+    Progressive,
+    InterlacedTopFieldFirst,
+    InterlacedBottomFieldFirst,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MediaRef {
+    pub clip_id: String,
+    pub locator: MediaLocator,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum MediaLocator {
+    LocalPath { path: PathBuf },
+    IntranetPath { uri: String },
+    ManagedAsset { asset_id: String },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MediaProbe {
+    pub width: u32,
+    pub height: u32,
+    pub duration_sec: Option<f64>,
+    pub timebase: FrameTimebase,
+    pub scan_mode: ScanMode,
+    pub codec: String,
+    pub field_order: String,
+    pub frame_count: Option<i64>,
+    pub duration_frames: Option<i64>,
+    pub has_video: bool,
+    pub has_audio: bool,
+    pub audio_channels: u16,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ArtifactRef {
+    pub path: PathBuf,
+    pub media_type: String,
+    pub render_version: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FrameExtractRequest {
+    pub input: MediaRef,
+    pub frame: i64,
+    pub output_path: PathBuf,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FilmstripRequest {
+    pub input: MediaRef,
+    pub frame_count: usize,
+    pub output_dir: PathBuf,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FilmstripFrameArtifact {
+    pub index: usize,
+    pub seek_sec: f64,
+    pub artifact: ArtifactRef,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProxyBuildRequest {
+    pub input: MediaRef,
+    pub output_path: PathBuf,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WaveformRequest {
+    pub input: MediaRef,
+    pub range: Option<FrameRange>,
+    pub peak_buckets: usize,
+    pub sample_rate_hz: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WaveformPeaks {
+    pub a1_peaks: Vec<f32>,
+    pub a2_peaks: Vec<f32>,
+    pub warning: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExtractRangeRequest {
+    pub input: MediaRef,
+    pub range: FrameRange,
+    pub output_path: PathBuf,
+}
+
+#[async_trait]
+pub trait MediaProcessor: Send + Sync {
+    async fn probe(&self, input: &MediaRef) -> ServiceResult<MediaProbe>;
+    async fn extract_frame(&self, request: FrameExtractRequest) -> ServiceResult<ArtifactRef>;
+    async fn build_filmstrip(
+        &self,
+        request: FilmstripRequest,
+    ) -> ServiceResult<Vec<FilmstripFrameArtifact>>;
+    async fn build_proxy(&self, request: ProxyBuildRequest) -> ServiceResult<ArtifactRef>;
+    async fn build_waveform(&self, request: WaveformRequest) -> ServiceResult<WaveformPeaks>;
+    async fn extract_range(&self, request: ExtractRangeRequest) -> ServiceResult<ArtifactRef>;
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TranscriptionRequest {
+    pub input: MediaRef,
+    pub range: Option<FrameRange>,
+    pub language: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Transcript {
+    pub clip_id: String,
+    pub language: Option<String>,
+    pub segments: Vec<TranscriptSegment>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TranscriptSegment {
+    pub source_in: i64,
+    pub source_out: i64,
+    pub text: String,
+}
+
+#[async_trait]
+pub trait TranscriptionEngine: Send + Sync {
+    async fn transcribe(&self, request: TranscriptionRequest) -> ServiceResult<Transcript>;
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SearchDocument {
+    pub clip_id: String,
+    pub source_in: i64,
+    pub source_out: i64,
+    pub title: Option<String>,
+    pub body: String,
+    pub metadata: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SearchRequest {
+    pub query: String,
+    pub limit: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SearchHit {
+    pub clip_id: String,
+    pub source_in: i64,
+    pub source_out: i64,
+    pub score: f32,
+    pub text: String,
+    pub metadata: serde_json::Value,
+}
+
+#[async_trait]
+pub trait SearchEngine: Send + Sync {
+    async fn index_document(&self, document: SearchDocument) -> ServiceResult<()>;
+    async fn remove_clip(&self, clip_id: &str) -> ServiceResult<()>;
+    async fn search(&self, request: SearchRequest) -> ServiceResult<Vec<SearchHit>>;
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AiRequest {
+    pub task: String,
+    pub input: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AiResponse {
+    pub output: serde_json::Value,
+}
+
+#[async_trait]
+pub trait AIOrchestrator: Send + Sync {
+    async fn run(&self, request: AiRequest) -> ServiceResult<AiResponse>;
+}
+
+#[derive(Clone)]
+pub struct ServiceRegistry {
+    pub media: Arc<dyn MediaProcessor>,
+    pub transcription: Arc<dyn TranscriptionEngine>,
+    pub search: Arc<dyn SearchEngine>,
+    pub ai: Arc<dyn AIOrchestrator>,
+}

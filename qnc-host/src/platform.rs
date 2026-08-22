@@ -17,7 +17,7 @@ pub fn runtime_info(root: &Path, config: &AppConfig) -> Value {
     json!({
         "status": "ok",
         "shell_api_version": SHELL_API_VERSION,
-        "app_version": std::env::var("QNC_APP_VERSION").unwrap_or_else(|_| "0.4.7.2".into()),
+        "app_version": std::env::var("QNC_APP_VERSION").unwrap_or_else(|_| "0.5.0".into()),
         "deployment": deployment,
         "hardware_hints": hardware_hints(),
         "hardware_profile": crate::hardware_profile::get().map(|p| p.snapshot()),
@@ -41,6 +41,8 @@ pub fn runtime_info(root: &Path, config: &AppConfig) -> Value {
         ),
         "ui": "qnc-app",
         "projects_root": crate::config::configured_projects_root(config).to_string_lossy(),
+        "runtime": &config.runtime,
+        "runtime_effective": crate::services::describe_runtime(&config.runtime),
         "capabilities": capabilities(root, &deployment),
         "network_presets": config.network_presets,
         "labels": {

@@ -1,7 +1,8 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use serde::Deserialize;
+use qnc_service_contracts::RuntimeProfile;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 #[derive(Clone, Debug, Deserialize)]
@@ -16,12 +17,62 @@ pub struct AppConfig {
     pub projects_root: Option<String>,
     #[serde(default)]
     pub network_presets: Vec<NetworkPreset>,
+    #[serde(default)]
+    pub runtime: RuntimeConfig,
 }
 
-#[derive(Clone, Debug, Deserialize, serde::Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct NetworkPreset {
     pub label: String,
     pub host: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct RuntimeConfig {
+    #[serde(default = "default_runtime_profile")]
+    pub profile: RuntimeProfile,
+    #[serde(default = "default_media_service_config")]
+    pub media: ServiceBackendConfig,
+    #[serde(default = "default_disabled_service_config")]
+    pub transcription: ServiceBackendConfig,
+    #[serde(default = "default_disabled_service_config")]
+    pub search: ServiceBackendConfig,
+    #[serde(default = "default_disabled_service_config")]
+    pub ai: ServiceBackendConfig,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct ServiceBackendConfig {
+    #[serde(default)]
+    pub backend: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_path: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct ConfigTomlFile {
+    #[serde(default)]
+    profile: Option<RuntimeProfile>,
+    #[serde(default)]
+    runtime: Option<RuntimeTomlSection>,
+    #[serde(default)]
+    media: Option<ServiceBackendConfig>,
+    #[serde(default)]
+    transcription: Option<ServiceBackendConfig>,
+    #[serde(default)]
+    search: Option<ServiceBackendConfig>,
+    #[serde(default)]
+    ai: Option<ServiceBackendConfig>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct RuntimeTomlSection {
+    #[serde(default)]
+    profile: Option<RuntimeProfile>,
 }
 
 fn default_port() -> u16 {
@@ -36,6 +87,41 @@ fn default_server_label() -> String {
     "QNC server".into()
 }
 
+fn default_runtime_profile() -> RuntimeProfile {
+    RuntimeProfile::Light
+}
+
+fn default_media_service_config() -> ServiceBackendConfig {
+    service_config_or("local_ffmpeg", None)
+}
+
+fn default_disabled_service_config() -> ServiceBackendConfig {
+    service_config_or("disabled", None)
+}
+
+fn service_config_or(
+    default_backend: &str,
+    configured: Option<ServiceBackendConfig>,
+) -> ServiceBackendConfig {
+    let mut config = configured.unwrap_or_default();
+    if config.backend.trim().is_empty() {
+        config.backend = default_backend.to_string();
+    }
+    config
+}
+
+impl Default for RuntimeConfig {
+    fn default() -> Self {
+        Self {
+            profile: default_runtime_profile(),
+            media: default_media_service_config(),
+            transcription: default_disabled_service_config(),
+            search: default_disabled_service_config(),
+            ai: default_disabled_service_config(),
+        }
+    }
+}
+
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
@@ -44,6 +130,7 @@ impl Default for AppConfig {
             server_label: default_server_label(),
             projects_root: None,
             network_presets: vec![],
+            runtime: RuntimeConfig::default(),
         }
     }
 }
@@ -55,6 +142,7 @@ impl AppConfig {
             Ok(raw) => serde_json::from_str::<AppConfig>(&raw).unwrap_or_default(),
             Err(_) => AppConfig::default(),
         };
+        cfg.runtime = load_runtime_config(root);
         if let Ok(raw) = std::env::var("QNC_API_PORT") {
             if let Ok(p) = raw.parse::<u16>() {
                 cfg.api_port = p;
@@ -71,6 +159,46 @@ impl AppConfig {
         cfg.bind_host = configured_bind_host();
         cfg
     }
+}
+
+pub fn load_runtime_config(root: &Path) -> RuntimeConfig {
+    let path = root.join("config.toml");
+    let raw = match fs::read_to_string(&path) {
+        Ok(raw) => raw,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return RuntimeConfig::default();
+        }
+        Err(error) => {
+            tracing::warn!("config.toml nije procitan: {error}");
+            return RuntimeConfig::default();
+        }
+    };
+
+    match parse_runtime_config_toml(&raw) {
+        Ok(config) => config,
+        Err(error) => {
+            tracing::warn!("config.toml nije valjan: {error}");
+            RuntimeConfig::default()
+        }
+    }
+}
+
+fn parse_runtime_config_toml(raw: &str) -> Result<RuntimeConfig, String> {
+    let file: ConfigTomlFile = toml::from_str(raw).map_err(|error| error.to_string())?;
+    let profile = file
+        .runtime
+        .as_ref()
+        .and_then(|runtime| runtime.profile)
+        .or(file.profile)
+        .unwrap_or_else(default_runtime_profile);
+
+    Ok(RuntimeConfig {
+        profile,
+        media: service_config_or("local_ffmpeg", file.media),
+        transcription: service_config_or("disabled", file.transcription),
+        search: service_config_or("disabled", file.search),
+        ai: service_config_or("disabled", file.ai),
+    })
 }
 
 /// HTTP bind address. Default `127.0.0.1`; set `QNC_BIND_HOST=0.0.0.0` for LAN
@@ -224,5 +352,71 @@ mod tests {
         assert!(bind_is_loopback("::1"));
         assert!(!bind_is_loopback("0.0.0.0"));
         assert!(!bind_is_loopback("192.168.1.10"));
+    }
+
+    #[test]
+    fn runtime_config_defaults_to_light_workstation_services() {
+        let config = parse_runtime_config_toml("").unwrap();
+
+        assert_eq!(config.profile, RuntimeProfile::Light);
+        assert_eq!(config.media.backend, "local_ffmpeg");
+        assert_eq!(config.transcription.backend, "disabled");
+        assert_eq!(config.search.backend, "disabled");
+        assert_eq!(config.ai.backend, "disabled");
+    }
+
+    #[test]
+    fn runtime_config_reads_root_profile_and_backends() {
+        let config = parse_runtime_config_toml(
+            r#"
+            profile = "local_ai"
+
+            [media]
+            backend = "local_ffmpeg"
+
+            [transcription]
+            backend = "whisper_cpp"
+            model_path = "models/whisper.bin"
+
+            [ai]
+            backend = "ollama"
+            model = "llama3.1"
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(config.profile, RuntimeProfile::LocalAi);
+        assert_eq!(config.media.backend, "local_ffmpeg");
+        assert_eq!(config.transcription.backend, "whisper_cpp");
+        assert_eq!(
+            config.transcription.model_path.as_deref(),
+            Some("models/whisper.bin")
+        );
+        assert_eq!(config.ai.backend, "ollama");
+        assert_eq!(config.ai.model.as_deref(), Some("llama3.1"));
+    }
+
+    #[test]
+    fn runtime_section_profile_overrides_root_profile() {
+        let config = parse_runtime_config_toml(
+            r#"
+            profile = "light"
+
+            [runtime]
+            profile = "enterprise"
+
+            [media]
+            backend = "remote_rest"
+            endpoint = "http://qnc-media.local:9000"
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(config.profile, RuntimeProfile::Enterprise);
+        assert_eq!(config.media.backend, "remote_rest");
+        assert_eq!(
+            config.media.endpoint.as_deref(),
+            Some("http://qnc-media.local:9000")
+        );
     }
 }

@@ -13,6 +13,7 @@ use crate::ingest_proxy::ProxyGenerateWorker;
 use crate::modules::ModuleStore;
 use crate::project::ProjectState;
 use crate::waveform::WaveformWorker;
+use qnc_service_contracts::ServiceRegistry;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -20,6 +21,8 @@ pub struct AppState {
     pub config: AppConfig,
     pub background_work: BackgroundWorkGate,
     pub modules: Arc<RwLock<ModuleStore>>,
+    #[allow(dead_code)]
+    pub services: ServiceRegistry,
     pub project: ProjectState,
     pub ingest_card_thumbs: Arc<CardThumbWorker>,
     pub ingest_durations: Arc<DurationWorker>,

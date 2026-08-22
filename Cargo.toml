@@ -2,6 +2,7 @@
 resolver = "2"
 exclude = ["qnc-client"]
 members = [
+    "qnc-service-contracts",
     "qnc-host",
     "qnc-app",
     "qnc-broadcast-player",
