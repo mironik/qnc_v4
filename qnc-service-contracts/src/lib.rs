@@ -312,6 +312,22 @@ pub struct JobLease {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProxyGenerateJobPayload {
+    pub source_path: PathBuf,
+    pub output_path: PathBuf,
+    pub asset_status: String,
+    pub card_locked: bool,
+    pub original_path: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProxyGenerateJobResult {
+    pub output_path: PathBuf,
+    #[serde(default)]
+    pub probe: Option<MediaProbe>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JobClaimResponse {
     pub jobs: Vec<JobLease>,
     pub playback_active: bool,

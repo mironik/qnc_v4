@@ -1,18 +1,27 @@
 use std::collections::HashSet;
+use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::{extract::State, http::StatusCode, routing::post, Json, Router};
 use qnc_service_contracts::{
     JobAck, JobClaimRequest, JobClaimResponse, JobCompleteRequest, JobFailRequest,
-    JobHeartbeatRequest, JobHeartbeatResponse, JobLease,
+    JobHeartbeatRequest, JobHeartbeatResponse, JobLease, ProxyGenerateJobPayload,
+    ProxyGenerateJobResult,
 };
 use rusqlite::{params, Connection};
 use serde_json::json;
 use uuid::Uuid;
 
 use crate::app_state::AppState;
-use crate::ingest::db::open_ingest;
-use crate::project::db::{now_str, ProjectPaths};
+use crate::ingest::asset_row::IngestAssetRow;
+use crate::ingest::db::{ingest_asset_meta, mark_ingest_job_done, open_ingest};
+use crate::ingest::import_finish::complete_imported_clip;
+use crate::ingest::proxy_generate::proxy_dest_for_source;
+use crate::ingest::store::ingest_probe_from_service;
+use crate::media::{
+    find_card_proxy_for_media_path, is_proxy_media_path, resolve_import_plan, ImportMediaMode,
+};
+use crate::project::db::{now_str, project_settings_snapshot, ProjectPaths};
 use crate::project::{list_project_ids, ProjectDbBroker};
 
 const DEFAULT_MAX_JOBS: usize = 1;
@@ -241,6 +250,168 @@ fn claim_jobs_for_project(
         }
         Ok(claimed)
     })
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+enum ProxyGeneratePreflight {
+    Generate(ProxyGenerateJobPayload),
+    ExistingProxy { source_path: PathBuf },
+    Skip { reason: String },
+}
+
+#[allow(dead_code)]
+fn proxy_generate_preflight(
+    paths: &ProjectPaths,
+    project_db: &ProjectDbBroker,
+    project_id: &str,
+    source_id: &str,
+    clip_id: &str,
+) -> Result<ProxyGeneratePreflight, String> {
+    let pid = required_runtime_id("project_id", project_id)?;
+    let sid = required_runtime_id("source_id", source_id)?;
+    let cid = required_runtime_id("clip_id", clip_id)?;
+    project_db.serialize_project_write(&pid, || {
+        let conn = open_ingest(paths, &pid).map_err(|e| e.to_string())?;
+        let row = read_ingest_asset_row(&conn, &sid, &cid)?;
+        let project = project_settings_snapshot(paths, &pid).unwrap_or_else(|_| json!({}));
+        proxy_generate_preflight_from_row(paths, &pid, &row, &project)
+    })
+}
+
+#[allow(dead_code)]
+fn proxy_generate_preflight_from_row(
+    paths: &ProjectPaths,
+    project_id: &str,
+    row: &IngestAssetRow,
+    project: &serde_json::Value,
+) -> Result<ProxyGeneratePreflight, String> {
+    if row.status != "generating_proxy" {
+        return Ok(ProxyGeneratePreflight::Skip {
+            reason: format!("clip is not waiting for proxy generation: {}", row.status),
+        });
+    }
+
+    if let Some(proxy) = existing_or_discovered_proxy(row) {
+        return Ok(ProxyGeneratePreflight::ExistingProxy { source_path: proxy });
+    }
+
+    let meta = ingest_asset_meta(&row.meta_input_without_project_proxy());
+    let plan = resolve_import_plan(&meta, project)?;
+    if plan.mode != ImportMediaMode::GenerateProxy {
+        return if is_proxy_media_path(&plan.source) {
+            Ok(ProxyGeneratePreflight::ExistingProxy {
+                source_path: plan.source,
+            })
+        } else {
+            Ok(ProxyGeneratePreflight::Skip {
+                reason: format!(
+                    "resolved import mode is not proxy generation: {:?}",
+                    plan.mode
+                ),
+            })
+        };
+    }
+
+    let proxy_dir = paths.project_dir(project_id).join("proxy");
+    let source = existing_original_or_plan_source(row, plan.source);
+    let output_path = proxy_dest_for_source(&proxy_dir, &row.clip_id, &source)?;
+    let original_path = existing_text_path(&row.original_path).or_else(|| Some(source.clone()));
+    Ok(ProxyGeneratePreflight::Generate(ProxyGenerateJobPayload {
+        source_path: source,
+        output_path,
+        asset_status: plan.asset_status.to_string(),
+        card_locked: plan.card_locked,
+        original_path,
+    }))
+}
+
+#[allow(dead_code)]
+fn apply_proxy_generate_result(
+    paths: &ProjectPaths,
+    project_db: &ProjectDbBroker,
+    project_id: &str,
+    source_id: &str,
+    clip_id: &str,
+    result: ProxyGenerateJobResult,
+) -> Result<(), String> {
+    let pid = required_runtime_id("project_id", project_id)?;
+    let sid = required_runtime_id("source_id", source_id)?;
+    let cid = required_runtime_id("clip_id", clip_id)?;
+    if !result.output_path.is_file() {
+        return Err(format!(
+            "generated proxy is missing: {}",
+            result.output_path.display()
+        ));
+    }
+
+    project_db.serialize_project_write(&pid, || {
+        let conn = open_ingest(paths, &pid).map_err(|e| e.to_string())?;
+        let row = read_ingest_asset_row(&conn, &sid, &cid)?;
+        let project = project_settings_snapshot(paths, &pid).unwrap_or_else(|_| json!({}));
+        let meta = ingest_asset_meta(&row.meta_input_without_project_proxy());
+        let plan = resolve_import_plan(&meta, &project)?;
+        let original_path = result
+            .output_path
+            .parent()
+            .and_then(|_| existing_text_path(&row.original_path))
+            .or_else(|| existing_text_path(&row.source_path))
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let probe = result.probe.and_then(ingest_probe_from_service);
+
+        complete_imported_clip(
+            paths,
+            &pid,
+            &sid,
+            &cid,
+            &result.output_path,
+            plan.asset_status,
+            false,
+            plan.card_locked,
+            &original_path,
+            probe.as_ref(),
+        )?;
+        let conn = open_ingest(paths, &pid).map_err(|e| e.to_string())?;
+        mark_ingest_job_done(&conn, "proxy_generate", &sid, &cid).map_err(|e| e.to_string())?;
+        Ok(())
+    })
+}
+
+fn read_ingest_asset_row(
+    conn: &Connection,
+    source_id: &str,
+    clip_id: &str,
+) -> Result<IngestAssetRow, String> {
+    conn.query_row(
+        "SELECT source_id, clip_id, source_path, original_path, proxy_path,
+                project_proxy_path, card_thumb_path, file_extension,
+                read_from_card, card_locked, poster_source, import_status
+         FROM ingest_assets
+         WHERE source_id = ?1 AND clip_id = ?2",
+        params![source_id, clip_id],
+        IngestAssetRow::from_row,
+    )
+    .map_err(|e| e.to_string())
+}
+
+fn existing_or_discovered_proxy(row: &IngestAssetRow) -> Option<PathBuf> {
+    existing_text_path(&row.project_proxy_path)
+        .or_else(|| existing_text_path(&row.proxy_path))
+        .or_else(|| {
+            existing_text_path(&row.original_path)
+                .or_else(|| existing_text_path(&row.source_path))
+                .and_then(|source| find_card_proxy_for_media_path(&source))
+        })
+}
+
+fn existing_original_or_plan_source(row: &IngestAssetRow, plan_source: PathBuf) -> PathBuf {
+    existing_text_path(&row.original_path).unwrap_or(plan_source)
+}
+
+fn existing_text_path(raw: &str) -> Option<PathBuf> {
+    let path = PathBuf::from(raw.trim());
+    path.is_file().then_some(path)
 }
 
 fn heartbeat_jobs(
@@ -607,6 +778,8 @@ fn request_error(error: String) -> (StatusCode, String) {
 mod tests {
     use super::*;
     use crate::ingest::db::queue_ingest_job;
+    use qnc_service_contracts::{FrameTimebase, MediaProbe, ScanMode};
+    use std::fs;
 
     fn test_paths(label: &str) -> ProjectPaths {
         let base =
@@ -617,6 +790,135 @@ mod tests {
             projects_root: base.join("projects"),
             seed_path: base.join("seed.json"),
         }
+    }
+
+    fn touch(path: PathBuf) -> PathBuf {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, b"media").unwrap();
+        path
+    }
+
+    fn field_project() -> serde_json::Value {
+        json!({
+            "settings": {
+                "storage": {
+                    "ingest_profile": "field",
+                    "proxy_policy": "generate_if_missing"
+                }
+            }
+        })
+    }
+
+    fn test_probe() -> MediaProbe {
+        MediaProbe {
+            width: 1920,
+            height: 1080,
+            duration_sec: Some(1.0),
+            timebase: FrameTimebase {
+                fps_num: 50,
+                fps_den: 1,
+            },
+            scan_mode: ScanMode::Progressive,
+            codec: "h264".into(),
+            field_order: "progressive".into(),
+            frame_count: Some(50),
+            duration_frames: Some(50),
+            has_video: true,
+            has_audio: true,
+            audio_channels: 2,
+        }
+    }
+
+    #[test]
+    fn proxy_preflight_uses_camera_proxy_before_generate() {
+        let paths = test_paths("proxy_preflight_existing");
+        let project_dir = paths.project_dir("project_a");
+        let original = touch(project_dir.join("card").join("Clip0001.MXF"));
+        let proxy = touch(project_dir.join("card").join("Sub").join("Clip0001S03.MP4"));
+        let row = IngestAssetRow {
+            source_id: "card".into(),
+            clip_id: "clip0001".into(),
+            source_path: original.to_string_lossy().to_string(),
+            original_path: original.to_string_lossy().to_string(),
+            proxy_path: proxy.to_string_lossy().to_string(),
+            project_proxy_path: String::new(),
+            card_thumb_path: String::new(),
+            file_extension: "mxf".into(),
+            read_from_card: 0,
+            card_locked: 0,
+            poster_source: String::new(),
+            status: "generating_proxy".into(),
+        };
+
+        let decision =
+            proxy_generate_preflight_from_row(&paths, "project_a", &row, &field_project()).unwrap();
+        match decision {
+            ProxyGeneratePreflight::ExistingProxy { source_path } => assert_eq!(source_path, proxy),
+            ProxyGeneratePreflight::Generate(payload) => {
+                panic!("expected existing proxy, got generate payload: {payload:?}")
+            }
+            ProxyGeneratePreflight::Skip { reason } => panic!("expected existing proxy: {reason}"),
+        }
+    }
+
+    #[test]
+    fn proxy_result_applier_records_generated_proxy_in_sqlite() {
+        let paths = test_paths("proxy_apply");
+        let broker = ProjectDbBroker::new(paths.clone());
+        let project_dir = paths.project_dir("project_a");
+        let original = touch(project_dir.join("card").join("Clip0002.MXF"));
+        let proxy = touch(project_dir.join("proxy").join("clip0002.mxf"));
+        let conn = open_ingest(&paths, "project_a").unwrap();
+        conn.execute(
+            "INSERT INTO ingest_assets
+                (source_id, clip_id, name, media_id, source_path, original_path,
+                 import_status, status, file_extension)
+             VALUES ('card', 'clip0002', 'Clip0002', 'clip0002', ?1, ?1,
+                     'generating_proxy', 'generating_proxy', 'mxf')",
+            params![original.to_string_lossy().as_ref()],
+        )
+        .unwrap();
+        queue_ingest_job(&conn, "proxy_generate", "card", "clip0002").unwrap();
+        drop(conn);
+
+        apply_proxy_generate_result(
+            &paths,
+            &broker,
+            "project_a",
+            "card",
+            "clip0002",
+            ProxyGenerateJobResult {
+                output_path: proxy.clone(),
+                probe: Some(test_probe()),
+            },
+        )
+        .unwrap();
+
+        let conn = open_ingest(&paths, "project_a").unwrap();
+        let row: (String, String, f64) = conn
+            .query_row(
+                "SELECT import_status, project_proxy_path, fps
+                 FROM ingest_assets
+                 WHERE source_id = 'card' AND clip_id = 'clip0002'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        let proxy_status: String = conn
+            .query_row(
+                "SELECT status FROM ingest_jobs WHERE job_id = ?1",
+                params![crate::ingest::db::ingest_job_id(
+                    "proxy_generate",
+                    "card",
+                    "clip0002"
+                )],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(row.0, "imported");
+        assert_eq!(row.1, proxy.to_string_lossy());
+        assert_eq!(row.2, 50.0);
+        assert_eq!(proxy_status, "done");
     }
 
     #[test]
