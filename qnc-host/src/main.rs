@@ -29,6 +29,7 @@ mod ingest_durations;
 mod ingest_import;
 mod ingest_posters;
 mod ingest_proxy;
+mod jobs;
 mod locale_number;
 mod media;
 mod media_pool;
@@ -131,46 +132,7 @@ async fn main() {
         background_work.clone(),
         services.media.clone(),
     ));
-    match ingest_import.enqueue_recoverable_projects() {
-        Ok(count) if count > 0 => info!("ingest import recovery queued projects={count}"),
-        Ok(_) => {}
-        Err(e) => warn!("ingest import recovery scan failed: {e}"),
-    }
-    match ingest_proxy.enqueue_recoverable_projects() {
-        Ok(count) if count > 0 => info!("ingest proxy recovery queued clips={count}"),
-        Ok(_) => {}
-        Err(e) => warn!("ingest proxy recovery scan failed: {e}"),
-    }
-    match ingest_card_thumbs.enqueue_recoverable_projects() {
-        Ok(count) if count > 0 => info!("ingest card thumbs recovery queued projects={count}"),
-        Ok(_) => {}
-        Err(e) => warn!("ingest card thumbs recovery scan failed: {e}"),
-    }
-    match ingest_durations.enqueue_recoverable_projects() {
-        Ok(count) if count > 0 => info!("ingest durations recovery queued projects={count}"),
-        Ok(_) => {}
-        Err(e) => warn!("ingest durations recovery scan failed: {e}"),
-    }
-    match ingest_posters.enqueue_recoverable_projects() {
-        Ok(count) if count > 0 => info!("ingest poster recovery queued projects={count}"),
-        Ok(_) => {}
-        Err(e) => warn!("ingest poster recovery scan failed: {e}"),
-    }
-    match filmstrip.enqueue_recoverable_projects(filmstrip::DEFAULT_FILMSTRIP_FRAMES) {
-        Ok(count) if count > 0 => info!("filmstrip recovery queued clips={count}"),
-        Ok(_) => {}
-        Err(e) => warn!("filmstrip recovery scan failed: {e}"),
-    }
-    match waveform.enqueue_recoverable_projects() {
-        Ok(count) if count > 0 => info!("waveform recovery queued clips={count}"),
-        Ok(_) => {}
-        Err(e) => warn!("waveform recovery scan failed: {e}"),
-    }
-    match ingest_audio_wrap.enqueue_recoverable_projects() {
-        Ok(count) if count > 0 => info!("ingest audio wrap recovery queued projects={count}"),
-        Ok(_) => {}
-        Err(e) => warn!("ingest audio wrap recovery scan failed: {e}"),
-    }
+    info!("background recovery: deferred to worker idle loops");
     ingest_posters.clone().spawn();
     ingest_proxy.clone().spawn();
     ingest_card_thumbs.clone().spawn();
@@ -180,13 +142,39 @@ async fn main() {
     ingest_import.clone().spawn();
     ingest_audio_wrap.clone().spawn();
 
-    // Metadata repair (fps/duration) runs once at boot, off the request path.
+    {
+        let card_thumb_recovery = ingest_card_thumbs.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(12)).await;
+            match card_thumb_recovery.enqueue_recoverable_projects() {
+                Ok(count) if count > 0 => {
+                    info!("ingest card thumbs recovery queued projects={count}")
+                }
+                Ok(_) => {}
+                Err(e) => warn!("ingest card thumbs recovery scan failed: {e}"),
+            }
+        });
+    }
+
+    // Metadata repair is boot recovery, not request-path work. Let the UI and
+    // any immediate import/play action settle before scanning project media.
     {
         let maintenance_paths = project_state.paths.clone();
         let maintenance_project_db = project_db.clone();
-        tokio::task::spawn_blocking(move || {
-            waveform::maintenance_purge_legacy(&maintenance_paths, &maintenance_project_db);
-            media_pool::backfill_all_imported_metadata(&maintenance_paths);
+        let maintenance_background = background_work.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(20)).await;
+            while maintenance_background.playback_active() {
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            }
+            let result = tokio::task::spawn_blocking(move || {
+                waveform::maintenance_purge_legacy(&maintenance_paths, &maintenance_project_db);
+                media_pool::backfill_all_imported_metadata(&maintenance_paths);
+            })
+            .await;
+            if let Err(error) = result {
+                warn!("metadata maintenance task failed: {error}");
+            }
         });
     }
 
@@ -243,6 +231,7 @@ async fn main() {
         .merge(project::router())
         .merge(ingest::router())
         .merge(story::router())
+        .merge(jobs::router())
         .merge(routes::design_tools::router())
         // Compat: legacy media-pool placeholder URLs used by older filmstrip paint.
         .route(

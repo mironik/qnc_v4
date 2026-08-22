@@ -283,6 +283,95 @@ pub trait AIOrchestrator: Send + Sync {
     async fn run(&self, request: AiRequest) -> ServiceResult<AiResponse>;
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JobClaimRequest {
+    pub worker_id: String,
+    #[serde(default)]
+    pub project_id: Option<String>,
+    #[serde(default)]
+    pub capabilities: Vec<String>,
+    #[serde(default)]
+    pub max_jobs: Option<usize>,
+    #[serde(default)]
+    pub lease_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JobLease {
+    pub job_id: String,
+    pub project_id: String,
+    pub job_type: String,
+    pub source_id: String,
+    pub clip_id: String,
+    pub worker_id: String,
+    pub lease_id: String,
+    pub lease_until_unix_ms: u64,
+    pub attempts: i64,
+    pub queued_at: Option<String>,
+    pub payload: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JobClaimResponse {
+    pub jobs: Vec<JobLease>,
+    pub playback_active: bool,
+    pub message: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JobHeartbeatRequest {
+    pub worker_id: String,
+    pub project_id: String,
+    pub lease_id: String,
+    #[serde(default)]
+    pub job_ids: Vec<String>,
+    #[serde(default)]
+    pub lease_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JobHeartbeatResponse {
+    pub accepted: Vec<String>,
+    pub rejected: Vec<String>,
+    pub lease_until_unix_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JobCompleteRequest {
+    pub worker_id: String,
+    pub project_id: String,
+    pub lease_id: String,
+    pub job_id: String,
+    #[serde(default)]
+    pub result: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JobFailRequest {
+    pub worker_id: String,
+    pub project_id: String,
+    pub lease_id: String,
+    pub job_id: String,
+    pub error: String,
+    #[serde(default)]
+    pub retryable: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JobAck {
+    pub accepted: bool,
+    pub job_id: String,
+    pub message: Option<String>,
+}
+
+#[async_trait]
+pub trait JobService: Send + Sync {
+    async fn claim(&self, request: JobClaimRequest) -> ServiceResult<JobClaimResponse>;
+    async fn heartbeat(&self, request: JobHeartbeatRequest) -> ServiceResult<JobHeartbeatResponse>;
+    async fn complete(&self, request: JobCompleteRequest) -> ServiceResult<JobAck>;
+    async fn fail(&self, request: JobFailRequest) -> ServiceResult<JobAck>;
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ExportJobState {

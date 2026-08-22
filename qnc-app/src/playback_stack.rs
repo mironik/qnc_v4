@@ -32,6 +32,7 @@ pub struct PlaybackStack {
     playlist_program_request: Option<BroadcastProgramOpenRequest>,
     playlist_program_preparing: bool,
     playlist_program_ready: bool,
+    input_opening: bool,
     pending_seek: Option<PendingSeek>,
 }
 
@@ -51,6 +52,7 @@ impl PlaybackStack {
             playlist_program_request: None,
             playlist_program_preparing: false,
             playlist_program_ready: false,
+            input_opening: false,
             pending_seek: None,
         }
     }
@@ -96,6 +98,7 @@ impl PlaybackStack {
             self.playlist_program_request = None;
             self.playlist_program_preparing = false;
             self.playlist_program_ready = false;
+            self.input_opening = false;
             self.pending_seek = None;
         }
         for event in events {
@@ -120,6 +123,10 @@ impl PlaybackStack {
                     self.playlist_input_active = true;
                     self.playlist_program_preparing = false;
                     self.playlist_program_ready = true;
+                    self.input_opening = false;
+                }
+                PlayerEvent::SourceReady { .. } => {
+                    self.input_opening = false;
                 }
                 _ => {}
             }
@@ -143,6 +150,7 @@ impl PlaybackStack {
         self.playlist_program_request = None;
         self.playlist_program_preparing = false;
         self.playlist_program_ready = false;
+        self.input_opening = false;
         self.pending_seek = None;
     }
 
@@ -167,6 +175,11 @@ impl PlaybackStack {
 
     pub fn playing(&self) -> bool {
         self.player.snapshot().playing || self.carrier.playing()
+    }
+
+    /// True while background workers should yield to playback setup or playback itself.
+    pub fn blocks_background_work(&self) -> bool {
+        self.playing() || self.input_opening || self.playlist_program_preparing
     }
 
     /// Live playlist/program frame for passive Program/Segment UI projections.
@@ -286,6 +299,7 @@ impl PlaybackStack {
             self.playlist_program_request = None;
             self.playlist_program_preparing = false;
             self.playlist_program_ready = false;
+            self.input_opening = false;
             return Ok(());
         }
         let source_ref = request.source_ref.clone();
@@ -297,7 +311,11 @@ impl PlaybackStack {
         self.playlist_program_ready = false;
         self.pending_seek = None;
         let _ = self.player.tx().stop();
-        self.player.tx().open(request)?;
+        self.input_opening = true;
+        if let Err(error) = self.player.tx().open(request) {
+            self.input_opening = false;
+            return Err(error);
+        }
         self.active_source_ref = Some(source_ref);
         Ok(())
     }
@@ -370,7 +388,11 @@ impl PlaybackStack {
         self.playlist_program_preparing = false;
         self.playlist_program_ready = false;
         self.pending_seek = None;
-        self.player.tx().open_program(request)?;
+        self.input_opening = true;
+        if let Err(error) = self.player.tx().open_program(request) {
+            self.input_opening = false;
+            return Err(error);
+        }
         self.playlist_input_active = true;
         self.playlist_program_request = Some(loaded_request);
         Ok(())
@@ -403,6 +425,7 @@ impl PlaybackStack {
         self.playlist_program_request = None;
         self.playlist_program_preparing = false;
         self.playlist_program_ready = false;
+        self.input_opening = false;
         self.pending_seek = None;
     }
 
@@ -659,6 +682,25 @@ mod tests {
     }
 
     #[test]
+    fn source_open_blocks_background_until_ready() {
+        let mut stack = PlaybackStack::new();
+
+        stack.ensure_open(open_request()).unwrap();
+
+        assert!(stack.blocks_background_work());
+
+        stack.ingest_events(&[PlayerEvent::SourceReady {
+            fps: 50.0,
+            duration_frames: 250,
+            in_frame: 10,
+            out_frame: 40,
+            field_mode: qnc_player_core::FieldMode::Progressive,
+        }]);
+
+        assert!(!stack.blocks_background_work());
+    }
+
+    #[test]
     fn playlist_display_frame_uses_carrier_only_for_active_playlist_input() {
         let mut stack = PlaybackStack::new();
         stack.ingest_events(&[
@@ -695,6 +737,7 @@ mod tests {
         assert!(stack.playlist_program_request_matches(&program_request(60)));
         assert!(stack.playlist_program_preparing);
         assert!(!stack.playlist_program_ready);
+        assert!(stack.blocks_background_work());
     }
 
     #[test]
@@ -710,6 +753,7 @@ mod tests {
         assert!(!stack.playlist_program_preparing);
         assert!(stack.playlist_program_ready);
         assert!(stack.playlist_program_request_matches(&program_request(60)));
+        assert!(!stack.blocks_background_work());
 
         stack.ingest_events(&[PlayerEvent::ProgramPrepareFailed {
             request,
@@ -730,6 +774,7 @@ mod tests {
         assert!(stack.playlist_input_active());
         assert!(!stack.playlist_input_playing());
         assert!(stack.playlist_program_matches(&program_request(60)));
+        assert!(stack.blocks_background_work());
     }
 
     #[test]

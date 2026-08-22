@@ -103,6 +103,28 @@ projektu za projektnu istinu, te runtime cache samo za brze, ne-trajne statuse.
   original, a neke djelomičan skup. Import/worker tok mora prvo upisati ono što
   stvarno postoji na kartici, koristiti postojeći proxy/thumbnail kad su
   prisutni, i generirati samo artefakte koji nedostaju kroz neutralne workere.
+- Camera proxy je zakon: ako proxy postoji na kartici/NAS-u, on se kopira ili
+  linka u projekt i ne smije se generirati novi proxy bez potrebe. FFmpeg proxy
+  generation je fallback samo za klipove koji nemaju postojeći proxy.
+- Camera thumbnail je zakon: ako THM/JPG/poster postoji na kartici/NAS-u, on se
+  kopira kao poster i ne smije se generirati FFmpeg poster bez potrebe.
+- Import se osvjezava po klipu, ne po batchu: cim pojedini klip dobije proxy,
+  thumb, filmstrip frame ili waveform status, host zapisuje status za taj klip,
+  a UI smije prikazati taj napredak bez cekanja zavrsetka cijele kartice.
+- Pipeline je po klipu i po dependencyju: proxy copy/generate zavrsava atomskim
+  ready statusom, zatim za isti klip mogu krenuti filmstrip, waveform i
+  fallback poster. Partial fajl ne smije biti playback/decode istina i ne smije
+  predstavljati cijeli filmstrip.
+- Buduci vanjski workeri ne smiju uvoditi paralelni queue niti direktan SQLite
+  javni model. Kanonski red je postojeci `ingest_jobs`, a vanjski procesi
+  komuniciraju kroz host `JobService` API (`claim`, `heartbeat`, `complete`,
+  `fail`) i `ProjectDbBroker`.
+- Dok je playback aktivan ili se tek otvara/priprema input, teški workeri ne
+  smiju claimati posao. Host `playback_active`/background gate ima prednost nad
+  recoveryjem, proxyjem, filmstripom, waveformom i ostalim pozadinskim poslom.
+- `Import/Uvezi` ostaje zakljucani DB-first ugovor dok se izricito ne napravi
+  zaseban migracijski korak. Worker split pocinje oko samostalnih artefakt
+  poslova, ne izmjenama Ingest forme.
 - Fizička lokacija medija nije workflow istina. UI, Story, timeline, export i
   player ne smiju pretpostavljati lokalni Windows path kao poslovno pravilo.
   Do medija se dolazi kroz neutralni resolver/host contract.

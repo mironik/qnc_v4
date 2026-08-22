@@ -280,7 +280,7 @@ impl QncApp {
         if !self.health_ok {
             return;
         }
-        let active = self.phase == Phase::Workspace && self.playback.playing();
+        let active = self.phase == Phase::Workspace && self.playback.blocks_background_work();
         let heartbeat_due = active
             && self.background_playback_active_sent == Some(active)
             && self
