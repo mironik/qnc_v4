@@ -84,7 +84,13 @@ If transcript data or status exists, it must be read/written via Rust API → `q
 
 **Rule:** JSON may describe *what exists* (manifest). JSON must not *be* the running workflow.
 
-### 2.6 Project filesystem vs project database
+### 2.6 Export boundary
+
+Export is owned by a separate plugin application. Main QNC may prepare project
+data, virtual shots, playlist/EDL, and metadata, but must not own the export
+engine or hard-code active export behavior in the core app.
+
+### 2.7 Project filesystem vs project database
 
 The project directory may contain media files and regenerable render artefacts, but it must not contain durable workflow truth outside SQLite.
 
@@ -134,9 +140,34 @@ onShow
 
 Modules enable flags live in **`project_store.db` → `module_state`** (Phase 1). Legacy `data/shell_module_state.json` is imported once on host start and renamed to `.migrated`.
 
+### 4.1 Database broker rule
+
+The durable layout stays simple:
+
+```
+qnc-app / worker / plugin adapter
+  -> qnc-host API or service component
+  -> ProjectDbBroker
+  -> data/project_store.db or {project_dir}/qnc_project.db
+```
+
+SQLite remains the long-term source of truth, but new host code must not make
+UI, workers, or plugin adapters share SQLite directly. `ProjectDbBroker` is the
+canonical boundary for new DB-facing code:
+
+- global DB = project catalog, templates, shell/module state
+- per-project DB = ingest, story, virtual shots, filmstrip/waveform metadata
+- runtime cache = non-durable fast status/progress projection
+- project writes use a single-writer gate per project
+- UI/components only call host APIs and never know the physical DB path
+
+This keeps the local workstation mode compatible with later intranet/enterprise
+deployment, where the broker can be replaced by a remote store adapter without
+changing UI/component contracts.
+
 ---
 
-## 4.1 Story editorial truth
+## 4.2 Story editorial truth
 
 Story montage is based on durable virtual entities, not transient UI trims.
 

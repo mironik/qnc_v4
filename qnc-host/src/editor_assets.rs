@@ -13,9 +13,8 @@ use serde_json::{json, Value};
 
 use crate::app_state::AppState;
 use crate::filmstrip::{
-    frame_path_for_index, frame_path_for_seek, get_filmstrip, list_frames_for_clip,
-    pad_frames_to_default_with_placeholder, placeholder_url_for_api, sync_filmstrip_from_disk,
-    PLACEHOLDER_JPEG,
+    frame_path_for_index, frame_path_for_seek, get_filmstrip, manifest_cache_key, manifest_for_api,
+    sync_filmstrip_from_disk, PLACEHOLDER_JPEG,
 };
 use crate::frame_time::{rational_fps, require_fps};
 use crate::ingest::db::resolve_ingest_poster_path;
@@ -23,8 +22,9 @@ use crate::ingest::thumb::{
     extract_poster_jpeg_at_seek, extract_preview_jpeg_at_seek, media_has_audio_stream,
     resolve_ffmpeg,
 };
+use crate::locale_number::format_decimal;
 use crate::media::resolve_play_media;
-use crate::media_pool::{list_clips_enriched, mark_filmstrip_building, resolve_clip_fps};
+use crate::media_pool::{list_clips_enriched, mark_filmstrip_building, resolve_stored_clip_fps};
 use crate::virtual_shots::{
     add_virtual_shot, add_virtual_shot_from_frames, cover_path_for_shot, derive_virtual_shot,
     derive_virtual_shot_from_frames, list_virtual_shots, update_virtual_shot,
@@ -36,62 +36,6 @@ use crate::waveform::{ready as waveform_ready, snapshot as waveform_snapshot};
 pub enum VirtualStreamKind {
     Mux,
     AudioOnly,
-}
-
-pub(crate) async fn ensure_virtual_stream_cached(
-    paths: &crate::project::db::ProjectPaths,
-    project_id: &str,
-    clip_id: &str,
-    in_frame: i64,
-    out_frame: i64,
-    fps: f64,
-) -> Result<PathBuf, String> {
-    ensure_virtual_stream_cached_kind(
-        paths,
-        project_id,
-        clip_id,
-        in_frame,
-        out_frame,
-        fps,
-        VirtualStreamKind::Mux,
-    )
-    .await
-}
-
-pub(crate) async fn ensure_virtual_stream_cached_kind(
-    paths: &crate::project::db::ProjectPaths,
-    project_id: &str,
-    clip_id: &str,
-    in_frame: i64,
-    out_frame: i64,
-    fps: f64,
-    kind: VirtualStreamKind,
-) -> Result<PathBuf, String> {
-    let pid = project_id.trim();
-    let clip = clip_id.trim();
-    if pid.is_empty() || clip.is_empty() {
-        return Err("project_id and clip_id required".into());
-    }
-    let play = resolve_play_media(paths, pid, clip)?;
-    let proxy = play.path;
-    let cache_root = std::env::temp_dir()
-        .join("qnc")
-        .join("qstory_virtual_stream")
-        .join(safe_id(pid));
-    let clip_id = clip.to_string();
-    tokio::task::spawn_blocking(move || {
-        ensure_virtual_stream(
-            &proxy,
-            &cache_root,
-            &clip_id,
-            in_frame,
-            out_frame,
-            fps,
-            kind,
-        )
-    })
-    .await
-    .map_err(|error| error.to_string())?
 }
 
 #[derive(serde::Deserialize)]
@@ -331,7 +275,7 @@ async fn api_virtual_stream(
     } else {
         let clip_id = required_clip_id(&q.clip_id)?.to_string();
         // Source FPS is resolved from the media/DB, never trusted from the client.
-        let fps = resolve_clip_fps(&app.project.paths, &pid, &clip_id).map_err(|error| {
+        let fps = resolve_stored_clip_fps(&app.project.paths, &pid, &clip_id).map_err(|error| {
             (
                 StatusCode::BAD_REQUEST,
                 format!("Virtualni stream: {error}"),
@@ -454,51 +398,36 @@ async fn api_filmstrip(
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let pid = resolve_project_id(&app, &q.project_id)?;
     let clip_id = required_clip_id(&q.clip_id)?;
-    let duration_hint = get_filmstrip(&app.project.paths, &pid, clip_id)
-        .and_then(|value| value.get("duration_sec").and_then(Value::as_f64))
-        .unwrap_or(0.0);
-    let _ = sync_filmstrip_from_disk(&app.project.paths, &pid, clip_id, duration_hint);
-    let filmstrip = get_filmstrip(&app.project.paths, &pid, clip_id).unwrap_or_else(|| {
-        json!({
-            "clip_id": clip_id,
-            "status": "missing",
-            "duration_sec": 0,
-            "frame_count": 0,
-            "error": "",
-        })
-    });
     let namespace = uri
         .path()
         .strip_suffix("/filmstrip")
         .unwrap_or("/api/story");
-    let placeholder = placeholder_url_for_api(namespace);
-    let frames = pad_frames_to_default_with_placeholder(
-        list_frames_for_clip(&app.project.paths, &pid, clip_id)
-            .unwrap_or_default()
-            .into_iter()
-            .map(|frame| {
-                let index = frame.get("index").and_then(Value::as_i64).unwrap_or(0);
-                json!({
-                    "index": index,
-                    "frame_index": index,
-                    "seek_sec": frame.get("seek_sec").and_then(Value::as_f64).unwrap_or(0.0),
-                    "url": format!(
-                        "{namespace}/thumbnail?clip_id={}&frame_index={}&project_id={}",
-                        url_encode(clip_id),
-                        index,
-                        url_encode(&pid)
-                    ),
-                })
-            })
-            .collect::<Vec<_>>(),
-        &placeholder,
-    );
-    Ok(Json(json!({
-        "project_id": pid,
-        "clip_id": clip_id,
-        "filmstrip": filmstrip,
-        "frames": frames,
-    })))
+    let cache_key = manifest_cache_key(clip_id, namespace);
+    if let Some(cached) = app.project_db.get_runtime_cache(&pid, &cache_key) {
+        if cached
+            .get("filmstrip")
+            .and_then(|filmstrip| filmstrip.get("status"))
+            .and_then(Value::as_str)
+            == Some("ready")
+        {
+            return Ok(Json(cached));
+        }
+    }
+    let duration_hint = get_filmstrip(&app.project.paths, &pid, clip_id)
+        .and_then(|value| value.get("duration_sec").and_then(Value::as_f64))
+        .unwrap_or(0.0);
+    let _ = sync_filmstrip_from_disk(&app.project.paths, &pid, clip_id, duration_hint);
+    let manifest = manifest_for_api(&app.project.paths, &pid, clip_id, namespace);
+    if manifest
+        .get("filmstrip")
+        .and_then(|filmstrip| filmstrip.get("status"))
+        .and_then(Value::as_str)
+        == Some("ready")
+    {
+        app.project_db
+            .put_runtime_cache(&pid, &cache_key, manifest.clone());
+    }
+    Ok(Json(manifest))
 }
 
 async fn api_filmstrip_placeholder() -> Response {
@@ -554,7 +483,7 @@ async fn api_timeline_build(
         }
         if status == "building" {
             if let Some(path) = requested_media_path(&app, &pid, clip_id, &body.media_path) {
-                app.filmstrip.enqueue(&pid, clip_id, &path, frames);
+                app.filmstrip.enqueue_priority(&pid, clip_id, &path, frames);
             }
             return Ok(Json(json!({ "status": "building", "clip_id": clip_id })));
         }
@@ -566,7 +495,8 @@ async fn api_timeline_build(
         )
     })?;
     mark_filmstrip_building(&app.project.paths, &pid, clip_id).map_err(internal)?;
-    app.filmstrip.enqueue(&pid, clip_id, &media, frames);
+    app.filmstrip
+        .enqueue_priority(&pid, clip_id, &media, frames);
     app.waveform.enqueue(&pid, clip_id, &media);
     Ok(Json(json!({ "status": "queued", "clip_id": clip_id })))
 }
@@ -672,9 +602,22 @@ fn requested_media_path(
     clip_id: &str,
     requested: &str,
 ) -> Option<PathBuf> {
-    if !requested.trim().is_empty() {
+    let requested_path = if !requested.trim().is_empty() {
         let path = PathBuf::from(requested.trim());
-        return path.is_file().then_some(path);
+        path.is_file().then_some(path)
+    } else {
+        None
+    };
+    if let Some(path) = crate::media::resolve_filmstrip_media(
+        &app.project.paths,
+        project_id,
+        clip_id,
+        requested_path.as_deref(),
+    ) {
+        return Some(path);
+    }
+    if !requested.trim().is_empty() {
+        return requested_path;
     }
     resolve_play_media(&app.project.paths, project_id, clip_id)
         .ok()
@@ -710,27 +653,8 @@ fn safe_id(raw: &str) -> String {
         .collect()
 }
 
-fn url_encode(raw: &str) -> String {
-    raw.bytes()
-        .map(|byte| match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                (byte as char).to_string()
-            }
-            _ => format!("%{byte:02X}"),
-        })
-        .collect()
-}
-
 fn internal(error: String) -> (StatusCode, String) {
     (StatusCode::INTERNAL_SERVER_ERROR, error)
-}
-
-pub(crate) async fn serve_media_path(
-    path: PathBuf,
-    range: Option<&header::HeaderValue>,
-    max_response_bytes: Option<u64>,
-) -> Result<Response, (StatusCode, String)> {
-    serve_file(path, range, max_response_bytes).await
 }
 
 async fn serve_file(
@@ -889,11 +813,11 @@ fn ensure_virtual_stream(
         .arg("error")
         .arg("-y")
         .arg("-ss")
-        .arg(format!("{start_sec:.9}"))
+        .arg(format_decimal(start_sec, 9))
         .arg("-i")
         .arg(proxy)
         .arg("-t")
-        .arg(format!("{duration_sec:.9}"));
+        .arg(format_decimal(duration_sec, 9));
     if kind == VirtualStreamKind::AudioOnly {
         cmd.arg("-vn")
             .arg("-map")
@@ -984,7 +908,7 @@ fn render_silence_audio_file(
             "-i",
             "anullsrc=channel_layout=stereo:sample_rate=48000",
             "-t",
-            &format!("{duration:.9}"),
+            &format_decimal(duration, 9),
             "-vn",
             "-c:a",
             "aac",

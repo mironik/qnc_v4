@@ -1,0 +1,117 @@
+{
+  "catalog_id": "qnc.export.profile.catalog.v1",
+  "presets": [
+    {
+      "id": "xdcam_hd422_50i",
+      "name": "XDCAM HD422 50i (PAL)",
+      "values": {
+        "format": "HD 1080i50",
+        "fps": 25.0,
+        "width": 1920,
+        "height": 1080,
+        "field_order": "upper_first",
+        "color_space": "rec709",
+        "container": "mxf_op1a",
+        "video_codec": "mpeg2_422_50mbit",
+        "audio_sample_rate": 48000,
+        "audio_channels": 2
+      }
+    },
+    {
+      "id": "xdcam_hd422_60i",
+      "name": "XDCAM HD422 60i (NTSC)",
+      "values": {
+        "format": "HD 1080i60",
+        "fps": 29.97,
+        "width": 1920,
+        "height": 1080,
+        "field_order": "upper_first",
+        "color_space": "rec709",
+        "container": "mxf_op1a",
+        "video_codec": "mpeg2_422_50mbit",
+        "audio_sample_rate": 48000,
+        "audio_channels": 2
+      }
+    },
+    {
+      "id": "xdcam_hd422_30p",
+      "name": "XDCAM HD422 30p (NTSC)",
+      "values": {
+        "format": "HD 1080p30",
+        "fps": 29.97,
+        "width": 1920,
+        "height": 1080,
+        "field_order": "progressive",
+        "color_space": "rec709",
+        "container": "mxf_op1a",
+        "video_codec": "mpeg2_422_50mbit",
+        "audio_sample_rate": 48000,
+        "audio_channels": 2
+      }
+    },
+    {
+      "id": "h264_1080p50",
+      "name": "H.264 1080p50 (PAL)",
+      "values": {
+        "format": "HD 1080p50",
+        "fps": 50.0,
+        "width": 1920,
+        "height": 1080,
+        "field_order": "progressive",
+        "color_space": "rec709",
+        "container": "mp4",
+        "video_codec": "h264",
+        "audio_sample_rate": 48000,
+        "audio_channels": 2
+      }
+    },
+    {
+      "id": "h264_1080p30",
+      "name": "H.264 1080p29.97 (NTSC)",
+      "values": {
+        "format": "HD 1080p30",
+        "fps": 29.97,
+        "width": 1920,
+        "height": 1080,
+        "field_order": "progressive",
+        "color_space": "rec709",
+        "container": "mp4",
+        "video_codec": "h264",
+        "audio_sample_rate": 48000,
+        "audio_channels": 2
+      }
+    },
+    {
+      "id": "h264_1080p60",
+      "name": "H.264 1080p59.94 (NTSC)",
+      "values": {
+        "format": "HD 1080p60",
+        "fps": 59.94,
+        "width": 1920,
+        "height": 1080,
+        "field_order": "progressive",
+        "color_space": "rec709",
+        "container": "mp4",
+        "video_codec": "h264",
+        "audio_sample_rate": 48000,
+        "audio_channels": 2
+      }
+    },
+    {
+      "id": "dnxhd_hq",
+      "name": "DNxHD HQ (Avid)",
+      "values": {
+        "format": "HD 1080i50",
+        "fps": 25.0,
+        "width": 1920,
+        "height": 1080,
+        "field_order": "upper_first",
+        "color_space": "rec709",
+        "container": "mxf_op1a",
+        "video_codec": "dnxhd_hq",
+        "audio_sample_rate": 48000,
+        "audio_channels": 2
+      }
+    }
+  ]
+}

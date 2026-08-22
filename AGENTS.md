@@ -81,6 +81,10 @@ Test: `.\test.ps1` (API + qnc-app unit smoke, bez web asset testova).
 ## DB-first
 
 Workflow stanje živi u SQLite preko Rust API-ja. UI je projekcija — nikad vlasnik.
+Novi host kod, workeri i budući plugin adapteri ne smiju uvoditi nove direktne
+SQLite veze kao javni model komunikacije. Kanonski put je `ProjectDbBroker`:
+globalni `project_store.db` za katalog/projekte, zasebni `qnc_project.db` po
+projektu za projektnu istinu, te runtime cache samo za brze, ne-trajne statuse.
 
 ## Deployment i mediji
 

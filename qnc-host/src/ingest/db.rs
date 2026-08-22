@@ -280,12 +280,17 @@ fn migrate_ingest_metadata_columns(conn: &Connection) -> rusqlite::Result<()> {
         .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
         .collect::<Result<Vec<_>, _>>()?;
     for (source_id, clip_id, raw) in rows {
-        let meta = parse_json(&raw, serde_json::json!({}));
-        let ext = meta.get("extension").and_then(|v| v.as_str()).unwrap_or("");
+        let mut meta = parse_json(&raw, serde_json::json!({}));
+        let ext = meta
+            .get("extension")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
         let poster = meta
             .get("poster_source")
             .and_then(|v| v.as_str())
-            .unwrap_or("");
+            .unwrap_or("")
+            .to_string();
         let read_from_card = meta
             .get("read_from_card")
             .and_then(|v| v.as_bool())
@@ -294,6 +299,45 @@ fn migrate_ingest_metadata_columns(conn: &Connection) -> rusqlite::Result<()> {
             .get("card_locked")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
+        let source_path = meta
+            .get("source_path")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let original_path = meta
+            .get("original_path")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let proxy_path = meta
+            .get("proxy_path")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let card_thumb_path = meta
+            .get("card_thumb_path")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        if let Some(obj) = meta.as_object_mut() {
+            for key in [
+                "extension",
+                "poster_source",
+                "read_from_card",
+                "card_locked",
+                "source_path",
+                "original_path",
+                "proxy_path",
+                "card_thumb_path",
+            ] {
+                obj.remove(key);
+            }
+        }
+        let remaining_meta = meta
+            .as_object()
+            .filter(|obj| !obj.is_empty())
+            .map(|_| meta.to_string())
+            .unwrap_or_else(|| "{}".to_string());
         conn.execute(
             "UPDATE ingest_assets SET
                 file_extension = CASE WHEN file_extension = '' THEN ?3 ELSE file_extension END,
@@ -304,7 +348,7 @@ fn migrate_ingest_metadata_columns(conn: &Connection) -> rusqlite::Result<()> {
                 original_path = CASE WHEN original_path = '' THEN COALESCE(?8, '') ELSE original_path END,
                 proxy_path = CASE WHEN proxy_path = '' THEN COALESCE(?9, '') ELSE proxy_path END,
                 card_thumb_path = CASE WHEN card_thumb_path = '' THEN COALESCE(?10, '') ELSE card_thumb_path END,
-                metadata_json = '{}'
+                metadata_json = ?11
              WHERE source_id = ?1 AND clip_id = ?2",
             params![
                 source_id,
@@ -313,10 +357,11 @@ fn migrate_ingest_metadata_columns(conn: &Connection) -> rusqlite::Result<()> {
                 poster,
                 if read_from_card { 1 } else { 0 },
                 if card_locked { 1 } else { 0 },
-                meta.get("source_path").and_then(|v| v.as_str()).unwrap_or(""),
-                meta.get("original_path").and_then(|v| v.as_str()).unwrap_or(""),
-                meta.get("proxy_path").and_then(|v| v.as_str()).unwrap_or(""),
-                meta.get("card_thumb_path").and_then(|v| v.as_str()).unwrap_or(""),
+                source_path,
+                original_path,
+                proxy_path,
+                card_thumb_path,
+                remaining_meta,
             ],
         )?;
     }
@@ -738,6 +783,60 @@ mod tests {
 
         assert_eq!(import_status, "queued");
         assert_eq!(proxy_status, "processing");
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn metadata_column_migration_preserves_non_migrated_keys() {
+        let base = std::env::temp_dir().join(format!(
+            "qnc_ingest_meta_preserve_test_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+        let paths = test_paths(&base);
+        let project_id = "meta_preserve_proj";
+        let conn = open_ingest(&paths, project_id).unwrap();
+        conn.execute(
+            "INSERT INTO ingest_assets
+                (source_id, clip_id, name, media_id, metadata_json)
+             VALUES ('local', 'clip_audio', 'clip_audio', 'clip_audio', ?1)",
+            rusqlite::params![serde_json::json!({
+                "source_path": "card/clip_audio.wav",
+                "extension": "wav",
+                "audio_project_path": "project/audio/clip_audio.wav",
+                "audio_wraps": { "50": "project/proxy/clip_audio_50.mp4" }
+            })
+            .to_string()],
+        )
+        .unwrap();
+        drop(conn);
+
+        let conn = open_ingest(&paths, project_id).unwrap();
+        let row: (String, String, String) = conn
+            .query_row(
+                "SELECT source_path, file_extension, metadata_json
+                 FROM ingest_assets
+                 WHERE source_id = 'local' AND clip_id = 'clip_audio'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(row.0, "card/clip_audio.wav");
+        assert_eq!(row.1, "wav");
+        let meta: serde_json::Value = serde_json::from_str(&row.2).unwrap();
+        assert_eq!(
+            meta.get("audio_project_path").and_then(|v| v.as_str()),
+            Some("project/audio/clip_audio.wav")
+        );
+        assert!(meta.get("audio_wraps").is_some());
+        assert!(meta.get("source_path").is_none());
+        assert!(meta.get("extension").is_none());
 
         let _ = fs::remove_dir_all(&base);
     }

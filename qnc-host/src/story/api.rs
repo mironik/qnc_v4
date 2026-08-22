@@ -4,10 +4,12 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use serde_json::Value;
+use qnc_service_contracts::{ExportRequest, ServiceError};
+use serde_json::{json, Value};
 
 use crate::app_state::AppState;
 use crate::frame_time::frame_to_seconds;
+use crate::project::db::{export_dir_from_settings, project_settings_snapshot_from_conn};
 
 use super::db::{
     commit_story, create_cover, create_marker, create_marker_from_frame,
@@ -17,8 +19,8 @@ use super::db::{
     set_part_mark_out, set_part_mark_out_frame, update_cover, update_marker, update_marker_frame,
     update_part, SegmentRangeInput,
 };
-use super::playlist::{build_editorial_playlist, EditorialPlaylist};
-use super::timeline_model::{build_source_timeline_model, build_wrap_timeline_model};
+use super::playlist::{build_editorial_playlist_with_broker, EditorialPlaylist};
+use super::timeline_model::{build_source_timeline_model, build_wrap_timeline_model_with_broker};
 
 #[derive(serde::Deserialize)]
 struct ProjectQuery {
@@ -194,6 +196,28 @@ struct CommitBody {
 }
 
 #[derive(serde::Deserialize)]
+struct ExportSubmitBody {
+    #[serde(default)]
+    project_id: String,
+}
+
+#[derive(serde::Deserialize)]
+struct ExportJobQuery {
+    #[serde(default)]
+    project_id: String,
+    #[serde(default)]
+    job_id: String,
+}
+
+#[derive(serde::Deserialize)]
+struct ExportCancelBody {
+    #[serde(default)]
+    project_id: String,
+    #[serde(default)]
+    job_id: String,
+}
+
+#[derive(serde::Deserialize)]
 struct SourceTimelineQuery {
     #[serde(default)]
     project_id: String,
@@ -246,7 +270,9 @@ pub fn router() -> Router<AppState> {
         .route("/api/story/cover/delete", post(api_cover_delete))
         .route("/api/story/cover/select", post(api_cover_select))
         .route("/api/story/commit", post(api_commit))
-        .route("/api/story/native/launch", post(api_native_launch))
+        .route("/api/story/export/submit", post(api_export_submit))
+        .route("/api/story/export/status", get(api_export_status))
+        .route("/api/story/export/cancel", post(api_export_cancel))
         .route("/api/story/play-media", get(api_play_media))
         .merge(crate::editor_assets::router("/api/story"))
 }
@@ -256,7 +282,8 @@ async fn api_playlist(
     Query(q): Query<ProjectQuery>,
 ) -> Result<Json<EditorialPlaylist>, (StatusCode, String)> {
     let pid = resolve_project_id(&app, &q.project_id)?;
-    let playlist = build_editorial_playlist(&app.project.paths, &pid).map_err(map_bad_request)?;
+    let playlist = build_editorial_playlist_with_broker(&app.project.paths, &app.project_db, &pid)
+        .map_err(map_bad_request)?;
     Ok(Json(playlist))
 }
 
@@ -265,7 +292,8 @@ async fn api_timeline_model(
     Query(q): Query<ProjectQuery>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let pid = resolve_project_id(&app, &q.project_id)?;
-    let model = build_wrap_timeline_model(&app.project.paths, &pid).map_err(map_bad_request)?;
+    let model = build_wrap_timeline_model_with_broker(&app.project.paths, &app.project_db, &pid)
+        .map_err(map_bad_request)?;
     serde_json::to_value(model)
         .map(Json)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
@@ -293,7 +321,7 @@ async fn api_source_timeline_model(
             "source timeline model FPS dolazi iz source klipa; ne šalji timeline_fps".into(),
         ));
     }
-    let fps = crate::media_pool::resolve_clip_fps(&app.project.paths, &pid, clip_id)
+    let fps = crate::media_pool::resolve_stored_clip_fps(&app.project.paths, &pid, clip_id)
         .map_err(map_bad_request)?;
     let duration_frames = q
         .duration_frames
@@ -321,7 +349,10 @@ async fn api_state(
     Query(q): Query<ProjectQuery>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let pid = resolve_project_id(&app, &q.project_id)?;
-    let state = load_state(&app.project.paths, &pid).map_err(map_store_err)?;
+    let state = app
+        .project_db
+        .serialize_project_write(&pid, || load_state(&app.project.paths, &pid))
+        .map_err(map_store_err)?;
     Ok(Json(state))
 }
 
@@ -330,32 +361,36 @@ async fn api_part_create(
     Json(body): Json<CreatePartBody>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let pid = resolve_project_id(&app, &body.project_id)?;
-    let state = if body.in_frame.is_some() || body.out_frame.is_some() {
-        create_part_with_range(
-            &app.project.paths,
-            &pid,
-            &body.kind,
-            body.virtual_shot_id.as_deref(),
-            body.clip_id.as_deref(),
-            SegmentRangeInput {
-                in_frame: body.in_frame,
-                out_frame: body.out_frame,
-                in_seconds: body.in_seconds,
-                out_seconds: body.out_seconds,
-            },
-        )
-    } else {
-        create_part(
-            &app.project.paths,
-            &pid,
-            &body.kind,
-            body.virtual_shot_id.as_deref(),
-            body.clip_id.as_deref(),
-            body.in_seconds,
-            body.out_seconds,
-        )
-    }
-    .map_err(map_bad_request)?;
+    let state = app
+        .project_db
+        .serialize_project_write(&pid, || {
+            if body.in_frame.is_some() || body.out_frame.is_some() {
+                create_part_with_range(
+                    &app.project.paths,
+                    &pid,
+                    &body.kind,
+                    body.virtual_shot_id.as_deref(),
+                    body.clip_id.as_deref(),
+                    SegmentRangeInput {
+                        in_frame: body.in_frame,
+                        out_frame: body.out_frame,
+                        in_seconds: body.in_seconds,
+                        out_seconds: body.out_seconds,
+                    },
+                )
+            } else {
+                create_part(
+                    &app.project.paths,
+                    &pid,
+                    &body.kind,
+                    body.virtual_shot_id.as_deref(),
+                    body.clip_id.as_deref(),
+                    body.in_seconds,
+                    body.out_seconds,
+                )
+            }
+        })
+        .map_err(map_bad_request)?;
     Ok(Json(state))
 }
 
@@ -367,7 +402,11 @@ async fn api_part_update(
     let title = body.title.as_deref();
     let text = body.text.as_deref();
     let kind = body.kind.as_deref();
-    let state = update_part(&app.project.paths, &pid, &body.part_id, title, text, kind)
+    let state = app
+        .project_db
+        .serialize_project_write(&pid, || {
+            update_part(&app.project.paths, &pid, &body.part_id, title, text, kind)
+        })
         .map_err(map_bad_request)?;
     Ok(Json(state))
 }
@@ -377,7 +416,12 @@ async fn api_part_delete(
     Json(body): Json<PartIdBody>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let pid = resolve_project_id(&app, &body.project_id)?;
-    let state = delete_part(&app.project.paths, &pid, &body.part_id).map_err(map_bad_request)?;
+    let state = app
+        .project_db
+        .serialize_project_write(&pid, || {
+            delete_part(&app.project.paths, &pid, &body.part_id)
+        })
+        .map_err(map_bad_request)?;
     Ok(Json(state))
 }
 
@@ -386,7 +430,11 @@ async fn api_part_reorder(
     Json(body): Json<ReorderPartBody>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let pid = resolve_project_id(&app, &body.project_id)?;
-    let state = reorder_part(&app.project.paths, &pid, &body.part_id, &body.direction)
+    let state = app
+        .project_db
+        .serialize_project_write(&pid, || {
+            reorder_part(&app.project.paths, &pid, &body.part_id, &body.direction)
+        })
         .map_err(map_bad_request)?;
     Ok(Json(state))
 }
@@ -396,7 +444,12 @@ async fn api_part_select(
     Json(body): Json<PartIdBody>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let pid = resolve_project_id(&app, &body.project_id)?;
-    let state = select_part(&app.project.paths, &pid, &body.part_id).map_err(map_bad_request)?;
+    let state = app
+        .project_db
+        .serialize_project_write(&pid, || {
+            select_part(&app.project.paths, &pid, &body.part_id)
+        })
+        .map_err(map_bad_request)?;
     Ok(Json(state))
 }
 
@@ -405,17 +458,21 @@ async fn api_part_mark_in(
     Json(body): Json<PartMarkBody>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let pid = resolve_project_id(&app, &body.project_id)?;
-    let state = (if let Some(local_frame) = body.local_frame {
-        set_part_mark_in_frame(&app.project.paths, &pid, &body.part_id, local_frame)
-    } else {
-        set_part_mark_in(
-            &app.project.paths,
-            &pid,
-            &body.part_id,
-            body.local_sec.unwrap_or(0.0),
-        )
-    })
-    .map_err(map_bad_request)?;
+    let state = app
+        .project_db
+        .serialize_project_write(&pid, || {
+            if let Some(local_frame) = body.local_frame {
+                set_part_mark_in_frame(&app.project.paths, &pid, &body.part_id, local_frame)
+            } else {
+                set_part_mark_in(
+                    &app.project.paths,
+                    &pid,
+                    &body.part_id,
+                    body.local_sec.unwrap_or(0.0),
+                )
+            }
+        })
+        .map_err(map_bad_request)?;
     Ok(Json(state))
 }
 
@@ -424,17 +481,21 @@ async fn api_part_mark_out(
     Json(body): Json<PartMarkBody>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let pid = resolve_project_id(&app, &body.project_id)?;
-    let state = (if let Some(local_frame) = body.local_frame {
-        set_part_mark_out_frame(&app.project.paths, &pid, &body.part_id, local_frame)
-    } else {
-        set_part_mark_out(
-            &app.project.paths,
-            &pid,
-            &body.part_id,
-            body.local_sec.unwrap_or(0.0),
-        )
-    })
-    .map_err(map_bad_request)?;
+    let state = app
+        .project_db
+        .serialize_project_write(&pid, || {
+            if let Some(local_frame) = body.local_frame {
+                set_part_mark_out_frame(&app.project.paths, &pid, &body.part_id, local_frame)
+            } else {
+                set_part_mark_out(
+                    &app.project.paths,
+                    &pid,
+                    &body.part_id,
+                    body.local_sec.unwrap_or(0.0),
+                )
+            }
+        })
+        .map_err(map_bad_request)?;
     Ok(Json(state))
 }
 
@@ -443,8 +504,12 @@ async fn api_shot_select(
     Json(body): Json<ShotIdBody>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let pid = resolve_project_id(&app, &body.project_id)?;
-    let state =
-        select_shot(&app.project.paths, &pid, &body.virtual_shot_id).map_err(map_bad_request)?;
+    let state = app
+        .project_db
+        .serialize_project_write(&pid, || {
+            select_shot(&app.project.paths, &pid, &body.virtual_shot_id)
+        })
+        .map_err(map_bad_request)?;
     Ok(Json(state))
 }
 
@@ -462,28 +527,32 @@ async fn api_marker_create(
         None
     };
     let local_frame = body.local_frame.or(body.origin_local_frame);
-    let state = (if let Some(timeline_frame) = body.timeline_frame {
-        create_marker_from_frame(
-            &app.project.paths,
-            &pid,
-            timeline_frame,
-            part_id,
-            label,
-            local_frame,
-        )
-    } else if let (Some(part_id), Some(local_frame)) = (part_id, local_frame) {
-        create_marker_from_part_frame(&app.project.paths, &pid, part_id, label, local_frame)
-    } else {
-        create_marker(
-            &app.project.paths,
-            &pid,
-            body.timeline_sec,
-            part_id,
-            label,
-            body.local_sec.or(body.origin_local_sec),
-        )
-    })
-    .map_err(map_bad_request)?;
+    let state = app
+        .project_db
+        .serialize_project_write(&pid, || {
+            if let Some(timeline_frame) = body.timeline_frame {
+                create_marker_from_frame(
+                    &app.project.paths,
+                    &pid,
+                    timeline_frame,
+                    part_id,
+                    label,
+                    local_frame,
+                )
+            } else if let (Some(part_id), Some(local_frame)) = (part_id, local_frame) {
+                create_marker_from_part_frame(&app.project.paths, &pid, part_id, label, local_frame)
+            } else {
+                create_marker(
+                    &app.project.paths,
+                    &pid,
+                    body.timeline_sec,
+                    part_id,
+                    label,
+                    body.local_sec.or(body.origin_local_sec),
+                )
+            }
+        })
+        .map_err(map_bad_request)?;
     Ok(Json(state))
 }
 
@@ -492,8 +561,12 @@ async fn api_marker_delete(
     Json(body): Json<MarkerIdBody>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let pid = resolve_project_id(&app, &body.project_id)?;
-    let state =
-        delete_marker(&app.project.paths, &pid, &body.marker_id).map_err(map_bad_request)?;
+    let state = app
+        .project_db
+        .serialize_project_write(&pid, || {
+            delete_marker(&app.project.paths, &pid, &body.marker_id)
+        })
+        .map_err(map_bad_request)?;
     Ok(Json(state))
 }
 
@@ -502,7 +575,11 @@ async fn api_marker_move(
     Json(body): Json<MoveMarkerBody>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let pid = resolve_project_id(&app, &body.project_id)?;
-    let state = move_marker(&app.project.paths, &pid, &body.marker_id, &body.direction)
+    let state = app
+        .project_db
+        .serialize_project_write(&pid, || {
+            move_marker(&app.project.paths, &pid, &body.marker_id, &body.direction)
+        })
         .map_err(map_bad_request)?;
     Ok(Json(state))
 }
@@ -512,24 +589,28 @@ async fn api_marker_update(
     Json(body): Json<UpdateMarkerBody>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let pid = resolve_project_id(&app, &body.project_id)?;
-    let state = if let Some(timeline_frame) = body.timeline_frame {
-        update_marker_frame(
-            &app.project.paths,
-            &pid,
-            &body.marker_id,
-            timeline_frame,
-            body.label.as_deref(),
-        )
-    } else {
-        update_marker(
-            &app.project.paths,
-            &pid,
-            &body.marker_id,
-            body.timeline_sec.unwrap_or(0.0),
-            body.label.as_deref(),
-        )
-    }
-    .map_err(map_bad_request)?;
+    let state = app
+        .project_db
+        .serialize_project_write(&pid, || {
+            if let Some(timeline_frame) = body.timeline_frame {
+                update_marker_frame(
+                    &app.project.paths,
+                    &pid,
+                    &body.marker_id,
+                    timeline_frame,
+                    body.label.as_deref(),
+                )
+            } else {
+                update_marker(
+                    &app.project.paths,
+                    &pid,
+                    &body.marker_id,
+                    body.timeline_sec.unwrap_or(0.0),
+                    body.label.as_deref(),
+                )
+            }
+        })
+        .map_err(map_bad_request)?;
     Ok(Json(state))
 }
 
@@ -538,8 +619,12 @@ async fn api_marker_slot_select(
     Json(body): Json<SlotIdBody>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let pid = resolve_project_id(&app, &body.project_id)?;
-    let state =
-        select_marker_slot(&app.project.paths, &pid, &body.slot_id).map_err(map_bad_request)?;
+    let state = app
+        .project_db
+        .serialize_project_write(&pid, || {
+            select_marker_slot(&app.project.paths, &pid, &body.slot_id)
+        })
+        .map_err(map_bad_request)?;
     Ok(Json(state))
 }
 
@@ -548,21 +633,25 @@ async fn api_cover_create(
     Json(body): Json<CreateCoverBody>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let pid = resolve_project_id(&app, &body.project_id)?;
-    let state = create_cover(
-        &app.project.paths,
-        &pid,
-        &body.slot_id,
-        body.clip_id.as_deref(),
-        body.virtual_shot_id.as_deref(),
-        body.title.as_deref(),
-        body.note.as_deref(),
-        SegmentRangeInput {
-            in_frame: body.in_frame.or(body.source_in_frame),
-            out_frame: body.out_frame.or(body.source_out_frame),
-            ..SegmentRangeInput::default()
-        },
-    )
-    .map_err(map_bad_request)?;
+    let state = app
+        .project_db
+        .serialize_project_write(&pid, || {
+            create_cover(
+                &app.project.paths,
+                &pid,
+                &body.slot_id,
+                body.clip_id.as_deref(),
+                body.virtual_shot_id.as_deref(),
+                body.title.as_deref(),
+                body.note.as_deref(),
+                SegmentRangeInput {
+                    in_frame: body.in_frame.or(body.source_in_frame),
+                    out_frame: body.out_frame.or(body.source_out_frame),
+                    ..SegmentRangeInput::default()
+                },
+            )
+        })
+        .map_err(map_bad_request)?;
     Ok(Json(state))
 }
 
@@ -571,16 +660,20 @@ async fn api_cover_update(
     Json(body): Json<UpdateCoverBody>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let pid = resolve_project_id(&app, &body.project_id)?;
-    let state = update_cover(
-        &app.project.paths,
-        &pid,
-        &body.cover_id,
-        body.title.as_deref(),
-        body.note.as_deref(),
-        body.clip_id.as_deref(),
-        body.virtual_shot_id.as_deref(),
-    )
-    .map_err(map_bad_request)?;
+    let state = app
+        .project_db
+        .serialize_project_write(&pid, || {
+            update_cover(
+                &app.project.paths,
+                &pid,
+                &body.cover_id,
+                body.title.as_deref(),
+                body.note.as_deref(),
+                body.clip_id.as_deref(),
+                body.virtual_shot_id.as_deref(),
+            )
+        })
+        .map_err(map_bad_request)?;
     Ok(Json(state))
 }
 
@@ -589,7 +682,12 @@ async fn api_cover_delete(
     Json(body): Json<CoverIdBody>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let pid = resolve_project_id(&app, &body.project_id)?;
-    let state = delete_cover(&app.project.paths, &pid, &body.cover_id).map_err(map_bad_request)?;
+    let state = app
+        .project_db
+        .serialize_project_write(&pid, || {
+            delete_cover(&app.project.paths, &pid, &body.cover_id)
+        })
+        .map_err(map_bad_request)?;
     Ok(Json(state))
 }
 
@@ -598,7 +696,12 @@ async fn api_cover_select(
     Json(body): Json<CoverIdBody>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let pid = resolve_project_id(&app, &body.project_id)?;
-    let state = select_cover(&app.project.paths, &pid, &body.cover_id).map_err(map_bad_request)?;
+    let state = app
+        .project_db
+        .serialize_project_write(&pid, || {
+            select_cover(&app.project.paths, &pid, &body.cover_id)
+        })
+        .map_err(map_bad_request)?;
     Ok(Json(state))
 }
 
@@ -607,18 +710,85 @@ async fn api_commit(
     Json(body): Json<CommitBody>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let pid = resolve_project_id(&app, &body.project_id)?;
-    let state = commit_story(&app.project.paths, &pid).map_err(map_bad_request)?;
+    let state = app
+        .project_db
+        .serialize_project_write(&pid, || commit_story(&app.project.paths, &pid))
+        .map_err(map_bad_request)?;
     Ok(Json(state))
 }
 
-#[derive(serde::Deserialize)]
-struct NativeLaunchBody {
-    #[serde(default)]
-    project_id: String,
-    #[serde(default)]
-    clip_id: String,
-    #[serde(default)]
-    seek: f64,
+async fn api_export_submit(
+    State(app): State<AppState>,
+    Json(body): Json<ExportSubmitBody>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let pid = resolve_project_id(&app, &body.project_id)?;
+    let playlist = build_editorial_playlist_with_broker(&app.project.paths, &app.project_db, &pid)
+        .map_err(map_bad_request)?;
+    let playlist = serde_json::to_value(playlist)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let settings_snapshot = app
+        .project_db
+        .with_project_read(&pid, |conn| {
+            project_settings_snapshot_from_conn(conn, &pid).map_err(|e| e.to_string())
+        })
+        .map_err(map_store_err)?;
+    let project_settings = effective_settings_from_snapshot(&settings_snapshot);
+    let request = ExportRequest {
+        project_id: pid,
+        playlist,
+        export_settings: export_settings_from_project_settings(&project_settings),
+        output_dir: export_dir_from_settings(&project_settings),
+        project_settings,
+    };
+    let job = app
+        .services
+        .export
+        .submit(request)
+        .await
+        .map_err(map_service_err)?;
+    serde_json::to_value(job)
+        .map(Json)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
+}
+
+async fn api_export_status(
+    State(app): State<AppState>,
+    Query(q): Query<ExportJobQuery>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let _pid = resolve_project_id(&app, &q.project_id)?;
+    let job_id = q.job_id.trim();
+    if job_id.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "job_id required".into()));
+    }
+    let job = app
+        .services
+        .export
+        .status(job_id)
+        .await
+        .map_err(map_service_err)?;
+    serde_json::to_value(job)
+        .map(Json)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
+}
+
+async fn api_export_cancel(
+    State(app): State<AppState>,
+    Json(body): Json<ExportCancelBody>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let _pid = resolve_project_id(&app, &body.project_id)?;
+    let job_id = body.job_id.trim();
+    if job_id.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "job_id required".into()));
+    }
+    app.services
+        .export
+        .cancel(job_id)
+        .await
+        .map_err(map_service_err)?;
+    Ok(Json(json!({
+        "job_id": job_id,
+        "state": "cancelled",
+    })))
 }
 
 #[derive(serde::Deserialize)]
@@ -656,25 +826,20 @@ async fn api_play_media(
     })))
 }
 
-async fn api_native_launch(
-    State(app): State<AppState>,
-    Json(body): Json<NativeLaunchBody>,
-) -> Result<Json<Value>, (StatusCode, String)> {
-    let pid = resolve_project_id(&app, &body.project_id)?;
-    let clip = body.clip_id.trim();
-    let req = super::native_launch::NativeLaunchRequest {
-        project_id: pid,
-        clip_id: if clip.is_empty() {
-            None
-        } else {
-            Some(clip.to_string())
-        },
-        seek: body.seek,
-    };
-    match super::native_launch::launch(&req) {
-        Ok(v) => Ok(Json(v)),
-        Err(e) => Err((StatusCode::BAD_REQUEST, e)),
-    }
+fn effective_settings_from_snapshot(snapshot: &Value) -> Value {
+    snapshot
+        .get("settings")
+        .cloned()
+        .filter(|settings| settings.is_object())
+        .unwrap_or_else(|| json!({}))
+}
+
+fn export_settings_from_project_settings(settings: &Value) -> Value {
+    settings
+        .get("export")
+        .cloned()
+        .filter(|export| export.is_object())
+        .unwrap_or_else(|| json!({}))
 }
 
 fn resolve_project_id(app: &AppState, project_id: &str) -> Result<String, (StatusCode, String)> {
@@ -694,6 +859,15 @@ fn map_bad_request(e: String) -> (StatusCode, String) {
     } else {
         (StatusCode::INTERNAL_SERVER_ERROR, e)
     }
+}
+
+fn map_service_err(e: ServiceError) -> (StatusCode, String) {
+    let status = match e.code.as_str() {
+        "export_disabled" | "export_backend_unavailable" => StatusCode::SERVICE_UNAVAILABLE,
+        code if code.contains("invalid") || code.contains("required") => StatusCode::BAD_REQUEST,
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+    (status, format!("{}: {}", e.code, e.message))
 }
 
 fn is_story_client_error(message: &str) -> bool {
@@ -732,8 +906,13 @@ fn is_story_client_error(message: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_story_client_error, map_bad_request};
+    use super::{
+        effective_settings_from_snapshot, export_settings_from_project_settings,
+        is_story_client_error, map_bad_request, map_service_err,
+    };
     use axum::http::StatusCode;
+    use qnc_service_contracts::ServiceError;
+    use serde_json::json;
 
     #[test]
     fn cover_validation_errors_are_bad_request() {
@@ -750,5 +929,33 @@ mod tests {
     fn map_bad_request_keeps_unknown_errors_internal() {
         let (status, _) = map_bad_request("database is locked".into());
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[test]
+    fn export_submit_uses_effective_export_settings() {
+        let snapshot = json!({
+            "project_id": "p1",
+            "settings": {
+                "video": { "fps": "50" },
+                "export": { "format": "xml", "directory": "D:/out" }
+            }
+        });
+        let settings = effective_settings_from_snapshot(&snapshot);
+        let export = export_settings_from_project_settings(&settings);
+
+        assert_eq!(settings["video"]["fps"], "50");
+        assert_eq!(export["format"], "xml");
+        assert_eq!(export["directory"], "D:/out");
+    }
+
+    #[test]
+    fn export_service_unavailable_maps_to_503() {
+        let (status, message) = map_service_err(ServiceError::new(
+            "export_backend_unavailable",
+            "export backend is missing",
+        ));
+
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(message.contains("export_backend_unavailable"));
     }
 }

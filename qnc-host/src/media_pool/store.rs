@@ -82,6 +82,12 @@ pub fn list_clips_enriched(paths: &ProjectPaths, project_id: &str) -> Result<Val
                 .get("status")
                 .and_then(|v| v.as_str())
                 .unwrap_or("missing");
+            let version = fs
+                .get("updated_at")
+                .or_else(|| fs.get("built_at"))
+                .and_then(|v| v.as_str())
+                .map(url_encode)
+                .unwrap_or_default();
             if let Some(obj) = clip.as_object_mut() {
                 obj.insert("filmstrip_status".into(), json!(st));
                 if let Some(err) = fs
@@ -91,41 +97,37 @@ pub fn list_clips_enriched(paths: &ProjectPaths, project_id: &str) -> Result<Val
                 {
                     obj.insert("filmstrip_error".into(), json!(err));
                 }
-                if st == "ready" {
-                    if let Some(dur) = fs.get("duration_sec") {
-                        obj.insert("timeline_duration_sec".into(), dur.clone());
-                    }
-                    let frames =
-                        list_frames_for_clip(paths, project_id, &clip_id).unwrap_or_default();
-                    if !frames.is_empty() {
-                        let seeks: Vec<Value> = frames
+                if let Some(dur) = fs.get("duration_sec") {
+                    obj.insert("timeline_duration_sec".into(), dur.clone());
+                }
+                let frames = list_frames_for_clip(paths, project_id, &clip_id).unwrap_or_default();
+                if !frames.is_empty() {
+                    let seeks: Vec<Value> = frames
+                        .iter()
+                        .map(|f| json!(f.get("seek_sec").and_then(|v| v.as_f64()).unwrap_or(0.0)))
+                        .collect();
+                    obj.insert("timeline_seeks".into(), json!(seeks));
+                    let filmstrip_frames: Vec<Value> = pad_frames_to_default(
+                        frames
                             .iter()
                             .map(|f| {
-                                json!(f.get("seek_sec").and_then(|v| v.as_f64()).unwrap_or(0.0))
-                            })
-                            .collect();
-                        obj.insert("timeline_seeks".into(), json!(seeks));
-                        let filmstrip_frames: Vec<Value> = pad_frames_to_default(
-                            frames
-                                .iter()
-                                .map(|f| {
-                                    let index =
-                                        f.get("index").and_then(|v| v.as_i64()).unwrap_or(0);
-                                    json!({
-                                        "frame_index": index,
-                                        "seek_sec": f.get("seek_sec").and_then(|v| v.as_f64()).unwrap_or(0.0),
-                                        "url": format!(
-                                            "/api/story/thumbnail?clip_id={}&frame_index={}&project_id={}",
-                                            url_encode(&clip_id),
-                                            index,
-                                            url_encode(project_id)
-                                        ),
-                                    })
+                                let index = f.get("index").and_then(|v| v.as_i64()).unwrap_or(0);
+                                json!({
+                                    "index": index,
+                                    "frame_index": index,
+                                    "seek_sec": f.get("seek_sec").and_then(|v| v.as_f64()).unwrap_or(0.0),
+                                    "url": format!(
+                                        "/api/story/thumbnail?clip_id={}&frame_index={}&project_id={}&v={}",
+                                        url_encode(&clip_id),
+                                        index,
+                                        url_encode(project_id),
+                                        version
+                                    ),
                                 })
-                                .collect(),
-                        );
-                        obj.insert("filmstrip_frames".into(), json!(filmstrip_frames));
-                    }
+                            })
+                            .collect(),
+                    );
+                    obj.insert("filmstrip_frames".into(), json!(filmstrip_frames));
                 }
             }
         } else if let Some(obj) = clip.as_object_mut() {

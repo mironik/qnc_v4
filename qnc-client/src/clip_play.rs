@@ -13,13 +13,12 @@ use crate::editorial::{
     apply_mark_in_fit_frames, create_cover_from_marks, create_segment, kind_for_action, SourceMarks,
 };
 use crate::focus::{
-    frame_to_seconds, seconds_to_frame, source_focus_chain, FocusTarget, TimelineFocus,
+    frame_to_seconds, is_valid_fps, seconds_to_frame, source_focus_chain, FocusTarget,
+    TimelineFocus,
 };
 use crate::shortcuts::StoryBindings;
 
 const AUDIO_WINDOW_SEC: f64 = 6.0;
-#[allow(dead_code)]
-const DEFAULT_FPS: f64 = 25.0;
 
 #[allow(dead_code)]
 pub struct ClipPlayApp {
@@ -70,6 +69,9 @@ impl ClipPlayApp {
             ..Default::default()
         };
         let story_state = host.story_state(&project_id).unwrap_or(Value::Null);
+        let fps = source_clip_fps(&story_state, &clip_id).ok_or_else(|| {
+            format!("Source FPS nije potvrđen za '{clip_id}'; probe metadata mora biti u SQLite.")
+        })?;
         let status = format!(
             "Ready — {} · {} · {}",
             bindings.chord_hint("mark_in_fit_duration"),
@@ -80,7 +82,7 @@ impl ClipPlayApp {
             host,
             project_id,
             clip_id,
-            seek_frame: seconds_to_frame(seek.max(0.0), DEFAULT_FPS),
+            seek_frame: seconds_to_frame(seek.max(0.0), fps),
             status,
             texture: None,
             pending_image: None,
@@ -89,7 +91,7 @@ impl ClipPlayApp {
             bindings,
             marks: SourceMarks::default(),
             focus: TimelineFocus::default(),
-            fps: DEFAULT_FPS,
+            fps,
             story_state,
         };
         if let Err(e) = app.fetch_thumb() {
@@ -464,4 +466,21 @@ pub fn run_oneshot(
         std::thread::sleep(Duration::from_secs_f64(AUDIO_WINDOW_SEC + 0.5));
     }
     Ok(())
+}
+
+fn source_clip_fps(story_state: &Value, clip_id: &str) -> Option<f64> {
+    story_state
+        .get("all_clips")
+        .and_then(Value::as_array)
+        .and_then(|clips| {
+            clips
+                .iter()
+                .find(|clip| clip.get("clip_id").and_then(Value::as_str) == Some(clip_id))
+        })
+        .and_then(|clip| {
+            clip.get("fps")
+                .or_else(|| clip.get("source_fps"))
+                .and_then(Value::as_f64)
+        })
+        .filter(|fps| is_valid_fps(*fps))
 }

@@ -28,20 +28,78 @@ pub fn pad_frames_to_default_with_placeholder(
     placeholder: &str,
 ) -> Vec<serde_json::Value> {
     let n = DEFAULT_FILMSTRIP_FRAMES as usize;
-    if frames.len() >= n {
-        return frames.into_iter().take(n).collect();
-    }
-    let mut out = frames;
     let ph = placeholder.trim();
     let ph = if ph.is_empty() { placeholder_url() } else { ph };
-    while out.len() < n {
-        let index = out.len() as i64;
-        out.push(serde_json::json!({
-            "frame_index": index,
-            "seek_sec": 0.0,
-            "url": ph,
-            "placeholder": true,
+    let mut slots: Vec<Option<serde_json::Value>> = vec![None; n];
+    for frame in frames {
+        let Some(index) = frame
+            .get("frame_index")
+            .or_else(|| frame.get("index"))
+            .and_then(|value| value.as_i64())
+            .filter(|index| *index >= 0 && (*index as usize) < n)
+        else {
+            continue;
+        };
+        let slot = &mut slots[index as usize];
+        if slot.is_none() {
+            *slot = Some(frame);
+        }
+    }
+    slots
+        .into_iter()
+        .enumerate()
+        .map(|(index, frame)| {
+            frame.unwrap_or_else(|| {
+                serde_json::json!({
+                    "index": index as i64,
+                    "frame_index": index as i64,
+                    "seek_sec": 0.0,
+                    "url": ph,
+                    "placeholder": true,
+                })
+            })
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn padding_keeps_frame_indices_in_their_slots() {
+        let frames = pad_frames_to_default_with_placeholder(
+            vec![json!({
+                "index": 5,
+                "frame_index": 5,
+                "seek_sec": 10.0,
+                "url": "/frame_5.jpg",
+            })],
+            "/placeholder.jpg",
+        );
+
+        assert_eq!(frames.len(), DEFAULT_FILMSTRIP_FRAMES as usize);
+        assert_eq!(
+            frames[0].get("placeholder").and_then(|v| v.as_bool()),
+            Some(true)
+        );
+        assert_eq!(
+            frames[5].get("url").and_then(|v| v.as_str()),
+            Some("/frame_5.jpg")
+        );
+        assert_eq!(frames[5].get("placeholder").and_then(|v| v.as_bool()), None);
+    }
+
+    #[test]
+    fn padding_uses_placeholder_for_empty_slots() {
+        let frames = pad_frames_to_default_with_placeholder(Vec::new(), "/placeholder.jpg");
+
+        assert_eq!(frames.len(), DEFAULT_FILMSTRIP_FRAMES as usize);
+        assert!(frames.iter().enumerate().all(|(index, frame)| {
+            frame.get("index").and_then(|v| v.as_i64()) == Some(index as i64)
+                && frame.get("frame_index").and_then(|v| v.as_i64()) == Some(index as i64)
+                && frame.get("url").and_then(|v| v.as_str()) == Some("/placeholder.jpg")
         }));
     }
-    out
 }

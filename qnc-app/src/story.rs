@@ -48,7 +48,7 @@ use self::playback_transport::{
 };
 
 const SOURCE_MEDIA_RETRY_DELAY: Duration = Duration::from_secs(1);
-const SOURCE_MEDIA_MAX_RETRIES: u8 = 5;
+const SOURCE_MEDIA_MAX_RETRIES: u8 = 30;
 const FILM_FRAME_MAX_LOAD_ATTEMPTS: u8 = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -118,6 +118,7 @@ pub struct StoryScreen {
     a1_peaks: Vec<f32>,
     a2_peaks: Vec<f32>,
     film_frames: Vec<FilmFrame>,
+    filmstrip_manifest_ready: bool,
     waveform_clip_id: String,
     image_loader: AsyncImageAssetLoader,
     source_media_loader: AsyncSourceMediaAssetLoader,
@@ -215,6 +216,7 @@ impl StoryScreen {
             a1_peaks: Vec::new(),
             a2_peaks: Vec::new(),
             film_frames: Vec::new(),
+            filmstrip_manifest_ready: false,
             waveform_clip_id: String::new(),
             image_loader: AsyncImageAssetLoader::new(),
             source_media_loader: AsyncSourceMediaAssetLoader::new(),
@@ -1130,6 +1132,7 @@ impl StoryScreen {
             self.a1_peaks.clear();
             self.a2_peaks.clear();
             self.film_frames.clear();
+            self.filmstrip_manifest_ready = false;
             self.waveform_clip_id.clear();
             self.clear_source_media_retry();
             self.image_loader.cancel_pending();
@@ -1170,6 +1173,7 @@ impl StoryScreen {
             self.a1_peaks.clear();
             self.a2_peaks.clear();
             self.film_frames.clear();
+            self.filmstrip_manifest_ready = false;
             self.waveform_clip_id.clear();
             self.clear_source_media_retry();
             return;
@@ -1181,6 +1185,7 @@ impl StoryScreen {
             host,
             self.project_id.clone(),
             clip.to_string(),
+            self.source_filmstrip_ready(),
             self.repaint_ctx.clone(),
         ) {
             self.source_media_retry_at = None;
@@ -1197,14 +1202,28 @@ impl StoryScreen {
         {
             return true;
         }
+        self.source_media_ready_for_clip(clip)
+    }
+
+    fn source_media_ready_for_clip(&self, clip: &str) -> bool {
         if clip != self.waveform_clip_id {
             return false;
         }
-        if self.selected_source_has_audio {
+        let waveform_ready = if self.selected_source_has_audio {
             !self.a1_peaks.is_empty() || !self.a2_peaks.is_empty()
         } else {
             true
-        }
+        };
+        waveform_ready && self.source_filmstrip_ready()
+    }
+
+    fn source_filmstrip_ready(&self) -> bool {
+        self.filmstrip_manifest_ready
+            && !self.film_frames.is_empty()
+            && self
+                .film_frames
+                .iter()
+                .all(|frame| filmstrip_frame_url_ready(&frame.url))
     }
 
     fn clear_source_media_retry(&mut self) {
@@ -1288,8 +1307,11 @@ impl StoryScreen {
             match result.media {
                 Ok(media) => {
                     self.waveform_clip_id = media.clip_id;
-                    self.a1_peaks = media.a1_peaks;
-                    self.a2_peaks = media.a2_peaks;
+                    if media.waveform_loaded {
+                        self.a1_peaks = media.a1_peaks;
+                        self.a2_peaks = media.a2_peaks;
+                    }
+                    self.filmstrip_manifest_ready = media.filmstrip_ready;
                     let media_clip_id = self.waveform_clip_id.clone();
                     let frames = media.film_frames.into_iter().map(|frame| FilmFrame {
                         index: frame.index,
@@ -1299,7 +1321,12 @@ impl StoryScreen {
                         load_attempts: 0,
                     });
                     crate::qnc_filmstrip_background::merge_frames(&mut self.film_frames, frames);
-                    if self.selected_source_has_audio
+                    if !self.source_filmstrip_ready() {
+                        self.schedule_source_media_retry(
+                            &media_clip_id,
+                            format!("Filmstrip se gradi · {}", self.selected_clip_id),
+                        );
+                    } else if self.selected_source_has_audio
                         && self.a1_peaks.is_empty()
                         && self.a2_peaks.is_empty()
                     {
@@ -1322,12 +1349,13 @@ impl StoryScreen {
     }
 
     fn pump_film_frames(&mut self, ctx: &egui::Context) {
-        if self.image_loader.is_saturated() {
-            return;
-        }
         for frame in &mut self.film_frames {
+            if self.image_loader.is_saturated() {
+                break;
+            }
             if frame.texture.is_some()
                 || frame.url.is_empty()
+                || !filmstrip_frame_url_ready(&frame.url)
                 || frame.load_attempts >= FILM_FRAME_MAX_LOAD_ATTEMPTS
             {
                 continue;
@@ -1341,7 +1369,6 @@ impl StoryScreen {
                 frame.url.clone(),
                 Some(ctx.clone()),
             );
-            break; // one per tick
         }
     }
 
@@ -1368,8 +1395,8 @@ impl StoryScreen {
         if self.project_id.is_empty() {
             return;
         }
-        self.pump_thumbs(host, ctx);
         self.pump_film_frames(ctx);
+        self.pump_thumbs(host, ctx);
         let _ = host;
         if self.film_frames.iter().any(|f| {
             f.texture.is_none()
@@ -1537,7 +1564,11 @@ impl StoryScreen {
                 ctx.request_repaint_after(retry_at - now);
             }
         }
-        if self.source_media_retry_at.is_none() && self.waveform_clip_id != self.selected_clip_id {
+        let selected_clip_id = self.selected_clip_id.clone();
+        if self.source_media_retry_at.is_none()
+            && !selected_clip_id.trim().is_empty()
+            && !self.source_media_ready_for_clip(&selected_clip_id)
+        {
             self.request_source_media(host);
         }
     }
@@ -2038,6 +2069,11 @@ fn story_thumb_ids(all_clips: &[StoryShot], virtual_shots: &[StoryShot]) -> Hash
             (!clip_id.is_empty()).then(|| clip_id.to_string())
         })
         .collect()
+}
+
+fn filmstrip_frame_url_ready(url: &str) -> bool {
+    let url = url.trim();
+    !url.is_empty() && !url.contains("/filmstrip/placeholder")
 }
 
 fn pending_cover_id(slot_id: &str, clip_id: &str, in_frame: i64, out_frame: i64) -> String {
@@ -3640,7 +3676,15 @@ mod tests {
         screen.selected_clip_id = "clip_a".into();
         screen.waveform_clip_id = "clip_a".into();
         screen.selected_source_has_audio = true;
+        screen.filmstrip_manifest_ready = true;
         screen.a2_peaks = vec![0.2, 0.4];
+        screen.film_frames = vec![FilmFrame {
+            index: 0,
+            seek_sec: 0.0,
+            url: "/api/story/thumbnail?clip_id=clip_a&frame_index=0".into(),
+            texture: None,
+            load_attempts: 0,
+        }];
 
         assert!(screen.source_media_request_blocked("clip_a"));
     }
@@ -3651,8 +3695,53 @@ mod tests {
         screen.selected_clip_id = "clip_a".into();
         screen.waveform_clip_id = "clip_a".into();
         screen.selected_source_has_audio = false;
+        screen.filmstrip_manifest_ready = true;
+        screen.film_frames = vec![FilmFrame {
+            index: 0,
+            seek_sec: 0.0,
+            url: "/api/story/thumbnail?clip_id=clip_a&frame_index=0".into(),
+            texture: None,
+            load_attempts: 0,
+        }];
 
         assert!(screen.source_media_request_blocked("clip_a"));
+    }
+
+    #[test]
+    fn source_media_request_blocker_retries_placeholder_filmstrip() {
+        let mut screen = StoryScreen::story();
+        screen.selected_clip_id = "clip_a".into();
+        screen.waveform_clip_id = "clip_a".into();
+        screen.selected_source_has_audio = true;
+        screen.a1_peaks = vec![0.2, 0.4];
+        screen.film_frames = vec![FilmFrame {
+            index: 0,
+            seek_sec: 0.0,
+            url: "/api/story/filmstrip/placeholder".into(),
+            texture: None,
+            load_attempts: 0,
+        }];
+
+        assert!(!screen.source_media_request_blocked("clip_a"));
+    }
+
+    #[test]
+    fn source_media_request_blocker_retries_until_filmstrip_manifest_is_ready() {
+        let mut screen = StoryScreen::story();
+        screen.selected_clip_id = "clip_a".into();
+        screen.waveform_clip_id = "clip_a".into();
+        screen.selected_source_has_audio = true;
+        screen.a1_peaks = vec![0.2, 0.4];
+        screen.filmstrip_manifest_ready = false;
+        screen.film_frames = vec![FilmFrame {
+            index: 0,
+            seek_sec: 0.0,
+            url: "/api/story/thumbnail?clip_id=clip_a&frame_index=0".into(),
+            texture: None,
+            load_attempts: 0,
+        }];
+
+        assert!(!screen.source_media_request_blocked("clip_a"));
     }
 
     #[test]

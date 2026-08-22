@@ -8,25 +8,27 @@ use tracing::{info, warn};
 
 use crate::background_work::BackgroundWorkGate;
 use crate::ingest::thumb::timeline_seek_seconds;
-use crate::media::imported_clip_media_rows;
-use crate::project::db::{open_global, ProjectPaths};
-use crate::project::list_project_ids;
+use crate::media::imported_filmstrip_media_rows;
+use crate::project::db::ProjectPaths;
+use crate::project::{list_project_ids, ProjectDbBroker};
 use qnc_service_contracts::MediaProcessor;
 
 use super::build::build_for_clip;
 use super::store::{get_filmstrip, list_frames_for_clip};
 
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct FilmstripJob {
     project_id: String,
     clip_id: String,
     media_path: PathBuf,
     frames: u32,
+    priority: bool,
 }
 
 #[derive(Clone)]
 pub struct FilmstripWorker {
     paths: ProjectPaths,
+    project_db: ProjectDbBroker,
     background: BackgroundWorkGate,
     media_processor: Arc<dyn MediaProcessor>,
     pending: Arc<Mutex<Vec<FilmstripJob>>>,
@@ -37,11 +39,13 @@ pub struct FilmstripWorker {
 impl FilmstripWorker {
     pub fn new(
         paths: ProjectPaths,
+        project_db: ProjectDbBroker,
         background: BackgroundWorkGate,
         media_processor: Arc<dyn MediaProcessor>,
     ) -> Self {
         Self {
             paths,
+            project_db,
             background,
             media_processor,
             pending: Arc::new(Mutex::new(Vec::new())),
@@ -81,6 +85,27 @@ impl FilmstripWorker {
     }
 
     pub fn enqueue(&self, project_id: &str, clip_id: &str, media_path: &Path, frames: u32) {
+        self.enqueue_with_priority(project_id, clip_id, media_path, frames, false);
+    }
+
+    pub fn enqueue_priority(
+        &self,
+        project_id: &str,
+        clip_id: &str,
+        media_path: &Path,
+        frames: u32,
+    ) {
+        self.enqueue_with_priority(project_id, clip_id, media_path, frames, true);
+    }
+
+    fn enqueue_with_priority(
+        &self,
+        project_id: &str,
+        clip_id: &str,
+        media_path: &Path,
+        frames: u32,
+        priority: bool,
+    ) {
         let pid = project_id.trim();
         let cid = clip_id.trim();
         if pid.is_empty() || cid.is_empty() || !media_path.is_file() {
@@ -91,28 +116,28 @@ impl FilmstripWorker {
         }
         let frames = frames.max(super::DEFAULT_FILMSTRIP_FRAMES);
         let mut pending = self.pending.lock().expect("filmstrip queue");
-        if pending
-            .iter()
-            .any(|job| job.project_id == pid && job.clip_id == cid)
-        {
-            return;
-        }
-        pending.push(FilmstripJob {
-            project_id: pid.to_string(),
-            clip_id: cid.to_string(),
-            media_path: media_path.to_path_buf(),
-            frames,
-        });
+        push_filmstrip_job(
+            &mut pending,
+            FilmstripJob {
+                project_id: pid.to_string(),
+                clip_id: cid.to_string(),
+                media_path: media_path.to_path_buf(),
+                frames,
+                priority,
+            },
+        );
     }
 
     pub fn enqueue_recoverable_projects(&self, frames: u32) -> Result<usize, String> {
-        let global = open_global(&self.paths).map_err(|e| e.to_string())?;
+        let project_ids = self
+            .project_db
+            .with_global(|global| list_project_ids(global).map_err(|e| e.to_string()))?;
         let mut queued = 0usize;
-        for project_id in list_project_ids(&global).map_err(|e| e.to_string())? {
+        for project_id in project_ids {
             if self.is_blocked(&project_id) {
                 continue;
             }
-            for (clip_id, media) in imported_clip_media_rows(&self.paths, &project_id)? {
+            for (clip_id, media) in imported_filmstrip_media_rows(&self.paths, &project_id)? {
                 if filmstrip_ready(&self.paths, &project_id, &clip_id) {
                     continue;
                 }
@@ -169,6 +194,7 @@ impl FilmstripWorker {
                 in_flight.fetch_add(1, Ordering::AcqRel);
                 let result = build_for_clip(
                     &worker.paths,
+                    &worker.project_db,
                     worker.media_processor.clone(),
                     &pid,
                     &cid,
@@ -185,6 +211,32 @@ impl FilmstripWorker {
                 }
             }
         });
+    }
+}
+
+fn push_filmstrip_job(pending: &mut Vec<FilmstripJob>, job: FilmstripJob) {
+    if let Some(pos) = pending.iter().position(|existing| {
+        existing.project_id == job.project_id && existing.clip_id == job.clip_id
+    }) {
+        let mut existing = pending.remove(pos);
+        existing.media_path = job.media_path;
+        existing.frames = job.frames;
+        existing.priority |= job.priority;
+        insert_filmstrip_job(pending, existing);
+        return;
+    }
+    insert_filmstrip_job(pending, job);
+}
+
+fn insert_filmstrip_job(pending: &mut Vec<FilmstripJob>, job: FilmstripJob) {
+    if job.priority {
+        let pos = pending
+            .iter()
+            .position(|existing| !existing.priority)
+            .unwrap_or(pending.len());
+        pending.insert(pos, job);
+    } else {
+        pending.push(job);
     }
 }
 
@@ -208,4 +260,64 @@ pub(crate) fn filmstrip_ready(paths: &ProjectPaths, project_id: &str, clip_id: &
     }
     let seeks = timeline_seek_seconds(duration, super::DEFAULT_FILMSTRIP_FRAMES);
     super::build::stored_frames_match_seeks(&frames, &seeks)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn job(clip_id: &str, priority: bool) -> FilmstripJob {
+        FilmstripJob {
+            project_id: "p".into(),
+            clip_id: clip_id.into(),
+            media_path: PathBuf::from(format!("{clip_id}.mp4")),
+            frames: 13,
+            priority,
+        }
+    }
+
+    #[test]
+    fn priority_jobs_run_before_normal_backlog() {
+        let mut pending = vec![job("a", false), job("b", false)];
+
+        push_filmstrip_job(&mut pending, job("selected", true));
+
+        assert_eq!(
+            pending
+                .iter()
+                .map(|job| job.clip_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["selected", "a", "b"]
+        );
+    }
+
+    #[test]
+    fn priority_duplicate_moves_existing_job_forward() {
+        let mut pending = vec![job("a", false), job("selected", false), job("b", false)];
+
+        push_filmstrip_job(&mut pending, job("selected", true));
+
+        assert_eq!(
+            pending
+                .iter()
+                .map(|job| (job.clip_id.as_str(), job.priority))
+                .collect::<Vec<_>>(),
+            vec![("selected", true), ("a", false), ("b", false)]
+        );
+    }
+
+    #[test]
+    fn normal_duplicate_does_not_demote_priority_job() {
+        let mut pending = vec![job("selected", true), job("a", false)];
+
+        push_filmstrip_job(&mut pending, job("selected", false));
+
+        assert_eq!(
+            pending
+                .iter()
+                .map(|job| (job.clip_id.as_str(), job.priority))
+                .collect::<Vec<_>>(),
+            vec![("selected", true), ("a", false)]
+        );
+    }
 }

@@ -3,13 +3,15 @@ use std::sync::Arc;
 
 use crate::ingest::thumb::timeline_seek_seconds;
 use crate::project::db::ProjectPaths;
+use crate::project::ProjectDbBroker;
 use qnc_service_contracts::{
     FilmstripRequest, MediaLocator, MediaProbe, MediaProcessor, MediaRef, ServiceError,
 };
 
 use super::store::{
-    filmstrip_clip_dir, get_filmstrip, list_frames_for_clip, mark_filmstrip, save_filmstrip,
-    sync_filmstrip_from_disk, FilmstripFrame,
+    filmstrip_clip_dir, get_filmstrip, list_frames_for_clip, manifest_cache_key,
+    manifest_from_frames_for_api, manifest_from_status_for_api, mark_filmstrip, save_filmstrip,
+    save_filmstrip_progress, sync_filmstrip_from_disk, FilmstripFrame,
 };
 
 fn frame_ready(path: &Path) -> bool {
@@ -49,6 +51,7 @@ pub(super) fn stored_frames_match_seeks(frames: &[serde_json::Value], seeks: &[f
 /// Gradi filmstrip za klip: 13 vremenskih cjelina, prvi JPG svake cjeline.
 pub async fn build_for_clip(
     paths: &ProjectPaths,
+    project_db: &ProjectDbBroker,
     media_processor: Arc<dyn MediaProcessor>,
     project_id: &str,
     clip_id: &str,
@@ -57,7 +60,7 @@ pub async fn build_for_clip(
 ) -> Result<(), String> {
     if !media.is_file() {
         let msg = format!("nema medija za klip '{clip_id}'");
-        mark_filmstrip(paths, project_id, clip_id, "error", &msg)?;
+        mark_status(paths, project_db, project_id, clip_id, "error", &msg)?;
         return Err(msg);
     }
 
@@ -80,13 +83,13 @@ pub async fn build_for_clip(
         Ok(probe) => probe,
         Err(error) => {
             let msg = service_error_message(error);
-            mark_filmstrip(paths, project_id, clip_id, "error", &msg)?;
+            mark_status(paths, project_db, project_id, clip_id, "error", &msg)?;
             return Err(msg);
         }
     };
     let Some(duration) = duration_from_probe(&probe).or(existing_duration) else {
         let msg = format!("filmstrip: trajanje nije potvrdeno za klip '{clip_id}'");
-        mark_filmstrip(paths, project_id, clip_id, "error", &msg)?;
+        mark_status(paths, project_db, project_id, clip_id, "error", &msg)?;
         return Err(msg);
     };
     let seeks = timeline_seek_seconds(duration, frames);
@@ -102,12 +105,13 @@ pub async fn build_for_clip(
         }
     }
 
-    mark_filmstrip(paths, project_id, clip_id, "building", "")?;
+    mark_status(paths, project_db, project_id, clip_id, "building", "")?;
     let out_dir = filmstrip_clip_dir(paths, project_id, clip_id);
     let artifacts = match media_processor
         .build_filmstrip(FilmstripRequest {
             input,
-            frame_count: frames as usize,
+            frame_count: seeks.len(),
+            seek_seconds: seeks.clone(),
             output_dir: out_dir,
         })
         .await
@@ -115,7 +119,7 @@ pub async fn build_for_clip(
         Ok(artifacts) => artifacts,
         Err(error) => {
             let msg = service_error_message(error);
-            mark_filmstrip(paths, project_id, clip_id, "error", &msg)?;
+            mark_status(paths, project_db, project_id, clip_id, "error", &msg)?;
             return Err(msg);
         }
     };
@@ -133,11 +137,125 @@ pub async fn build_for_clip(
         .collect();
     built_frames.sort_by_key(|f| f.index);
 
-    save_filmstrip(paths, project_id, clip_id, duration, &built_frames, "")?;
     if built_frames.is_empty() {
+        mark_status(
+            paths,
+            project_db,
+            project_id,
+            clip_id,
+            "error",
+            "filmstrip: nema kadrova",
+        )?;
         return Err("filmstrip: nema kadrova".into());
     }
+    if !built_frames_cover_seeks(&built_frames, &seeks) {
+        let msg = format!(
+            "filmstrip: nepotpun set kadrova {}/{}",
+            built_frames.len(),
+            seeks.len()
+        );
+        save_progress(
+            paths,
+            project_db,
+            project_id,
+            clip_id,
+            duration,
+            &built_frames,
+            &msg,
+        )?;
+        return Err(msg);
+    }
+    save_ready(
+        paths,
+        project_db,
+        project_id,
+        clip_id,
+        duration,
+        &built_frames,
+        "",
+    )?;
     Ok(())
+}
+
+fn mark_status(
+    paths: &ProjectPaths,
+    project_db: &ProjectDbBroker,
+    project_id: &str,
+    clip_id: &str,
+    status: &str,
+    error: &str,
+) -> Result<(), String> {
+    project_db.serialize_project_write(project_id, || {
+        mark_filmstrip(paths, project_id, clip_id, status, error)
+    })?;
+    publish_manifest_cache_value(
+        project_db,
+        project_id,
+        clip_id,
+        manifest_from_status_for_api(project_id, clip_id, status, error, "/api/story"),
+    );
+    Ok(())
+}
+
+fn save_progress(
+    paths: &ProjectPaths,
+    project_db: &ProjectDbBroker,
+    project_id: &str,
+    clip_id: &str,
+    duration: f64,
+    frames: &[FilmstripFrame],
+    error: &str,
+) -> Result<(), String> {
+    let filmstrip = project_db.serialize_project_write(project_id, || {
+        save_filmstrip_progress(paths, project_id, clip_id, duration, frames, error)
+    })?;
+    publish_manifest_cache_value(
+        project_db,
+        project_id,
+        clip_id,
+        manifest_from_frames_for_api(project_id, clip_id, filmstrip, frames, "/api/story"),
+    );
+    Ok(())
+}
+
+fn save_ready(
+    paths: &ProjectPaths,
+    project_db: &ProjectDbBroker,
+    project_id: &str,
+    clip_id: &str,
+    duration: f64,
+    frames: &[FilmstripFrame],
+    error: &str,
+) -> Result<(), String> {
+    let filmstrip = project_db.serialize_project_write(project_id, || {
+        save_filmstrip(paths, project_id, clip_id, duration, frames, error)
+    })?;
+    publish_manifest_cache_value(
+        project_db,
+        project_id,
+        clip_id,
+        manifest_from_frames_for_api(project_id, clip_id, filmstrip, frames, "/api/story"),
+    );
+    Ok(())
+}
+
+fn publish_manifest_cache_value(
+    project_db: &ProjectDbBroker,
+    project_id: &str,
+    clip_id: &str,
+    manifest: serde_json::Value,
+) {
+    let api = "/api/story";
+    project_db.put_runtime_cache(project_id, &manifest_cache_key(clip_id, api), manifest);
+}
+
+fn built_frames_cover_seeks(frames: &[FilmstripFrame], seeks: &[f64]) -> bool {
+    !seeks.is_empty()
+        && (0..seeks.len()).all(|index| {
+            frames
+                .iter()
+                .any(|frame| frame.index == index && (frame.seek_sec - seeks[index]).abs() <= 0.011)
+        })
 }
 
 fn filmstrip_is_current(
@@ -197,11 +315,13 @@ mod tests {
     use crate::project::db::{
         ensure_project_dirs_at, open_global, open_project, project_dir_in_root, ProjectPaths,
     };
+    use crate::project::ProjectDbBroker;
     use async_trait::async_trait;
     use qnc_service_contracts::{
-        ArtifactRef, ExtractRangeRequest, FilmstripFrameArtifact, FilmstripRequest,
-        FrameExtractRequest, FrameTimebase, MediaProbe, MediaProcessor, ProxyBuildRequest,
-        ScanMode, ServiceError, ServiceResult, WaveformPeaks, WaveformRequest,
+        ArtifactRef, AudioProbe, AudioProbeRequest, AudioWrapRequest, ExtractRangeRequest,
+        FilmstripFrameArtifact, FilmstripRequest, FrameExtractRequest, FrameTimebase, MediaProbe,
+        MediaProcessor, PosterExtractRequest, ProxyBuildRequest, ScanMode, ServiceError,
+        ServiceResult, WaveformPeaks, WaveformRequest,
     };
     use rusqlite::params;
     use serde_json::json;
@@ -263,7 +383,18 @@ mod tests {
             })
         }
 
+        async fn probe_audio(&self, _request: AudioProbeRequest) -> ServiceResult<AudioProbe> {
+            Err(unused_service_error())
+        }
+
         async fn extract_frame(&self, _request: FrameExtractRequest) -> ServiceResult<ArtifactRef> {
+            Err(unused_service_error())
+        }
+
+        async fn extract_poster(
+            &self,
+            _request: PosterExtractRequest,
+        ) -> ServiceResult<ArtifactRef> {
             Err(unused_service_error())
         }
 
@@ -275,13 +406,17 @@ mod tests {
             fs::create_dir_all(&request.output_dir)
                 .map_err(|error| ServiceError::new("test_fs_error", error.to_string()))?;
             let mut frames = Vec::new();
-            for index in 0..request.frame_count {
-                let path = request.output_dir.join(format!("{index:03}_fake.jpg"));
+            for (index, seek_sec) in request.seek_seconds.iter().copied().enumerate() {
+                let path = crate::ingest::thumb::filmstrip_frame_path(
+                    &request.output_dir,
+                    index,
+                    seek_sec,
+                );
                 fs::write(&path, b"jpeg")
                     .map_err(|error| ServiceError::new("test_fs_error", error.to_string()))?;
                 frames.push(FilmstripFrameArtifact {
                     index,
-                    seek_sec: index as f64,
+                    seek_sec,
                     artifact: ArtifactRef {
                         path,
                         media_type: "image/jpeg".into(),
@@ -293,6 +428,10 @@ mod tests {
         }
 
         async fn build_proxy(&self, _request: ProxyBuildRequest) -> ServiceResult<ArtifactRef> {
+            Err(unused_service_error())
+        }
+
+        async fn build_audio_wrap(&self, _request: AudioWrapRequest) -> ServiceResult<ArtifactRef> {
             Err(unused_service_error())
         }
 
@@ -372,9 +511,18 @@ mod tests {
         let media = base.join("source.mp4");
         fs::write(&media, b"fake-video").unwrap();
         let processor = Arc::new(FakeMediaProcessor::default());
-        build_for_clip(&paths, processor.clone(), project_id, clip_id, &media, 13)
-            .await
-            .unwrap();
+        let project_db = ProjectDbBroker::new(paths.clone());
+        build_for_clip(
+            &paths,
+            &project_db,
+            processor.clone(),
+            project_id,
+            clip_id,
+            &media,
+            13,
+        )
+        .await
+        .unwrap();
 
         let stored =
             super::super::store::list_frames_for_clip(&paths, project_id, clip_id).unwrap();

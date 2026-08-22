@@ -8,8 +8,8 @@ use tracing::{info, warn};
 
 use crate::background_work::BackgroundWorkGate;
 use crate::media::imported_clip_media_rows;
-use crate::project::db::{open_global, ProjectPaths};
-use crate::project::list_project_ids;
+use crate::project::db::ProjectPaths;
+use crate::project::{list_project_ids, ProjectDbBroker};
 use qnc_service_contracts::MediaProcessor;
 
 use super::store::{build_for_clip, ready as waveform_ready};
@@ -24,6 +24,7 @@ struct WaveformJob {
 #[derive(Clone)]
 pub struct WaveformWorker {
     paths: ProjectPaths,
+    project_db: ProjectDbBroker,
     background: BackgroundWorkGate,
     media_processor: Arc<dyn MediaProcessor>,
     pending: Arc<Mutex<Vec<WaveformJob>>>,
@@ -34,11 +35,13 @@ pub struct WaveformWorker {
 impl WaveformWorker {
     pub fn new(
         paths: ProjectPaths,
+        project_db: ProjectDbBroker,
         background: BackgroundWorkGate,
         media_processor: Arc<dyn MediaProcessor>,
     ) -> Self {
         Self {
             paths,
+            project_db,
             background,
             media_processor,
             pending: Arc::new(Mutex::new(Vec::new())),
@@ -103,9 +106,11 @@ impl WaveformWorker {
     }
 
     pub fn enqueue_recoverable_projects(&self) -> Result<usize, String> {
-        let global = open_global(&self.paths).map_err(|e| e.to_string())?;
+        let project_ids = self
+            .project_db
+            .with_global(|global| list_project_ids(global).map_err(|e| e.to_string()))?;
         let mut queued = 0usize;
-        for project_id in list_project_ids(&global).map_err(|e| e.to_string())? {
+        for project_id in project_ids {
             if self.is_blocked(&project_id) {
                 continue;
             }
@@ -164,6 +169,7 @@ impl WaveformWorker {
                 in_flight.fetch_add(1, Ordering::AcqRel);
                 let result = build_for_clip(
                     &worker.paths,
+                    &worker.project_db,
                     worker.media_processor.clone(),
                     &pid,
                     &cid,

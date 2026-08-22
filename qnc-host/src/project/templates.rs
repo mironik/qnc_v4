@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 use std::fs;
 
+use qnc_service_contracts::export_profile::export_profile_is_forbidden_pal_progressive;
 use rusqlite::{params, Connection};
 use serde_json::{json, Value};
 
@@ -576,48 +577,12 @@ pub(crate) fn validate_project_export_settings(settings: &Value) -> Result<(), S
     let Some(export) = settings.get("export") else {
         return Ok(());
     };
-    if export_is_forbidden_pal_progressive(export) {
+    if export_profile_is_forbidden_pal_progressive(export) {
         return Err(
             "PAL single-rate progressive export nije dozvoljen; koristi p50 ili i50.".into(),
         );
     }
     Ok(())
-}
-
-fn export_str<'a>(export: &'a Value, key: &str) -> &'a str {
-    export.get(key).and_then(Value::as_str).unwrap_or("")
-}
-
-fn export_fps(export: &Value) -> f64 {
-    export
-        .get("fps")
-        .and_then(Value::as_f64)
-        .or_else(|| {
-            export
-                .get("fps")
-                .and_then(Value::as_i64)
-                .map(|value| value as f64)
-        })
-        .or_else(|| export.get("fps").and_then(Value::as_str)?.parse().ok())
-        .unwrap_or(0.0)
-}
-
-fn contains_forbidden_pal_progressive_marker(format: &str) -> bool {
-    let bytes = format.as_bytes();
-    bytes.windows(3).any(|window| {
-        (window[0].eq_ignore_ascii_case(&b'p') && window[1] == b'2' && window[2] == b'5')
-            || (window[0] == b'2' && window[1] == b'5' && window[2].eq_ignore_ascii_case(&b'p'))
-    })
-}
-
-fn export_is_forbidden_pal_progressive(export: &Value) -> bool {
-    let fps = export_fps(export);
-    let field_order = export_str(export, "field_order").to_ascii_lowercase();
-    let format = export_str(export, "format").to_ascii_lowercase();
-    let single_rate_pal = (fps - 25.0).abs() < 0.01;
-    let explicit_forbidden = contains_forbidden_pal_progressive_marker(&format);
-    let explicit_i50 = format.contains("i50") || field_order.contains("upper");
-    explicit_forbidden || (single_rate_pal && field_order == "progressive" && !explicit_i50)
 }
 
 /// Legacy v1 workspace tab id → registered plugin tab id.
@@ -1701,6 +1666,20 @@ mod legacy_ingest_tests {
                 "preset": "single_rate_pal",
                 "format": "PAL single-rate progressive",
                 "fps": 25,
+                "field_order": "progressive"
+            }
+        });
+
+        assert!(validate_project_export_settings(&settings).is_err());
+    }
+
+    #[test]
+    fn export_settings_reject_forbidden_pal_progressive_with_decimal_comma() {
+        let settings = json!({
+            "export": {
+                "preset": "single_rate_pal",
+                "format": "PAL single-rate progressive",
+                "fps": "25,0",
                 "field_order": "progressive"
             }
         });

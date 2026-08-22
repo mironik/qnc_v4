@@ -39,6 +39,8 @@ pub struct RuntimeConfig {
     pub search: ServiceBackendConfig,
     #[serde(default = "default_disabled_service_config")]
     pub ai: ServiceBackendConfig,
+    #[serde(default = "default_disabled_service_config")]
+    pub export: ServiceBackendConfig,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -47,6 +49,8 @@ pub struct ServiceBackendConfig {
     pub backend: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub endpoint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -67,6 +71,8 @@ struct ConfigTomlFile {
     search: Option<ServiceBackendConfig>,
     #[serde(default)]
     ai: Option<ServiceBackendConfig>,
+    #[serde(default)]
+    export: Option<ServiceBackendConfig>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -118,6 +124,7 @@ impl Default for RuntimeConfig {
             transcription: default_disabled_service_config(),
             search: default_disabled_service_config(),
             ai: default_disabled_service_config(),
+            export: default_disabled_service_config(),
         }
     }
 }
@@ -198,6 +205,7 @@ fn parse_runtime_config_toml(raw: &str) -> Result<RuntimeConfig, String> {
         transcription: service_config_or("disabled", file.transcription),
         search: service_config_or("disabled", file.search),
         ai: service_config_or("disabled", file.ai),
+        export: service_config_or("disabled", file.export),
     })
 }
 
@@ -363,6 +371,7 @@ mod tests {
         assert_eq!(config.transcription.backend, "disabled");
         assert_eq!(config.search.backend, "disabled");
         assert_eq!(config.ai.backend, "disabled");
+        assert_eq!(config.export.backend, "disabled");
     }
 
     #[test]
@@ -381,6 +390,10 @@ mod tests {
             [ai]
             backend = "ollama"
             model = "llama3.1"
+
+            [export]
+            backend = "external_process"
+            command = "qnc-export-plugin"
             "#,
         )
         .unwrap();
@@ -394,6 +407,8 @@ mod tests {
         );
         assert_eq!(config.ai.backend, "ollama");
         assert_eq!(config.ai.model.as_deref(), Some("llama3.1"));
+        assert_eq!(config.export.backend, "external_process");
+        assert_eq!(config.export.command.as_deref(), Some("qnc-export-plugin"));
     }
 
     #[test]

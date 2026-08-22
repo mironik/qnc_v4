@@ -1,5 +1,7 @@
 #![forbid(unsafe_code)]
 
+pub mod export_profile;
+
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -107,6 +109,19 @@ pub struct MediaProbe {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AudioProbeRequest {
+    pub input: MediaRef,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AudioProbe {
+    pub duration_sec: Option<f64>,
+    pub codec: String,
+    pub has_audio: bool,
+    pub audio_channels: u16,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ArtifactRef {
     pub path: PathBuf,
     pub media_type: String,
@@ -121,9 +136,17 @@ pub struct FrameExtractRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PosterExtractRequest {
+    pub input: MediaRef,
+    pub output_path: PathBuf,
+    pub seek_sec: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FilmstripRequest {
     pub input: MediaRef,
     pub frame_count: usize,
+    pub seek_seconds: Vec<f64>,
     pub output_dir: PathBuf,
 }
 
@@ -138,6 +161,13 @@ pub struct FilmstripFrameArtifact {
 pub struct ProxyBuildRequest {
     pub input: MediaRef,
     pub output_path: PathBuf,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AudioWrapRequest {
+    pub input: MediaRef,
+    pub output_path: PathBuf,
+    pub fps: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -165,12 +195,15 @@ pub struct ExtractRangeRequest {
 #[async_trait]
 pub trait MediaProcessor: Send + Sync {
     async fn probe(&self, input: &MediaRef) -> ServiceResult<MediaProbe>;
+    async fn probe_audio(&self, request: AudioProbeRequest) -> ServiceResult<AudioProbe>;
     async fn extract_frame(&self, request: FrameExtractRequest) -> ServiceResult<ArtifactRef>;
+    async fn extract_poster(&self, request: PosterExtractRequest) -> ServiceResult<ArtifactRef>;
     async fn build_filmstrip(
         &self,
         request: FilmstripRequest,
     ) -> ServiceResult<Vec<FilmstripFrameArtifact>>;
     async fn build_proxy(&self, request: ProxyBuildRequest) -> ServiceResult<ArtifactRef>;
+    async fn build_audio_wrap(&self, request: AudioWrapRequest) -> ServiceResult<ArtifactRef>;
     async fn build_waveform(&self, request: WaveformRequest) -> ServiceResult<WaveformPeaks>;
     async fn extract_range(&self, request: ExtractRangeRequest) -> ServiceResult<ArtifactRef>;
 }
@@ -250,10 +283,45 @@ pub trait AIOrchestrator: Send + Sync {
     async fn run(&self, request: AiRequest) -> ServiceResult<AiResponse>;
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExportJobState {
+    Queued,
+    Running,
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExportRequest {
+    pub project_id: String,
+    pub playlist: serde_json::Value,
+    pub project_settings: serde_json::Value,
+    pub export_settings: serde_json::Value,
+    pub output_dir: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExportJob {
+    pub job_id: String,
+    pub state: ExportJobState,
+    pub artifacts: Vec<ArtifactRef>,
+    pub message: Option<String>,
+}
+
+#[async_trait]
+pub trait ExportEngine: Send + Sync {
+    async fn submit(&self, request: ExportRequest) -> ServiceResult<ExportJob>;
+    async fn status(&self, job_id: &str) -> ServiceResult<ExportJob>;
+    async fn cancel(&self, job_id: &str) -> ServiceResult<()>;
+}
+
 #[derive(Clone)]
 pub struct ServiceRegistry {
     pub media: Arc<dyn MediaProcessor>,
     pub transcription: Arc<dyn TranscriptionEngine>,
     pub search: Arc<dyn SearchEngine>,
     pub ai: Arc<dyn AIOrchestrator>,
+    pub export: Arc<dyn ExportEngine>,
 }

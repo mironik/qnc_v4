@@ -11,8 +11,8 @@ use std::sync::Arc;
 use tracing::info;
 
 use crate::ingest::db::open_ingest;
-use crate::project::db::{now_str, open_global, ProjectPaths};
-use crate::project::list_project_ids;
+use crate::project::db::{now_str, ProjectPaths};
+use crate::project::{list_project_ids, ProjectDbBroker};
 
 static SCHEMA_READY: Mutex<Option<HashSet<String>>> = Mutex::new(None);
 
@@ -113,17 +113,19 @@ pub fn purge_project_waveform_disk_tree(paths: &ProjectPaths, project_id: &str) 
 }
 
 /// Boot održavanje: obriši legacy wave PNG-e i invalidiraj stare DB redove.
-pub fn maintenance_purge_legacy(paths: &ProjectPaths) {
-    let Ok(global) = open_global(paths) else {
-        return;
-    };
-    let Ok(project_ids) = list_project_ids(&global) else {
+pub fn maintenance_purge_legacy(paths: &ProjectPaths, project_db: &ProjectDbBroker) {
+    let Ok(project_ids) =
+        project_db.with_global(|global| list_project_ids(global).map_err(|e| e.to_string()))
+    else {
         return;
     };
     let mut purged = 0usize;
     for project_id in project_ids {
         purge_project_waveform_disk_tree(paths, &project_id);
-        if ensure_schema_inner(paths, &project_id).is_ok() {
+        if project_db
+            .serialize_project_write(&project_id, || ensure_schema_inner(paths, &project_id))
+            .is_ok()
+        {
             let key = schema_cache_key(paths, &project_id);
             SCHEMA_READY
                 .lock()
@@ -283,6 +285,23 @@ fn mark(
     Ok(())
 }
 
+fn mark_via_broker(
+    paths: &ProjectPaths,
+    project_db: &ProjectDbBroker,
+    project_id: &str,
+    clip_id: &str,
+    status: &str,
+    a1_peaks: &[f32],
+    a2_peaks: &[f32],
+    error: &str,
+) -> Result<(), String> {
+    project_db.serialize_project_write(project_id, || {
+        mark(
+            paths, project_id, clip_id, status, a1_peaks, a2_peaks, error,
+        )
+    })
+}
+
 fn peaks_to_json(peaks: &[f32]) -> String {
     serde_json::to_string(peaks).unwrap_or_else(|_| "[]".into())
 }
@@ -306,6 +325,7 @@ fn parse_peaks_json(raw: &str) -> Option<Vec<f32>> {
 
 pub async fn build_for_clip(
     paths: &ProjectPaths,
+    project_db: &ProjectDbBroker,
     media_processor: Arc<dyn MediaProcessor>,
     project_id: &str,
     clip_id: &str,
@@ -315,7 +335,16 @@ pub async fn build_for_clip(
     if ready(paths, project_id, clip_id) {
         return Ok(());
     }
-    mark(paths, project_id, clip_id, "building", &[], &[], "")?;
+    mark_via_broker(
+        paths,
+        project_db,
+        project_id,
+        clip_id,
+        "building",
+        &[],
+        &[],
+        "",
+    )?;
 
     let peaks = match media_processor
         .build_waveform(WaveformRequest {
@@ -329,7 +358,16 @@ pub async fn build_for_clip(
         Ok(peaks) => peaks,
         Err(error) => {
             let message = format!("{}: {}", error.code, error.message);
-            mark(paths, project_id, clip_id, "failed", &[], &[], &message)?;
+            mark_via_broker(
+                paths,
+                project_db,
+                project_id,
+                clip_id,
+                "failed",
+                &[],
+                &[],
+                &message,
+            )?;
             return Err(message);
         }
     };
@@ -339,8 +377,9 @@ pub async fn build_for_clip(
     } else {
         peaks.warning.unwrap_or_default()
     };
-    mark(
+    mark_via_broker(
         paths,
+        project_db,
         project_id,
         clip_id,
         "ready",
@@ -375,9 +414,9 @@ mod tests {
     use super::*;
     use async_trait::async_trait;
     use qnc_service_contracts::{
-        ArtifactRef, ExtractRangeRequest, FilmstripFrameArtifact, FilmstripRequest,
-        FrameExtractRequest, MediaProbe, ProxyBuildRequest, ServiceError, ServiceResult,
-        WaveformPeaks,
+        ArtifactRef, AudioProbe, AudioProbeRequest, AudioWrapRequest, ExtractRangeRequest,
+        FilmstripFrameArtifact, FilmstripRequest, FrameExtractRequest, MediaProbe,
+        PosterExtractRequest, ProxyBuildRequest, ServiceError, ServiceResult, WaveformPeaks,
     };
     use rusqlite::params;
     use std::path::Path;
@@ -427,7 +466,18 @@ mod tests {
             Err(unused_service_error())
         }
 
+        async fn probe_audio(&self, _request: AudioProbeRequest) -> ServiceResult<AudioProbe> {
+            Err(unused_service_error())
+        }
+
         async fn extract_frame(&self, _request: FrameExtractRequest) -> ServiceResult<ArtifactRef> {
+            Err(unused_service_error())
+        }
+
+        async fn extract_poster(
+            &self,
+            _request: PosterExtractRequest,
+        ) -> ServiceResult<ArtifactRef> {
             Err(unused_service_error())
         }
 
@@ -439,6 +489,10 @@ mod tests {
         }
 
         async fn build_proxy(&self, _request: ProxyBuildRequest) -> ServiceResult<ArtifactRef> {
+            Err(unused_service_error())
+        }
+
+        async fn build_audio_wrap(&self, _request: AudioWrapRequest) -> ServiceResult<ArtifactRef> {
             Err(unused_service_error())
         }
 
@@ -489,9 +543,17 @@ mod tests {
         let media = base.join("source.mp4");
         fs::write(&media, b"fake-video").unwrap();
         let processor = Arc::new(FakeWaveformProcessor::default());
-        build_for_clip(&paths, processor.clone(), project_id, clip_id, &media)
-            .await
-            .unwrap();
+        let project_db = ProjectDbBroker::new(paths.clone());
+        build_for_clip(
+            &paths,
+            &project_db,
+            processor.clone(),
+            project_id,
+            clip_id,
+            &media,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(processor.waveform_calls.load(Ordering::Acquire), 1);
         assert_eq!(

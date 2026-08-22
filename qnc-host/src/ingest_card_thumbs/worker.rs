@@ -6,22 +6,28 @@ use tracing::{info, warn};
 
 use crate::ingest::thumb_process::copy_thumbs_from_card;
 use crate::ingest_posters::PosterWorker;
-use crate::project::db::{open_global, ProjectPaths};
-use crate::project::list_project_ids;
+use crate::project::db::ProjectPaths;
+use crate::project::{list_project_ids, ProjectDbBroker};
 
 /// Samostalan worker — kopija THM/JPG s kartice u ingest poster (bez ffmpeg).
 #[derive(Clone)]
 pub struct CardThumbWorker {
     paths: ProjectPaths,
+    project_db: ProjectDbBroker,
     posters: Arc<PosterWorker>,
     pending: Arc<Mutex<HashSet<String>>>,
     blocked: Arc<Mutex<HashSet<String>>>,
 }
 
 impl CardThumbWorker {
-    pub fn new(paths: ProjectPaths, posters: Arc<PosterWorker>) -> Self {
+    pub fn new(
+        paths: ProjectPaths,
+        project_db: ProjectDbBroker,
+        posters: Arc<PosterWorker>,
+    ) -> Self {
         Self {
             paths,
+            project_db,
             posters,
             pending: Arc::new(Mutex::new(HashSet::new())),
             blocked: Arc::new(Mutex::new(HashSet::new())),
@@ -59,22 +65,27 @@ impl CardThumbWorker {
     }
 
     pub fn enqueue_recoverable_projects(&self) -> Result<usize, String> {
-        let global = open_global(&self.paths).map_err(|e| e.to_string())?;
+        let project_ids = self
+            .project_db
+            .with_global(|global| list_project_ids(global).map_err(|e| e.to_string()))?;
         let mut queued = 0usize;
-        for project_id in list_project_ids(&global).map_err(|e| e.to_string())? {
+        for project_id in project_ids {
             if self.is_blocked(&project_id) {
                 continue;
             }
-            let conn = crate::ingest::db::open_ingest(&self.paths, &project_id)
-                .map_err(|e| e.to_string())?;
-            let count: i64 = conn
-                .query_row(
-                    "SELECT COUNT(*) FROM ingest_assets
-                     WHERE thumb_status NOT IN ('ready')",
-                    [],
-                    |r| r.get(0),
-                )
-                .unwrap_or(0);
+            let count: i64 = self.project_db.serialize_project_write(&project_id, || {
+                let conn = crate::ingest::db::open_ingest(&self.paths, &project_id)
+                    .map_err(|e| e.to_string())?;
+                let count = conn
+                    .query_row(
+                        "SELECT COUNT(*) FROM ingest_assets
+                         WHERE thumb_status NOT IN ('ready')",
+                        [],
+                        |r| r.get(0),
+                    )
+                    .unwrap_or(0);
+                Ok(count)
+            })?;
             if count > 0 {
                 self.enqueue(&project_id);
                 queued += 1;
@@ -117,7 +128,7 @@ impl CardThumbWorker {
         if self.is_blocked(project_id) {
             return Ok(0);
         }
-        let result = copy_thumbs_from_card(&self.paths, project_id)?;
+        let result = copy_thumbs_from_card(&self.paths, &self.project_db, project_id)?;
         if !result.no_thumb_clip_ids.is_empty() {
             self.posters
                 .enqueue_proxy_generate(project_id, &result.no_thumb_clip_ids);

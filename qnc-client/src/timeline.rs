@@ -4,7 +4,10 @@
 use eframe::egui::{self, Color32, Pos2, Rect, Sense, Stroke, Ui, Vec2};
 
 use crate::api::{SegmentSchema, TimelineApplication, TimelineModel, TimelinePin};
-use crate::focus::{frame_to_seconds, timeline_pin_frame, timeline_span_frames, FocusTarget};
+use crate::focus::{
+    fps_from_timeline, frame_to_seconds, is_valid_fps, timeline_pin_frame, timeline_span_frames,
+    FocusTarget,
+};
 
 const ROW_H: f32 = 28.0;
 const LABEL_W: f32 = 44.0;
@@ -52,18 +55,20 @@ pub fn paint_timeline(
     virtual_frame: i64,
     focus: Option<&FocusTarget>,
 ) -> Option<i64> {
-    let fps = if model.timeline_fps.is_finite() && model.timeline_fps > 1.0 {
-        model.timeline_fps
-    } else {
-        25.0
-    };
+    let fps = fps_from_timeline(Some(model));
     let duration_frames = if model.duration_frames > 0 {
         model.duration_frames
-    } else {
+    } else if is_valid_fps(fps) {
         ((model.duration_sec.max(0.0) * fps).round() as i64).max(1)
+    } else {
+        1
     }
     .max(1);
-    let duration_sec = frame_to_seconds(duration_frames, fps);
+    let duration_sec = if is_valid_fps(fps) {
+        frame_to_seconds(duration_frames, fps)
+    } else {
+        model.duration_sec.max(0.0)
+    };
     let available = ui.available_width();
     let height = ROW_H * 3.0 + PAD * 4.0 + 18.0;
     let (response, painter) = ui.allocate_painter(Vec2::new(available, height), Sense::click());
@@ -226,7 +231,11 @@ pub fn paint_timeline(
     painter.text(
         Pos2::new(px, rect.bottom() - 12.0),
         egui::Align2::CENTER_CENTER,
-        format!("{:.2}s", frame_to_seconds(virtual_frame, fps)),
+        if is_valid_fps(fps) {
+            format!("{:.2}s", frame_to_seconds(virtual_frame, fps))
+        } else {
+            "FPS ?".to_string()
+        },
         egui::FontId::proportional(11.0),
         Color32::from_rgb(220, 220, 220),
     );

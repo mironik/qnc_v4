@@ -212,6 +212,14 @@ pub fn project_settings_snapshot(
 ) -> rusqlite::Result<Value> {
     let pid = project_id.trim();
     let conn = open_project(paths, pid)?;
+    project_settings_snapshot_from_conn(&conn, pid)
+}
+
+pub fn project_settings_snapshot_from_conn(
+    conn: &Connection,
+    project_id: &str,
+) -> rusqlite::Result<Value> {
+    let pid = project_id.trim();
     let row: Option<(String, String)> = conn
         .query_row(
             "SELECT template_id, settings_json FROM project_settings WHERE project_id = ?1",

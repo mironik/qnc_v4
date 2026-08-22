@@ -2,16 +2,18 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use qnc_service_contracts::{
-    AIOrchestrator, AiRequest, AiResponse, ArtifactRef, ExtractRangeRequest,
+    AIOrchestrator, AiRequest, AiResponse, ArtifactRef, AudioProbe, AudioProbeRequest,
+    AudioWrapRequest, ExportEngine, ExportJob, ExportJobState, ExportRequest, ExtractRangeRequest,
     FilmstripFrameArtifact, FilmstripRequest, FrameExtractRequest, MediaProbe, MediaProcessor,
-    MediaRef, ProxyBuildRequest, SearchDocument, SearchEngine, SearchHit, SearchRequest,
-    ServiceError, ServiceRegistry, ServiceResult, Transcript, TranscriptionEngine,
+    MediaRef, PosterExtractRequest, ProxyBuildRequest, SearchDocument, SearchEngine, SearchHit,
+    SearchRequest, ServiceError, ServiceRegistry, ServiceResult, Transcript, TranscriptionEngine,
     TranscriptionRequest, WaveformPeaks, WaveformRequest,
 };
 use serde_json::{json, Value};
 
 use crate::config::{RuntimeConfig, ServiceBackendConfig};
 
+use super::export_process::ExternalProcessExportEngine;
 use super::media_ffmpeg::LocalFfmpegMediaProcessor;
 
 pub fn build_registry(config: &RuntimeConfig) -> ServiceRegistry {
@@ -20,6 +22,7 @@ pub fn build_registry(config: &RuntimeConfig) -> ServiceRegistry {
         transcription: build_transcription_engine(&config.transcription),
         search: build_search_engine(&config.search),
         ai: build_ai_orchestrator(&config.ai),
+        export: build_export_engine(&config.export),
     }
 }
 
@@ -35,6 +38,7 @@ pub fn describe_runtime(config: &RuntimeConfig) -> Value {
             ),
             "search": describe_optional_backend("search", &config.search, &[]),
             "ai": describe_optional_backend("ai", &config.ai, &[]),
+            "export": describe_export_backend(&config.export),
         },
     })
 }
@@ -71,6 +75,18 @@ fn build_ai_orchestrator(config: &ServiceBackendConfig) -> Arc<dyn AIOrchestrato
     }
 }
 
+fn build_export_engine(config: &ServiceBackendConfig) -> Arc<dyn ExportEngine> {
+    let backend = normalized_backend(config, "disabled");
+    match backend.as_str() {
+        "disabled" | "none" | "off" => Arc::new(DisabledExportEngine),
+        "external_process" => configured_command(config)
+            .map(ExternalProcessExportEngine::new)
+            .map(|engine| Arc::new(engine) as Arc<dyn ExportEngine>)
+            .unwrap_or_else(|| Arc::new(MisconfiguredExportEngine::external_process())),
+        _ => Arc::new(UnavailableExportEngine::new(backend)),
+    }
+}
+
 fn normalized_backend(config: &ServiceBackendConfig, default_backend: &str) -> String {
     let backend = config.backend.trim();
     if backend.is_empty() {
@@ -95,6 +111,47 @@ fn describe_media_backend(config: &ServiceBackendConfig) -> Value {
             "unavailable",
             false,
             "Configured media backend is not implemented yet.",
+            config,
+        ),
+    }
+}
+
+fn describe_export_backend(config: &ServiceBackendConfig) -> Value {
+    let backend = normalized_backend(config, "disabled");
+    match backend.as_str() {
+        "disabled" | "none" | "off" => service_description(
+            &backend,
+            "disabled",
+            true,
+            "export service is disabled.",
+            config,
+        ),
+        "external_process" if configured_command(config).is_some() => service_description(
+            &backend,
+            "active",
+            true,
+            "External export process adapter is active.",
+            config,
+        ),
+        "external_process" => service_description(
+            &backend,
+            "unavailable",
+            false,
+            "External export process requires [export].command.",
+            config,
+        ),
+        "remote_rest" => service_description(
+            &backend,
+            "unavailable",
+            false,
+            "Remote REST export adapter is not implemented yet.",
+            config,
+        ),
+        _ => service_description(
+            &backend,
+            "unavailable",
+            false,
+            "Configured export backend is not implemented yet.",
             config,
         ),
     }
@@ -144,9 +201,19 @@ fn service_description(
         "implemented": implemented,
         "message": message,
         "endpoint_configured": config.endpoint.as_ref().is_some_and(|v| !v.trim().is_empty()),
+        "command_configured": config.command.as_ref().is_some_and(|v| !v.trim().is_empty()),
         "model_configured": config.model.as_ref().is_some_and(|v| !v.trim().is_empty()),
         "model_path_configured": config.model_path.as_ref().is_some_and(|v| !v.trim().is_empty()),
     })
+}
+
+fn configured_command(config: &ServiceBackendConfig) -> Option<String> {
+    config
+        .command
+        .as_deref()
+        .map(str::trim)
+        .filter(|command| !command.is_empty())
+        .map(str::to_string)
 }
 
 #[derive(Debug, Clone)]
@@ -170,7 +237,15 @@ impl MediaProcessor for UnavailableMediaProcessor {
         Err(self.error())
     }
 
+    async fn probe_audio(&self, _request: AudioProbeRequest) -> ServiceResult<AudioProbe> {
+        Err(self.error())
+    }
+
     async fn extract_frame(&self, _request: FrameExtractRequest) -> ServiceResult<ArtifactRef> {
+        Err(self.error())
+    }
+
+    async fn extract_poster(&self, _request: PosterExtractRequest) -> ServiceResult<ArtifactRef> {
         Err(self.error())
     }
 
@@ -182,6 +257,10 @@ impl MediaProcessor for UnavailableMediaProcessor {
     }
 
     async fn build_proxy(&self, _request: ProxyBuildRequest) -> ServiceResult<ArtifactRef> {
+        Err(self.error())
+    }
+
+    async fn build_audio_wrap(&self, _request: AudioWrapRequest) -> ServiceResult<ArtifactRef> {
         Err(self.error())
     }
 
@@ -313,6 +392,97 @@ impl AIOrchestrator for UnavailableAiOrchestrator {
     }
 }
 
+#[derive(Debug, Default, Clone)]
+struct DisabledExportEngine;
+
+#[async_trait]
+impl ExportEngine for DisabledExportEngine {
+    async fn submit(&self, _request: ExportRequest) -> ServiceResult<ExportJob> {
+        Err(disabled("export_disabled", "Export service is disabled."))
+    }
+
+    async fn status(&self, job_id: &str) -> ServiceResult<ExportJob> {
+        Ok(ExportJob {
+            job_id: job_id.to_string(),
+            state: ExportJobState::Cancelled,
+            artifacts: vec![],
+            message: Some("Export service is disabled.".into()),
+        })
+    }
+
+    async fn cancel(&self, _job_id: &str) -> ServiceResult<()> {
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone)]
+struct MisconfiguredExportEngine {
+    code: &'static str,
+    message: &'static str,
+}
+
+impl MisconfiguredExportEngine {
+    fn external_process() -> Self {
+        Self {
+            code: "export_command_required",
+            message: "Export backend external_process requires [export].command.",
+        }
+    }
+}
+
+#[async_trait]
+impl ExportEngine for MisconfiguredExportEngine {
+    async fn submit(&self, _request: ExportRequest) -> ServiceResult<ExportJob> {
+        Err(disabled(self.code, self.message))
+    }
+
+    async fn status(&self, _job_id: &str) -> ServiceResult<ExportJob> {
+        Err(disabled(self.code, self.message))
+    }
+
+    async fn cancel(&self, _job_id: &str) -> ServiceResult<()> {
+        Err(disabled(self.code, self.message))
+    }
+}
+
+#[derive(Debug, Clone)]
+struct UnavailableExportEngine {
+    backend: String,
+}
+
+impl UnavailableExportEngine {
+    fn new(backend: String) -> Self {
+        Self { backend }
+    }
+}
+
+#[async_trait]
+impl ExportEngine for UnavailableExportEngine {
+    async fn submit(&self, _request: ExportRequest) -> ServiceResult<ExportJob> {
+        Err(unavailable(
+            "export_backend_unavailable",
+            "export",
+            &self.backend,
+        ))
+    }
+
+    async fn status(&self, _job_id: &str) -> ServiceResult<ExportJob> {
+        Err(unavailable(
+            "export_backend_unavailable",
+            "export",
+            &self.backend,
+        ))
+    }
+
+    async fn cancel(&self, _job_id: &str) -> ServiceResult<()> {
+        Err(unavailable(
+            "export_backend_unavailable",
+            "export",
+            &self.backend,
+        ))
+    }
+}
+
 fn disabled(code: &'static str, message: &'static str) -> ServiceError {
     ServiceError::new(code, message)
 }
@@ -338,18 +508,26 @@ mod tests {
         ServiceBackendConfig {
             backend: name.to_string(),
             endpoint: None,
+            command: None,
             model: None,
             model_path: None,
         }
     }
 
-    fn runtime_config(media: &str, transcription: &str, search: &str, ai: &str) -> RuntimeConfig {
+    fn runtime_config(
+        media: &str,
+        transcription: &str,
+        search: &str,
+        ai: &str,
+        export: &str,
+    ) -> RuntimeConfig {
         RuntimeConfig {
             profile: RuntimeProfile::Light,
             media: backend(media),
             transcription: backend(transcription),
             search: backend(search),
             ai: backend(ai),
+            export: backend(export),
         }
     }
 
@@ -369,6 +547,7 @@ mod tests {
             "disabled",
             "disabled",
             "disabled",
+            "disabled",
         ));
         let err = registry
             .media
@@ -383,6 +562,7 @@ mod tests {
     async fn remote_media_backend_is_explicitly_unavailable() {
         let registry = build_registry(&runtime_config(
             "remote_rest",
+            "disabled",
             "disabled",
             "disabled",
             "disabled",
@@ -404,6 +584,7 @@ mod tests {
             "disabled",
             "disabled",
             "ollama",
+            "disabled",
         ));
         let err = registry
             .ai
@@ -422,6 +603,7 @@ mod tests {
     async fn default_disabled_backends_return_disabled_errors() {
         let registry = build_registry(&runtime_config(
             "local_ffmpeg",
+            "disabled",
             "disabled",
             "disabled",
             "disabled",
@@ -452,10 +634,22 @@ mod tests {
             })
             .await
             .unwrap_err();
+        let export_err = registry
+            .export
+            .submit(ExportRequest {
+                project_id: "p1".into(),
+                playlist: serde_json::json!({}),
+                project_settings: serde_json::json!({}),
+                export_settings: serde_json::json!({}),
+                output_dir: None,
+            })
+            .await
+            .unwrap_err();
 
         assert_eq!(transcription_err.code, "transcription_disabled");
         assert_eq!(search_err.code, "search_disabled");
         assert_eq!(ai_err.code, "ai_disabled");
+        assert_eq!(export_err.code, "export_disabled");
     }
 
     #[test]
@@ -465,6 +659,7 @@ mod tests {
             "whisper_cpp",
             "disabled",
             "ollama",
+            "external_process",
         ));
 
         assert_eq!(description["profile"], "light");
@@ -476,5 +671,60 @@ mod tests {
         );
         assert_eq!(description["services"]["search"]["status"], "disabled");
         assert_eq!(description["services"]["ai"]["backend"], "ollama");
+        assert_eq!(
+            description["services"]["export"]["backend"],
+            "external_process"
+        );
+        assert_eq!(description["services"]["export"]["status"], "unavailable");
+    }
+
+    #[test]
+    fn runtime_description_reports_external_process_active_with_command() {
+        let mut config = runtime_config(
+            "local_ffmpeg",
+            "disabled",
+            "disabled",
+            "disabled",
+            "external_process",
+        );
+        config.export.command = Some("qnc-export-plugin".into());
+
+        let description = describe_runtime(&config);
+
+        assert_eq!(
+            description["services"]["export"]["backend"],
+            "external_process"
+        );
+        assert_eq!(description["services"]["export"]["status"], "active");
+        assert_eq!(description["services"]["export"]["implemented"], true);
+        assert_eq!(
+            description["services"]["export"]["command_configured"],
+            true
+        );
+    }
+
+    #[tokio::test]
+    async fn external_process_without_command_returns_configuration_error() {
+        let registry = build_registry(&runtime_config(
+            "local_ffmpeg",
+            "disabled",
+            "disabled",
+            "disabled",
+            "external_process",
+        ));
+
+        let err = registry
+            .export
+            .submit(ExportRequest {
+                project_id: "p1".into(),
+                playlist: serde_json::json!({}),
+                project_settings: serde_json::json!({}),
+                export_settings: serde_json::json!({}),
+                output_dir: None,
+            })
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.code, "export_command_required");
     }
 }

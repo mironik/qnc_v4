@@ -2,7 +2,10 @@ mod clip_path;
 mod play;
 mod resolve;
 
-pub use clip_path::{first_existing_path, imported_clip_media_rows};
+pub use clip_path::{
+    first_existing_path, imported_clip_media_rows, imported_filmstrip_media_rows,
+    resolve_filmstrip_media,
+};
 pub use play::{resolve_original_media, resolve_play_media, PlayMediaKind};
 pub use resolve::{
     card_original_on_card, clip_id_token, derived_shot_id, find_card_poster_copy,

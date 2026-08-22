@@ -3,12 +3,13 @@ use std::process::Command;
 
 use async_trait::async_trait;
 use qnc_service_contracts::{
-    ArtifactRef, ExtractRangeRequest, FilmstripFrameArtifact, FilmstripRequest,
-    FrameExtractRequest, FrameTimebase, MediaLocator, MediaProbe, MediaProcessor, MediaRef,
-    ProxyBuildRequest, ScanMode, ServiceError, ServiceResult, WaveformPeaks, WaveformRequest,
+    ArtifactRef, AudioProbe, AudioProbeRequest, AudioWrapRequest, ExtractRangeRequest,
+    FilmstripFrameArtifact, FilmstripRequest, FrameExtractRequest, FrameTimebase, MediaLocator,
+    MediaProbe, MediaProcessor, MediaRef, PosterExtractRequest, ProxyBuildRequest, ScanMode,
+    ServiceError, ServiceResult, WaveformPeaks, WaveformRequest,
 };
 
-use crate::ingest::{proxy_generate, thumb};
+use crate::ingest::{audio_wrap, proxy_generate, thumb};
 
 #[derive(Debug, Default, Clone)]
 pub struct LocalFfmpegMediaProcessor;
@@ -36,6 +37,21 @@ impl MediaProcessor for LocalFfmpegMediaProcessor {
         map_probe(probed)
     }
 
+    async fn probe_audio(&self, request: AudioProbeRequest) -> ServiceResult<AudioProbe> {
+        let source = local_media_path(&request.input)?;
+        let probed = run_blocking("probe_audio", move || {
+            thumb::probe_media(&source).ok_or_else(|| {
+                ServiceError::new(
+                    "probe_failed",
+                    format!("ffprobe could not read audio media: {}", source.display()),
+                )
+            })
+        })
+        .await?;
+
+        Ok(map_audio_probe(probed))
+    }
+
     async fn extract_frame(&self, request: FrameExtractRequest) -> ServiceResult<ArtifactRef> {
         let source = local_media_path(&request.input)?;
         let output_path = request.output_path;
@@ -57,33 +73,49 @@ impl MediaProcessor for LocalFfmpegMediaProcessor {
         .await
     }
 
+    async fn extract_poster(&self, request: PosterExtractRequest) -> ServiceResult<ArtifactRef> {
+        let source = local_media_path(&request.input)?;
+        let output_path = request.output_path;
+        let seek_sec = if request.seek_sec.is_finite() {
+            request.seek_sec.max(0.0)
+        } else {
+            0.0
+        };
+
+        run_blocking("extract_poster", move || {
+            thumb::extract_poster_jpeg_at_seek(&source, &output_path, seek_sec)
+                .map_err(|message| ServiceError::new("poster_extract_failed", message))?;
+            Ok(artifact(output_path))
+        })
+        .await
+    }
+
     async fn build_filmstrip(
         &self,
         request: FilmstripRequest,
     ) -> ServiceResult<Vec<FilmstripFrameArtifact>> {
-        if request.frame_count < 2 {
+        if request.frame_count < 2 || request.seek_seconds.len() < 2 {
             return Err(ServiceError::new(
                 "invalid_filmstrip_request",
                 "Filmstrip requires at least two frames.",
             ));
         }
+        if request.frame_count != request.seek_seconds.len() {
+            return Err(ServiceError::new(
+                "invalid_filmstrip_request",
+                "Filmstrip frame count must match explicit seek list.",
+            ));
+        }
 
         let source = local_media_path(&request.input)?;
         let output_dir = request.output_dir;
-        let frame_count = request.frame_count;
+        let seeks = request.seek_seconds;
 
         run_blocking("build_filmstrip", move || {
-            let probe = thumb::probe_media(&source).ok_or_else(|| {
-                ServiceError::new(
-                    "probe_failed",
-                    format!("ffprobe could not read media: {}", source.display()),
-                )
-            })?;
-            let seeks = thumb::timeline_seek_seconds(probe.duration_sec, frame_count as u32);
             let outputs: Vec<PathBuf> = seeks
                 .iter()
                 .enumerate()
-                .map(|(index, sec)| filmstrip_output_path(&output_dir, index, *sec))
+                .map(|(index, sec)| thumb::filmstrip_frame_path(&output_dir, index, *sec))
                 .collect();
 
             let missing: Vec<usize> = (0..outputs.len())
@@ -97,7 +129,7 @@ impl MediaProcessor for LocalFfmpegMediaProcessor {
                     .map(|&index| outputs[index].clone())
                     .collect();
                 let results =
-                    thumb::extract_filmstrip_batch_at_seeks(&source, &batch_seeks, &batch_outputs);
+                    thumb::extract_filmstrip_frames_at_seeks(&source, &batch_seeks, &batch_outputs);
                 for (slot, result) in missing.iter().zip(results.into_iter()) {
                     let index = *slot;
                     let sec = seeks[index];
@@ -152,6 +184,19 @@ impl MediaProcessor for LocalFfmpegMediaProcessor {
         run_blocking("build_proxy", move || {
             proxy_generate::generate_field_proxy(&source, &output_path)
                 .map_err(|message| ServiceError::new("proxy_failed", message))?;
+            Ok(artifact(output_path))
+        })
+        .await
+    }
+
+    async fn build_audio_wrap(&self, request: AudioWrapRequest) -> ServiceResult<ArtifactRef> {
+        let source = local_media_path(&request.input)?;
+        let output_path = request.output_path;
+        let fps = request.fps;
+
+        run_blocking("build_audio_wrap", move || {
+            audio_wrap::wrap_audio_with_timecode(&source, &output_path, fps)
+                .map_err(|message| ServiceError::new("audio_wrap_failed", message))?;
             Ok(artifact(output_path))
         })
         .await
@@ -272,6 +317,15 @@ fn map_probe(probe: thumb::MediaProbe) -> ServiceResult<MediaProbe> {
     })
 }
 
+fn map_audio_probe(probe: thumb::MediaProbe) -> AudioProbe {
+    AudioProbe {
+        duration_sec: Some(probe.duration_sec).filter(|value| value.is_finite() && *value > 0.0),
+        codec: probe.codec,
+        has_audio: probe.has_audio,
+        audio_channels: probe.audio_channels as u16,
+    }
+}
+
 fn parse_resolution(resolution: &str) -> (u32, u32) {
     let Some((w, h)) = resolution.split_once('x') else {
         return (0, 0);
@@ -357,11 +411,6 @@ fn media_type_for_path(path: &Path) -> &'static str {
         "wav" => "audio/wav",
         _ => "application/octet-stream",
     }
-}
-
-fn filmstrip_output_path(out_dir: &Path, index: usize, sec: f64) -> PathBuf {
-    let sec_label = format!("{:.2}", sec).replace('.', "_");
-    out_dir.join(format!("{:03}_{}.jpg", index, sec_label))
 }
 
 fn file_ready(path: &Path) -> bool {

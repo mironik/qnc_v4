@@ -13,6 +13,7 @@ clap = { version = "4", features = ["derive", "env"] }
 eframe = { version = "0.31", default-features = true }
 egui = "0.31"
 image = { version = "0.25", default-features = false, features = ["jpeg"] }
+qnc-service-contracts = { path = "../qnc-service-contracts" }
 qnc-media-ffmpeg = { path = "../qnc-media-ffmpeg" }
 qnc-player-core = { package = "qnc-broadcast-player", path = "../qnc-broadcast-player" }
 qnc-player-monitor = { path = "../qnc-player-monitor" }

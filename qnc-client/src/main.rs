@@ -13,6 +13,7 @@ mod transport;
 use clap::{Parser, Subcommand};
 
 use api::HostClient;
+use focus::fps_from_timeline;
 use transport::TransportApp;
 
 #[derive(Parser, Debug)]
@@ -119,11 +120,10 @@ fn run_editorial_oneshot(
     let _ = host.health()?;
     let start = host.playback_start(project_id)?;
     let timeline = host.timeline_model(project_id).ok();
-    let timeline_fps = timeline
-        .as_ref()
-        .map(|model| model.timeline_fps)
-        .filter(|fps| fps.is_finite() && *fps > 0.0)
-        .unwrap_or(25.0);
+    let timeline_fps = fps_from_timeline(timeline.as_ref());
+    if timeline_fps <= 0.0 {
+        return Err("Timeline FPS nije potvrđen; host mora poslati probe/source FPS.".into());
+    }
     let seek_frame = (seek.max(0.0) * timeline_fps).round() as i64;
     println!(
         "session={} buses={}",

@@ -30,11 +30,13 @@ Start-Sleep -Milliseconds 400
 
 Push-Location $Root
 cargo build --release -p qnc-host --target-dir $TargetDir
-cargo build -p qnc-client --target-dir $TargetDir
+if ($LASTEXITCODE -ne 0) {
+    Pop-Location
+    exit $LASTEXITCODE
+}
 Pop-Location
 Write-Host "QNC API: http://127.0.0.1:$($env:QNC_API_PORT)/api/health"
 Write-Host "Native UI: .\run_app.ps1  (LAN: QNC_BIND_HOST=0.0.0.0 requires QNC_TRUSTED_LAN=1)"
 Write-Host "Host binary: $Bin"
-Write-Host "Client: $(Join-Path $TargetDir 'debug\qnc-client.exe')"
 Write-Host "Root: $Root"
 & $Bin

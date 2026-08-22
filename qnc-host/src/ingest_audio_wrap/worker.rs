@@ -9,23 +9,32 @@ use tracing::{info, warn};
 
 use crate::background_work::BackgroundWorkGate;
 use crate::ingest::audio_wrap::process_project_audio_wraps;
-use crate::ingest::db::open_ingest;
-use crate::project::db::{open_global, ProjectPaths};
-use crate::project::list_project_ids;
+use crate::project::db::ProjectPaths;
+use crate::project::{list_project_ids, ProjectDbBroker};
+use qnc_service_contracts::MediaProcessor;
 
 #[derive(Clone)]
 pub struct AudioWrapWorker {
     paths: ProjectPaths,
+    project_db: ProjectDbBroker,
     background: BackgroundWorkGate,
+    media_processor: Arc<dyn MediaProcessor>,
     pending: Arc<Mutex<HashSet<String>>>,
     blocked: Arc<Mutex<HashSet<String>>>,
 }
 
 impl AudioWrapWorker {
-    pub fn new(paths: ProjectPaths, background: BackgroundWorkGate) -> Self {
+    pub fn new(
+        paths: ProjectPaths,
+        project_db: ProjectDbBroker,
+        background: BackgroundWorkGate,
+        media_processor: Arc<dyn MediaProcessor>,
+    ) -> Self {
         Self {
             paths,
+            project_db,
             background,
+            media_processor,
             pending: Arc::new(Mutex::new(HashSet::new())),
             blocked: Arc::new(Mutex::new(HashSet::new())),
         }
@@ -63,13 +72,15 @@ impl AudioWrapWorker {
 
     /// Projects that have imported audio waiting for wraps (metadata in SQLite).
     pub fn enqueue_recoverable_projects(&self) -> Result<usize, String> {
-        let global = open_global(&self.paths).map_err(|e| e.to_string())?;
+        let project_ids = self
+            .project_db
+            .with_global(|global| list_project_ids(global).map_err(|e| e.to_string()))?;
         let mut queued = 0usize;
-        for project_id in list_project_ids(&global).map_err(|e| e.to_string())? {
+        for project_id in project_ids {
             if self.is_blocked(&project_id) {
                 continue;
             }
-            if !project_has_pending_audio_wrap(&self.paths, &project_id) {
+            if !project_has_pending_audio_wrap(&self.paths, &self.project_db, &project_id) {
                 continue;
             }
             self.enqueue(&project_id);
@@ -105,19 +116,19 @@ impl AudioWrapWorker {
                     }
                     let worker = self.clone();
                     let pid = project_id.clone();
-                    let result = tokio::task::spawn_blocking(move || {
-                        process_project_audio_wraps(&worker.paths, &pid)
-                    })
+                    let result = process_project_audio_wraps(
+                        &worker.paths,
+                        &worker.project_db,
+                        worker.media_processor.clone(),
+                        &pid,
+                    )
                     .await;
                     match result {
-                        Ok(Ok(n)) if n > 0 => {
+                        Ok(n) if n > 0 => {
                             info!("ingest audio wrap: project={} built={}", project_id, n)
                         }
-                        Ok(Ok(_)) => {}
-                        Ok(Err(e)) => warn!("ingest audio wrap: project={} err={}", project_id, e),
-                        Err(e) => {
-                            warn!("ingest audio wrap: project={} join err={}", project_id, e)
-                        }
+                        Ok(_) => {}
+                        Err(e) => warn!("ingest audio wrap: project={} err={}", project_id, e),
                     }
                 }
             }
@@ -125,17 +136,25 @@ impl AudioWrapWorker {
     }
 }
 
-fn project_has_pending_audio_wrap(paths: &ProjectPaths, project_id: &str) -> bool {
-    let Ok(conn) = open_ingest(paths, project_id) else {
-        return false;
-    };
-    conn.query_row(
-        "SELECT 1 FROM ingest_assets
-         WHERE import_status IN ('imported', 'done')
-           AND metadata_json LIKE '%audio_project_path%'
-         LIMIT 1",
-        [],
-        |_| Ok(1i64),
-    )
-    .is_ok()
+fn project_has_pending_audio_wrap(
+    paths: &ProjectPaths,
+    project_db: &ProjectDbBroker,
+    project_id: &str,
+) -> bool {
+    project_db
+        .serialize_project_write(project_id, || {
+            let conn = crate::ingest::db::open_ingest(paths, project_id)
+                .map_err(|error| error.to_string())?;
+            Ok(conn
+                .query_row(
+                    "SELECT 1 FROM ingest_assets
+                     WHERE import_status IN ('imported', 'done')
+                       AND metadata_json LIKE '%audio_project_path%'
+                     LIMIT 1",
+                    [],
+                    |_| Ok(1i64),
+                )
+                .is_ok())
+        })
+        .unwrap_or(false)
 }

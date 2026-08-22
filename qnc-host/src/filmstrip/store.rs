@@ -4,6 +4,8 @@ use std::path::{Path, PathBuf};
 use rusqlite::{params, Connection};
 use serde_json::{json, Value};
 
+use crate::ingest::thumb::timeline_seek_seconds;
+use crate::locale_number::parse_decimal;
 use crate::project::db::{now_str, open_project_strict, ProjectPaths};
 
 #[derive(Clone, Debug)]
@@ -116,6 +118,142 @@ pub fn clip_filmstrip_snapshot(paths: &ProjectPaths, project_id: &str, clip_id: 
     clip_filmstrip_snapshot_for_api(paths, project_id, clip_id, "/api/story")
 }
 
+pub fn manifest_for_api(
+    paths: &ProjectPaths,
+    project_id: &str,
+    clip_id: &str,
+    api_prefix: &str,
+) -> Value {
+    let pid = project_id.trim();
+    let clip = clip_id.trim();
+    let snapshot = clip_filmstrip_snapshot_for_api(paths, pid, clip, api_prefix);
+    let filmstrip = get_filmstrip(paths, pid, clip).unwrap_or_else(|| {
+        json!({
+            "clip_id": clip,
+            "status": "missing",
+            "duration_sec": 0,
+            "frame_count": 0,
+            "error": "",
+        })
+    });
+    json!({
+        "project_id": pid,
+        "clip_id": clip,
+        "filmstrip": filmstrip,
+        "frames": snapshot
+            .get("filmstrip_frames")
+            .cloned()
+            .unwrap_or_else(|| json!(crate::filmstrip::pad_frames_to_default_with_placeholder(
+                Vec::new(),
+                &crate::filmstrip::placeholder_url_for_api(api_prefix.trim().trim_end_matches('/'))
+            ))),
+    })
+}
+
+pub fn manifest_from_frames_for_api(
+    project_id: &str,
+    clip_id: &str,
+    filmstrip: Value,
+    frames: &[FilmstripFrame],
+    api_prefix: &str,
+) -> Value {
+    let pid = project_id.trim();
+    let clip = clip_id.trim();
+    let api = api_prefix.trim().trim_end_matches('/');
+    let api = if api.is_empty() { "/api/story" } else { api };
+    let ph = crate::filmstrip::placeholder_url_for_api(api);
+    let version = filmstrip
+        .get("updated_at")
+        .or_else(|| filmstrip.get("built_at"))
+        .and_then(Value::as_str)
+        .map(url_encode_component)
+        .unwrap_or_default();
+    let mut out = json!({
+        "filmstrip_status": filmstrip
+            .get("status")
+            .and_then(Value::as_str)
+            .unwrap_or("missing"),
+        "filmstrip_frames": crate::filmstrip::pad_frames_to_default_with_placeholder(Vec::new(), &ph),
+    });
+    if let Some(err) = filmstrip
+        .get("error")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+    {
+        out["filmstrip_error"] = json!(err);
+    }
+    let filmstrip_frames: Vec<Value> = frames
+        .iter()
+        .filter(|frame| frame_file_valid(&frame.path))
+        .map(|frame| {
+            json!({
+                "index": frame.index,
+                "frame_index": frame.index,
+                "seek_sec": frame.seek_sec,
+                "url": format!(
+                    "{api}/thumbnail?clip_id={}&frame_index={}&project_id={}&v={}",
+                    url_encode_component(clip),
+                    frame.index,
+                    url_encode_component(pid),
+                    version,
+                ),
+            })
+        })
+        .collect();
+    if !filmstrip_frames.is_empty() {
+        out["filmstrip_frames"] = json!(crate::filmstrip::pad_frames_to_default_with_placeholder(
+            filmstrip_frames,
+            &ph
+        ));
+        out["timeline_seeks"] = json!(frames
+            .iter()
+            .filter(|frame| frame_file_valid(&frame.path))
+            .map(|frame| frame.seek_sec)
+            .collect::<Vec<_>>());
+    }
+    if let Some(duration) = filmstrip.get("duration_sec") {
+        out["timeline_duration_sec"] = duration.clone();
+    }
+    json!({
+        "project_id": pid,
+        "clip_id": clip,
+        "filmstrip": filmstrip,
+        "frames": out["filmstrip_frames"].clone(),
+    })
+}
+
+pub fn manifest_from_status_for_api(
+    project_id: &str,
+    clip_id: &str,
+    status: &str,
+    error: &str,
+    api_prefix: &str,
+) -> Value {
+    manifest_from_frames_for_api(
+        project_id,
+        clip_id,
+        json!({
+            "clip_id": clip_id.trim(),
+            "status": status,
+            "duration_sec": 0,
+            "frame_count": 0,
+            "error": error,
+            "built_at": Value::Null,
+            "updated_at": Value::Null,
+        }),
+        &[],
+        api_prefix,
+    )
+}
+
+pub fn manifest_cache_key(clip_id: &str, api_prefix: &str) -> String {
+    format!(
+        "filmstrip_manifest:{}:{}",
+        api_prefix.trim().trim_end_matches('/'),
+        clip_id.trim()
+    )
+}
+
 pub fn clip_filmstrip_snapshot_for_api(
     paths: &ProjectPaths,
     project_id: &str,
@@ -143,46 +281,53 @@ pub fn clip_filmstrip_snapshot_for_api(
         .get("status")
         .and_then(|v| v.as_str())
         .unwrap_or("missing");
+    let version = fs
+        .get("updated_at")
+        .or_else(|| fs.get("built_at"))
+        .and_then(Value::as_str)
+        .map(url_encode_component)
+        .unwrap_or_default();
     let mut out = json!({
         "filmstrip_status": status,
         "filmstrip_frames": ph_frames(),
     });
-    if status != "ready" {
-        if let Some(err) = fs
-            .get("error")
-            .and_then(|v| v.as_str())
-            .filter(|s| !s.is_empty())
-        {
-            out["filmstrip_error"] = json!(err);
+    if let Some(err) = fs
+        .get("error")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+    {
+        out["filmstrip_error"] = json!(err);
+    }
+    if let Ok(frames) = list_frames_for_clip(paths, project_id, clip_id) {
+        if !frames.is_empty() {
+            let filmstrip_frames: Vec<Value> = frames
+                .iter()
+                .map(|f| {
+                    let index = f.get("index").and_then(|v| v.as_i64()).unwrap_or(0);
+                    json!({
+                        "index": index,
+                        "frame_index": index,
+                        "seek_sec": f.get("seek_sec").and_then(|v| v.as_f64()).unwrap_or(0.0),
+                        "url": format!(
+                            "{api}/thumbnail?clip_id={}&frame_index={}&project_id={}&v={}",
+                            url_encode_component(clip_id),
+                            index,
+                            url_encode_component(project_id),
+                            version,
+                        ),
+                    })
+                })
+                .collect();
+            out["filmstrip_frames"] = json!(
+                crate::filmstrip::pad_frames_to_default_with_placeholder(filmstrip_frames, &ph)
+            );
+            let seeks: Vec<Value> = frames
+                .iter()
+                .map(|f| json!(f.get("seek_sec").and_then(|v| v.as_f64()).unwrap_or(0.0)))
+                .collect();
+            out["timeline_seeks"] = json!(seeks);
         }
-        return out;
     }
-    let Ok(frames) = list_frames_for_clip(paths, project_id, clip_id) else {
-        return out;
-    };
-    if frames.is_empty() {
-        return out;
-    }
-    let filmstrip_frames: Vec<Value> = frames
-        .iter()
-        .map(|f| {
-            let index = f.get("index").and_then(|v| v.as_i64()).unwrap_or(0);
-            json!({
-                "frame_index": index,
-                "seek_sec": f.get("seek_sec").and_then(|v| v.as_f64()).unwrap_or(0.0),
-                "url": format!(
-                    "{api}/thumbnail?clip_id={}&frame_index={}&project_id={}",
-                    url_encode_component(clip_id),
-                    index,
-                    url_encode_component(project_id),
-                ),
-            })
-        })
-        .collect();
-    out["filmstrip_frames"] = json!(crate::filmstrip::pad_frames_to_default_with_placeholder(
-        filmstrip_frames,
-        &ph
-    ));
     if let Some(dur) = fs.get("duration_sec") {
         out["timeline_duration_sec"] = dur.clone();
     }
@@ -239,7 +384,7 @@ fn parse_frame_filename(name: &str) -> Option<(usize, f64)> {
         .or_else(|| name.strip_suffix(".JPG"))?;
     let (idx_part, seek_part) = stem.split_once('_')?;
     let index: usize = idx_part.parse().ok()?;
-    let seek: f64 = seek_part.replace('_', ".").parse().ok()?;
+    let seek = parse_decimal(&seek_part.replace('_', "."))?;
     Some((index, seek))
 }
 
@@ -268,45 +413,123 @@ fn discover_frames_on_disk(dir: &Path) -> Vec<FilmstripFrame> {
     out
 }
 
-fn db_frames_valid(paths: &ProjectPaths, project_id: &str, clip_id: &str) -> bool {
-    let Ok(frames) = list_frames_for_clip(paths, project_id, clip_id) else {
-        return false;
-    };
-    !frames.is_empty()
-        && frames.iter().all(|f| {
-            f.get("path")
-                .and_then(|v| v.as_str())
-                .map(Path::new)
-                .map(frame_file_valid)
-                .unwrap_or(false)
+fn expected_default_frame_set(duration_sec: f64) -> Vec<f64> {
+    if duration_sec.is_finite() && duration_sec > 0.0 {
+        timeline_seek_seconds(duration_sec, super::DEFAULT_FILMSTRIP_FRAMES)
+    } else {
+        Vec::new()
+    }
+}
+
+fn keep_current_frame_positions(
+    mut frames: Vec<FilmstripFrame>,
+    expected: &[f64],
+) -> Vec<FilmstripFrame> {
+    if expected.is_empty() {
+        return frames;
+    }
+    frames.retain(|frame| {
+        expected
+            .get(frame.index)
+            .map(|seek| (frame.seek_sec - *seek).abs() <= 0.011)
+            .unwrap_or(false)
+    });
+    frames
+}
+
+fn has_complete_default_frame_set(frames: &[FilmstripFrame], expected: &[f64]) -> bool {
+    !expected.is_empty()
+        && (0..expected.len()).all(|index| {
+            frames.iter().any(|frame| {
+                frame.index == index && (frame.seek_sec - expected[index]).abs() <= 0.011
+            })
         })
 }
 
-/// Ako su JPG kadrovi na disku, a `filmstrip_frames` u bazi prazan — registriraj ih.
+fn stored_frames_equal(stored: &[Value], frames: &[FilmstripFrame]) -> bool {
+    if stored.len() != frames.len() {
+        return false;
+    }
+    stored.iter().zip(frames.iter()).all(|(stored, frame)| {
+        stored.get("index").and_then(Value::as_i64) == Some(frame.index as i64)
+            && (stored
+                .get("seek_sec")
+                .and_then(Value::as_f64)
+                .unwrap_or(f64::NAN)
+                - frame.seek_sec)
+                .abs()
+                <= 0.011
+            && stored
+                .get("path")
+                .and_then(Value::as_str)
+                .map(Path::new)
+                .map(|path| path == frame.path.as_path() && frame_file_valid(path))
+                .unwrap_or(false)
+    })
+}
+
+fn filmstrip_state_matches(
+    paths: &ProjectPaths,
+    project_id: &str,
+    clip_id: &str,
+    status: &str,
+    frames: &[FilmstripFrame],
+) -> bool {
+    let Some(existing) = get_filmstrip(paths, project_id, clip_id) else {
+        return false;
+    };
+    if existing.get("status").and_then(Value::as_str) != Some(status) {
+        return false;
+    }
+    let Ok(stored) = list_frames_for_clip(paths, project_id, clip_id) else {
+        return false;
+    };
+    stored_frames_equal(&stored, frames)
+}
+
+/// Ako su JPG kadrovi na disku, a `filmstrip_frames` u bazi nije usklađen —
+/// registriraj ih. Djelomični set ostaje `building`; `ready` znači puni set.
 pub fn sync_filmstrip_from_disk(
     paths: &ProjectPaths,
     project_id: &str,
     clip_id: &str,
     duration_hint: f64,
 ) -> Result<bool, String> {
-    if db_frames_valid(paths, project_id, clip_id) {
+    let dir = filmstrip_clip_dir(paths, project_id, clip_id);
+    let discovered = discover_frames_on_disk(&dir);
+    if discovered.is_empty() {
         return Ok(false);
     }
-    let dir = filmstrip_clip_dir(paths, project_id, clip_id);
-    let frames = discover_frames_on_disk(&dir);
+    let duration = duration_hint
+        .is_finite()
+        .then_some(duration_hint)
+        .filter(|duration| *duration > 0.0)
+        .or_else(|| {
+            get_filmstrip(paths, project_id, clip_id)
+                .and_then(|fs| fs.get("duration_sec").and_then(Value::as_f64))
+                .filter(|duration| *duration > 0.0)
+        })
+        .unwrap_or_else(|| {
+            discovered
+                .iter()
+                .map(|f| f.seek_sec)
+                .fold(0.0_f64, f64::max)
+                .max(1.0)
+        });
+    let expected = expected_default_frame_set(duration);
+    let frames = keep_current_frame_positions(discovered, &expected);
     if frames.is_empty() {
         return Ok(false);
     }
-    let duration = if duration_hint > 0.0 {
-        duration_hint
+    let status = if has_complete_default_frame_set(&frames, &expected) {
+        "ready"
     } else {
-        frames
-            .iter()
-            .map(|f| f.seek_sec)
-            .fold(0.0_f64, f64::max)
-            .max(1.0)
+        "building"
     };
-    save_filmstrip(paths, project_id, clip_id, duration, &frames, "")?;
+    if filmstrip_state_matches(paths, project_id, clip_id, status, &frames) {
+        return Ok(false);
+    }
+    save_filmstrip_with_status(paths, project_id, clip_id, duration, &frames, "", status)?;
     Ok(true)
 }
 
@@ -366,13 +589,57 @@ pub fn save_filmstrip(
     frames: &[FilmstripFrame],
     error: &str,
 ) -> Result<Value, String> {
+    let status = if frames.iter().any(|f| frame_file_valid(&f.path)) {
+        "ready"
+    } else {
+        "error"
+    };
+    save_filmstrip_with_status(
+        paths,
+        project_id,
+        clip_id,
+        duration_sec,
+        frames,
+        error,
+        status,
+    )
+}
+
+pub(super) fn save_filmstrip_progress(
+    paths: &ProjectPaths,
+    project_id: &str,
+    clip_id: &str,
+    duration_sec: f64,
+    frames: &[FilmstripFrame],
+    error: &str,
+) -> Result<Value, String> {
+    save_filmstrip_with_status(
+        paths,
+        project_id,
+        clip_id,
+        duration_sec,
+        frames,
+        error,
+        "building",
+    )
+}
+
+fn save_filmstrip_with_status(
+    paths: &ProjectPaths,
+    project_id: &str,
+    clip_id: &str,
+    duration_sec: f64,
+    frames: &[FilmstripFrame],
+    error: &str,
+    status: &str,
+) -> Result<Value, String> {
     let valid: Vec<FilmstripFrame> = frames
         .iter()
         .filter(|f| frame_file_valid(&f.path))
         .cloned()
         .collect();
     let frame_count = valid.len() as i64;
-    let status = if frame_count > 0 { "ready" } else { "error" };
+    let status = if frame_count > 0 { status } else { "error" };
     let conn = open_db(paths, project_id)?;
     let now = now_str();
     let built_at = if status == "ready" {
@@ -405,7 +672,15 @@ pub fn save_filmstrip(
     if frame_count > 0 {
         write_frames(&conn, clip_id, &valid, &now)?;
     }
-    get_filmstrip(paths, project_id, clip_id).ok_or_else(|| "filmstrip save failed".into())
+    Ok(json!({
+        "clip_id": clip_id,
+        "status": status,
+        "duration_sec": duration_sec,
+        "frame_count": frame_count,
+        "error": error,
+        "built_at": if built_at.is_empty() { Value::Null } else { json!(built_at) },
+        "updated_at": now,
+    }))
 }
 
 pub fn frame_path_for_seek(
@@ -560,8 +835,11 @@ mod tests {
         register_project(&paths, project_id);
         let clip_id = "clip_b";
         let dir = filmstrip_clip_dir(&paths, project_id, clip_id);
-        for (index, seek) in timeline_seek_seconds(30.0, 3).into_iter().enumerate() {
-            let sec_label = format!("{seek:.2}").replace('.', "_");
+        for (index, seek) in timeline_seek_seconds(30.0, crate::filmstrip::DEFAULT_FILMSTRIP_FRAMES)
+            .into_iter()
+            .enumerate()
+        {
+            let sec_label = crate::locale_number::format_decimal(seek, 2).replace('.', "_");
             let path = dir.join(format!("{index:03}_{sec_label}.jpg"));
             let mut f = fs::File::create(&path).unwrap();
             f.write_all(b"jpeg").unwrap();
@@ -572,9 +850,44 @@ mod tests {
             .is_empty());
         assert!(sync_filmstrip_from_disk(&paths, project_id, clip_id, 30.0).unwrap());
         let stored = list_frames_for_clip(&paths, project_id, clip_id).unwrap();
-        assert_eq!(stored.len(), 3);
+        assert_eq!(
+            stored.len(),
+            crate::filmstrip::DEFAULT_FILMSTRIP_FRAMES as usize
+        );
         let fs = get_filmstrip(&paths, project_id, clip_id).unwrap();
         assert_eq!(fs.get("status").and_then(|v| v.as_str()), Some("ready"));
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn sync_from_disk_registers_partial_jpgs_as_building() {
+        let base =
+            std::env::temp_dir().join(format!("qnc_filmstrip_partial_sync_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+        let paths = test_paths(&base);
+        let project_id = "test_proj";
+        register_project(&paths, project_id);
+        let clip_id = "clip_partial";
+        let dir = filmstrip_clip_dir(&paths, project_id, clip_id);
+        for (index, seek) in timeline_seek_seconds(30.0, crate::filmstrip::DEFAULT_FILMSTRIP_FRAMES)
+            .into_iter()
+            .take(3)
+            .enumerate()
+        {
+            let sec_label = crate::locale_number::format_decimal(seek, 2).replace('.', "_");
+            let path = dir.join(format!("{index:03}_{sec_label}.jpg"));
+            let mut f = fs::File::create(&path).unwrap();
+            f.write_all(b"jpeg").unwrap();
+        }
+        mark_filmstrip(&paths, project_id, clip_id, "building", "").unwrap();
+
+        assert!(sync_filmstrip_from_disk(&paths, project_id, clip_id, 30.0).unwrap());
+
+        let stored = list_frames_for_clip(&paths, project_id, clip_id).unwrap();
+        assert_eq!(stored.len(), 3);
+        let fs = get_filmstrip(&paths, project_id, clip_id).unwrap();
+        assert_eq!(fs.get("status").and_then(|v| v.as_str()), Some("building"));
         let _ = fs::remove_dir_all(&base);
     }
 }

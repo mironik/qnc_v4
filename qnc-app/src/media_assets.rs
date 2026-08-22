@@ -9,7 +9,7 @@ use std::io::Read;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{
     atomic::{AtomicU64, Ordering},
-    Arc,
+    Arc, Mutex,
 };
 use std::thread;
 use std::time::Duration;
@@ -20,8 +20,9 @@ use serde_json::json;
 use crate::api::{self, HostClient, HostRequestMethod, HostRequestTimeout};
 
 const DOWNLOAD_CONNECT_TIMEOUT: Duration = Duration::from_secs(8);
-const DOWNLOAD_READ_TIMEOUT: Duration = Duration::from_secs(120);
+const DOWNLOAD_READ_TIMEOUT: Duration = Duration::from_secs(12);
 pub(crate) const IMAGE_ASSET_MAX_IN_FLIGHT: usize = 64;
+const IMAGE_ASSET_WORKERS: usize = 4;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct ImageAssetKey {
@@ -74,12 +75,19 @@ impl AsyncImageAssetLoader {
         let (tx_req, rx_req) = mpsc::channel::<ImageAssetRequest>();
         let (tx_res, rx_res) = mpsc::channel::<ImageAssetResult>();
         let generation = Arc::new(AtomicU64::new(0));
-        let worker_generation = generation.clone();
+        let rx_req = Arc::new(Mutex::new(rx_req));
 
-        let _ = thread::Builder::new()
-            .name("qnc-media-image-assets".into())
-            .spawn(move || {
-                while let Ok(req) = rx_req.recv() {
+        for worker_ix in 0..IMAGE_ASSET_WORKERS {
+            let worker_generation = generation.clone();
+            let worker_rx = rx_req.clone();
+            let worker_tx = tx_res.clone();
+            let _ = thread::Builder::new()
+                .name(format!("qnc-media-image-assets-{worker_ix}"))
+                .spawn(move || loop {
+                    let req = match worker_rx.lock().expect("image asset queue").recv() {
+                        Ok(req) => req,
+                        Err(_) => break,
+                    };
                     if req.generation != worker_generation.load(Ordering::Acquire) {
                         continue;
                     }
@@ -87,15 +95,15 @@ impl AsyncImageAssetLoader {
                     if req.generation != worker_generation.load(Ordering::Acquire) {
                         continue;
                     }
-                    let _ = tx_res.send(ImageAssetResult {
+                    let _ = worker_tx.send(ImageAssetResult {
                         key: req.key,
                         image,
                     });
                     if let Some(ctx) = req.repaint {
                         ctx.request_repaint();
                     }
-                }
-            });
+                });
+        }
 
         Self {
             tx: tx_req,
@@ -174,7 +182,9 @@ pub(crate) struct SourceMediaAsset {
     pub clip_id: String,
     pub a1_peaks: Vec<f32>,
     pub a2_peaks: Vec<f32>,
+    pub waveform_loaded: bool,
     pub film_frames: Vec<SourceFilmFrameAsset>,
+    pub filmstrip_ready: bool,
 }
 
 pub(crate) struct SourceMediaAssetResult {
@@ -187,6 +197,7 @@ struct SourceMediaAssetRequest {
     host: HostClient,
     project_id: String,
     clip_id: String,
+    include_waveform: bool,
     repaint: Option<egui::Context>,
 }
 
@@ -215,7 +226,12 @@ impl AsyncSourceMediaAssetLoader {
                         req = next;
                     }
 
-                    let media = load_source_media(&req.host, &req.project_id, &req.clip_id);
+                    let media = load_source_media(
+                        &req.host,
+                        &req.project_id,
+                        &req.clip_id,
+                        req.include_waveform,
+                    );
                     let _ = tx_res.send(SourceMediaAssetResult {
                         project_id: req.project_id,
                         clip_id: req.clip_id,
@@ -239,6 +255,7 @@ impl AsyncSourceMediaAssetLoader {
         host: &HostClient,
         project_id: String,
         clip_id: String,
+        include_waveform: bool,
         repaint: Option<egui::Context>,
     ) -> bool {
         if project_id.trim().is_empty() || clip_id.trim().is_empty() {
@@ -254,6 +271,7 @@ impl AsyncSourceMediaAssetLoader {
                 host: host.clone(),
                 project_id,
                 clip_id,
+                include_waveform,
                 repaint,
             })
             .is_err()
@@ -403,6 +421,7 @@ fn load_source_media(
     host: &HostClient,
     project_id: &str,
     clip_id: &str,
+    include_waveform: bool,
 ) -> Result<SourceMediaAsset, String> {
     let _ = host.request_json(
         HostRequestMethod::Post,
@@ -414,11 +433,22 @@ fn load_source_media(
         })),
         HostRequestTimeout::Default,
     );
+    let filmstrip = filmstrip_frames(host, project_id, clip_id).unwrap_or_default();
+    let (a1_peaks, a2_peaks) = if include_waveform {
+        (
+            waveform_peaks(host, project_id, clip_id, 1).unwrap_or_default(),
+            waveform_peaks(host, project_id, clip_id, 2).unwrap_or_default(),
+        )
+    } else {
+        (Vec::new(), Vec::new())
+    };
     Ok(SourceMediaAsset {
         clip_id: clip_id.to_string(),
-        a1_peaks: waveform_peaks(host, project_id, clip_id, 1).unwrap_or_default(),
-        a2_peaks: waveform_peaks(host, project_id, clip_id, 2).unwrap_or_default(),
-        film_frames: filmstrip_frames(host, project_id, clip_id).unwrap_or_default(),
+        a1_peaks,
+        a2_peaks,
+        waveform_loaded: include_waveform,
+        film_frames: filmstrip.frames,
+        filmstrip_ready: filmstrip.ready,
     })
 }
 
@@ -462,11 +492,17 @@ fn waveform_peaks(
         .unwrap_or_default())
 }
 
+#[derive(Default)]
+struct SourceFilmstripAsset {
+    ready: bool,
+    frames: Vec<SourceFilmFrameAsset>,
+}
+
 fn filmstrip_frames(
     host: &HostClient,
     project_id: &str,
     clip_id: &str,
-) -> Result<Vec<SourceFilmFrameAsset>, String> {
+) -> Result<SourceFilmstripAsset, String> {
     let value = host.request_json(
         HostRequestMethod::Get,
         &format!(
@@ -477,27 +513,35 @@ fn filmstrip_frames(
         None,
         HostRequestTimeout::Default,
     )?;
+    let ready = value
+        .get("filmstrip")
+        .and_then(|f| f.get("status"))
+        .and_then(|s| s.as_str())
+        == Some("ready");
     let frames = value
         .get("frames")
         .and_then(|f| f.as_array())
         .cloned()
         .unwrap_or_default();
-    Ok(frames
-        .into_iter()
-        .filter_map(|frame| {
-            let index = frame.get("index").and_then(|x| x.as_i64()).unwrap_or(0);
-            let seek_sec = frame
-                .get("seek_sec")
-                .and_then(|x| x.as_f64())
-                .unwrap_or(0.0);
-            let rel = frame.get("url").and_then(|x| x.as_str())?;
-            Some(SourceFilmFrameAsset {
-                index,
-                seek_sec,
-                url: host.absolute(rel),
+    Ok(SourceFilmstripAsset {
+        ready,
+        frames: frames
+            .into_iter()
+            .filter_map(|frame| {
+                let index = frame.get("index").and_then(|x| x.as_i64()).unwrap_or(0);
+                let seek_sec = frame
+                    .get("seek_sec")
+                    .and_then(|x| x.as_f64())
+                    .unwrap_or(0.0);
+                let rel = frame.get("url").and_then(|x| x.as_str())?;
+                Some(SourceFilmFrameAsset {
+                    index,
+                    seek_sec,
+                    url: host.absolute(rel),
+                })
             })
-        })
-        .collect())
+            .collect(),
+    })
 }
 
 fn download_color_image_url(url: &str) -> Result<ColorImage, String> {

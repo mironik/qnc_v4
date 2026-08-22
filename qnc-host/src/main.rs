@@ -29,6 +29,7 @@ mod ingest_durations;
 mod ingest_import;
 mod ingest_posters;
 mod ingest_proxy;
+mod locale_number;
 mod media;
 mod media_pool;
 mod modules;
@@ -75,27 +76,35 @@ async fn main() {
     let modules = Arc::new(RwLock::new(ModuleStore::load(&root.join("data"))));
     let services = services::build_registry(&config.runtime);
     let project_state = project::ProjectState::new(&root, &config);
+    let project_db = project_state.db_broker();
     let background_work = background_work::BackgroundWorkGate::new();
     let ingest_posters = Arc::new(ingest_posters::PosterWorker::new(
         project_state.paths.clone(),
+        project_db.clone(),
         background_work.clone(),
+        services.media.clone(),
     ));
     let filmstrip = Arc::new(filmstrip::FilmstripWorker::new(
         project_state.paths.clone(),
+        project_db.clone(),
         background_work.clone(),
         services.media.clone(),
     ));
     let waveform = Arc::new(waveform::WaveformWorker::new(
         project_state.paths.clone(),
+        project_db.clone(),
         background_work.clone(),
         services.media.clone(),
     ));
     let ingest_audio_wrap = Arc::new(ingest_audio_wrap::AudioWrapWorker::new(
         project_state.paths.clone(),
+        project_db.clone(),
         background_work.clone(),
+        services.media.clone(),
     ));
     let ingest_proxy = Arc::new(ingest_proxy::ProxyGenerateWorker::new(
         project_state.paths.clone(),
+        project_db.clone(),
         filmstrip.clone(),
         ingest_posters.clone(),
         background_work.clone(),
@@ -103,18 +112,22 @@ async fn main() {
     ));
     let ingest_import = Arc::new(ingest_import::ImportWorker::new(
         project_state.paths.clone(),
+        project_db.clone(),
         ingest_proxy.clone(),
         filmstrip.clone(),
         ingest_posters.clone(),
         ingest_audio_wrap.clone(),
         background_work.clone(),
+        services.media.clone(),
     ));
     let ingest_card_thumbs = Arc::new(ingest_card_thumbs::CardThumbWorker::new(
         project_state.paths.clone(),
+        project_db.clone(),
         ingest_posters.clone(),
     ));
     let ingest_durations = Arc::new(ingest_durations::DurationWorker::new(
         project_state.paths.clone(),
+        project_db.clone(),
         background_work.clone(),
         services.media.clone(),
     ));
@@ -170,8 +183,9 @@ async fn main() {
     // Metadata repair (fps/duration) runs once at boot, off the request path.
     {
         let maintenance_paths = project_state.paths.clone();
+        let maintenance_project_db = project_db.clone();
         tokio::task::spawn_blocking(move || {
-            waveform::maintenance_purge_legacy(&maintenance_paths);
+            waveform::maintenance_purge_legacy(&maintenance_paths, &maintenance_project_db);
             media_pool::backfill_all_imported_metadata(&maintenance_paths);
         });
     }
@@ -183,6 +197,7 @@ async fn main() {
         modules,
         services,
         project: project_state,
+        project_db,
         ingest_card_thumbs,
         ingest_durations,
         ingest_posters,
@@ -316,6 +331,7 @@ async fn api_shell_diagnostics(State(state): State<AppState>) -> Json<serde_json
         .and_then(|v| v.as_object())
         .map(|o| o.len())
         .unwrap_or(0);
+    let active_project_id = state.project.active_project_id().ok();
 
     Json(serde_json::json!({
         "status": "ok",
@@ -333,6 +349,9 @@ async fn api_shell_diagnostics(State(state): State<AppState>) -> Json<serde_json
         "plugins_loaded_count": plugins_loaded.len(),
         "plugin_manifest_errors": scan.errors,
         "components_count": components_count,
+        "database": state
+            .project_db
+            .layout_snapshot(active_project_id.as_deref()),
     }))
 }
 

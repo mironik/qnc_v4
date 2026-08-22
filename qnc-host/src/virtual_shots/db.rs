@@ -23,7 +23,7 @@ use crate::media::{
     clip_id_token, derived_shot_id, root_shot_id, virtual_name_for_derived_shot,
     virtual_name_for_root_clip,
 };
-use crate::media_pool::{proxy_path_for_clip, read_imported_clips, resolve_clip_fps};
+use crate::media_pool::{proxy_path_for_clip, read_imported_clips, resolve_stored_clip_fps};
 use crate::project::db::{now_str, open_project, ProjectPaths};
 
 /// Open the project DB and guarantee the virtual_shots schema is present.
@@ -698,7 +698,7 @@ fn round3(v: f64) -> f64 {
 }
 
 fn fps_for_clip(paths: &ProjectPaths, project_id: &str, clip_id: &str) -> Result<f64, String> {
-    resolve_clip_fps(paths, project_id, clip_id)
+    resolve_stored_clip_fps(paths, project_id, clip_id)
 }
 
 #[derive(Debug, Clone, Default)]

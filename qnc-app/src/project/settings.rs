@@ -874,7 +874,7 @@ fn field_fps_cell(
     let before = value.clone();
     field_combo_cell(ui, cell_w, label, id, value, &opts, |_| {});
     if *value != before {
-        if let Ok(n) = value.parse::<f64>() {
+        if let Some(n) = crate::locale_number::parse_decimal(value) {
             if path.contains("audio") || n.fract().abs() < f64::EPSILON {
                 *action = ProjectAction::SetSettingsPath(path.into(), json!(n.round() as i64));
             } else {

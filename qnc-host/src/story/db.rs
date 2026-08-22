@@ -197,7 +197,8 @@ pub(crate) fn sync_story_part_source_fps(
         .collect::<rusqlite::Result<Vec<_>>>()
         .map_err(|e| e.to_string())?;
     for (part_id, clip_id, in_frame, out_frame, stored_fps) in rows {
-        let Ok(fps) = crate::media_pool::resolve_clip_fps(paths, project_id, &clip_id) else {
+        let Ok(fps) = crate::media_pool::resolve_stored_clip_fps(paths, project_id, &clip_id)
+        else {
             continue;
         };
         if !is_valid_fps(fps) || (stored_fps - fps).abs() <= 0.01 {
@@ -1552,7 +1553,7 @@ fn segment_source_from_clip_frames(
     in_frame: i64,
     out_frame: i64,
 ) -> Result<StoryShotForPart, String> {
-    let fps = crate::media_pool::resolve_clip_fps(paths, project_id, clip_id)?;
+    let fps = crate::media_pool::resolve_stored_clip_fps(paths, project_id, clip_id)?;
     if !is_valid_fps(fps) {
         return Err(format!("clip '{clip_id}' nema valjan source FPS"));
     }
@@ -1587,7 +1588,7 @@ fn segment_source_from_clip_seconds(
     in_seconds: f64,
     out_seconds: f64,
 ) -> Result<StoryShotForPart, String> {
-    let fps = crate::media_pool::resolve_clip_fps(paths, project_id, clip_id)?;
+    let fps = crate::media_pool::resolve_stored_clip_fps(paths, project_id, clip_id)?;
     if !is_valid_fps(fps) {
         return Err(format!("clip '{clip_id}' nema valjan source FPS"));
     }
@@ -2242,7 +2243,7 @@ pub fn part_stream_frames(
     let fps = if source_fps.is_finite() && source_fps > 0.0 {
         normalize_fps(source_fps)
     } else {
-        crate::media_pool::resolve_clip_fps(paths, pid, &clip_id)?
+        crate::media_pool::resolve_stored_clip_fps(paths, pid, &clip_id)?
     };
     if out_frame <= in_frame {
         let in_sec = in_seconds.unwrap_or(0.0).max(0.0);
@@ -2311,7 +2312,7 @@ pub fn cover_stream_frames(
                 cover_id.trim()
             ));
         }
-        let fps = crate::media_pool::resolve_clip_fps(paths, pid, &clip_id)?;
+        let fps = crate::media_pool::resolve_stored_clip_fps(paths, pid, &clip_id)?;
         (clip_id, fps)
     };
     let in_frame = source_in_frame.max(0);

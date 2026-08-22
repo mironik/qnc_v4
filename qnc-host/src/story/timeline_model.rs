@@ -1,7 +1,10 @@
 //! Story builders for the shared QNC-timeline contract (`crate::timeline_model`).
 
+use rusqlite::Connection;
+
 use crate::frame_time::is_valid_fps;
 use crate::project::db::{open_project, ProjectPaths};
+use crate::project::ProjectDbBroker;
 use crate::timeline_model::{
     build_source_timeline_model as shared_source_model, wrap_segment_io_pins, SegmentSchema,
     TimelineApplication, TimelineCover, TimelineMarkerSlot, TimelineModel, TimelinePin,
@@ -20,6 +23,21 @@ fn round3(v: f64) -> f64 {
 }
 
 /// Wrap application from Story SQLite (parts + covers + M markers).
+pub fn build_wrap_timeline_model_with_broker(
+    paths: &ProjectPaths,
+    project_db: &ProjectDbBroker,
+    project_id: &str,
+) -> Result<TimelineModel, String> {
+    let pid = project_id.trim();
+    if pid.is_empty() {
+        return Err("project_id required".into());
+    }
+    project_db.with_project_write(pid, |conn| {
+        build_wrap_timeline_model_from_conn(paths, pid, conn)
+    })
+}
+
+#[allow(dead_code)]
 pub fn build_wrap_timeline_model(
     paths: &ProjectPaths,
     project_id: &str,
@@ -29,12 +47,20 @@ pub fn build_wrap_timeline_model(
         return Err("project_id required".into());
     }
     let conn = open_project(paths, pid).map_err(|e| e.to_string())?;
-    ensure_schema(&conn).map_err(|e| e.to_string())?;
-    let parts = list_parts(&conn).map_err(|e| e.to_string())?;
+    build_wrap_timeline_model_from_conn(paths, pid, &conn)
+}
+
+fn build_wrap_timeline_model_from_conn(
+    _paths: &ProjectPaths,
+    project_id: &str,
+    conn: &Connection,
+) -> Result<TimelineModel, String> {
+    ensure_schema(conn).map_err(|e| e.to_string())?;
+    let parts = list_parts(conn).map_err(|e| e.to_string())?;
     let timeline_fps = story_program_source_fps(&parts).unwrap_or(0.0);
-    let covers = list_covers(&conn).map_err(|e| e.to_string())?;
-    let markers = list_markers_rows(&conn).map_err(|e| e.to_string())?;
-    let slots = list_marker_slots_rows(&conn).map_err(|e| e.to_string())?;
+    let covers = list_covers(conn).map_err(|e| e.to_string())?;
+    let markers = list_markers_rows(conn).map_err(|e| e.to_string())?;
+    let slots = list_marker_slots_rows(conn).map_err(|e| e.to_string())?;
 
     let segments = build_segments(&parts, &covers, timeline_fps);
     let duration_frames = if segments.is_empty() {
@@ -45,7 +71,7 @@ pub fn build_wrap_timeline_model(
     let duration_sec = round3(parts.iter().map(part_span_seconds).sum());
 
     Ok(TimelineModel {
-        project_id: pid.to_string(),
+        project_id: project_id.to_string(),
         application: TimelineApplication::Wrap,
         timeline_fps,
         duration_frames,

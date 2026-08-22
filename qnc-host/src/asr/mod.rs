@@ -19,6 +19,7 @@ use tokio::sync::mpsc;
 use tokio_stream::{wrappers::ReceiverStream, StreamExt};
 
 use crate::app_state::AppState;
+use crate::locale_number::parse_decimal;
 use crate::media_pool::{get_transcript, proxy_path_for_clip, save_transcript};
 use crate::project::db::{project_settings_snapshot, ProjectPaths};
 
@@ -1160,11 +1161,10 @@ fn segment_times(entry: &Value) -> (f64, f64) {
 }
 
 fn parse_timestamp(raw: &str) -> Option<f64> {
-    let normalized = raw.trim().replace(',', ".");
-    let mut parts = normalized.split(':');
-    let hours = parts.next()?.parse::<f64>().ok()?;
-    let minutes = parts.next()?.parse::<f64>().ok()?;
-    let seconds = parts.next()?.parse::<f64>().ok()?;
+    let mut parts = raw.trim().split(':');
+    let hours = parse_decimal(parts.next()?)?;
+    let minutes = parse_decimal(parts.next()?)?;
+    let seconds = parse_decimal(parts.next()?)?;
     Some(hours * 3600.0 + minutes * 60.0 + seconds)
 }
 

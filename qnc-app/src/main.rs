@@ -11,6 +11,7 @@ mod editorial;
 mod frame_time;
 mod ingest;
 mod ingest_player;
+mod locale_number;
 mod media_assets;
 mod media_assist;
 mod playback_routing;

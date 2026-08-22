@@ -2,12 +2,12 @@
 //!
 //! Reads montage rows from SQLite; no ffprobe in the hot path.
 
-#[cfg(test)]
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 
 use crate::frame_time::{frame_to_seconds, is_valid_fps, seconds_to_frame};
 use crate::project::db::{open_project, ProjectPaths};
+use crate::project::ProjectDbBroker;
 
 use super::covers::{list_covers, StoryCoverRow};
 use super::db::{ensure_schema, list_parts, sync_story_part_source_fps, StoryPartRow};
@@ -282,6 +282,21 @@ fn story_program_source_fps(parts: &[StoryPartRow]) -> f64 {
 }
 
 /// Build the canonical editorial playlist from project DB rows.
+pub fn build_editorial_playlist_with_broker(
+    paths: &ProjectPaths,
+    project_db: &ProjectDbBroker,
+    project_id: &str,
+) -> Result<EditorialPlaylist, String> {
+    let pid = project_id.trim();
+    if pid.is_empty() {
+        return Err("project_id required".into());
+    }
+    project_db.with_project_write(pid, |conn| {
+        build_editorial_playlist_from_conn(paths, pid, conn)
+    })
+}
+
+#[allow(dead_code)]
 pub fn build_editorial_playlist(
     paths: &ProjectPaths,
     project_id: &str,
@@ -291,11 +306,19 @@ pub fn build_editorial_playlist(
         return Err("project_id required".into());
     }
     let conn = open_project(paths, pid).map_err(|e| e.to_string())?;
-    ensure_schema(&conn).map_err(|e| e.to_string())?;
-    sync_story_part_source_fps(paths, pid, &conn)?;
-    let parts = list_parts(&conn).map_err(|e| e.to_string())?;
+    build_editorial_playlist_from_conn(paths, pid, &conn)
+}
+
+fn build_editorial_playlist_from_conn(
+    paths: &ProjectPaths,
+    project_id: &str,
+    conn: &Connection,
+) -> Result<EditorialPlaylist, String> {
+    ensure_schema(conn).map_err(|e| e.to_string())?;
+    sync_story_part_source_fps(paths, project_id, conn)?;
+    let parts = list_parts(conn).map_err(|e| e.to_string())?;
     let timeline_fps = story_program_source_fps(&parts);
-    let covers = list_covers(&conn).map_err(|e| e.to_string())?;
+    let covers = list_covers(conn).map_err(|e| e.to_string())?;
     let segments = build_segments(&parts, &covers, timeline_fps);
     let duration_frames = if segments.is_empty() {
         0
@@ -308,7 +331,7 @@ pub fn build_editorial_playlist(
         round3(segments.iter().map(|segment| segment.duration_sec).sum())
     };
     Ok(EditorialPlaylist {
-        project_id: pid.to_string(),
+        project_id: project_id.to_string(),
         timeline_fps,
         duration_frames,
         duration_sec,

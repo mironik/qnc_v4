@@ -6,15 +6,16 @@ use tracing::{info, warn};
 
 use crate::background_work::BackgroundWorkGate;
 use crate::ingest::db::{open_ingest, set_meta};
-use crate::ingest::store::{needs_duration_probe, probe_missing_durations};
-use crate::project::db::{open_global, ProjectPaths};
-use crate::project::list_project_ids;
+use crate::ingest::store::{needs_duration_probe_conn, probe_missing_durations_with_broker};
+use crate::project::db::ProjectPaths;
+use crate::project::{list_project_ids, ProjectDbBroker};
 use qnc_service_contracts::MediaProcessor;
 
 /// Samostalan worker — ffprobe trajanja u pozadini (ne blokira discover/import).
 #[derive(Clone)]
 pub struct DurationWorker {
     paths: ProjectPaths,
+    project_db: ProjectDbBroker,
     background: BackgroundWorkGate,
     media_processor: Arc<dyn MediaProcessor>,
     pending: Arc<Mutex<HashSet<String>>>,
@@ -24,11 +25,13 @@ pub struct DurationWorker {
 impl DurationWorker {
     pub fn new(
         paths: ProjectPaths,
+        project_db: ProjectDbBroker,
         background: BackgroundWorkGate,
         media_processor: Arc<dyn MediaProcessor>,
     ) -> Self {
         Self {
             paths,
+            project_db,
             background,
             media_processor,
             pending: Arc::new(Mutex::new(HashSet::new())),
@@ -60,9 +63,12 @@ impl DurationWorker {
         if pid.is_empty() || self.is_blocked(pid) {
             return;
         }
-        if let Ok(conn) = open_ingest(&self.paths, pid) {
-            let _ = set_meta(&conn, "durations_probe", "processing");
-        }
+        let _ = self.project_db.serialize_project_write(pid, || {
+            if let Ok(conn) = open_ingest(&self.paths, pid) {
+                let _ = set_meta(&conn, "durations_probe", "processing");
+            }
+            Ok(())
+        });
         self.pending
             .lock()
             .expect("duration queue")
@@ -70,13 +76,22 @@ impl DurationWorker {
     }
 
     pub fn enqueue_recoverable_projects(&self) -> Result<usize, String> {
-        let global = open_global(&self.paths).map_err(|e| e.to_string())?;
+        let project_ids = self
+            .project_db
+            .with_global(|global| list_project_ids(global).map_err(|e| e.to_string()))?;
         let mut queued = 0usize;
-        for project_id in list_project_ids(&global).map_err(|e| e.to_string())? {
+        for project_id in project_ids {
             if self.is_blocked(&project_id) {
                 continue;
             }
-            if needs_duration_probe(&self.paths, &project_id).unwrap_or(false) {
+            let needs = self
+                .project_db
+                .serialize_project_write(&project_id, || {
+                    let conn = open_ingest(&self.paths, &project_id).map_err(|e| e.to_string())?;
+                    needs_duration_probe_conn(&conn).map_err(|e| e.to_string())
+                })
+                .unwrap_or(false);
+            if needs {
                 self.enqueue(&project_id);
                 queued += 1;
             }
@@ -125,8 +140,12 @@ impl DurationWorker {
         if self.is_blocked(project_id) {
             return Ok(0);
         }
-        probe_missing_durations(&self.paths, self.media_processor.clone(), project_id)
-            .await
-            .map_err(|e| e.to_string())
+        probe_missing_durations_with_broker(
+            &self.paths,
+            &self.project_db,
+            self.media_processor.clone(),
+            project_id,
+        )
+        .await
     }
 }

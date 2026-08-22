@@ -287,6 +287,25 @@ fn load_ingest_clip_row(
     .map_err(|_| format!("Uvezeni klip '{clip_id}' nije pronađen u projektnoj bazi."))
 }
 
+/// Hot-path source FPS lookup: read the already imported/probed value from SQLite only.
+pub fn resolve_stored_clip_fps(
+    paths: &ProjectPaths,
+    project_id: &str,
+    clip_id: &str,
+) -> Result<f64, String> {
+    let clip_id = clip_id.trim();
+    if clip_id.is_empty() {
+        return Err("clip_id je prazan".into());
+    }
+    let row = load_ingest_clip_row(paths, project_id, clip_id)?;
+    if row.fps.is_finite() && row.fps > 0.0 {
+        return Ok(normalize_fps(row.fps));
+    }
+    Err(format!(
+        "Klip '{clip_id}' nema valjan fps u ingest bazi; pričekaj import/probe worker."
+    ))
+}
+
 fn clip_probe_media_path(row: &IngestClipProbeRow) -> Option<std::path::PathBuf> {
     [&row.project_proxy_path, &row.proxy_path]
         .iter()
@@ -338,7 +357,7 @@ fn persist_clip_probe(
     Ok(())
 }
 
-/// Source FPS: ffprobe proxy/master kad postoji; SQLite se ažurira ako je zastarjelo.
+/// Background/repair source FPS: may ffprobe proxy/master and update SQLite.
 pub fn resolve_clip_fps(
     paths: &ProjectPaths,
     project_id: &str,

@@ -11,7 +11,7 @@ use crate::ingest_import::ImportWorker;
 use crate::ingest_posters::PosterWorker;
 use crate::ingest_proxy::ProxyGenerateWorker;
 use crate::modules::ModuleStore;
-use crate::project::ProjectState;
+use crate::project::{ProjectDbBroker, ProjectState};
 use crate::waveform::WaveformWorker;
 use qnc_service_contracts::ServiceRegistry;
 
@@ -24,6 +24,7 @@ pub struct AppState {
     #[allow(dead_code)]
     pub services: ServiceRegistry,
     pub project: ProjectState,
+    pub project_db: ProjectDbBroker,
     pub ingest_card_thumbs: Arc<CardThumbWorker>,
     pub ingest_durations: Arc<DurationWorker>,
     pub ingest_posters: Arc<PosterWorker>,

@@ -23,6 +23,8 @@ pub struct PlaybackState {
     pub playing: bool,
     #[serde(default)]
     pub paused: bool,
+    #[serde(default)]
+    pub timebase_fps: f64,
     pub active: ActiveLayer,
     #[serde(default)]
     pub audio_buses: Vec<AudioBus>,

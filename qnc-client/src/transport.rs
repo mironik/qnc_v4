@@ -14,7 +14,7 @@ use crate::editorial::{
     source_frame_at_part, SourceMarks,
 };
 use crate::focus::{
-    duration_frames_from_timeline, focus_chain, fps_from_timeline, frame_to_seconds,
+    duration_frames_from_timeline, focus_chain, fps_from_timeline, frame_to_seconds, is_valid_fps,
     seconds_to_frame, FocusTarget, TimelineFocus,
 };
 use crate::shortcuts::StoryBindings;
@@ -47,6 +47,7 @@ pub struct TransportApp {
     project_id: String,
     virtual_frame: i64,
     playing: bool,
+    timebase_fps: f64,
     layer: String,
     buses: String,
     status: String,
@@ -95,8 +96,14 @@ impl TransportApp {
                 None
             }
         };
-        let initial_frame =
-            seconds_to_frame(initial_seek.max(0.0), fps_from_timeline(timeline.as_ref()));
+        let initial_fps = match view_mode {
+            ViewMode::Source => resolved_clip
+                .as_deref()
+                .and_then(|clip_id| source_clip_fps(&story_state, clip_id))
+                .unwrap_or(0.0),
+            ViewMode::Wrap => fps_from_timeline(timeline.as_ref()),
+        };
+        let initial_frame = seconds_to_frame(initial_seek.max(0.0), initial_fps);
         let start = host.playback_start(&project_id)?;
         if initial_frame > 0 {
             host.playback_seek_frame(&start.session_id, initial_frame)?;
@@ -135,6 +142,7 @@ impl TransportApp {
                 state.virtual_frame
             },
             playing: false,
+            timebase_fps: state.timebase_fps,
             layer: state.active.layer.clone(),
             buses,
             status: format!(
@@ -172,7 +180,17 @@ impl TransportApp {
     }
 
     fn fps(&self) -> f64 {
-        fps_from_timeline(self.timeline.as_ref())
+        let timeline_fps = fps_from_timeline(self.timeline.as_ref());
+        if is_valid_fps(timeline_fps) {
+            return timeline_fps;
+        }
+        if is_valid_fps(self.timebase_fps) {
+            return self.timebase_fps;
+        }
+        self.source_clip_id
+            .as_deref()
+            .and_then(|clip_id| source_clip_fps(&self.story_state, clip_id))
+            .unwrap_or(0.0)
     }
 
     fn duration_frames(&self) -> i64 {
@@ -195,6 +213,9 @@ impl TransportApp {
         self.host
             .playback_seek_frame(&self.session_id, self.virtual_frame)?;
         let state = self.host.playback_state(&self.session_id)?;
+        if is_valid_fps(state.timebase_fps) {
+            self.timebase_fps = state.timebase_fps;
+        }
         self.layer = state.active.layer.clone();
         let url = self.host.frame_url_for_frame(&state, self.virtual_frame);
         let bytes = self.host.download_bytes(&url)?;
@@ -278,7 +299,12 @@ impl TransportApp {
         if !self.playing {
             return;
         }
-        let margin = (self.fps() / 4.0).round() as i64;
+        let fps = self.fps();
+        if !is_valid_fps(fps) {
+            self.status = "Audio: FPS nije potvrđen".into();
+            return;
+        }
+        let margin = (fps / 4.0).round() as i64;
         if self.virtual_frame + margin < self.audio_until_frame && !engine.empty() {
             return;
         }
@@ -977,14 +1003,37 @@ fn load_bindings(host: &HostClient) -> StoryBindings {
     StoryBindings::from_catalog(&catalog, &user, "storyboard")
 }
 
+fn source_clip_fps(story_state: &Value, clip_id: &str) -> Option<f64> {
+    story_state
+        .get("all_clips")
+        .and_then(Value::as_array)
+        .and_then(|clips| {
+            clips
+                .iter()
+                .find(|clip| clip.get("clip_id").and_then(Value::as_str) == Some(clip_id))
+        })
+        .and_then(|clip| {
+            clip.get("fps")
+                .or_else(|| clip.get("source_fps"))
+                .and_then(Value::as_f64)
+        })
+        .filter(|fps| is_valid_fps(*fps))
+}
+
 impl eframe::App for TransportApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.consume_keys(ctx);
 
         if self.playing && self.view_mode == ViewMode::Wrap {
+            let fps = self.fps();
+            if !is_valid_fps(fps) {
+                self.playing = false;
+                self.status = "Play zaustavljen: FPS nije potvrđen iz host/probe metadata.".into();
+                return;
+            }
             let dt = self.last_tick.elapsed().as_secs_f64();
             self.last_tick = Instant::now();
-            let delta_frames = seconds_to_frame(dt, self.fps()).max(1);
+            let delta_frames = seconds_to_frame(dt, fps).max(1);
             let max = self.duration_frames();
             self.virtual_frame = if max > 0 {
                 (self.virtual_frame + delta_frames).clamp(0, max)

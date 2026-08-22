@@ -1,6 +1,8 @@
 use rusqlite::{params, Connection};
 use serde_json::{json, Map, Value};
 
+use crate::locale_number::parse_decimal;
+
 /// Flat key-value rows in SQLite (replaces JSON blob columns for settings/config).
 pub fn replace_object(
     conn: &Connection,
@@ -178,7 +180,7 @@ fn parse_scalar(raw: &str) -> Value {
     if let Ok(n) = raw.parse::<i64>() {
         return json!(n);
     }
-    if let Ok(n) = raw.parse::<f64>() {
+    if let Some(n) = parse_decimal(raw) {
         return json!(n);
     }
     json!(raw)

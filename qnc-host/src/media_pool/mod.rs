@@ -9,6 +9,7 @@ mod store;
 mod transcripts;
 
 pub(crate) use ingest_db::{
-    backfill_all_imported_metadata, proxy_path_for_clip, read_imported_clips, resolve_clip_fps,
+    backfill_all_imported_metadata, proxy_path_for_clip, read_imported_clips,
+    resolve_stored_clip_fps,
 };
 pub(crate) use store::{list_clips_enriched, mark_filmstrip_building};

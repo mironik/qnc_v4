@@ -3199,6 +3199,7 @@ dependencies = [
  "qnc-player-monitor-bridge",
  "qnc-player-output",
  "qnc-player-runtime",
+ "qnc-service-contracts",
  "rodio 0.20.1",
  "serde",
  "serde_json",

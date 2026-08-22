@@ -2,14 +2,11 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
 
+use crate::locale_number::{format_decimal, parse_decimal};
+
 /// Filmstrip / media-pool traka (112×64 u UI).
 pub const FILMSTRIP_THUMB_WIDTH: u32 = 112;
 pub const FILMSTRIP_THUMB_HEIGHT: u32 = 64;
-
-#[allow(dead_code)]
-const SELECT_EPS_SEC: f64 = 0.08;
-#[allow(dead_code)]
-const BATCH_PREFIX: &str = "_qnc_batch_";
 
 #[cfg(windows)]
 fn find_file_recursive(dir: &Path, file_name: &str, depth: u32) -> Option<PathBuf> {
@@ -198,11 +195,6 @@ fn resolve_ffprobe() -> Option<PathBuf> {
         .clone()
 }
 
-#[allow(dead_code)]
-fn ffmpeg_path_arg(path: &Path) -> String {
-    path.to_string_lossy().replace('\\', "/")
-}
-
 fn filmstrip_scale_filter() -> String {
     format!(
         "scale={}:{}:force_original_aspect_ratio=decrease,pad={}:{}:(ow-iw)/2:(oh-ih)/2:color=black",
@@ -216,31 +208,6 @@ fn filmstrip_scale_filter() -> String {
 /// Keep source raster (even dims) — no hardcoded 720/1080 pad.
 fn preview_native_scale_filter() -> &'static str {
     "scale=trunc(iw/2)*2:trunc(ih/2)*2"
-}
-
-#[allow(dead_code)]
-fn select_filter_for_seeks(seeks: &[f64]) -> String {
-    let parts: Vec<String> = seeks
-        .iter()
-        .map(|sec| {
-            let s = (*sec).max(0.0);
-            format!("between(t,{s:.3},{end:.3})", end = s + SELECT_EPS_SEC)
-        })
-        .collect();
-    format!("select='{}'", parts.join("+"))
-}
-
-#[allow(dead_code)]
-fn cleanup_batch_files(dir: &Path) {
-    if let Ok(entries) = std::fs::read_dir(dir) {
-        for entry in entries.flatten() {
-            let name = entry.file_name();
-            let name = name.to_string_lossy();
-            if name.starts_with(BATCH_PREFIX) && name.ends_with(".jpg") {
-                let _ = std::fs::remove_file(entry.path());
-            }
-        }
-    }
 }
 
 fn ffmpeg_err(output: &std::process::Output) -> String {
@@ -263,6 +230,11 @@ pub fn timeline_seek_seconds(duration_sec: f64, frames: u32) -> Vec<f64> {
             (sec * 100.0).round() / 100.0
         })
         .collect()
+}
+
+pub fn filmstrip_frame_path(out_dir: &Path, index: usize, sec: f64) -> PathBuf {
+    let sec_label = format_decimal(sec.max(0.0), 2).replace('.', "_");
+    out_dir.join(format!("{:03}_{}.jpg", index, sec_label))
 }
 
 /// Trajanje medija preko ffprobe (QNC_FFPROBE, QNC_ROOT/bin, PATH).
@@ -317,6 +289,9 @@ pub fn probe_media(source: &Path) -> Option<MediaProbe> {
     let stream = streams
         .iter()
         .find(|s| s.get("codec_type").and_then(|v| v.as_str()) == Some("video"));
+    let audio_stream = streams
+        .iter()
+        .find(|s| s.get("codec_type").and_then(|v| v.as_str()) == Some("audio"));
     let audio_channels = streams
         .iter()
         .filter(|s| s.get("codec_type").and_then(|v| v.as_str()) == Some("audio"))
@@ -327,13 +302,20 @@ pub fn probe_media(source: &Path) -> Option<MediaProbe> {
     let duration_sec = format
         .and_then(|f| f.get("duration"))
         .and_then(|v| v.as_str())
-        .and_then(|s| s.parse::<f64>().ok())
+        .and_then(parse_decimal)
         .filter(|d| *d > 0.0)
         .or_else(|| {
             stream
                 .and_then(|s| s.get("duration"))
                 .and_then(|v| v.as_str())
-                .and_then(|s| s.parse::<f64>().ok())
+                .and_then(parse_decimal)
+                .filter(|d| *d > 0.0)
+        })
+        .or_else(|| {
+            audio_stream
+                .and_then(|s| s.get("duration"))
+                .and_then(|v| v.as_str())
+                .and_then(parse_decimal)
                 .filter(|d| *d > 0.0)
         })?;
     let width = stream
@@ -345,6 +327,7 @@ pub fn probe_media(source: &Path) -> Option<MediaProbe> {
         .and_then(|v| v.as_u64())
         .unwrap_or(0);
     let codec = stream
+        .or(audio_stream)
         .and_then(|s| s.get("codec_name"))
         .and_then(|v| v.as_str())
         .unwrap_or("")
@@ -434,7 +417,7 @@ fn parse_frame_rate(text: &str) -> Option<f64> {
         }
         return None;
     }
-    t.parse::<f64>().ok().filter(|v| *v > 0.0)
+    parse_decimal(t).filter(|v| *v > 0.0)
 }
 
 #[cfg(test)]
@@ -452,11 +435,6 @@ mod tests {
         assert!(parse_frame_rate("0/0").is_none());
         assert!(parse_frame_rate("").is_none());
     }
-}
-
-/// Ekstrakcija poster JPEG-a iz medija (QNC_FFMPEG, QNC_ROOT/bin, PATH).
-pub fn extract_poster_jpeg(source: &Path, dest: &Path) -> Result<(), String> {
-    extract_poster_jpeg_at_seek(source, dest, 0.5)
 }
 
 /// Ekstrakcija JPEG-a na zadanoj seek poziciji (fallback za jedan kadar).
@@ -511,7 +489,7 @@ fn extract_jpeg_at_seek_with_hw(
     }
     let ffmpeg = resolve_ffmpeg()
         .ok_or("ffmpeg nije instaliran (postavi QNC_FFMPEG ili dodaj u PATH)".to_string())?;
-    let seek = format!("{:.2}", seek_sec.max(0.0));
+    let seek = format_decimal(seek_sec.max(0.0), 2);
     let encoder = crate::ingest::proxy_encode::resolve_proxy_encoder(&ffmpeg);
     let run = |use_hw: bool| -> Result<(), String> {
         let mut cmd = Command::new(&ffmpeg);
@@ -549,8 +527,12 @@ fn extract_jpeg_at_seek_with_hw(
     run(false)
 }
 
-/// Jedan ffmpeg decode pass — svi kadrovi filmstripa (brže od N procesa).
-pub fn extract_filmstrip_batch_at_seeks(
+/// Filmstrip frameovi se moraju vaditi kao pocetak svake vremenske cjeline.
+///
+/// Jedan FFmpeg proces otvara isti klip vise puta s razlicitim input seekom.
+/// Time izbjegavamo 13/14 odvojenih procesa, a svaki slot i dalje dobiva
+/// vlastitu pocetnu slicicu iz cijelog trajanja klipa.
+pub fn extract_filmstrip_frames_at_seeks(
     source: &Path,
     seeks: &[f64],
     outputs: &[PathBuf],
@@ -565,103 +547,99 @@ pub fn extract_filmstrip_batch_at_seeks(
         return vec![Err(format!("izvor ne postoji: {}", source.display()))];
     }
 
-    if seeks.len() == 1 {
-        return vec![extract_poster_jpeg_at_seek(source, &outputs[0], seeks[0])];
-    }
-
-    let out_dir = outputs[0]
-        .parent()
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."));
-    if std::fs::create_dir_all(&out_dir).is_err() {
+    if !outputs.iter().all(|out| {
+        out.parent()
+            .map(|parent| std::fs::create_dir_all(parent).is_ok())
+            .unwrap_or(true)
+    }) {
         return seeks
             .iter()
             .zip(outputs.iter())
-            .map(|(sec, out)| extract_poster_jpeg_at_seek(source, out, *sec))
+            .map(|(sec, out)| extract_poster_jpeg_at_seek_cpu(source, out, *sec))
             .collect();
     }
 
     let ffmpeg = match resolve_ffmpeg() {
-        Some(p) => p,
+        Some(path) => path,
         None => {
             return seeks
                 .iter()
                 .zip(outputs.iter())
                 .map(|(sec, out)| {
-                    extract_poster_jpeg_at_seek(source, out, *sec)
+                    extract_poster_jpeg_at_seek_cpu(source, out, *sec)
                         .map_err(|_| "ffmpeg nije instaliran".into())
                 })
                 .collect();
         }
     };
 
-    cleanup_batch_files(&out_dir);
-    let batch_pattern = out_dir.join(format!("{BATCH_PREFIX}%03d.jpg"));
-    let select = select_filter_for_seeks(seeks);
     let scale = filmstrip_scale_filter();
-    let vf = format!("{select},{scale}");
-
-    let output = Command::new(&ffmpeg)
-        .args(["-hide_banner", "-loglevel", "error", "-y"])
-        .arg("-i")
-        .arg(source)
-        .args(["-vf"])
-        .arg(&vf)
-        .args(["-vsync", "vfr"])
-        .arg("-frames:v")
-        .arg(seeks.len().to_string())
-        .arg(ffmpeg_path_arg(&batch_pattern))
-        .output()
-        .map_err(|e| format!("ffmpeg pokretanje: {e}"));
-
-    let mut results: Vec<Result<(), String>> = Vec::with_capacity(seeks.len());
-
-    if let Err(e) = output {
-        for (sec, out) in seeks.iter().zip(outputs.iter()) {
-            results.push(
-                extract_poster_jpeg_at_seek(source, out, *sec)
-                    .map_err(|fallback| format!("batch: {e}; fallback: {fallback}")),
-            );
-        }
-        cleanup_batch_files(&out_dir);
-        return results;
+    let mut cmd = Command::new(&ffmpeg);
+    cmd.args(["-hide_banner", "-loglevel", "error", "-y"]);
+    for sec in seeks {
+        cmd.arg("-ss")
+            .arg(format_decimal(sec.max(0.0), 2))
+            .arg("-i")
+            .arg(source);
+    }
+    for (index, out) in outputs.iter().enumerate() {
+        cmd.arg("-map")
+            .arg(format!("{index}:v:0"))
+            .arg("-vf")
+            .arg(&scale)
+            .args([
+                "-frames:v",
+                "1",
+                "-q:v",
+                "2",
+                "-pix_fmt",
+                "yuvj420p",
+                "-strict",
+                "unofficial",
+            ])
+            .arg(out);
     }
 
-    let output = output.unwrap();
-    if !output.status.success() {
-        let err = ffmpeg_err(&output);
-        for (sec, out) in seeks.iter().zip(outputs.iter()) {
-            results.push(
-                extract_poster_jpeg_at_seek(source, out, *sec)
-                    .map_err(|fallback| format!("batch: {err}; fallback: {fallback}")),
-            );
+    match cmd.output() {
+        Ok(output) if output.status.success() => {}
+        Ok(output) => {
+            let err = ffmpeg_err(&output);
+            return seeks
+                .iter()
+                .zip(outputs.iter())
+                .map(|(sec, out)| {
+                    extract_poster_jpeg_at_seek_cpu(source, out, *sec)
+                        .map_err(|fallback| format!("filmstrip multi-seek: {err}; {fallback}"))
+                })
+                .collect();
         }
-        cleanup_batch_files(&out_dir);
-        return results;
+        Err(error) => {
+            return seeks
+                .iter()
+                .zip(outputs.iter())
+                .map(|(sec, out)| {
+                    extract_poster_jpeg_at_seek_cpu(source, out, *sec).map_err(|fallback| {
+                        format!("filmstrip multi-seek pokretanje: {error}; {fallback}")
+                    })
+                })
+                .collect();
+        }
     }
 
-    for (index, dest) in outputs.iter().enumerate() {
-        let batch = out_dir.join(format!("{BATCH_PREFIX}{:03}.jpg", index + 1));
-        let mut ok = false;
-        if batch.is_file() && batch.metadata().map(|m| m.len()).unwrap_or(0) > 0 {
-            if batch == *dest {
-                ok = true;
-            } else if std::fs::rename(&batch, dest).is_ok() || std::fs::copy(&batch, dest).is_ok() {
-                let _ = std::fs::remove_file(&batch);
-                ok = dest.is_file();
+    seeks
+        .iter()
+        .zip(outputs.iter())
+        .map(|(sec, out)| {
+            if frame_file_ready(out) {
+                Ok(())
+            } else {
+                extract_poster_jpeg_at_seek_cpu(source, out, *sec)
+                    .map_err(|fallback| format!("filmstrip frame missing; {fallback}"))
             }
-        }
-        if ok {
-            results.push(Ok(()));
-        } else {
-            let sec = seeks[index];
-            results.push(
-                extract_poster_jpeg_at_seek(source, dest, sec)
-                    .map_err(|e| format!("{sec}s: batch frame missing; {e}")),
-            );
-        }
-    }
+        })
+        .collect()
+}
 
-    cleanup_batch_files(&out_dir);
-    results
+fn frame_file_ready(path: &Path) -> bool {
+    path.is_file() && path.metadata().map(|m| m.len()).unwrap_or(0) > 0
 }

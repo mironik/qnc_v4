@@ -16,6 +16,7 @@ use crate::media::{
 use crate::project::db::{
     bump_project_data_revision, project_display_name, project_settings_snapshot, ProjectPaths,
 };
+use crate::project::ProjectDbBroker;
 
 use super::db::{
     backfill_virtual_names_for_selected, ensure_ingest_dirs, get_meta, mark_ingest_job_done,
@@ -27,6 +28,9 @@ use super::scanner;
 
 const META_ARCHIVE_ORIGINAL: &str = "archive_original";
 const META_SELECTION_REVISION: &str = "selection_revision";
+
+type DurationProbeRow = (String, String, String, String, String);
+type DurationProbeResult = (String, super::thumb::MediaProbe, PathBuf);
 
 pub fn ingest_archive_original_default(_project: &Value) -> bool {
     // Default: isključeno — korisnik ručno uključuje „Kopiraj original u projekt”.
@@ -346,24 +350,37 @@ pub fn discover(
     }))
 }
 
-/// Pozadinski ffprobe trajanje — DB se ne drži otvorenim tijekom ffprobe
-/// (inače load_state / poster response čeka cijeli probe).
-pub async fn probe_missing_durations(
+/// Pozadinski ffprobe trajanje: broker serializira SQLite snapshot/finalni upis,
+/// a media probe radi izvan DB locka.
+pub async fn probe_missing_durations_with_broker(
     paths: &ProjectPaths,
+    project_db: &ProjectDbBroker,
     media_processor: Arc<dyn MediaProcessor>,
     project_id: &str,
-) -> rusqlite::Result<usize> {
-    let source_id = {
-        let conn = open_ingest(paths, project_id)?;
-        let sid = get_meta(&conn, "active_source_id", "local")?;
-        set_meta(&conn, "durations_probe", "processing")?;
-        sid
-    };
-    let filled = fill_missing_media_probe(paths, media_processor, project_id, &source_id).await?;
-    let conn = open_ingest(paths, project_id)?;
-    set_meta(&conn, "durations_probe", "done")?;
-    bump_project_data_revision(&conn, "ingest")?;
-    Ok(filled)
+) -> Result<usize, String> {
+    let pid = project_id.trim();
+    if pid.is_empty() {
+        return Err("project_id required".into());
+    }
+    let source_id = project_db.serialize_project_write(pid, || {
+        let conn = open_ingest(paths, pid).map_err(|e| e.to_string())?;
+        let sid = get_meta(&conn, "active_source_id", "local").map_err(|e| e.to_string())?;
+        set_meta(&conn, "durations_probe", "processing").map_err(|e| e.to_string())?;
+        Ok(sid)
+    })?;
+    let rows = project_db.serialize_project_write(pid, || {
+        let conn = open_ingest(paths, pid).map_err(|e| e.to_string())?;
+        load_missing_media_probe_rows(&conn, &source_id).map_err(|e| e.to_string())
+    })?;
+    let results = run_media_probe_batch(media_processor, pid, rows).await;
+    project_db.serialize_project_write(pid, || {
+        let conn = open_ingest(paths, pid).map_err(|e| e.to_string())?;
+        let filled =
+            write_media_probe_results(&conn, &source_id, results).map_err(|e| e.to_string())?;
+        set_meta(&conn, "durations_probe", "done").map_err(|e| e.to_string())?;
+        bump_project_data_revision(&conn, "ingest").map_err(|e| e.to_string())?;
+        Ok(filled)
+    })
 }
 
 /// UI pending samo dok worker radi — inače poll nikad ne završi (failed probe = forever).
@@ -383,10 +400,7 @@ fn count_missing_durations(conn: &rusqlite::Connection, source_id: &str) -> rusq
     )
 }
 
-/// Treba enqueue: ima klipova bez duration, probe nije u tijeku i nije već završen
-/// (inače bi se na neuspješnim probeovima vrtio beskonačno).
-pub fn needs_duration_probe(paths: &ProjectPaths, project_id: &str) -> rusqlite::Result<bool> {
-    let conn = open_ingest(paths, project_id)?;
+pub fn needs_duration_probe_conn(conn: &rusqlite::Connection) -> rusqlite::Result<bool> {
     let source_id = get_meta(&conn, "active_source_id", "local")?;
     let flag = get_meta(&conn, "durations_probe", "")?;
     if flag == "processing" || flag == "done" {
@@ -395,28 +409,28 @@ pub fn needs_duration_probe(paths: &ProjectPaths, project_id: &str) -> rusqlite:
     Ok(count_missing_durations(&conn, &source_id)? > 0)
 }
 
-/// Popuni duration/fps/resolution/codec u ingest_assets — istina samo u SQLite.
-async fn fill_missing_media_probe(
-    paths: &ProjectPaths,
+fn load_missing_media_probe_rows(
+    conn: &rusqlite::Connection,
+    source_id: &str,
+) -> rusqlite::Result<Vec<DurationProbeRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT clip_id, source_path, original_path, proxy_path, project_proxy_path
+         FROM ingest_assets
+         WHERE source_id = ?1 AND (duration_sec IS NULL OR duration_sec <= 0)
+         ORDER BY clip_id",
+    )?;
+    let mapped = stmt.query_map(params![source_id], |r| {
+        Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+    })?;
+    mapped.collect::<Result<_, _>>()
+}
+
+async fn run_media_probe_batch(
     media_processor: Arc<dyn MediaProcessor>,
     project_id: &str,
-    source_id: &str,
-) -> rusqlite::Result<usize> {
+    rows: Vec<DurationProbeRow>,
+) -> Vec<DurationProbeResult> {
     use super::thumb::MediaProbe;
-
-    let rows: Vec<(String, String, String, String, String)> = {
-        let conn = open_ingest(paths, project_id)?;
-        let mut stmt = conn.prepare(
-            "SELECT clip_id, source_path, original_path, proxy_path, project_proxy_path
-             FROM ingest_assets
-             WHERE source_id = ?1 AND (duration_sec IS NULL OR duration_sec <= 0)
-             ORDER BY clip_id",
-        )?;
-        let mapped = stmt.query_map(params![source_id], |r| {
-            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
-        })?;
-        mapped.collect::<Result<_, _>>()?
-    };
 
     // Prefer proxy (field default import) so fps/duration match playable media, not MXF.
     let work: Vec<(String, PathBuf)> = rows
@@ -439,7 +453,7 @@ async fn fill_missing_media_probe(
         .map(|n| n.get().clamp(2, 4))
         .unwrap_or(2);
     if work.is_empty() {
-        return Ok(0);
+        return Vec::new();
     }
     let semaphore = Arc::new(tokio::sync::Semaphore::new(parallel));
     let mut handles = Vec::with_capacity(work.len());
@@ -491,9 +505,16 @@ async fn fill_missing_media_probe(
             }
         }
     }
+    results
+}
 
+/// Popuni duration/fps/resolution/codec u ingest_assets — istina samo u SQLite.
+fn write_media_probe_results(
+    conn: &rusqlite::Connection,
+    source_id: &str,
+    results: Vec<DurationProbeResult>,
+) -> rusqlite::Result<usize> {
     let mut filled = 0usize;
-    let conn = open_ingest(paths, project_id)?;
     for (clip_id, probe, _media) in results {
         let source_class = classify_tv_source(&probe);
         let proxy_recipe = recipe_for_source(source_class);
@@ -539,7 +560,9 @@ fn media_ref(clip_id: &str, media: &std::path::Path) -> MediaRef {
     }
 }
 
-fn ingest_probe_from_service(probe: ServiceMediaProbe) -> Option<super::thumb::MediaProbe> {
+pub(crate) fn ingest_probe_from_service(
+    probe: ServiceMediaProbe,
+) -> Option<super::thumb::MediaProbe> {
     let fps = fps_from_service_probe(&probe)?;
     let duration_sec = duration_from_service_probe(&probe, fps)?;
     let resolution = if probe.width > 0 && probe.height > 0 {
@@ -1230,11 +1253,13 @@ mod archive_original_tests {
     use super::*;
     use crate::ingest::db::{get_meta, open_ingest};
     use crate::project::db::ProjectPaths;
+    use crate::project::ProjectDbBroker;
     use async_trait::async_trait;
     use qnc_service_contracts::{
-        ArtifactRef, ExtractRangeRequest, FilmstripFrameArtifact, FilmstripRequest,
-        FrameExtractRequest, FrameTimebase, MediaProbe as ContractMediaProbe, ProxyBuildRequest,
-        ServiceError, ServiceResult, WaveformPeaks, WaveformRequest,
+        ArtifactRef, AudioProbe, AudioProbeRequest, AudioWrapRequest, ExtractRangeRequest,
+        FilmstripFrameArtifact, FilmstripRequest, FrameExtractRequest, FrameTimebase,
+        MediaProbe as ContractMediaProbe, PosterExtractRequest, ProxyBuildRequest, ServiceError,
+        ServiceResult, WaveformPeaks, WaveformRequest,
     };
     use serde_json::json;
     use std::path::Path;
@@ -1282,7 +1307,18 @@ mod archive_original_tests {
             })
         }
 
+        async fn probe_audio(&self, _request: AudioProbeRequest) -> ServiceResult<AudioProbe> {
+            Err(unused_service_error())
+        }
+
         async fn extract_frame(&self, _request: FrameExtractRequest) -> ServiceResult<ArtifactRef> {
+            Err(unused_service_error())
+        }
+
+        async fn extract_poster(
+            &self,
+            _request: PosterExtractRequest,
+        ) -> ServiceResult<ArtifactRef> {
             Err(unused_service_error())
         }
 
@@ -1294,6 +1330,10 @@ mod archive_original_tests {
         }
 
         async fn build_proxy(&self, _request: ProxyBuildRequest) -> ServiceResult<ArtifactRef> {
+            Err(unused_service_error())
+        }
+
+        async fn build_audio_wrap(&self, _request: AudioWrapRequest) -> ServiceResult<ArtifactRef> {
             Err(unused_service_error())
         }
 
@@ -1365,9 +1405,11 @@ mod archive_original_tests {
         drop(conn);
 
         let processor = Arc::new(FakeDurationProcessor::default());
-        let filled = probe_missing_durations(&paths, processor.clone(), project_id)
-            .await
-            .unwrap();
+        let broker = ProjectDbBroker::new(paths.clone());
+        let filled =
+            probe_missing_durations_with_broker(&paths, &broker, processor.clone(), project_id)
+                .await
+                .unwrap();
 
         assert_eq!(filled, 1);
         assert_eq!(processor.probe_calls.load(Ordering::Acquire), 1);

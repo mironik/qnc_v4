@@ -15,9 +15,9 @@ use crate::app_state::AppState;
 use super::db::resolve_ingest_poster_path;
 use super::orchestrator::{after_discover, after_import_queued};
 use super::store::{
-    discover, load_state, needs_duration_probe, queue_import, register_media_paths, save_selection,
-    select_all_clips, set_active_source, set_browse_path, set_ingest_archive_original,
-    toggle_clip_selection,
+    discover, load_state, needs_duration_probe_conn, queue_import, register_media_paths,
+    save_selection, select_all_clips, set_active_source, set_browse_path,
+    set_ingest_archive_original, toggle_clip_selection,
 };
 use crate::media_pool::proxy_path_for_clip;
 use crate::waveform::{peaks_for_channel, ready as waveform_ready, snapshot as waveform_snapshot};
@@ -71,9 +71,20 @@ async fn api_ingest_state(
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let pid = resolve_project_id(&app, &q.project_id)?;
     // Prvo snapshotr (posteri), tek onda enqueue — inače GET čeka probe.
-    let needs = needs_duration_probe(&app.project.paths, &pid).unwrap_or(false);
-    let state = load_state(&app.project.paths, &pid)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let needs = app
+        .project_db
+        .serialize_project_write(&pid, || {
+            let conn = crate::ingest::db::open_ingest(&app.project.paths, &pid)
+                .map_err(|e| e.to_string())?;
+            needs_duration_probe_conn(&conn).map_err(|e| e.to_string())
+        })
+        .unwrap_or(false);
+    let state = app
+        .project_db
+        .serialize_project_write(&pid, || {
+            load_state(&app.project.paths, &pid).map_err(|e| e.to_string())
+        })
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
     if needs {
         app.ingest_durations.enqueue(&pid);
     }
@@ -116,14 +127,18 @@ async fn api_ingest_selection(
     Json(body): Json<IngestSelectionBody>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let pid = resolve_project_id(&app, &body.project_id)?;
-    save_selection(
-        &app.project.paths,
-        &pid,
-        &body.selected_clip_ids,
-        body.selection_revision,
-    )
-    .map(Json)
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
+    app.project_db
+        .serialize_project_write(&pid, || {
+            save_selection(
+                &app.project.paths,
+                &pid,
+                &body.selected_clip_ids,
+                body.selection_revision,
+            )
+            .map_err(|e| e.to_string())
+        })
+        .map(Json)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))
 }
 
 #[derive(serde::Deserialize)]
@@ -139,9 +154,13 @@ async fn api_ingest_selection_toggle(
     Json(body): Json<IngestToggleBody>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let pid = resolve_project_id(&app, &body.project_id)?;
-    toggle_clip_selection(&app.project.paths, &pid, &body.clip_id)
+    app.project_db
+        .serialize_project_write(&pid, || {
+            toggle_clip_selection(&app.project.paths, &pid, &body.clip_id)
+                .map_err(|e| e.to_string())
+        })
         .map(Json)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))
 }
 
 #[derive(serde::Deserialize)]
@@ -155,9 +174,12 @@ async fn api_ingest_selection_select_all(
     Json(body): Json<IngestSelectAllBody>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let pid = resolve_project_id(&app, &body.project_id)?;
-    select_all_clips(&app.project.paths, &pid)
+    app.project_db
+        .serialize_project_write(&pid, || {
+            select_all_clips(&app.project.paths, &pid).map_err(|e| e.to_string())
+        })
         .map(Json)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))
 }
 
 #[derive(serde::Deserialize)]
@@ -206,12 +228,15 @@ async fn api_ingest_browse(
     }
     set_browse_path(&app.project.paths, &pid, path)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    let source_id = {
-        let conn = crate::ingest::db::open_ingest(&app.project.paths, &pid)
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-        crate::ingest::db::get_meta(&conn, "active_source_id", "local")
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-    };
+    let source_id = app
+        .project_db
+        .serialize_project_write(&pid, || {
+            let conn = crate::ingest::db::open_ingest(&app.project.paths, &pid)
+                .map_err(|e| e.to_string())?;
+            crate::ingest::db::get_meta(&conn, "active_source_id", "local")
+                .map_err(|e| e.to_string())
+        })
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
     let paths = app.project.paths.clone();
     let project_id = pid.clone();
     let sid = source_id.clone();
@@ -267,9 +292,11 @@ async fn api_ingest_register_files(
     register_media_paths(&app.project.paths, &pid, &body.source_id, &file_paths, &[])
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     // Novi fajlovi — dopusti ponovni duration probe (reset "done").
-    if let Ok(conn) = crate::ingest::db::open_ingest(&app.project.paths, &pid) {
-        let _ = crate::ingest::db::set_meta(&conn, "durations_probe", "");
-    }
+    let _ = app.project_db.serialize_project_write(&pid, || {
+        let conn =
+            crate::ingest::db::open_ingest(&app.project.paths, &pid).map_err(|e| e.to_string())?;
+        crate::ingest::db::set_meta(&conn, "durations_probe", "").map_err(|e| e.to_string())
+    });
     let state = load_state(&app.project.paths, &pid)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     after_discover(&app, &pid);

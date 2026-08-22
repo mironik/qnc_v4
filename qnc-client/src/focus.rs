@@ -88,26 +88,48 @@ impl TimelineFocus {
     }
 }
 
-pub fn normalized_fps(fps: f64) -> f64 {
+pub fn is_valid_fps(fps: f64) -> bool {
     if fps.is_finite() && fps > 1.0 {
+        return true;
+    }
+    false
+}
+
+pub fn normalized_fps(fps: f64) -> f64 {
+    if is_valid_fps(fps) {
         fps
     } else {
-        25.0
+        0.0
     }
 }
 
 pub fn seconds_to_frame(seconds: f64, fps: f64) -> i64 {
-    (seconds.max(0.0) * normalized_fps(fps)).round() as i64
+    let fps = normalized_fps(fps);
+    if fps > 0.0 {
+        (seconds.max(0.0) * fps).round() as i64
+    } else {
+        0
+    }
 }
 
 pub fn frame_to_seconds(frame: i64, fps: f64) -> f64 {
-    frame.max(0) as f64 / normalized_fps(fps)
+    let fps = normalized_fps(fps);
+    if fps > 0.0 {
+        frame.max(0) as f64 / fps
+    } else {
+        0.0
+    }
 }
 
 /// 1 frame in seconds, for display labels only.
 #[allow(dead_code)]
 pub fn frame_sec(fps: f64) -> f64 {
-    1.0 / normalized_fps(fps)
+    let fps = normalized_fps(fps);
+    if fps > 0.0 {
+        1.0 / fps
+    } else {
+        0.0
+    }
 }
 
 pub fn duration_frames_from_timeline(model: Option<&TimelineModel>) -> i64 {
@@ -155,8 +177,8 @@ pub fn timeline_span_frames(
 pub fn fps_from_timeline(model: Option<&TimelineModel>) -> f64 {
     model
         .map(|m| m.timeline_fps)
-        .filter(|f| f.is_finite() && *f > 1.0)
-        .unwrap_or(25.0)
+        .filter(|f| is_valid_fps(*f))
+        .unwrap_or(0.0)
 }
 
 /// Build Tab cycle: playhead → IN → OUT → markers → slots.

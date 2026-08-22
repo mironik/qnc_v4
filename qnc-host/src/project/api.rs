@@ -1,5 +1,3 @@
-use std::sync::Mutex;
-
 use axum::{
     extract::{Path, State},
     http::StatusCode,
@@ -12,7 +10,8 @@ use crate::app_state::AppState;
 
 use super::appearance_settings::{load_appearance_user, save_appearance_user};
 use super::collab::{start_session, touch_session};
-use super::db::{open_global, project_data_revision_snapshot, ProjectPaths};
+use super::db::{project_data_revision_snapshot, ProjectPaths};
+use super::db_broker::ProjectDbBroker;
 use super::keyboard_settings::{list_keyboard_presets, load_keyboard_user, save_keyboard_user};
 use super::store::{
     cleanup_orphan_project_dirs, create_project, delete_projects, get_active_project_id,
@@ -32,29 +31,32 @@ use super::ui_state::{
 #[derive(Clone)]
 pub struct ProjectState {
     pub paths: ProjectPaths,
-    db: std::sync::Arc<Mutex<rusqlite::Connection>>,
+    db: ProjectDbBroker,
 }
 
 impl ProjectState {
     pub fn new(root: &std::path::Path, config: &crate::config::AppConfig) -> Self {
         let paths = ProjectPaths::from_root(root, config);
-        let conn = open_global(&paths).expect("project_store.db");
-        ensure_templates_seeded(&conn, &paths.seed_path).ok();
-        Self {
-            paths,
-            db: std::sync::Arc::new(Mutex::new(conn)),
-        }
+        let db = ProjectDbBroker::new(paths.clone());
+        db.with_global(|conn| {
+            ensure_templates_seeded(conn, &paths.seed_path).map_err(|e| e.to_string())?;
+            Ok(())
+        })
+        .expect("project_store.db");
+        Self { paths, db }
+    }
+
+    pub fn db_broker(&self) -> ProjectDbBroker {
+        self.db.clone()
     }
 
     fn with_db<F, T>(&self, f: F) -> Result<T, (StatusCode, String)>
     where
         F: FnOnce(&rusqlite::Connection) -> Result<T, String>,
     {
-        let guard = self
-            .db
-            .lock()
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-        f(&guard).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))
+        self.db
+            .with_global(f)
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))
     }
 
     pub fn active_project_id(&self) -> Result<String, (StatusCode, String)> {

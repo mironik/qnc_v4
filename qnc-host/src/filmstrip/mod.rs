@@ -9,7 +9,8 @@ pub use placeholder::{
 };
 pub use store::{
     clip_filmstrip_snapshot, frame_path_for_index, frame_path_for_seek, get_filmstrip,
-    list_frames_for_clip, mark_filmstrip, sync_filmstrip_from_disk,
+    list_frames_for_clip, manifest_cache_key, manifest_for_api, mark_filmstrip,
+    sync_filmstrip_from_disk,
 };
 pub(crate) use worker::filmstrip_ready;
 pub use worker::FilmstripWorker;
