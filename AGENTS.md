@@ -108,6 +108,10 @@ projektu za projektnu istinu, te runtime cache samo za brze, ne-trajne statuse.
   generation je fallback samo za klipove koji nemaju postojeći proxy.
 - Camera thumbnail je zakon: ako THM/JPG/poster postoji na kartici/NAS-u, on se
   kopira kao poster i ne smije se generirati FFmpeg poster bez potrebe.
+- Prvi korak svakog artifact workera je provjera kartice/NAS metapodataka i
+  stvarnih fajlova. Ako proxy, thumbnail, audio ili drugi trazeni pomocni
+  artefakt vec postoji na kameri/kartici/NAS-u, koristi se taj artefakt; tek
+  nakon dokaza da artefakt ne postoji smije se enqueueati/generirati fallback.
 - Import se osvjezava po klipu, ne po batchu: cim pojedini klip dobije proxy,
   thumb, filmstrip frame ili waveform status, host zapisuje status za taj klip,
   a UI smije prikazati taj napredak bez cekanja zavrsetka cijele kartice.
@@ -122,8 +126,10 @@ projektu za projektnu istinu, te runtime cache samo za brze, ne-trajne statuse.
 - Produkcijski artifact job (`proxy_generate`, filmstrip, waveform, poster,
   audio wrap) ne smije biti dodan u external claim allowlist dok istodobno ne
   postoje worker handler i host-side result applier koji zapisuje isti SQLite
-  status kao postojeci interni worker. U suprotnom vanjski proces moze
-  oznaciti posao gotovim bez stvarnog artefakta.
+  status kao postojeci interni worker. Za `proxy_generate` host-side preflight
+  prije claima mora ponovno dokazati da kamera/kartica/NAS nema postojeci
+  proxy; u suprotnom se proxy kopira/linka i generate se ne pokrece. Bez toga
+  vanjski proces moze oznaciti posao gotovim bez stvarnog artefakta.
 - Dok je playback aktivan ili se tek otvara/priprema input, teški workeri ne
   smiju claimati posao. Host `playback_active`/background gate ima prednost nad
   recoveryjem, proxyjem, filmstripom, waveformom i ostalim pozadinskim poslom.

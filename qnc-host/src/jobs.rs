@@ -23,6 +23,8 @@ const MAX_LEASE_MS: u64 = 300_000;
 const EXTERNAL_CLAIMABLE_JOB_TYPES: &[&str] = &[
     // Protocol canary only. Product artifact jobs are added here only after
     // they have both an external worker handler and a host-side result applier.
+    // Proxy generation also requires host preflight that proves no camera/NAS
+    // proxy exists; existing camera artefacts are copied/linked before fallback.
     "qnc_worker_smoke",
 ];
 
@@ -618,7 +620,7 @@ mod tests {
     }
 
     #[test]
-    fn claim_uses_existing_ingest_jobs_and_skips_internal_jobs() {
+    fn claim_does_not_expose_proxy_generate_without_card_preflight_and_applier() {
         let paths = test_paths("claim");
         let broker = ProjectDbBroker::new(paths.clone());
         let conn = open_ingest(&paths, "project_a").unwrap();
