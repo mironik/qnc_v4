@@ -10,6 +10,9 @@ use serde::{Deserialize, Serialize};
 
 pub type ServiceResult<T> = Result<T, ServiceError>;
 
+pub const JOB_TYPE_FILMSTRIP: &str = "filmstrip";
+pub const JOB_SOURCE_FILMSTRIP: &str = "filmstrip";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RuntimeProfile {
@@ -155,6 +158,26 @@ pub struct FilmstripFrameArtifact {
     pub index: usize,
     pub seek_sec: f64,
     pub artifact: ArtifactRef,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FilmstripJobFrame {
+    pub index: usize,
+    pub seek_sec: f64,
+    pub output_path: PathBuf,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FilmstripJobPayload {
+    pub media_path: PathBuf,
+    pub duration_sec: f64,
+    pub frames: Vec<FilmstripJobFrame>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FilmstripJobResult {
+    pub duration_sec: f64,
+    pub frames: Vec<FilmstripFrameArtifact>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

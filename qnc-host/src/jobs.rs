@@ -4,9 +4,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::{extract::State, http::StatusCode, routing::post, Json, Router};
 use qnc_service_contracts::{
-    JobAck, JobClaimRequest, JobClaimResponse, JobCompleteRequest, JobFailRequest,
-    JobHeartbeatRequest, JobHeartbeatResponse, JobLease, ProxyGenerateJobPayload,
-    ProxyGenerateJobResult,
+    FilmstripJobFrame, FilmstripJobPayload, FilmstripJobResult, JobAck, JobClaimRequest,
+    JobClaimResponse, JobCompleteRequest, JobFailRequest, JobHeartbeatRequest,
+    JobHeartbeatResponse, JobLease, ProxyGenerateJobPayload, ProxyGenerateJobResult,
+    JOB_SOURCE_FILMSTRIP, JOB_TYPE_FILMSTRIP,
 };
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::{json, Value};
@@ -15,7 +16,8 @@ use uuid::Uuid;
 use crate::app_state::AppState;
 use crate::ingest::asset_row::IngestAssetRow;
 use crate::ingest::db::{
-    ingest_asset_meta, mark_ingest_job_done, migrate_ingest_job_lease_columns, open_ingest,
+    ingest_asset_meta, mark_ingest_job_done, mark_ingest_job_error,
+    migrate_ingest_job_lease_columns, open_ingest,
 };
 use crate::ingest::import_finish::complete_imported_clip;
 use crate::ingest::proxy_generate::proxy_dest_for_source;
@@ -33,7 +35,10 @@ const MIN_LEASE_MS: u64 = 5_000;
 const MAX_LEASE_MS: u64 = 300_000;
 const SMOKE_JOB_TYPE: &str = "qnc_worker_smoke";
 const PROXY_GENERATE_JOB_TYPE: &str = "proxy_generate";
-const EXTERNAL_CLAIMABLE_JOB_TYPES: &[&str] = &[SMOKE_JOB_TYPE, PROXY_GENERATE_JOB_TYPE];
+const FILMSTRIP_JOB_TYPE: &str = JOB_TYPE_FILMSTRIP;
+const FILMSTRIP_SOURCE_ID: &str = JOB_SOURCE_FILMSTRIP;
+const EXTERNAL_CLAIMABLE_JOB_TYPES: &[&str] =
+    &[SMOKE_JOB_TYPE, PROXY_GENERATE_JOB_TYPE, FILMSTRIP_JOB_TYPE];
 
 pub fn router() -> Router<AppState> {
     Router::new()
@@ -265,8 +270,88 @@ fn payload_for_job_claim(
     match row.job_type.as_str() {
         SMOKE_JOB_TYPE => Ok(Some(json!({}))),
         PROXY_GENERATE_JOB_TYPE => payload_for_proxy_generate_claim(paths, project_id, conn, row),
+        FILMSTRIP_JOB_TYPE => payload_for_filmstrip_claim(paths, project_id, conn, row),
         _ => Ok(None),
     }
+}
+
+fn payload_for_filmstrip_claim(
+    paths: &ProjectPaths,
+    project_id: &str,
+    conn: &Connection,
+    row: &QueuedJobRow,
+) -> Result<Option<Value>, String> {
+    let clip_id = row.clip_id.trim();
+    if clip_id.is_empty() || row.source_id.trim() != FILMSTRIP_SOURCE_ID {
+        return Ok(None);
+    }
+    let Some(media) = crate::media::resolve_filmstrip_media(paths, project_id, clip_id, None)
+    else {
+        let _ = mark_ingest_job_error(
+            conn,
+            FILMSTRIP_JOB_TYPE,
+            FILMSTRIP_SOURCE_ID,
+            clip_id,
+            "filmstrip media missing",
+        );
+        return Ok(None);
+    };
+    let duration = stored_clip_duration_sec(conn, clip_id)
+        .or_else(|| {
+            qnc_media_ffmpeg::proxy::probe_media(&media)
+                .ok()
+                .and_then(|probe| probe.duration_sec)
+        })
+        .filter(|value| value.is_finite() && *value > 0.0);
+    let Some(duration) = duration else {
+        let _ = mark_ingest_job_error(
+            conn,
+            FILMSTRIP_JOB_TYPE,
+            FILMSTRIP_SOURCE_ID,
+            clip_id,
+            "filmstrip duration missing",
+        );
+        return Ok(None);
+    };
+    let seeks = crate::ingest::thumb::timeline_seek_seconds(
+        duration,
+        crate::filmstrip::DEFAULT_FILMSTRIP_FRAMES,
+    );
+    let out_dir = crate::filmstrip::filmstrip_clip_dir(paths, project_id, clip_id);
+    let frames: Vec<FilmstripJobFrame> = seeks
+        .iter()
+        .enumerate()
+        .map(|(index, seek_sec)| FilmstripJobFrame {
+            index,
+            seek_sec: *seek_sec,
+            output_path: crate::ingest::thumb::filmstrip_frame_path(&out_dir, index, *seek_sec),
+        })
+        .collect();
+    if frames.len() < 2 {
+        return Ok(None);
+    }
+    serde_json::to_value(FilmstripJobPayload {
+        media_path: media,
+        duration_sec: duration,
+        frames,
+    })
+    .map(Some)
+    .map_err(|error| error.to_string())
+}
+
+fn stored_clip_duration_sec(conn: &Connection, clip_id: &str) -> Option<f64> {
+    conn.query_row(
+        "SELECT duration_sec
+         FROM ingest_assets
+         WHERE clip_id = ?1
+           AND import_status IN ('imported', 'done')
+         ORDER BY CASE import_status WHEN 'imported' THEN 0 WHEN 'done' THEN 1 ELSE 2 END
+         LIMIT 1",
+        params![clip_id],
+        |row| row.get::<_, f64>(0),
+    )
+    .ok()
+    .filter(|value| value.is_finite() && *value > 0.0)
 }
 
 fn payload_for_proxy_generate_claim(
@@ -420,6 +505,44 @@ fn apply_proxy_generate_result(
     })
 }
 
+fn apply_filmstrip_job_result(
+    paths: &ProjectPaths,
+    project_db: &ProjectDbBroker,
+    project_id: &str,
+    clip_id: &str,
+    result: FilmstripJobResult,
+) -> Result<(), String> {
+    let duration = result
+        .duration_sec
+        .is_finite()
+        .then_some(result.duration_sec)
+        .filter(|value| *value > 0.0)
+        .ok_or_else(|| format!("filmstrip duration missing for clip_id={clip_id}"))?;
+    let mut frames: Vec<crate::filmstrip::FilmstripFrame> = result
+        .frames
+        .into_iter()
+        .filter_map(|frame| {
+            let path = frame.artifact.path;
+            (path.is_file() && path.metadata().map(|m| m.len()).unwrap_or(0) > 0).then_some(
+                crate::filmstrip::FilmstripFrame {
+                    index: frame.index,
+                    seek_sec: frame.seek_sec,
+                    path,
+                },
+            )
+        })
+        .collect();
+    frames.sort_by_key(|frame| frame.index);
+
+    let seeks = crate::ingest::thumb::timeline_seek_seconds(
+        duration,
+        crate::filmstrip::DEFAULT_FILMSTRIP_FRAMES,
+    );
+    crate::filmstrip::save_built_filmstrip_frames(
+        paths, project_db, project_id, clip_id, duration, &frames, &seeks,
+    )
+}
+
 fn read_ingest_asset_row(
     conn: &Connection,
     source_id: &str,
@@ -487,10 +610,10 @@ fn heartbeat_jobs(
                          lease_until_ms = ?5,
                          updated_at = ?6
                      WHERE job_id = ?1
-                       AND worker_id = ?2
-                       AND lease_id = ?3
-                       AND status = 'processing'
-                       AND job_type IN ('qnc_worker_smoke', 'proxy_generate')",
+                   AND worker_id = ?2
+                   AND lease_id = ?3
+                   AND status = 'processing'
+                   AND job_type IN ('qnc_worker_smoke', 'proxy_generate', 'filmstrip')",
                     params![
                         job_id,
                         worker_id,
@@ -558,6 +681,13 @@ fn complete_job(
                 &active.clip_id,
                 result,
             )?;
+        }
+        FILMSTRIP_JOB_TYPE => {
+            let result: FilmstripJobResult =
+                serde_json::from_value(request.result).map_err(|error| {
+                    format!("invalid filmstrip result for job_id={job_id}: {error}")
+                })?;
+            apply_filmstrip_job_result(&paths, &project_db, &project_id, &active.clip_id, result)?;
         }
         _ => {
             return Ok(JobAck {
@@ -743,6 +873,11 @@ fn fail_job(
                 .map_err(|e| e.to_string())
         })?;
     }
+    if changed == 1 && !request.retryable && active.job_type == FILMSTRIP_JOB_TYPE {
+        project_db.serialize_project_write(&project_id, || {
+            crate::filmstrip::mark_filmstrip(&paths, &project_id, &active.clip_id, "error", &error)
+        })?;
+    }
 
     Ok(JobAck {
         accepted: changed == 1,
@@ -832,7 +967,10 @@ fn is_external_claimable_job_type(job_type: &str) -> bool {
 }
 
 fn is_lease_managed_job_type(job_type: &str) -> bool {
-    matches!(job_type, SMOKE_JOB_TYPE | PROXY_GENERATE_JOB_TYPE)
+    matches!(
+        job_type,
+        SMOKE_JOB_TYPE | PROXY_GENERATE_JOB_TYPE | FILMSTRIP_JOB_TYPE
+    )
 }
 
 fn normalize_lease_ms(value: Option<u64>) -> u64 {
@@ -910,6 +1048,24 @@ mod tests {
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(&path, b"media").unwrap();
         path
+    }
+
+    fn register_project(paths: &ProjectPaths, project_id: &str) {
+        let global = crate::project::db::open_global(paths).unwrap();
+        let project_dir = crate::project::db::project_dir_in_root(&paths.projects_root, project_id);
+        global
+            .execute(
+                "INSERT INTO projects (project_id, name, project_dir)
+                 VALUES (?1, ?2, ?3)",
+                params![
+                    project_id,
+                    project_id,
+                    project_dir.to_string_lossy().to_string()
+                ],
+            )
+            .unwrap();
+        crate::project::db::ensure_project_dirs_at(&project_dir).unwrap();
+        let _ = crate::project::db::open_project(paths, project_id).unwrap();
     }
 
     fn field_project() -> serde_json::Value {
@@ -1154,6 +1310,149 @@ mod tests {
     #[test]
     fn proxy_generate_is_external_claimable_after_handler_and_applier() {
         assert!(is_external_claimable_job_type(PROXY_GENERATE_JOB_TYPE));
+    }
+
+    #[test]
+    fn filmstrip_is_external_claimable_after_handler_and_applier() {
+        assert!(is_external_claimable_job_type(FILMSTRIP_JOB_TYPE));
+    }
+
+    #[test]
+    fn filmstrip_claim_uses_proxy_media_and_segment_start_frames() {
+        let paths = test_paths("filmstrip_claim");
+        let broker = ProjectDbBroker::new(paths.clone());
+        register_project(&paths, "project_a");
+        let project_dir = paths.project_dir("project_a");
+        let original = touch(project_dir.join("original").join("clip_a.mxf"));
+        let proxy = touch(project_dir.join("proxy").join("clip_a.mp4"));
+        let conn = open_ingest(&paths, "project_a").unwrap();
+        conn.execute(
+            "INSERT INTO ingest_assets
+                (source_id, clip_id, name, media_id, source_path, original_path, proxy_path,
+                 import_status, status, duration_sec, file_extension)
+             VALUES ('card', 'clip_a', 'Clip A', 'clip_a', ?1, ?1, ?2,
+                     'imported', 'imported', 26.0, 'mxf')",
+            params![
+                original.to_string_lossy().as_ref(),
+                proxy.to_string_lossy().as_ref()
+            ],
+        )
+        .unwrap();
+        queue_ingest_job(&conn, FILMSTRIP_JOB_TYPE, FILMSTRIP_SOURCE_ID, "clip_a").unwrap();
+        drop(conn);
+
+        let claim = NormalizedClaim::from_request(JobClaimRequest {
+            worker_id: "worker_a".into(),
+            project_id: Some("project_a".into()),
+            capabilities: vec![FILMSTRIP_JOB_TYPE.into()],
+            max_jobs: Some(1),
+            lease_ms: Some(10_000),
+        })
+        .unwrap();
+        let jobs = claim_jobs(paths, broker, claim).unwrap();
+
+        assert_eq!(jobs.len(), 1);
+        let payload: FilmstripJobPayload = serde_json::from_value(jobs[0].payload.clone()).unwrap();
+        assert_eq!(payload.media_path, proxy);
+        assert_eq!(payload.duration_sec, 26.0);
+        assert_eq!(
+            payload.frames.len(),
+            crate::filmstrip::DEFAULT_FILMSTRIP_FRAMES as usize
+        );
+        assert_eq!(payload.frames[0].seek_sec, 0.0);
+        assert_eq!(payload.frames[1].seek_sec, 2.0);
+        assert_eq!(
+            payload.frames[0]
+                .output_path
+                .file_name()
+                .and_then(|v| v.to_str()),
+            Some("000_0_00.jpg")
+        );
+    }
+
+    #[test]
+    fn filmstrip_complete_route_stores_frames_and_clears_lease() {
+        let paths = test_paths("filmstrip_complete");
+        let broker = ProjectDbBroker::new(paths.clone());
+        register_project(&paths, "project_a");
+        let conn = open_ingest(&paths, "project_a").unwrap();
+        lease_job(
+            &conn,
+            FILMSTRIP_JOB_TYPE,
+            FILMSTRIP_SOURCE_ID,
+            "clip_a",
+            "worker_a",
+            "lease_a",
+        );
+        drop(conn);
+
+        let duration = 26.0;
+        let seeks = crate::ingest::thumb::timeline_seek_seconds(
+            duration,
+            crate::filmstrip::DEFAULT_FILMSTRIP_FRAMES,
+        );
+        let out_dir = crate::filmstrip::filmstrip_clip_dir(&paths, "project_a", "clip_a");
+        let frames: Vec<qnc_service_contracts::FilmstripFrameArtifact> = seeks
+            .iter()
+            .enumerate()
+            .map(|(index, seek_sec)| {
+                let path = crate::ingest::thumb::filmstrip_frame_path(&out_dir, index, *seek_sec);
+                fs::create_dir_all(path.parent().unwrap()).unwrap();
+                fs::write(&path, b"jpeg").unwrap();
+                qnc_service_contracts::FilmstripFrameArtifact {
+                    index,
+                    seek_sec: *seek_sec,
+                    artifact: qnc_service_contracts::ArtifactRef {
+                        path,
+                        media_type: "image/jpeg".into(),
+                        render_version: None,
+                    },
+                }
+            })
+            .collect();
+        let job_id =
+            crate::ingest::db::ingest_job_id(FILMSTRIP_JOB_TYPE, FILMSTRIP_SOURCE_ID, "clip_a");
+        let ack = complete_job(
+            paths.clone(),
+            broker,
+            JobCompleteRequest {
+                worker_id: "worker_a".into(),
+                project_id: "project_a".into(),
+                lease_id: "lease_a".into(),
+                job_id: job_id.clone(),
+                result: serde_json::to_value(FilmstripJobResult {
+                    duration_sec: duration,
+                    frames,
+                })
+                .unwrap(),
+            },
+        )
+        .unwrap();
+
+        assert!(ack.accepted);
+        let manifest = crate::filmstrip::get_filmstrip(&paths, "project_a", "clip_a").unwrap();
+        assert_eq!(
+            manifest.get("status").and_then(|v| v.as_str()),
+            Some("ready")
+        );
+        assert_eq!(
+            crate::filmstrip::list_frames_for_clip(&paths, "project_a", "clip_a")
+                .unwrap()
+                .len(),
+            crate::filmstrip::DEFAULT_FILMSTRIP_FRAMES as usize
+        );
+        let conn = open_ingest(&paths, "project_a").unwrap();
+        let job: (String, String, String) = conn
+            .query_row(
+                "SELECT status, worker_id, lease_id
+                 FROM ingest_jobs WHERE job_id = ?1",
+                params![job_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(job.0, "done");
+        assert!(job.1.is_empty());
+        assert!(job.2.is_empty());
     }
 
     #[test]

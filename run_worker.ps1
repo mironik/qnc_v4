@@ -3,7 +3,7 @@ $ErrorActionPreference = "Stop"
 $Root = Split-Path -Parent $MyInvocation.MyCommand.Path
 $env:QNC_ROOT = $Root
 $HostUrl = if ($env:QNC_HOST_URL) { $env:QNC_HOST_URL } else { "http://127.0.0.1:8001" }
-$CapabilitiesRaw = if ($env:QNC_WORKER_CAPABILITIES) { $env:QNC_WORKER_CAPABILITIES } else { "proxy_generate" }
+$CapabilitiesRaw = if ($env:QNC_WORKER_CAPABILITIES) { $env:QNC_WORKER_CAPABILITIES } else { "proxy_generate,filmstrip" }
 $Capabilities = $CapabilitiesRaw -split "," | ForEach-Object { $_.Trim() } | Where-Object { $_ }
 
 # Reuse the same local target tree as run_host.ps1.

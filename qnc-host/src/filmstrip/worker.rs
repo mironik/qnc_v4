@@ -2,16 +2,20 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tracing::{info, warn};
 
 use crate::background_work::BackgroundWorkGate;
+use crate::ingest::db::{
+    ingest_job_has_active_external_lease, mark_ingest_job_done, mark_ingest_job_error,
+    mark_ingest_job_processing, open_ingest, queue_ingest_job,
+};
 use crate::ingest::thumb::timeline_seek_seconds;
 use crate::media::imported_filmstrip_media_rows;
 use crate::project::db::ProjectPaths;
 use crate::project::{list_project_ids, ProjectDbBroker};
-use qnc_service_contracts::MediaProcessor;
+use qnc_service_contracts::{MediaProcessor, JOB_SOURCE_FILMSTRIP, JOB_TYPE_FILMSTRIP};
 
 use super::build::build_for_clip;
 use super::store::{get_filmstrip, list_frames_for_clip};
@@ -115,6 +119,7 @@ impl FilmstripWorker {
             return;
         }
         let frames = frames.max(super::DEFAULT_FILMSTRIP_FRAMES);
+        self.queue_filmstrip_job(pid, cid);
         let mut pending = self.pending.lock().expect("filmstrip queue");
         push_filmstrip_job(
             &mut pending,
@@ -191,6 +196,17 @@ impl FilmstripWorker {
                 let cid = job.clip_id;
                 let media = job.media_path;
                 let frames = job.frames;
+                match worker.claim_local_filmstrip_job(&pid, &cid) {
+                    Ok(true) => {}
+                    Ok(false) => continue,
+                    Err(error) => {
+                        warn!(
+                            "filmstrip claim: project={} clip={} err={}",
+                            pid_log, cid_log, error
+                        );
+                        continue;
+                    }
+                }
                 in_flight.fetch_add(1, Ordering::AcqRel);
                 let result = build_for_clip(
                     &worker.paths,
@@ -204,14 +220,93 @@ impl FilmstripWorker {
                 .await;
                 in_flight.fetch_sub(1, Ordering::AcqRel);
                 match result {
-                    Ok(()) => info!("filmstrip: project={} clip={}", pid_log, cid_log),
+                    Ok(()) => {
+                        let _ = worker.finish_local_filmstrip_job(&pid_log, &cid_log, None);
+                        info!("filmstrip: project={} clip={}", pid_log, cid_log)
+                    }
                     Err(e) => {
+                        let _ = worker.finish_local_filmstrip_job(&pid_log, &cid_log, Some(&e));
                         warn!("filmstrip: project={} clip={} err={}", pid_log, cid_log, e)
                     }
                 }
             }
         });
     }
+
+    fn queue_filmstrip_job(&self, project_id: &str, clip_id: &str) {
+        if let Err(error) = self.project_db.serialize_project_write(project_id, || {
+            let conn = open_ingest(&self.paths, project_id).map_err(|e| e.to_string())?;
+            if ingest_job_has_active_external_lease(
+                &conn,
+                JOB_TYPE_FILMSTRIP,
+                JOB_SOURCE_FILMSTRIP,
+                clip_id,
+                now_unix_ms() as i64,
+            )
+            .map_err(|e| e.to_string())?
+            {
+                return Ok(());
+            }
+            queue_ingest_job(&conn, JOB_TYPE_FILMSTRIP, JOB_SOURCE_FILMSTRIP, clip_id)
+                .map_err(|e| e.to_string())
+        }) {
+            warn!(
+                "filmstrip queue: project={} clip={} err={}",
+                project_id, clip_id, error
+            );
+        }
+    }
+
+    fn claim_local_filmstrip_job(&self, project_id: &str, clip_id: &str) -> Result<bool, String> {
+        self.project_db.serialize_project_write(project_id, || {
+            let conn = open_ingest(&self.paths, project_id).map_err(|e| e.to_string())?;
+            if ingest_job_has_active_external_lease(
+                &conn,
+                JOB_TYPE_FILMSTRIP,
+                JOB_SOURCE_FILMSTRIP,
+                clip_id,
+                now_unix_ms() as i64,
+            )
+            .map_err(|e| e.to_string())?
+            {
+                return Ok(false);
+            }
+            mark_ingest_job_processing(&conn, JOB_TYPE_FILMSTRIP, JOB_SOURCE_FILMSTRIP, clip_id)
+                .map_err(|e| e.to_string())?;
+            Ok(true)
+        })
+    }
+
+    fn finish_local_filmstrip_job(
+        &self,
+        project_id: &str,
+        clip_id: &str,
+        error: Option<&str>,
+    ) -> Result<(), String> {
+        self.project_db.serialize_project_write(project_id, || {
+            let conn = open_ingest(&self.paths, project_id).map_err(|e| e.to_string())?;
+            match error {
+                Some(message) => mark_ingest_job_error(
+                    &conn,
+                    JOB_TYPE_FILMSTRIP,
+                    JOB_SOURCE_FILMSTRIP,
+                    clip_id,
+                    message,
+                ),
+                None => {
+                    mark_ingest_job_done(&conn, JOB_TYPE_FILMSTRIP, JOB_SOURCE_FILMSTRIP, clip_id)
+                }
+            }
+            .map_err(|e| e.to_string())
+        })
+    }
+}
+
+fn now_unix_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 fn push_filmstrip_job(pending: &mut Vec<FilmstripJob>, job: FilmstripJob) {

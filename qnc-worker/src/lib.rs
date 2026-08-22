@@ -4,9 +4,9 @@ use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use qnc_service_contracts::{
-    JobAck, JobClaimRequest, JobClaimResponse, JobCompleteRequest, JobFailRequest,
-    JobHeartbeatRequest, JobHeartbeatResponse, JobLease, ProxyGenerateJobPayload,
-    ProxyGenerateJobResult,
+    FilmstripJobPayload, FilmstripJobResult, JobAck, JobClaimRequest, JobClaimResponse,
+    JobCompleteRequest, JobFailRequest, JobHeartbeatRequest, JobHeartbeatResponse, JobLease,
+    ProxyGenerateJobPayload, ProxyGenerateJobResult, JOB_TYPE_FILMSTRIP,
 };
 use serde::{de::DeserializeOwned, Serialize};
 use serde_json::{json, Value};
@@ -16,6 +16,7 @@ pub const DEFAULT_POLL_MS: u64 = 500;
 pub const DEFAULT_LEASE_MS: u64 = 30_000;
 pub const SMOKE_JOB_TYPE: &str = "qnc_worker_smoke";
 pub const PROXY_GENERATE_JOB_TYPE: &str = "proxy_generate";
+pub const FILMSTRIP_JOB_TYPE: &str = JOB_TYPE_FILMSTRIP;
 
 #[derive(Debug, Clone)]
 pub struct WorkerConfig {
@@ -98,6 +99,13 @@ pub trait ProxyBuilder: Send + Sync {
     ) -> Result<ProxyGenerateJobResult, JobHandlerError>;
 }
 
+pub trait FilmstripBuilder: Send + Sync {
+    fn build_filmstrip(
+        &self,
+        payload: FilmstripJobPayload,
+    ) -> Result<FilmstripJobResult, JobHandlerError>;
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JobHandlerError {
     pub message: String,
@@ -135,6 +143,7 @@ impl HandlerRegistry {
         let mut registry = Self::empty();
         registry.register(SmokeJobHandler);
         registry.register(ProxyGenerateJobHandler::new(LocalFfmpegProxyBuilder));
+        registry.register(FilmstripJobHandler::new(LocalFfmpegFilmstripBuilder));
         registry
     }
 
@@ -401,6 +410,63 @@ impl ProxyBuilder for LocalFfmpegProxyBuilder {
     }
 }
 
+pub struct FilmstripJobHandler<B: FilmstripBuilder> {
+    builder: B,
+}
+
+impl<B: FilmstripBuilder> FilmstripJobHandler<B> {
+    pub fn new(builder: B) -> Self {
+        Self { builder }
+    }
+}
+
+impl<B> JobHandler for FilmstripJobHandler<B>
+where
+    B: FilmstripBuilder + 'static,
+{
+    fn job_type(&self) -> &'static str {
+        FILMSTRIP_JOB_TYPE
+    }
+
+    fn run(&self, job: &JobLease) -> Result<Value, JobHandlerError> {
+        let payload: FilmstripJobPayload =
+            serde_json::from_value(job.payload.clone()).map_err(|error| {
+                JobHandlerError::fatal(format!("invalid filmstrip payload: {error}"))
+            })?;
+        let result = self.builder.build_filmstrip(payload)?;
+        serde_json::to_value(result)
+            .map_err(|error| JobHandlerError::fatal(format!("invalid filmstrip result: {error}")))
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct LocalFfmpegFilmstripBuilder;
+
+impl FilmstripBuilder for LocalFfmpegFilmstripBuilder {
+    fn build_filmstrip(
+        &self,
+        payload: FilmstripJobPayload,
+    ) -> Result<FilmstripJobResult, JobHandlerError> {
+        let requested = payload.frames.len();
+        let frames = qnc_media_ffmpeg::filmstrip::build_filmstrip_frame_artifacts_at_paths(
+            &payload.media_path,
+            &payload.frames,
+        )
+        .map_err(JobHandlerError::retryable)?;
+        if frames.len() != requested {
+            return Err(JobHandlerError::retryable(format!(
+                "filmstrip incomplete: {}/{} frames",
+                frames.len(),
+                requested
+            )));
+        }
+        Ok(FilmstripJobResult {
+            duration_sec: payload.duration_sec,
+            frames,
+        })
+    }
+}
+
 fn normalize_job_type(value: &str) -> String {
     value.trim().to_ascii_lowercase()
 }
@@ -501,6 +567,32 @@ mod tests {
         }
     }
 
+    struct FakeFilmstripBuilder;
+
+    impl FilmstripBuilder for FakeFilmstripBuilder {
+        fn build_filmstrip(
+            &self,
+            payload: FilmstripJobPayload,
+        ) -> Result<FilmstripJobResult, JobHandlerError> {
+            Ok(FilmstripJobResult {
+                duration_sec: payload.duration_sec,
+                frames: payload
+                    .frames
+                    .into_iter()
+                    .map(|frame| qnc_service_contracts::FilmstripFrameArtifact {
+                        index: frame.index,
+                        seek_sec: frame.seek_sec,
+                        artifact: qnc_service_contracts::ArtifactRef {
+                            path: frame.output_path,
+                            media_type: "image/jpeg".into(),
+                            render_version: None,
+                        },
+                    })
+                    .collect(),
+            })
+        }
+    }
+
     #[test]
     fn requested_capabilities_are_limited_to_registered_handlers() {
         let config = WorkerConfig::new(
@@ -592,5 +684,39 @@ mod tests {
         let decoded: ProxyGenerateJobResult = serde_json::from_value(result).unwrap();
         assert_eq!(decoded.output_path, output_path);
         assert!(decoded.probe.is_none());
+    }
+
+    #[test]
+    fn filmstrip_handler_roundtrips_payload_and_result() {
+        let handler = FilmstripJobHandler::new(FakeFilmstripBuilder);
+        let output_path = PathBuf::from("C:/qnc/project/filmstrip/clip_a/000_0_00.jpg");
+        let payload = FilmstripJobPayload {
+            media_path: PathBuf::from("C:/qnc/project/proxy/clip_a.mp4"),
+            duration_sec: 13.0,
+            frames: vec![qnc_service_contracts::FilmstripJobFrame {
+                index: 0,
+                seek_sec: 0.0,
+                output_path: output_path.clone(),
+            }],
+        };
+        let job = JobLease {
+            job_id: "filmstrip:filmstrip:clip_a".into(),
+            project_id: "project_a".into(),
+            job_type: FILMSTRIP_JOB_TYPE.into(),
+            source_id: "filmstrip".into(),
+            clip_id: "clip_a".into(),
+            worker_id: "worker_a".into(),
+            lease_id: "lease_a".into(),
+            lease_until_unix_ms: 123,
+            attempts: 1,
+            queued_at: None,
+            payload: serde_json::to_value(payload).unwrap(),
+        };
+
+        let result = handler.run(&job).unwrap();
+        let decoded: FilmstripJobResult = serde_json::from_value(result).unwrap();
+        assert_eq!(decoded.duration_sec, 13.0);
+        assert_eq!(decoded.frames.len(), 1);
+        assert_eq!(decoded.frames[0].artifact.path, output_path);
     }
 }

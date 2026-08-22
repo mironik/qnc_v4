@@ -1,3 +1,4 @@
+pub mod filmstrip;
 pub mod proxy;
 
 use std::collections::BTreeMap;

@@ -4,9 +4,9 @@ use std::process::Command;
 use async_trait::async_trait;
 use qnc_service_contracts::{
     ArtifactRef, AudioProbe, AudioProbeRequest, AudioWrapRequest, ExtractRangeRequest,
-    FilmstripFrameArtifact, FilmstripRequest, FrameExtractRequest, FrameTimebase, MediaLocator,
-    MediaProbe, MediaProcessor, MediaRef, PosterExtractRequest, ProxyBuildRequest, ScanMode,
-    ServiceError, ServiceResult, WaveformPeaks, WaveformRequest,
+    FilmstripFrameArtifact, FilmstripJobFrame, FilmstripRequest, FrameExtractRequest,
+    FrameTimebase, MediaLocator, MediaProbe, MediaProcessor, MediaRef, PosterExtractRequest,
+    ProxyBuildRequest, ScanMode, ServiceError, ServiceResult, WaveformPeaks, WaveformRequest,
 };
 
 use crate::ingest::{audio_wrap, proxy_generate, thumb};
@@ -123,33 +123,20 @@ impl MediaProcessor for LocalFfmpegMediaProcessor {
                 .collect();
 
             if !missing.is_empty() {
-                let batch_seeks: Vec<f64> = missing.iter().map(|&index| seeks[index]).collect();
-                let batch_outputs: Vec<PathBuf> = missing
+                let frame_requests: Vec<FilmstripJobFrame> = seeks
                     .iter()
-                    .map(|&index| outputs[index].clone())
+                    .enumerate()
+                    .map(|(index, seek_sec)| FilmstripJobFrame {
+                        index,
+                        seek_sec: *seek_sec,
+                        output_path: outputs[index].clone(),
+                    })
                     .collect();
-                let results =
-                    thumb::extract_filmstrip_frames_at_seeks(&source, &batch_seeks, &batch_outputs);
-                for (slot, result) in missing.iter().zip(results.into_iter()) {
-                    let index = *slot;
-                    let sec = seeks[index];
-                    let out = &outputs[index];
-                    let ok = match result {
-                        Ok(()) if file_ready(out) => true,
-                        _ => {
-                            thumb::extract_poster_jpeg_at_seek_cpu(&source, out, sec).is_ok()
-                                && file_ready(out)
-                        }
-                    };
-                    if !ok {
-                        tracing::warn!(
-                            "filmstrip: frame missing source={} index={} seek={:.2}",
-                            source.display(),
-                            index,
-                            sec
-                        );
-                    }
-                }
+                qnc_media_ffmpeg::filmstrip::build_filmstrip_frame_artifacts_at_paths(
+                    &source,
+                    &frame_requests,
+                )
+                .map_err(|message| ServiceError::new("filmstrip_failed", message))?;
             }
 
             let frames: Vec<FilmstripFrameArtifact> = seeks

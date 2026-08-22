@@ -177,6 +177,40 @@ pub async fn build_for_clip(
     Ok(())
 }
 
+pub(crate) fn save_built_filmstrip_frames(
+    paths: &ProjectPaths,
+    project_db: &ProjectDbBroker,
+    project_id: &str,
+    clip_id: &str,
+    duration: f64,
+    frames: &[FilmstripFrame],
+    seeks: &[f64],
+) -> Result<(), String> {
+    if frames.is_empty() {
+        mark_status(
+            paths,
+            project_db,
+            project_id,
+            clip_id,
+            "error",
+            "filmstrip: nema kadrova",
+        )?;
+        return Err("filmstrip: nema kadrova".into());
+    }
+    if !built_frames_cover_seeks(frames, seeks) {
+        let msg = format!(
+            "filmstrip: nepotpun set kadrova {}/{}",
+            frames.len(),
+            seeks.len()
+        );
+        save_progress(
+            paths, project_db, project_id, clip_id, duration, frames, &msg,
+        )?;
+        return Err(msg);
+    }
+    save_ready(paths, project_db, project_id, clip_id, duration, frames, "")
+}
+
 fn mark_status(
     paths: &ProjectPaths,
     project_db: &ProjectDbBroker,

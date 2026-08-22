@@ -19,8 +19,8 @@ Vanjski worker za teske artifact poslove pokrece se zasebno:
 .\run_worker.ps1
 ```
 
-Default capability je `proxy_generate`; `QNC_WORKER_CAPABILITIES` moze zadati
-drugi popis kad dodamo nove vanjske workere.
+Default capabilities su `proxy_generate,filmstrip`; `QNC_WORKER_CAPABILITIES`
+moze zadati drugi popis za specijalizirane workere.
 
 LAN: `QNC_BIND_HOST=0.0.0.0` zahtijeva `QNC_TRUSTED_LAN=1`. Internet bez auth/proxy **nije** podržan.
 
