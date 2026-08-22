@@ -5,7 +5,8 @@ use std::time::Duration;
 
 use qnc_service_contracts::{
     JobAck, JobClaimRequest, JobClaimResponse, JobCompleteRequest, JobFailRequest,
-    JobHeartbeatRequest, JobHeartbeatResponse, JobLease,
+    JobHeartbeatRequest, JobHeartbeatResponse, JobLease, ProxyGenerateJobPayload,
+    ProxyGenerateJobResult,
 };
 use serde::{de::DeserializeOwned, Serialize};
 use serde_json::{json, Value};
@@ -14,6 +15,7 @@ pub const DEFAULT_HOST_URL: &str = "http://127.0.0.1:8001";
 pub const DEFAULT_POLL_MS: u64 = 500;
 pub const DEFAULT_LEASE_MS: u64 = 30_000;
 pub const SMOKE_JOB_TYPE: &str = "qnc_worker_smoke";
+pub const PROXY_GENERATE_JOB_TYPE: &str = "proxy_generate";
 
 #[derive(Debug, Clone)]
 pub struct WorkerConfig {
@@ -87,6 +89,13 @@ pub trait WorkerHost: Send + Sync {
 pub trait JobHandler: Send + Sync {
     fn job_type(&self) -> &'static str;
     fn run(&self, job: &JobLease) -> Result<Value, JobHandlerError>;
+}
+
+pub trait ProxyBuilder: Send + Sync {
+    fn build_proxy(
+        &self,
+        payload: ProxyGenerateJobPayload,
+    ) -> Result<ProxyGenerateJobResult, JobHandlerError>;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -344,6 +353,33 @@ impl JobHandler for SmokeJobHandler {
     }
 }
 
+pub struct ProxyGenerateJobHandler<B: ProxyBuilder> {
+    builder: B,
+}
+
+impl<B: ProxyBuilder> ProxyGenerateJobHandler<B> {
+    pub fn new(builder: B) -> Self {
+        Self { builder }
+    }
+}
+
+impl<B> JobHandler for ProxyGenerateJobHandler<B>
+where
+    B: ProxyBuilder + 'static,
+{
+    fn job_type(&self) -> &'static str {
+        PROXY_GENERATE_JOB_TYPE
+    }
+
+    fn run(&self, job: &JobLease) -> Result<Value, JobHandlerError> {
+        let payload: ProxyGenerateJobPayload = serde_json::from_value(job.payload.clone())
+            .map_err(|error| JobHandlerError::fatal(format!("invalid proxy payload: {error}")))?;
+        let result = self.builder.build_proxy(payload)?;
+        serde_json::to_value(result)
+            .map_err(|error| JobHandlerError::fatal(format!("invalid proxy result: {error}")))
+    }
+}
+
 fn normalize_job_type(value: &str) -> String {
     value.trim().to_ascii_lowercase()
 }
@@ -351,6 +387,7 @@ fn normalize_job_type(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
+    use std::path::PathBuf;
     use std::sync::Mutex;
 
     use super::*;
@@ -429,6 +466,20 @@ mod tests {
         }
     }
 
+    struct FakeProxyBuilder;
+
+    impl ProxyBuilder for FakeProxyBuilder {
+        fn build_proxy(
+            &self,
+            payload: ProxyGenerateJobPayload,
+        ) -> Result<ProxyGenerateJobResult, JobHandlerError> {
+            Ok(ProxyGenerateJobResult {
+                output_path: payload.output_path,
+                probe: None,
+            })
+        }
+    }
+
     #[test]
     fn requested_capabilities_are_limited_to_registered_handlers() {
         let config = WorkerConfig::new(
@@ -483,5 +534,36 @@ mod tests {
         assert_eq!(completes.len(), 1);
         assert_eq!(completes[0].job_id, "qnc_worker_smoke:worker:clip_a");
         assert_eq!(completes[0].result["status"], "ok");
+    }
+
+    #[test]
+    fn proxy_generate_handler_roundtrips_payload_and_result() {
+        let handler = ProxyGenerateJobHandler::new(FakeProxyBuilder);
+        let output_path = PathBuf::from("C:/qnc/project/proxy/clip_a.mxf");
+        let payload = ProxyGenerateJobPayload {
+            source_path: PathBuf::from("C:/card/ClipA.MXF"),
+            output_path: output_path.clone(),
+            asset_status: "ready".into(),
+            card_locked: false,
+            original_path: Some(PathBuf::from("C:/card/ClipA.MXF")),
+        };
+        let job = JobLease {
+            job_id: "proxy_generate:card:clip_a".into(),
+            project_id: "project_a".into(),
+            job_type: PROXY_GENERATE_JOB_TYPE.into(),
+            source_id: "card".into(),
+            clip_id: "clip_a".into(),
+            worker_id: "worker_a".into(),
+            lease_id: "lease_a".into(),
+            lease_until_unix_ms: 123,
+            attempts: 1,
+            queued_at: None,
+            payload: serde_json::to_value(payload).unwrap(),
+        };
+
+        let result = handler.run(&job).unwrap();
+        let decoded: ProxyGenerateJobResult = serde_json::from_value(result).unwrap();
+        assert_eq!(decoded.output_path, output_path);
+        assert!(decoded.probe.is_none());
     }
 }
