@@ -13,6 +13,15 @@ cd C:\Users\miron\Projects\qnc_v4
 
 Host je **samo API** (`/api/...`). Nema `/app` HTML/JS.
 
+Vanjski worker za teske artifact poslove pokrece se zasebno:
+
+```powershell
+.\run_worker.ps1
+```
+
+Default capability je `proxy_generate`; `QNC_WORKER_CAPABILITIES` moze zadati
+drugi popis kad dodamo nove vanjske workere.
+
 LAN: `QNC_BIND_HOST=0.0.0.0` zahtijeva `QNC_TRUSTED_LAN=1`. Internet bez auth/proxy **nije** podržan.
 
 ## Struktura

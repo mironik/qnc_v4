@@ -37,6 +37,7 @@ if ($LASTEXITCODE -ne 0) {
 Pop-Location
 Write-Host "QNC API: http://127.0.0.1:$($env:QNC_API_PORT)/api/health"
 Write-Host "Native UI: .\run_app.ps1  (LAN: QNC_BIND_HOST=0.0.0.0 requires QNC_TRUSTED_LAN=1)"
+Write-Host "External worker: .\run_worker.ps1  (default capability: proxy_generate)"
 Write-Host "Host binary: $Bin"
 Write-Host "Root: $Root"
 & $Bin
