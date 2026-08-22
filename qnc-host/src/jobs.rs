@@ -8,8 +8,8 @@ use qnc_service_contracts::{
     JobHeartbeatRequest, JobHeartbeatResponse, JobLease, ProxyGenerateJobPayload,
     ProxyGenerateJobResult,
 };
-use rusqlite::{params, Connection};
-use serde_json::json;
+use rusqlite::{params, Connection, OptionalExtension};
+use serde_json::{json, Value};
 use uuid::Uuid;
 
 use crate::app_state::AppState;
@@ -17,7 +17,7 @@ use crate::ingest::asset_row::IngestAssetRow;
 use crate::ingest::db::{ingest_asset_meta, mark_ingest_job_done, open_ingest};
 use crate::ingest::import_finish::complete_imported_clip;
 use crate::ingest::proxy_generate::proxy_dest_for_source;
-use crate::ingest::store::ingest_probe_from_service;
+use crate::ingest::store::{ingest_probe_from_service, row_import_error};
 use crate::media::{
     find_card_proxy_for_media_path, is_proxy_media_path, resolve_import_plan, ImportMediaMode,
 };
@@ -29,12 +29,14 @@ const MAX_CLAIM_JOBS: usize = 8;
 const DEFAULT_LEASE_MS: u64 = 30_000;
 const MIN_LEASE_MS: u64 = 5_000;
 const MAX_LEASE_MS: u64 = 300_000;
+const SMOKE_JOB_TYPE: &str = "qnc_worker_smoke";
+const PROXY_GENERATE_JOB_TYPE: &str = "proxy_generate";
 const EXTERNAL_CLAIMABLE_JOB_TYPES: &[&str] = &[
     // Protocol canary only. Product artifact jobs are added here only after
     // they have both an external worker handler and a host-side result applier.
     // Proxy generation also requires host preflight that proves no camera/NAS
     // proxy exists; existing camera artefacts are copied/linked before fallback.
-    "qnc_worker_smoke",
+    SMOKE_JOB_TYPE,
 ];
 
 pub fn router() -> Router<AppState> {
@@ -200,12 +202,18 @@ fn claim_jobs_for_project(
             if claimed.len() >= limit {
                 break;
             }
+            if !is_external_claimable_job_type(job_type) {
+                continue;
+            }
             let remaining = limit - claimed.len();
             let rows = queued_jobs_for_type(&conn, job_type, remaining)?;
             for row in rows {
                 if claimed.len() >= limit {
                     break;
                 }
+                let Some(payload) = payload_for_job_claim(paths, &pid, &conn, &row)? else {
+                    continue;
+                };
                 let lease_until = now_ms.saturating_add(claim.lease_ms);
                 let now_text = now_str();
                 let changed = conn
@@ -243,7 +251,7 @@ fn claim_jobs_for_project(
                         lease_until_unix_ms: lease_until,
                         attempts: row.attempts + 1,
                         queued_at: row.queued_at,
-                        payload: json!({}),
+                        payload,
                     });
                 }
             }
@@ -252,7 +260,42 @@ fn claim_jobs_for_project(
     })
 }
 
-#[allow(dead_code)]
+fn payload_for_job_claim(
+    paths: &ProjectPaths,
+    project_id: &str,
+    conn: &Connection,
+    row: &QueuedJobRow,
+) -> Result<Option<Value>, String> {
+    match row.job_type.as_str() {
+        SMOKE_JOB_TYPE => Ok(Some(json!({}))),
+        PROXY_GENERATE_JOB_TYPE => payload_for_proxy_generate_claim(paths, project_id, conn, row),
+        _ => Ok(None),
+    }
+}
+
+fn payload_for_proxy_generate_claim(
+    paths: &ProjectPaths,
+    project_id: &str,
+    conn: &Connection,
+    row: &QueuedJobRow,
+) -> Result<Option<Value>, String> {
+    let asset = read_ingest_asset_row(conn, &row.source_id, &row.clip_id)?;
+    let project = project_settings_snapshot(paths, project_id).unwrap_or_else(|_| json!({}));
+    match proxy_generate_preflight_from_row(paths, project_id, &asset, &project)? {
+        ProxyGeneratePreflight::Generate(payload) => serde_json::to_value(payload)
+            .map(Some)
+            .map_err(|error| error.to_string()),
+        ProxyGeneratePreflight::ExistingProxy { source_path } => {
+            let _ = source_path;
+            Ok(None)
+        }
+        ProxyGeneratePreflight::Skip { reason } => {
+            let _ = reason;
+            Ok(None)
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 enum ProxyGeneratePreflight {
     Generate(ProxyGenerateJobPayload),
@@ -448,7 +491,7 @@ fn heartbeat_jobs(
                        AND worker_id = ?2
                        AND lease_id = ?3
                        AND status = 'processing'
-                       AND job_type = 'qnc_worker_smoke'",
+                       AND job_type IN ('qnc_worker_smoke', 'proxy_generate')",
                     params![
                         job_id,
                         worker_id,
@@ -485,31 +528,57 @@ fn complete_job(
     let lease_id = required_runtime_id("lease_id", &request.lease_id)?;
     let job_id = required_runtime_id("job_id", &request.job_id)?;
     let result_json = serde_json::to_string(&request.result).unwrap_or_else(|_| "{}".into());
-    let now = now_str();
+    let Some(active) = active_lease_job(
+        &paths,
+        &project_db,
+        &project_id,
+        &job_id,
+        &worker_id,
+        &lease_id,
+    )?
+    else {
+        return Ok(JobAck {
+            accepted: false,
+            job_id,
+            message: Some("lease_not_active".into()),
+        });
+    };
 
-    let changed = project_db.serialize_project_write(&project_id, || {
-        let conn = open_ingest(&paths, &project_id).map_err(|e| e.to_string())?;
-        ensure_job_service_schema(&conn).map_err(|e| e.to_string())?;
-        conn.execute(
-            "UPDATE ingest_jobs
-             SET status = 'done',
-                 error = '',
-                 finished_at = ?4,
-                 updated_at = ?4,
-                 worker_id = '',
-                 lease_id = '',
-                 lease_until_ms = 0,
-                 heartbeat_ms = 0,
-                 result_json = ?5
-             WHERE job_id = ?1
-               AND worker_id = ?2
-               AND lease_id = ?3
-               AND status = 'processing'
-               AND job_type = 'qnc_worker_smoke'",
-            params![job_id, worker_id, lease_id, now, result_json],
-        )
-        .map_err(|e| e.to_string())
-    })?;
+    match active.job_type.as_str() {
+        SMOKE_JOB_TYPE => {}
+        PROXY_GENERATE_JOB_TYPE => {
+            let result: ProxyGenerateJobResult =
+                serde_json::from_value(request.result).map_err(|error| {
+                    format!("invalid proxy_generate result for job_id={job_id}: {error}")
+                })?;
+            apply_proxy_generate_result(
+                &paths,
+                &project_db,
+                &project_id,
+                &active.source_id,
+                &active.clip_id,
+                result,
+            )?;
+        }
+        _ => {
+            return Ok(JobAck {
+                accepted: false,
+                job_id,
+                message: Some("unsupported_job_type".into()),
+            });
+        }
+    }
+
+    let changed = finish_active_job_done(
+        &paths,
+        &project_db,
+        &project_id,
+        &job_id,
+        &worker_id,
+        &lease_id,
+        &active.job_type,
+        &result_json,
+    )?;
 
     Ok(JobAck {
         accepted: changed == 1,
@@ -519,6 +588,83 @@ fn complete_job(
         } else {
             Some("lease_not_active".into())
         },
+    })
+}
+
+#[derive(Debug, Clone)]
+struct ActiveLeaseJob {
+    job_type: String,
+    source_id: String,
+    clip_id: String,
+}
+
+fn active_lease_job(
+    paths: &ProjectPaths,
+    project_db: &ProjectDbBroker,
+    project_id: &str,
+    job_id: &str,
+    worker_id: &str,
+    lease_id: &str,
+) -> Result<Option<ActiveLeaseJob>, String> {
+    project_db.serialize_project_write(project_id, || {
+        let conn = open_ingest(paths, project_id).map_err(|e| e.to_string())?;
+        ensure_job_service_schema(&conn).map_err(|e| e.to_string())?;
+        let row = conn
+            .query_row(
+                "SELECT job_type, source_id, clip_id
+                 FROM ingest_jobs
+                 WHERE job_id = ?1
+                   AND worker_id = ?2
+                   AND lease_id = ?3
+                   AND status = 'processing'",
+                params![job_id, worker_id, lease_id],
+                |row| {
+                    Ok(ActiveLeaseJob {
+                        job_type: row.get(0)?,
+                        source_id: row.get(1)?,
+                        clip_id: row.get(2)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(|e| e.to_string())?;
+        Ok(row.filter(|job| is_lease_managed_job_type(&job.job_type)))
+    })
+}
+
+fn finish_active_job_done(
+    paths: &ProjectPaths,
+    project_db: &ProjectDbBroker,
+    project_id: &str,
+    job_id: &str,
+    worker_id: &str,
+    lease_id: &str,
+    job_type: &str,
+    result_json: &str,
+) -> Result<usize, String> {
+    let now = now_str();
+    project_db.serialize_project_write(project_id, || {
+        let conn = open_ingest(paths, project_id).map_err(|e| e.to_string())?;
+        ensure_job_service_schema(&conn).map_err(|e| e.to_string())?;
+        conn.execute(
+            "UPDATE ingest_jobs
+             SET status = 'done',
+                 error = '',
+                 finished_at = ?5,
+                 updated_at = ?5,
+                 worker_id = '',
+                 lease_id = '',
+                 lease_until_ms = 0,
+                 heartbeat_ms = 0,
+                 result_json = ?6
+             WHERE job_id = ?1
+               AND worker_id = ?2
+               AND lease_id = ?3
+               AND job_type = ?4
+               AND status IN ('processing', 'done')",
+            params![job_id, worker_id, lease_id, job_type, now, result_json],
+        )
+        .map_err(|e| e.to_string())
     })
 }
 
@@ -533,6 +679,21 @@ fn fail_job(
     let job_id = required_runtime_id("job_id", &request.job_id)?;
     let error = truncate_error(&request.error);
     let now = now_str();
+    let active = active_lease_job(
+        &paths,
+        &project_db,
+        &project_id,
+        &job_id,
+        &worker_id,
+        &lease_id,
+    )?;
+    let Some(active) = active else {
+        return Ok(JobAck {
+            accepted: false,
+            job_id,
+            message: Some("lease_not_active".into()),
+        });
+    };
 
     let changed = project_db.serialize_project_write(&project_id, || {
         let conn = open_ingest(&paths, &project_id).map_err(|e| e.to_string())?;
@@ -551,8 +712,8 @@ fn fail_job(
                    AND worker_id = ?2
                    AND lease_id = ?3
                    AND status = 'processing'
-                   AND job_type = 'qnc_worker_smoke'",
-                params![job_id, worker_id, lease_id, error, now],
+                   AND job_type = ?6",
+                params![job_id, worker_id, lease_id, error, now, &active.job_type],
             )
         } else {
             conn.execute(
@@ -569,12 +730,20 @@ fn fail_job(
                    AND worker_id = ?2
                    AND lease_id = ?3
                    AND status = 'processing'
-                   AND job_type = 'qnc_worker_smoke'",
-                params![job_id, worker_id, lease_id, error, now],
+                   AND job_type = ?6",
+                params![job_id, worker_id, lease_id, error, now, &active.job_type],
             )
         }
         .map_err(|e| e.to_string())
     })?;
+
+    if changed == 1 && !request.retryable && active.job_type == PROXY_GENERATE_JOB_TYPE {
+        project_db.serialize_project_write(&project_id, || {
+            let conn = open_ingest(&paths, &project_id).map_err(|e| e.to_string())?;
+            row_import_error(&conn, &active.source_id, &active.clip_id, &error)
+                .map_err(|e| e.to_string())
+        })?;
+    }
 
     Ok(JobAck {
         accepted: changed == 1,
@@ -721,6 +890,10 @@ fn is_external_claimable_job_type(job_type: &str) -> bool {
     EXTERNAL_CLAIMABLE_JOB_TYPES.contains(&job_type)
 }
 
+fn is_lease_managed_job_type(job_type: &str) -> bool {
+    matches!(job_type, SMOKE_JOB_TYPE | PROXY_GENERATE_JOB_TYPE)
+}
+
 fn normalize_lease_ms(value: Option<u64>) -> u64 {
     value
         .unwrap_or(DEFAULT_LEASE_MS)
@@ -829,6 +1002,30 @@ mod tests {
         }
     }
 
+    fn lease_job(
+        conn: &Connection,
+        job_type: &str,
+        source_id: &str,
+        clip_id: &str,
+        worker_id: &str,
+        lease_id: &str,
+    ) {
+        queue_ingest_job(conn, job_type, source_id, clip_id).unwrap();
+        ensure_job_service_schema(conn).unwrap();
+        let job_id = crate::ingest::db::ingest_job_id(job_type, source_id, clip_id);
+        conn.execute(
+            "UPDATE ingest_jobs
+             SET status = 'processing',
+                 worker_id = ?2,
+                 lease_id = ?3,
+                 lease_until_ms = 999999999,
+                 heartbeat_ms = 123
+             WHERE job_id = ?1",
+            params![job_id, worker_id, lease_id],
+        )
+        .unwrap();
+    }
+
     #[test]
     fn proxy_preflight_uses_camera_proxy_before_generate() {
         let paths = test_paths("proxy_preflight_existing");
@@ -919,6 +1116,98 @@ mod tests {
         assert_eq!(row.1, proxy.to_string_lossy());
         assert_eq!(row.2, 50.0);
         assert_eq!(proxy_status, "done");
+    }
+
+    #[test]
+    fn proxy_generate_complete_route_applies_result_and_clears_lease() {
+        let paths = test_paths("proxy_complete_route");
+        let broker = ProjectDbBroker::new(paths.clone());
+        let project_dir = paths.project_dir("project_a");
+        let original = touch(project_dir.join("card").join("Clip0003.MXF"));
+        let proxy = touch(project_dir.join("proxy").join("clip0003.mxf"));
+        let conn = open_ingest(&paths, "project_a").unwrap();
+        conn.execute(
+            "INSERT INTO ingest_assets
+                (source_id, clip_id, name, media_id, source_path, original_path,
+                 import_status, status, file_extension)
+             VALUES ('card', 'clip0003', 'Clip0003', 'clip0003', ?1, ?1,
+                     'generating_proxy', 'generating_proxy', 'mxf')",
+            params![original.to_string_lossy().as_ref()],
+        )
+        .unwrap();
+        lease_job(
+            &conn,
+            PROXY_GENERATE_JOB_TYPE,
+            "card",
+            "clip0003",
+            "worker_a",
+            "lease_a",
+        );
+        drop(conn);
+
+        let heartbeat = heartbeat_jobs(
+            paths.clone(),
+            broker.clone(),
+            JobHeartbeatRequest {
+                worker_id: "worker_a".into(),
+                project_id: "project_a".into(),
+                lease_id: "lease_a".into(),
+                job_ids: vec![crate::ingest::db::ingest_job_id(
+                    PROXY_GENERATE_JOB_TYPE,
+                    "card",
+                    "clip0003",
+                )],
+                lease_ms: Some(10_000),
+            },
+        )
+        .unwrap();
+        assert_eq!(heartbeat.accepted.len(), 1);
+        assert!(heartbeat.rejected.is_empty());
+
+        let result = ProxyGenerateJobResult {
+            output_path: proxy.clone(),
+            probe: Some(test_probe()),
+        };
+        let job_id = crate::ingest::db::ingest_job_id(PROXY_GENERATE_JOB_TYPE, "card", "clip0003");
+        let ack = complete_job(
+            paths.clone(),
+            broker,
+            JobCompleteRequest {
+                worker_id: "worker_a".into(),
+                project_id: "project_a".into(),
+                lease_id: "lease_a".into(),
+                job_id: job_id.clone(),
+                result: serde_json::to_value(result).unwrap(),
+            },
+        )
+        .unwrap();
+        assert!(ack.accepted);
+
+        let conn = open_ingest(&paths, "project_a").unwrap();
+        let asset: (String, String, f64) = conn
+            .query_row(
+                "SELECT import_status, project_proxy_path, fps
+                 FROM ingest_assets
+                 WHERE source_id = 'card' AND clip_id = 'clip0003'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        let job: (String, String, String, String) = conn
+            .query_row(
+                "SELECT status, worker_id, lease_id, result_json
+                 FROM ingest_jobs WHERE job_id = ?1",
+                params![job_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(asset.0, "imported");
+        assert_eq!(asset.1, proxy.to_string_lossy());
+        assert_eq!(asset.2, 50.0);
+        assert_eq!(job.0, "done");
+        assert!(job.1.is_empty());
+        assert!(job.2.is_empty());
+        assert!(job.3.contains("clip0003.mxf"));
     }
 
     #[test]
