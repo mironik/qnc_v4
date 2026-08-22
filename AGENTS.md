@@ -119,6 +119,11 @@ projektu za projektnu istinu, te runtime cache samo za brze, ne-trajne statuse.
   javni model. Kanonski red je postojeci `ingest_jobs`, a vanjski procesi
   komuniciraju kroz host `JobService` API (`claim`, `heartbeat`, `complete`,
   `fail`) i `ProjectDbBroker`.
+- Produkcijski artifact job (`proxy_generate`, filmstrip, waveform, poster,
+  audio wrap) ne smije biti dodan u external claim allowlist dok istodobno ne
+  postoje worker handler i host-side result applier koji zapisuje isti SQLite
+  status kao postojeci interni worker. U suprotnom vanjski proces moze
+  oznaciti posao gotovim bez stvarnog artefakta.
 - Dok je playback aktivan ili se tek otvara/priprema input, teški workeri ne
   smiju claimati posao. Host `playback_active`/background gate ima prednost nad
   recoveryjem, proxyjem, filmstripom, waveformom i ostalim pozadinskim poslom.

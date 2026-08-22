@@ -20,6 +20,11 @@ const MAX_CLAIM_JOBS: usize = 8;
 const DEFAULT_LEASE_MS: u64 = 30_000;
 const MIN_LEASE_MS: u64 = 5_000;
 const MAX_LEASE_MS: u64 = 300_000;
+const EXTERNAL_CLAIMABLE_JOB_TYPES: &[&str] = &[
+    // Protocol canary only. Product artifact jobs are added here only after
+    // they have both an external worker handler and a host-side result applier.
+    "qnc_worker_smoke",
+];
 
 pub fn router() -> Router<AppState> {
     Router::new()
@@ -270,7 +275,7 @@ fn heartbeat_jobs(
                        AND worker_id = ?2
                        AND lease_id = ?3
                        AND status = 'processing'
-                       AND job_type IN ('proxy_generate', 'thumb_card', 'thumb_proxy')",
+                       AND job_type = 'qnc_worker_smoke'",
                     params![
                         job_id,
                         worker_id,
@@ -327,7 +332,7 @@ fn complete_job(
                AND worker_id = ?2
                AND lease_id = ?3
                AND status = 'processing'
-               AND job_type IN ('proxy_generate', 'thumb_card', 'thumb_proxy')",
+               AND job_type = 'qnc_worker_smoke'",
             params![job_id, worker_id, lease_id, now, result_json],
         )
         .map_err(|e| e.to_string())
@@ -373,7 +378,7 @@ fn fail_job(
                    AND worker_id = ?2
                    AND lease_id = ?3
                    AND status = 'processing'
-                   AND job_type IN ('proxy_generate', 'thumb_card', 'thumb_proxy')",
+                   AND job_type = 'qnc_worker_smoke'",
                 params![job_id, worker_id, lease_id, error, now],
             )
         } else {
@@ -391,7 +396,7 @@ fn fail_job(
                    AND worker_id = ?2
                    AND lease_id = ?3
                    AND status = 'processing'
-                   AND job_type IN ('proxy_generate', 'thumb_card', 'thumb_proxy')",
+                   AND job_type = 'qnc_worker_smoke'",
                 params![job_id, worker_id, lease_id, error, now],
             )
         }
@@ -540,7 +545,7 @@ fn normalize_capabilities(values: Vec<String>) -> Vec<String> {
 }
 
 fn is_external_claimable_job_type(job_type: &str) -> bool {
-    matches!(job_type, "proxy_generate" | "thumb_card" | "thumb_proxy")
+    EXTERNAL_CLAIMABLE_JOB_TYPES.contains(&job_type)
 }
 
 fn normalize_lease_ms(value: Option<u64>) -> u64 {
@@ -613,18 +618,23 @@ mod tests {
     }
 
     #[test]
-    fn claim_uses_existing_ingest_jobs_and_skips_import_jobs() {
+    fn claim_uses_existing_ingest_jobs_and_skips_internal_jobs() {
         let paths = test_paths("claim");
         let broker = ProjectDbBroker::new(paths.clone());
         let conn = open_ingest(&paths, "project_a").unwrap();
         queue_ingest_job(&conn, "import", "card", "clip_a").unwrap();
         queue_ingest_job(&conn, "proxy_generate", "card", "clip_a").unwrap();
+        queue_ingest_job(&conn, "qnc_worker_smoke", "worker", "clip_a").unwrap();
         drop(conn);
 
         let claim = NormalizedClaim::from_request(JobClaimRequest {
             worker_id: "worker_a".into(),
             project_id: Some("project_a".into()),
-            capabilities: vec!["import".into(), "proxy_generate".into()],
+            capabilities: vec![
+                "import".into(),
+                "proxy_generate".into(),
+                "qnc_worker_smoke".into(),
+            ],
             max_jobs: Some(4),
             lease_ms: Some(10_000),
         })
@@ -632,15 +642,26 @@ mod tests {
 
         let jobs = claim_jobs(paths.clone(), broker.clone(), claim).unwrap();
         assert_eq!(jobs.len(), 1);
-        assert_eq!(jobs[0].job_type, "proxy_generate");
+        assert_eq!(jobs[0].job_type, "qnc_worker_smoke");
         assert_eq!(jobs[0].project_id, "project_a");
         assert!(!jobs[0].lease_id.is_empty());
 
         let conn = open_ingest(&paths, "project_a").unwrap();
-        let proxy_status: String = conn
+        let smoke_status: String = conn
             .query_row(
                 "SELECT status FROM ingest_jobs WHERE job_id = ?1",
                 params![jobs[0].job_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let proxy_status: String = conn
+            .query_row(
+                "SELECT status FROM ingest_jobs WHERE job_id = ?1",
+                params![crate::ingest::db::ingest_job_id(
+                    "proxy_generate",
+                    "card",
+                    "clip_a"
+                )],
                 |row| row.get(0),
             )
             .unwrap();
@@ -651,7 +672,8 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(proxy_status, "processing");
+        assert_eq!(smoke_status, "processing");
+        assert_eq!(proxy_status, "queued");
         assert_eq!(import_status, "queued");
     }
 
@@ -660,13 +682,13 @@ mod tests {
         let paths = test_paths("complete");
         let broker = ProjectDbBroker::new(paths.clone());
         let conn = open_ingest(&paths, "project_a").unwrap();
-        queue_ingest_job(&conn, "thumb_proxy", "card", "clip_a").unwrap();
+        queue_ingest_job(&conn, "qnc_worker_smoke", "worker", "clip_a").unwrap();
         drop(conn);
 
         let claim = NormalizedClaim::from_request(JobClaimRequest {
             worker_id: "worker_a".into(),
             project_id: Some("project_a".into()),
-            capabilities: vec!["thumb_proxy".into()],
+            capabilities: vec!["qnc_worker_smoke".into()],
             max_jobs: Some(1),
             lease_ms: Some(10_000),
         })

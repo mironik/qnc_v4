@@ -1,0 +1,17 @@
+[package]
+name = "qnc-worker"
+version = "0.5.0"
+edition = "2021"
+description = "External QNC background worker process for host JobService jobs"
+publish = false
+
+[[bin]]
+name = "qnc-worker"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive", "env"] }
+qnc-service-contracts = { path = "../qnc-service-contracts" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ureq = { version = "2", features = ["json"] }

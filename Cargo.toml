@@ -4,6 +4,7 @@ exclude = ["qnc-client"]
 members = [
     "qnc-service-contracts",
     "qnc-host",
+    "qnc-worker",
     "qnc-app",
     "qnc-broadcast-player",
     "qnc-media-ffmpeg",
