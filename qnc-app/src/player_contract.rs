@@ -7,6 +7,30 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
 pub struct FrameNumber(pub i64);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct BroadcastSourceTimebase {
+    pub fps_num: u32,
+    pub fps_den: u32,
+}
+
+impl BroadcastSourceTimebase {
+    pub fn from_i64(fps_num: i64, fps_den: i64) -> Option<Self> {
+        let fps_num = u32::try_from(fps_num).ok()?;
+        let fps_den = u32::try_from(fps_den).ok()?;
+        let timebase = Self { fps_num, fps_den };
+        timebase.is_valid().then_some(timebase)
+    }
+
+    pub fn is_valid(self) -> bool {
+        self.fps_num > 0 && self.fps_den > 0
+    }
+
+    pub fn fps(self) -> Option<f64> {
+        self.is_valid()
+            .then_some(f64::from(self.fps_num) / f64::from(self.fps_den))
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BroadcastSourceKind {
     VideoAndAudio,

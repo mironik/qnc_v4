@@ -225,7 +225,9 @@ pub struct TimelineInteract {
     pub expand_click: Option<ExpandedAudio>,
     pub select_virtual: Option<String>,
     pub select_cover: Option<String>,
+    pub select_cover_frame: Option<i64>,
     pub select_marker_slot: Option<String>,
+    pub select_marker_slot_frame: Option<i64>,
     pub select_marker: Option<String>,
 }
 
@@ -624,9 +626,11 @@ fn merge_interact(out: &mut TimelineInteract, update: TimelineInteract) {
     }
     if out.select_cover.is_none() {
         out.select_cover = update.select_cover;
+        out.select_cover_frame = update.select_cover_frame;
     }
     if out.select_marker_slot.is_none() {
         out.select_marker_slot = update.select_marker_slot;
+        out.select_marker_slot_frame = update.select_marker_slot_frame;
     }
     if out.select_virtual.is_none() {
         out.select_virtual = update.select_virtual;
@@ -823,21 +827,25 @@ fn pointer_interact(
     }
 
     if response.clicked() {
+        let clicked_frame = frame_from_pos(inner, duration_frames, pos);
         if let Some(id) = marker_hit(inner, duration_frames, pos, markers) {
             out.select_marker = Some(id.to_string());
+            out.seek_frame = clicked_frame;
             return out;
         }
         if let Some(id) = cover_hit(inner, duration_frames, pos, covers) {
             out.select_cover = Some(id.to_string());
+            out.select_cover_frame = clicked_frame;
             return out;
         }
         if let Some(id) = marker_slot_hit(inner, duration_frames, pos, slots) {
             out.select_marker_slot = Some(id.to_string());
+            out.select_marker_slot_frame = clicked_frame;
             return out;
         }
         if let Some(id) = virtual_span_hit(inner, duration_frames, pos, virtual_spans) {
             out.select_virtual = Some(id.to_string());
-            out.seek_frame = frame_from_pos(inner, duration_frames, pos);
+            out.seek_frame = clicked_frame;
             return out;
         }
     }
@@ -1138,5 +1146,26 @@ mod tests {
             Some("virtual_b")
         );
         assert_eq!(frame_from_pos(area, 100, egui::pos2(30.0, 30.0)), Some(30));
+    }
+
+    #[test]
+    fn marker_slot_hit_uses_full_timeline_row_height() {
+        let area = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), Vec2::new(100.0, 60.0));
+        let slots = [TimelineSlotSpan {
+            id: "slot_mid",
+            start_frame: 10,
+            end_frame: 40,
+            has_cover: false,
+            selected: false,
+        }];
+
+        assert_eq!(
+            marker_slot_hit(area, 100, egui::pos2(25.0, 6.0), &slots),
+            Some("slot_mid")
+        );
+        assert_eq!(
+            marker_slot_hit(area, 100, egui::pos2(25.0, 54.0), &slots),
+            Some("slot_mid")
+        );
     }
 }

@@ -1,32 +1,22 @@
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use tracing::{info, warn};
 
 use crate::background_work::BackgroundWorkGate;
-use crate::ingest::db::{open_ingest, queue_ingest_job, reset_processing_ingest_jobs_for_type};
-use crate::ingest::thumb_process::generate_thumbs_from_proxy;
+use crate::ingest::db::{
+    open_ingest, queue_ingest_job, set_poster_proxy_generation_approved, set_thumb_status,
+};
 use crate::project::db::ProjectPaths;
-use crate::project::{list_project_ids, ProjectDbBroker};
-use qnc_service_contracts::MediaProcessor;
-
-#[derive(Clone)]
-struct ProxyThumbJob {
-    project_id: String,
-    clip_ids: Vec<String>,
-}
+use crate::project::ProjectDbBroker;
 
 #[derive(Clone)]
 pub struct PosterWorker {
     paths: ProjectPaths,
     project_db: ProjectDbBroker,
     background: BackgroundWorkGate,
-    media_processor: Arc<dyn MediaProcessor>,
-    pending: Arc<Mutex<Vec<ProxyThumbJob>>>,
     blocked: Arc<Mutex<HashSet<String>>>,
-    in_flight: Arc<AtomicUsize>,
 }
 
 impl PosterWorker {
@@ -34,28 +24,16 @@ impl PosterWorker {
         paths: ProjectPaths,
         project_db: ProjectDbBroker,
         background: BackgroundWorkGate,
-        media_processor: Arc<dyn MediaProcessor>,
     ) -> Self {
         Self {
             paths,
             project_db,
             background,
-            media_processor,
-            pending: Arc::new(Mutex::new(Vec::new())),
             blocked: Arc::new(Mutex::new(HashSet::new())),
-            in_flight: Arc::new(AtomicUsize::new(0)),
         }
     }
 
-    pub async fn wait_drained(&self, max_ms: u64) {
-        let deadline = Instant::now() + Duration::from_millis(max_ms);
-        while self.in_flight.load(Ordering::Acquire) > 0 {
-            if Instant::now() >= deadline {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-    }
+    pub async fn wait_drained(&self, _max_ms: u64) {}
 
     pub fn block_project(&self, project_id: &str) {
         let pid = project_id.trim();
@@ -66,8 +44,6 @@ impl PosterWorker {
             .lock()
             .expect("thumb block")
             .insert(pid.to_string());
-        let mut q = self.pending.lock().expect("proxy thumb queue");
-        q.retain(|j| j.project_id != pid);
     }
 
     fn is_blocked(&self, project_id: &str) -> bool {
@@ -77,7 +53,7 @@ impl PosterWorker {
             .contains(project_id)
     }
 
-    /// Proces 2: generiranje postera iz proxya (orchestrator nakon copy-card).
+    /// Proces 2: eksplicitno odobreno generiranje postera iz proxya.
     pub fn enqueue_proxy_generate(&self, project_id: &str, clip_ids: &[String]) {
         let pid = project_id.trim();
         if pid.is_empty() || self.is_blocked(pid) {
@@ -97,53 +73,14 @@ impl PosterWorker {
                 pid, err
             );
         }
-        self.pending
-            .lock()
-            .expect("proxy thumb queue")
-            .push(ProxyThumbJob {
-                project_id: pid.to_string(),
-                clip_ids: ids,
-            });
     }
 
     pub fn enqueue_recoverable_projects(&self) -> Result<usize, String> {
-        let project_ids = self
-            .project_db
-            .with_global(|global| list_project_ids(global).map_err(|e| e.to_string()))?;
-        let mut queued = 0usize;
-        for project_id in project_ids {
-            if self.is_blocked(&project_id) {
-                continue;
-            }
-            let count: i64 = self.project_db.serialize_project_write(&project_id, || {
-                let conn = open_ingest(&self.paths, &project_id).map_err(|e| e.to_string())?;
-                reset_processing_ingest_jobs_for_type(&conn, "thumb_proxy")
-                    .map_err(|e| e.to_string())?;
-                let count = conn
-                    .query_row(
-                        "SELECT COUNT(*) FROM ingest_assets
-                         WHERE thumb_status IN ('pending', 'processing', 'no_card_thumb', 'error')
-                           AND (
-                                import_status IN ('imported', 'done')
-                                OR project_proxy_path != ''
-                                OR proxy_path != ''
-                                OR card_thumb_path != ''
-                           )",
-                        [],
-                        |r| r.get(0),
-                    )
-                    .unwrap_or(0);
-                Ok(count)
-            })?;
-            if count > 0 {
-                self.enqueue_proxy_generate(&project_id, &[]);
-                queued += 1;
-            }
-        }
-        Ok(queued)
+        Ok(0)
     }
 
     pub fn spawn(self: Arc<Self>) {
+        info!("ingest proxy thumbs: scheduler only; external JobService owner");
         tokio::spawn(async move {
             let mut last_recover = Instant::now();
             loop {
@@ -151,66 +88,13 @@ impl PosterWorker {
                     tokio::time::sleep(Duration::from_millis(250)).await;
                     continue;
                 }
-                let batch: Vec<ProxyThumbJob> = {
-                    let mut q = self.pending.lock().expect("proxy thumb queue");
-                    if q.is_empty() {
-                        Vec::new()
-                    } else {
-                        q.drain(..).collect()
-                    }
-                };
-                if batch.is_empty() {
-                    if last_recover.elapsed() >= Duration::from_secs(8) {
-                        let _ = self.enqueue_recoverable_projects();
-                        last_recover = Instant::now();
-                    }
-                    tokio::time::sleep(Duration::from_millis(250)).await;
-                    continue;
+                if last_recover.elapsed() >= Duration::from_secs(8) {
+                    let _ = self.enqueue_recoverable_projects();
+                    last_recover = Instant::now();
                 }
-                for job in batch {
-                    if self.is_blocked(&job.project_id) {
-                        continue;
-                    }
-                    let worker = self.clone();
-                    let in_flight = worker.in_flight.clone();
-                    let pid_log = job.project_id.clone();
-                    let clip_ids = job.clip_ids.clone();
-                    in_flight.fetch_add(1, Ordering::AcqRel);
-                    let result = worker
-                        .process_proxy_generate(&job.project_id, &clip_ids)
-                        .await;
-                    in_flight.fetch_sub(1, Ordering::AcqRel);
-                    match result {
-                        Ok(count) if count > 0 => {
-                            info!(
-                                "ingest proxy thumbs: project={} processed={}",
-                                pid_log, count
-                            );
-                        }
-                        Ok(_) => {}
-                        Err(e) => warn!("ingest proxy thumbs: project={} err={}", pid_log, e),
-                    }
-                }
+                tokio::time::sleep(Duration::from_millis(250)).await;
             }
         });
-    }
-
-    async fn process_proxy_generate(
-        &self,
-        project_id: &str,
-        clip_ids: &[String],
-    ) -> Result<usize, String> {
-        if self.is_blocked(project_id) {
-            return Ok(0);
-        }
-        generate_thumbs_from_proxy(
-            &self.paths,
-            &self.project_db,
-            self.media_processor.clone(),
-            project_id,
-            clip_ids,
-        )
-        .await
     }
 
     fn queue_thumb_jobs(&self, project_id: &str, clip_ids: &[String]) -> Result<(), String> {
@@ -219,7 +103,7 @@ impl PosterWorker {
             let mut stmt = conn
                 .prepare(
                     "SELECT source_id, clip_id FROM ingest_assets
-                     WHERE thumb_status IN ('pending', 'processing', 'no_card_thumb', 'error')
+                     WHERE thumb_status IN ('no_card_thumb', 'error')
                        AND (
                             import_status IN ('imported', 'done')
                             OR project_proxy_path != ''
@@ -234,6 +118,10 @@ impl PosterWorker {
                 .map_err(|e| e.to_string())?;
             for row in rows {
                 let (source_id, clip_id) = row.map_err(|e| e.to_string())?;
+                set_poster_proxy_generation_approved(&conn, &source_id, &clip_id, true)
+                    .map_err(|e| e.to_string())?;
+                set_thumb_status(&conn, &source_id, &clip_id, "pending", "")
+                    .map_err(|e| e.to_string())?;
                 queue_ingest_job(&conn, "thumb_proxy", &source_id, &clip_id)
                     .map_err(|e| e.to_string())?;
             }
@@ -242,16 +130,97 @@ impl PosterWorker {
         for clip_id in clip_ids {
             let source_id: String = conn
                 .query_row(
-                    "SELECT source_id FROM ingest_assets WHERE clip_id = ?1 ORDER BY source_id LIMIT 1",
+                    "SELECT source_id FROM ingest_assets
+                     WHERE clip_id = ?1 AND thumb_status != 'ready'
+                     ORDER BY source_id LIMIT 1",
                     rusqlite::params![clip_id],
                     |r| r.get(0),
                 )
                 .unwrap_or_default();
             if !source_id.trim().is_empty() {
+                set_poster_proxy_generation_approved(&conn, &source_id, clip_id, true)
+                    .map_err(|e| e.to_string())?;
+                set_thumb_status(&conn, &source_id, clip_id, "pending", "")
+                    .map_err(|e| e.to_string())?;
                 queue_ingest_job(&conn, "thumb_proxy", &source_id, clip_id)
                     .map_err(|e| e.to_string())?;
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ingest::db::{ingest_job_id, poster_proxy_generation_approved_for_asset};
+    use rusqlite::params;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn test_paths(label: &str) -> ProjectPaths {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0);
+        let base = std::env::temp_dir().join(format!(
+            "qnc_ingest_posters_{label}_{}_{}",
+            std::process::id(),
+            nanos
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        ProjectPaths {
+            data_dir: base.join("data"),
+            projects_root: base.join("projects"),
+            seed_path: base.join("seed.json"),
+        }
+    }
+
+    #[test]
+    fn enqueue_proxy_generate_records_user_approval_and_pending_job() {
+        let paths = test_paths("approve_proxy");
+        let conn = open_ingest(&paths, "project_a").unwrap();
+        conn.execute(
+            "INSERT INTO ingest_assets
+                (source_id, clip_id, name, media_id, import_status, status,
+                 thumb_status, thumb_error, project_proxy_path)
+             VALUES ('card', 'clip_a', 'Clip A', 'clip_a', 'imported', 'imported',
+                     'no_card_thumb', 'missing card poster', 'proxy/clip_a.mp4')",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        let worker = PosterWorker::new(
+            paths.clone(),
+            ProjectDbBroker::new(paths.clone()),
+            BackgroundWorkGate::new(),
+        );
+        worker.enqueue_proxy_generate("project_a", &[String::from("clip_a")]);
+
+        let conn = open_ingest(&paths, "project_a").unwrap();
+        assert!(
+            poster_proxy_generation_approved_for_asset(&conn, "card", "clip_a").unwrap(),
+            "proxy poster generation must be persisted before worker claim"
+        );
+        let row: (String, String, String) = conn
+            .query_row(
+                "SELECT thumb_status, thumb_error, status
+                 FROM ingest_assets
+                 WHERE source_id = 'card' AND clip_id = 'clip_a'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(row, ("pending".into(), "".into(), "imported".into()));
+
+        let job_id = ingest_job_id("thumb_proxy", "card", "clip_a");
+        let status: String = conn
+            .query_row(
+                "SELECT status FROM ingest_jobs WHERE job_id = ?1",
+                params![job_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "queued");
     }
 }

@@ -1,12 +1,18 @@
 #![forbid(unsafe_code)]
 
 use std::collections::{HashMap, HashSet};
+use std::sync::mpsc;
+use std::thread;
 use std::time::Duration;
 
 use qnc_service_contracts::{
-    FilmstripJobPayload, FilmstripJobResult, JobAck, JobClaimRequest, JobClaimResponse,
-    JobCompleteRequest, JobFailRequest, JobHeartbeatRequest, JobHeartbeatResponse, JobLease,
-    ProxyGenerateJobPayload, ProxyGenerateJobResult, JOB_TYPE_FILMSTRIP,
+    AudioWrapJobArtifact, AudioWrapJobPayload, AudioWrapJobResult, FilmstripJobPayload,
+    FilmstripJobResult, JobAck, JobClaimRequest, JobClaimResponse, JobCompleteRequest,
+    JobFailRequest, JobHeartbeatRequest, JobHeartbeatResponse, JobLease, MediaProbeJobPayload,
+    MediaProbeJobResult, PosterJobPayload, PosterJobResult, ProxyGenerateJobPayload,
+    ProxyGenerateJobResult, WaveformJobPayload, WaveformJobResult, WorkerPlacement,
+    JOB_TYPE_AUDIO_WRAP, JOB_TYPE_FILMSTRIP, JOB_TYPE_MEDIA_PROBE, JOB_TYPE_THUMB_PROXY,
+    JOB_TYPE_WAVEFORM,
 };
 use serde::{de::DeserializeOwned, Serialize};
 use serde_json::{json, Value};
@@ -17,10 +23,15 @@ pub const DEFAULT_LEASE_MS: u64 = 30_000;
 pub const SMOKE_JOB_TYPE: &str = "qnc_worker_smoke";
 pub const PROXY_GENERATE_JOB_TYPE: &str = "proxy_generate";
 pub const FILMSTRIP_JOB_TYPE: &str = JOB_TYPE_FILMSTRIP;
+pub const WAVEFORM_JOB_TYPE: &str = JOB_TYPE_WAVEFORM;
+pub const THUMB_PROXY_JOB_TYPE: &str = JOB_TYPE_THUMB_PROXY;
+pub const AUDIO_WRAP_JOB_TYPE: &str = JOB_TYPE_AUDIO_WRAP;
+pub const MEDIA_PROBE_JOB_TYPE: &str = JOB_TYPE_MEDIA_PROBE;
 
 #[derive(Debug, Clone)]
 pub struct WorkerConfig {
     pub worker_id: String,
+    pub placement: WorkerPlacement,
     pub requested_capabilities: Vec<String>,
     pub poll_interval: Duration,
     pub lease_ms: u64,
@@ -35,10 +46,16 @@ impl WorkerConfig {
     ) -> Self {
         Self {
             worker_id: worker_id.into(),
+            placement: WorkerPlacement::LocalWorkstation,
             requested_capabilities,
             poll_interval: Duration::from_millis(poll_ms.max(50)),
             lease_ms: lease_ms.max(5_000),
         }
+    }
+
+    pub fn with_placement(mut self, placement: WorkerPlacement) -> Self {
+        self.placement = placement;
+        self
     }
 
     pub fn claim_capabilities(&self, registry: &HandlerRegistry) -> Vec<String> {
@@ -106,6 +123,31 @@ pub trait FilmstripBuilder: Send + Sync {
     ) -> Result<FilmstripJobResult, JobHandlerError>;
 }
 
+pub trait WaveformBuilder: Send + Sync {
+    fn build_waveform(
+        &self,
+        payload: WaveformJobPayload,
+    ) -> Result<WaveformJobResult, JobHandlerError>;
+}
+
+pub trait PosterBuilder: Send + Sync {
+    fn build_poster(&self, payload: PosterJobPayload) -> Result<PosterJobResult, JobHandlerError>;
+}
+
+pub trait AudioWrapBuilder: Send + Sync {
+    fn build_audio_wrap(
+        &self,
+        payload: AudioWrapJobPayload,
+    ) -> Result<AudioWrapJobResult, JobHandlerError>;
+}
+
+pub trait MediaProbeBuilder: Send + Sync {
+    fn probe_media(
+        &self,
+        payload: MediaProbeJobPayload,
+    ) -> Result<MediaProbeJobResult, JobHandlerError>;
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JobHandlerError {
     pub message: String,
@@ -144,6 +186,10 @@ impl HandlerRegistry {
         registry.register(SmokeJobHandler);
         registry.register(ProxyGenerateJobHandler::new(LocalFfmpegProxyBuilder));
         registry.register(FilmstripJobHandler::new(LocalFfmpegFilmstripBuilder));
+        registry.register(WaveformJobHandler::new(LocalFfmpegWaveformBuilder));
+        registry.register(PosterJobHandler::new(LocalFfmpegPosterBuilder));
+        registry.register(AudioWrapJobHandler::new(LocalFfmpegAudioWrapBuilder));
+        registry.register(MediaProbeJobHandler::new(LocalFfmpegMediaProbeBuilder));
         registry
     }
 
@@ -191,6 +237,7 @@ impl<H: WorkerHost> Worker<H> {
 
         let claim = self.host.claim(&JobClaimRequest {
             worker_id: self.config.worker_id.clone(),
+            placement: Some(self.config.placement),
             project_id: None,
             capabilities,
             max_jobs: Some(1),
@@ -242,21 +289,31 @@ impl<H: WorkerHost> Worker<H> {
             ));
         };
 
-        let heartbeat = self.host.heartbeat(&JobHeartbeatRequest {
+        let heartbeat_request = JobHeartbeatRequest {
             worker_id: self.config.worker_id.clone(),
             project_id: job.project_id.clone(),
             lease_id: job.lease_id.clone(),
             job_ids: vec![job.job_id.clone()],
             lease_ms: Some(self.config.lease_ms),
-        })?;
-        if !heartbeat.accepted.iter().any(|id| id == &job.job_id) {
-            return Err(format!(
-                "Lease heartbeat rejected for job_id={}",
-                job.job_id
-            ));
-        }
+        };
+        ensure_heartbeat_accepted(&self.host.heartbeat(&heartbeat_request)?, &job.job_id)?;
 
-        match handler.run(job) {
+        let (stop_heartbeat_tx, stop_heartbeat_rx) = mpsc::channel();
+        let heartbeat_interval = heartbeat_interval(self.config.lease_ms);
+        let run_result = thread::scope(|scope| {
+            let host = &self.host;
+            let request = heartbeat_request.clone();
+            let job_id = job.job_id.clone();
+            let heartbeat_thread = scope.spawn(move || {
+                run_heartbeat_loop(host, request, job_id, heartbeat_interval, stop_heartbeat_rx);
+            });
+            let result = handler.run(job);
+            let _ = stop_heartbeat_tx.send(());
+            let _ = heartbeat_thread.join();
+            result
+        });
+
+        match run_result {
             Ok(result) => {
                 let ack = self.host.complete(&JobCompleteRequest {
                     worker_id: self.config.worker_id.clone(),
@@ -283,6 +340,86 @@ impl<H: WorkerHost> Worker<H> {
                 Err(error.message)
             }
         }
+    }
+}
+
+pub fn detect_worker_placement(host_url: &str) -> WorkerPlacement {
+    let host = host_from_url(host_url).unwrap_or_default();
+    if host.eq_ignore_ascii_case("localhost")
+        || host == "127.0.0.1"
+        || host == "::1"
+        || host == "[::1]"
+    {
+        WorkerPlacement::LocalWorkstation
+    } else {
+        WorkerPlacement::IntranetSharedMedia
+    }
+}
+
+fn host_from_url(url: &str) -> Option<String> {
+    let trimmed = url.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let after_scheme = trimmed
+        .split_once("://")
+        .map(|(_, rest)| rest)
+        .unwrap_or(trimmed);
+    let authority = after_scheme
+        .split('/')
+        .next()
+        .unwrap_or(after_scheme)
+        .trim();
+    if authority.is_empty() {
+        return None;
+    }
+    if let Some(rest) = authority.strip_prefix('[') {
+        return rest.split_once(']').map(|(host, _)| host.to_string());
+    }
+    Some(
+        authority
+            .rsplit_once('@')
+            .map(|(_, rest)| rest)
+            .unwrap_or(authority)
+            .split(':')
+            .next()
+            .unwrap_or(authority)
+            .to_string(),
+    )
+}
+
+fn heartbeat_interval(lease_ms: u64) -> Duration {
+    Duration::from_millis((lease_ms / 3).clamp(500, 10_000))
+}
+
+fn run_heartbeat_loop<H: WorkerHost>(
+    host: &H,
+    request: JobHeartbeatRequest,
+    job_id: String,
+    interval: Duration,
+    stop: mpsc::Receiver<()>,
+) {
+    loop {
+        match stop.recv_timeout(interval) {
+            Ok(_) | Err(mpsc::RecvTimeoutError::Disconnected) => return,
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+        }
+        match host.heartbeat(&request) {
+            Ok(response) => {
+                if ensure_heartbeat_accepted(&response, &job_id).is_err() {
+                    return;
+                }
+            }
+            Err(_) => {}
+        }
+    }
+}
+
+fn ensure_heartbeat_accepted(response: &JobHeartbeatResponse, job_id: &str) -> Result<(), String> {
+    if response.accepted.iter().any(|id| id == job_id) {
+        Ok(())
+    } else {
+        Err(format!("Lease heartbeat rejected for job_id={job_id}"))
     }
 }
 
@@ -467,6 +604,195 @@ impl FilmstripBuilder for LocalFfmpegFilmstripBuilder {
     }
 }
 
+pub struct WaveformJobHandler<B: WaveformBuilder> {
+    builder: B,
+}
+
+impl<B: WaveformBuilder> WaveformJobHandler<B> {
+    pub fn new(builder: B) -> Self {
+        Self { builder }
+    }
+}
+
+impl<B> JobHandler for WaveformJobHandler<B>
+where
+    B: WaveformBuilder + 'static,
+{
+    fn job_type(&self) -> &'static str {
+        WAVEFORM_JOB_TYPE
+    }
+
+    fn run(&self, job: &JobLease) -> Result<Value, JobHandlerError> {
+        let payload: WaveformJobPayload =
+            serde_json::from_value(job.payload.clone()).map_err(|error| {
+                JobHandlerError::fatal(format!("invalid waveform payload: {error}"))
+            })?;
+        let result = self.builder.build_waveform(payload)?;
+        serde_json::to_value(result)
+            .map_err(|error| JobHandlerError::fatal(format!("invalid waveform result: {error}")))
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct LocalFfmpegWaveformBuilder;
+
+impl WaveformBuilder for LocalFfmpegWaveformBuilder {
+    fn build_waveform(
+        &self,
+        payload: WaveformJobPayload,
+    ) -> Result<WaveformJobResult, JobHandlerError> {
+        qnc_media_ffmpeg::waveform::build_waveform_peaks(
+            &payload.media_path,
+            payload.sample_rate_hz,
+            payload.peak_buckets,
+        )
+        .map_err(JobHandlerError::retryable)
+    }
+}
+
+pub struct PosterJobHandler<B: PosterBuilder> {
+    builder: B,
+}
+
+impl<B: PosterBuilder> PosterJobHandler<B> {
+    pub fn new(builder: B) -> Self {
+        Self { builder }
+    }
+}
+
+impl<B> JobHandler for PosterJobHandler<B>
+where
+    B: PosterBuilder + 'static,
+{
+    fn job_type(&self) -> &'static str {
+        THUMB_PROXY_JOB_TYPE
+    }
+
+    fn run(&self, job: &JobLease) -> Result<Value, JobHandlerError> {
+        let payload: PosterJobPayload = serde_json::from_value(job.payload.clone())
+            .map_err(|error| JobHandlerError::fatal(format!("invalid poster payload: {error}")))?;
+        let result = self.builder.build_poster(payload)?;
+        serde_json::to_value(result)
+            .map_err(|error| JobHandlerError::fatal(format!("invalid poster result: {error}")))
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct LocalFfmpegPosterBuilder;
+
+impl PosterBuilder for LocalFfmpegPosterBuilder {
+    fn build_poster(&self, payload: PosterJobPayload) -> Result<PosterJobResult, JobHandlerError> {
+        qnc_media_ffmpeg::poster::extract_poster_jpeg_at_seek(
+            &payload.media_path,
+            &payload.output_path,
+            payload.seek_sec,
+        )
+        .map_err(JobHandlerError::retryable)?;
+        Ok(PosterJobResult {
+            output_path: payload.output_path,
+        })
+    }
+}
+
+pub struct AudioWrapJobHandler<B: AudioWrapBuilder> {
+    builder: B,
+}
+
+impl<B: AudioWrapBuilder> AudioWrapJobHandler<B> {
+    pub fn new(builder: B) -> Self {
+        Self { builder }
+    }
+}
+
+impl<B> JobHandler for AudioWrapJobHandler<B>
+where
+    B: AudioWrapBuilder + 'static,
+{
+    fn job_type(&self) -> &'static str {
+        AUDIO_WRAP_JOB_TYPE
+    }
+
+    fn run(&self, job: &JobLease) -> Result<Value, JobHandlerError> {
+        let payload: AudioWrapJobPayload =
+            serde_json::from_value(job.payload.clone()).map_err(|error| {
+                JobHandlerError::fatal(format!("invalid audio_wrap payload: {error}"))
+            })?;
+        let result = self.builder.build_audio_wrap(payload)?;
+        serde_json::to_value(result)
+            .map_err(|error| JobHandlerError::fatal(format!("invalid audio_wrap result: {error}")))
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct LocalFfmpegAudioWrapBuilder;
+
+impl AudioWrapBuilder for LocalFfmpegAudioWrapBuilder {
+    fn build_audio_wrap(
+        &self,
+        payload: AudioWrapJobPayload,
+    ) -> Result<AudioWrapJobResult, JobHandlerError> {
+        let mut wraps = Vec::with_capacity(payload.wraps.len());
+        for item in payload.wraps {
+            qnc_media_ffmpeg::audio_wrap::wrap_audio_with_timecode(
+                &payload.media_path,
+                &item.output_path,
+                item.fps,
+            )
+            .map_err(JobHandlerError::retryable)?;
+            let probe = qnc_media_ffmpeg::proxy::probe_media(&item.output_path).ok();
+            wraps.push(AudioWrapJobArtifact {
+                fps: item.fps,
+                output_path: item.output_path,
+                probe,
+            });
+        }
+        Ok(AudioWrapJobResult { wraps })
+    }
+}
+
+pub struct MediaProbeJobHandler<B: MediaProbeBuilder> {
+    builder: B,
+}
+
+impl<B: MediaProbeBuilder> MediaProbeJobHandler<B> {
+    pub fn new(builder: B) -> Self {
+        Self { builder }
+    }
+}
+
+impl<B> JobHandler for MediaProbeJobHandler<B>
+where
+    B: MediaProbeBuilder + 'static,
+{
+    fn job_type(&self) -> &'static str {
+        MEDIA_PROBE_JOB_TYPE
+    }
+
+    fn run(&self, job: &JobLease) -> Result<Value, JobHandlerError> {
+        let payload: MediaProbeJobPayload =
+            serde_json::from_value(job.payload.clone()).map_err(|error| {
+                JobHandlerError::fatal(format!("invalid media_probe payload: {error}"))
+            })?;
+        let result = self.builder.probe_media(payload)?;
+        serde_json::to_value(result)
+            .map_err(|error| JobHandlerError::fatal(format!("invalid media_probe result: {error}")))
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct LocalFfmpegMediaProbeBuilder;
+
+impl MediaProbeBuilder for LocalFfmpegMediaProbeBuilder {
+    fn probe_media(
+        &self,
+        payload: MediaProbeJobPayload,
+    ) -> Result<MediaProbeJobResult, JobHandlerError> {
+        let probe = qnc_media_ffmpeg::proxy::probe_media(&payload.media_path)
+            .map_err(JobHandlerError::retryable)?;
+        Ok(MediaProbeJobResult { probe })
+    }
+}
+
 fn normalize_job_type(value: &str) -> String {
     value.trim().to_ascii_lowercase()
 }
@@ -593,6 +919,120 @@ mod tests {
         }
     }
 
+    struct FakeWaveformBuilder;
+
+    impl WaveformBuilder for FakeWaveformBuilder {
+        fn build_waveform(
+            &self,
+            payload: WaveformJobPayload,
+        ) -> Result<WaveformJobResult, JobHandlerError> {
+            Ok(WaveformJobResult {
+                a1_peaks: vec![1.0; payload.peak_buckets.min(3)],
+                a2_peaks: vec![0.5],
+                warning: None,
+            })
+        }
+    }
+
+    struct FakePosterBuilder;
+
+    impl PosterBuilder for FakePosterBuilder {
+        fn build_poster(
+            &self,
+            payload: PosterJobPayload,
+        ) -> Result<PosterJobResult, JobHandlerError> {
+            Ok(PosterJobResult {
+                output_path: payload.output_path,
+            })
+        }
+    }
+
+    struct FakeAudioWrapBuilder;
+
+    impl AudioWrapBuilder for FakeAudioWrapBuilder {
+        fn build_audio_wrap(
+            &self,
+            payload: AudioWrapJobPayload,
+        ) -> Result<AudioWrapJobResult, JobHandlerError> {
+            Ok(AudioWrapJobResult {
+                wraps: payload
+                    .wraps
+                    .into_iter()
+                    .map(|item| AudioWrapJobArtifact {
+                        fps: item.fps,
+                        output_path: item.output_path,
+                        probe: None,
+                    })
+                    .collect(),
+            })
+        }
+    }
+
+    struct FakeMediaProbeBuilder;
+
+    impl MediaProbeBuilder for FakeMediaProbeBuilder {
+        fn probe_media(
+            &self,
+            _payload: MediaProbeJobPayload,
+        ) -> Result<MediaProbeJobResult, JobHandlerError> {
+            Ok(MediaProbeJobResult {
+                probe: qnc_service_contracts::MediaProbe {
+                    width: 1920,
+                    height: 1080,
+                    duration_sec: Some(12.5),
+                    timebase: qnc_service_contracts::FrameTimebase {
+                        fps_num: 50,
+                        fps_den: 1,
+                    },
+                    scan_mode: qnc_service_contracts::ScanMode::Progressive,
+                    codec: "h264".into(),
+                    field_order: "progressive".into(),
+                    frame_count: Some(625),
+                    duration_frames: Some(625),
+                    has_video: true,
+                    has_audio: true,
+                    audio_channels: 2,
+                },
+            })
+        }
+    }
+
+    struct SlowJobHandler;
+
+    impl JobHandler for SlowJobHandler {
+        fn job_type(&self) -> &'static str {
+            "slow_job"
+        }
+
+        fn run(&self, job: &JobLease) -> Result<Value, JobHandlerError> {
+            thread::sleep(Duration::from_millis(700));
+            Ok(json!({
+                "status": "ok",
+                "job_type": job.job_type,
+            }))
+        }
+    }
+
+    #[test]
+    fn worker_placement_detects_local_and_intranet_hosts() {
+        assert_eq!(
+            detect_worker_placement("http://127.0.0.1:8001"),
+            WorkerPlacement::LocalWorkstation
+        );
+        assert_eq!(
+            detect_worker_placement("http://localhost:8001"),
+            WorkerPlacement::LocalWorkstation
+        );
+        assert_eq!(
+            detect_worker_placement("http://192.168.1.20:8001"),
+            WorkerPlacement::IntranetSharedMedia
+        );
+        assert_eq!(
+            detect_worker_placement("http://qnc-host.local:8001"),
+            WorkerPlacement::IntranetSharedMedia
+        );
+    }
+
     #[test]
     fn requested_capabilities_are_limited_to_registered_handlers() {
         let config = WorkerConfig::new(
@@ -649,10 +1089,52 @@ mod tests {
             }
         );
         assert_eq!(worker.host.heartbeats.lock().unwrap().len(), 1);
+        let claims = worker.host.claim_requests.lock().unwrap();
+        assert_eq!(claims.len(), 1);
+        assert_eq!(claims[0].placement, Some(WorkerPlacement::LocalWorkstation));
         let completes = worker.host.completes.lock().unwrap();
         assert_eq!(completes.len(), 1);
         assert_eq!(completes[0].job_id, "qnc_worker_smoke:worker:clip_a");
         assert_eq!(completes[0].result["status"], "ok");
+    }
+
+    #[test]
+    fn run_once_renews_heartbeat_while_job_runs() {
+        let host = FakeHost::with_claim(JobClaimResponse {
+            jobs: vec![JobLease {
+                job_id: "slow_job:worker:clip_a".into(),
+                project_id: "project_a".into(),
+                job_type: "slow_job".into(),
+                source_id: "worker".into(),
+                clip_id: "clip_a".into(),
+                worker_id: "worker_a".into(),
+                lease_id: "lease_a".into(),
+                lease_until_unix_ms: 123,
+                attempts: 1,
+                queued_at: None,
+                payload: json!({}),
+            }],
+            playback_active: false,
+            message: None,
+        });
+        let mut registry = HandlerRegistry::empty();
+        registry.register(SlowJobHandler);
+        let config = WorkerConfig {
+            worker_id: "worker_a".into(),
+            placement: WorkerPlacement::LocalWorkstation,
+            requested_capabilities: vec!["slow_job".into()],
+            poll_interval: Duration::from_millis(50),
+            lease_ms: 600,
+        };
+        let worker = Worker::new(config, host, registry);
+
+        let tick = worker.run_once().unwrap();
+
+        assert_eq!(tick.completed, 1);
+        assert!(
+            worker.host.heartbeats.lock().unwrap().len() >= 2,
+            "long jobs must renew the lease while the handler is running"
+        );
     }
 
     #[test]
@@ -718,5 +1200,121 @@ mod tests {
         assert_eq!(decoded.duration_sec, 13.0);
         assert_eq!(decoded.frames.len(), 1);
         assert_eq!(decoded.frames[0].artifact.path, output_path);
+    }
+
+    #[test]
+    fn waveform_handler_roundtrips_payload_and_result() {
+        let handler = WaveformJobHandler::new(FakeWaveformBuilder);
+        let payload = WaveformJobPayload {
+            media_path: PathBuf::from("C:/qnc/project/proxy/clip_a.mp4"),
+            peak_buckets: 3,
+            sample_rate_hz: 8_000,
+        };
+        let job = JobLease {
+            job_id: "waveform:waveform:clip_a".into(),
+            project_id: "project_a".into(),
+            job_type: WAVEFORM_JOB_TYPE.into(),
+            source_id: "waveform".into(),
+            clip_id: "clip_a".into(),
+            worker_id: "worker_a".into(),
+            lease_id: "lease_a".into(),
+            lease_until_unix_ms: 123,
+            attempts: 1,
+            queued_at: None,
+            payload: serde_json::to_value(payload).unwrap(),
+        };
+
+        let result = handler.run(&job).unwrap();
+        let decoded: WaveformJobResult = serde_json::from_value(result).unwrap();
+        assert_eq!(decoded.a1_peaks, vec![1.0, 1.0, 1.0]);
+        assert_eq!(decoded.a2_peaks, vec![0.5]);
+        assert!(decoded.warning.is_none());
+    }
+
+    #[test]
+    fn poster_handler_roundtrips_payload_and_result() {
+        let handler = PosterJobHandler::new(FakePosterBuilder);
+        let output_path = PathBuf::from("C:/qnc/project/ingest/thumbnails/clip_a/poster.jpg");
+        let payload = PosterJobPayload {
+            media_path: PathBuf::from("C:/qnc/project/proxy/clip_a.mp4"),
+            output_path: output_path.clone(),
+            seek_sec: 0.0,
+        };
+        let job = JobLease {
+            job_id: "thumb_proxy:card:clip_a".into(),
+            project_id: "project_a".into(),
+            job_type: THUMB_PROXY_JOB_TYPE.into(),
+            source_id: "card".into(),
+            clip_id: "clip_a".into(),
+            worker_id: "worker_a".into(),
+            lease_id: "lease_a".into(),
+            lease_until_unix_ms: 123,
+            attempts: 1,
+            queued_at: None,
+            payload: serde_json::to_value(payload).unwrap(),
+        };
+
+        let result = handler.run(&job).unwrap();
+        let decoded: PosterJobResult = serde_json::from_value(result).unwrap();
+        assert_eq!(decoded.output_path, output_path);
+    }
+
+    #[test]
+    fn audio_wrap_handler_roundtrips_payload_and_result() {
+        let handler = AudioWrapJobHandler::new(FakeAudioWrapBuilder);
+        let output_path = PathBuf::from("C:/qnc/project/proxy/vo_a_50.mp4");
+        let payload = AudioWrapJobPayload {
+            media_path: PathBuf::from("C:/qnc/project/audio/vo_a.wav"),
+            wraps: vec![qnc_service_contracts::AudioWrapJobItem {
+                fps: 50.0,
+                output_path: output_path.clone(),
+            }],
+        };
+        let job = JobLease {
+            job_id: "audio_wrap:voice:vo_a".into(),
+            project_id: "project_a".into(),
+            job_type: AUDIO_WRAP_JOB_TYPE.into(),
+            source_id: "voice".into(),
+            clip_id: "vo_a".into(),
+            worker_id: "worker_a".into(),
+            lease_id: "lease_a".into(),
+            lease_until_unix_ms: 123,
+            attempts: 1,
+            queued_at: None,
+            payload: serde_json::to_value(payload).unwrap(),
+        };
+
+        let result = handler.run(&job).unwrap();
+        let decoded: AudioWrapJobResult = serde_json::from_value(result).unwrap();
+        assert_eq!(decoded.wraps.len(), 1);
+        assert_eq!(decoded.wraps[0].fps, 50.0);
+        assert_eq!(decoded.wraps[0].output_path, output_path);
+    }
+
+    #[test]
+    fn media_probe_handler_roundtrips_payload_and_result() {
+        let handler = MediaProbeJobHandler::new(FakeMediaProbeBuilder);
+        let payload = MediaProbeJobPayload {
+            media_path: PathBuf::from("C:/qnc/project/proxy/clip_a.mp4"),
+        };
+        let job = JobLease {
+            job_id: "media_probe:card:clip_a".into(),
+            project_id: "project_a".into(),
+            job_type: MEDIA_PROBE_JOB_TYPE.into(),
+            source_id: "card".into(),
+            clip_id: "clip_a".into(),
+            worker_id: "worker_a".into(),
+            lease_id: "lease_a".into(),
+            lease_until_unix_ms: 123,
+            attempts: 1,
+            queued_at: None,
+            payload: serde_json::to_value(payload).unwrap(),
+        };
+
+        let result = handler.run(&job).unwrap();
+        let decoded: MediaProbeJobResult = serde_json::from_value(result).unwrap();
+        assert_eq!(decoded.probe.width, 1920);
+        assert_eq!(decoded.probe.timebase.fps_num, 50);
+        assert_eq!(decoded.probe.duration_sec, Some(12.5));
     }
 }

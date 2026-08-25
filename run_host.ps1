@@ -37,7 +37,15 @@ if ($LASTEXITCODE -ne 0) {
 Pop-Location
 Write-Host "QNC API: http://127.0.0.1:$($env:QNC_API_PORT)/api/health"
 Write-Host "Native UI: .\run_app.ps1  (LAN: QNC_BIND_HOST=0.0.0.0 requires QNC_TRUSTED_LAN=1)"
-Write-Host "External worker: .\run_worker.ps1  (default capabilities: proxy_generate,filmstrip)"
+Write-Host "Artifact workers: JobService owner"
+Write-Host "Worker app: qnc-worker self-detects placement; QNC_WORKER_PLACEMENT may override it"
+if (Get-Process -Name "qnc-worker" -ErrorAction SilentlyContinue | Select-Object -First 1) {
+    Write-Host "Local worker autostart: qnc-worker already running"
+} else {
+    $WorkerScript = Join-Path $Root "run_worker.ps1"
+    Write-Host "Local worker autostart: $WorkerScript"
+    Start-Process -FilePath "powershell.exe" -ArgumentList @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $WorkerScript) -WorkingDirectory $Root -WindowStyle Hidden
+}
 Write-Host "Host binary: $Bin"
 Write-Host "Root: $Root"
 & $Bin

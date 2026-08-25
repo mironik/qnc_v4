@@ -11,6 +11,13 @@ use serde_json::Value;
 pub(crate) const STORYBOARD_SHORTCUT_SCOPE: &str = "storyboard";
 pub(crate) const PROJECT_SHORTCUT_SCOPE: &str = "project";
 
+/// Form/panel shortcuts are active only when egui has not reserved keyboard input.
+/// Text fields must receive ordinary characters (`i`, `o`, `s`, etc.) and cursor
+/// keys before any montage shortcut resolver sees them.
+pub(crate) fn keyboard_input_is_reserved(ctx: &egui::Context) -> bool {
+    ctx.wants_keyboard_input()
+}
+
 #[derive(Debug, Clone)]
 pub struct KeyChord {
     pub code: Option<String>,

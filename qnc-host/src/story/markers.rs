@@ -206,10 +206,7 @@ pub fn timeline_duration_from_parts(parts: &[StoryPartRow]) -> f64 {
     round3(parts.iter().map(part_span_seconds).sum())
 }
 
-pub fn part_span_frames(part: &StoryPartRow, timeline_fps: f64) -> i64 {
-    if is_valid_fps(timeline_fps) {
-        return seconds_to_frame(part_span_seconds(part), timeline_fps).max(1);
-    }
+pub fn part_span_frames(part: &StoryPartRow) -> i64 {
     if part.duration_frames > 0 {
         return part.duration_frames.max(1);
     }
@@ -222,11 +219,8 @@ pub fn part_span_frames(part: &StoryPartRow, timeline_fps: f64) -> i64 {
     0
 }
 
-pub fn timeline_duration_frames_from_parts(parts: &[StoryPartRow], timeline_fps: f64) -> i64 {
-    parts
-        .iter()
-        .map(|part| part_span_frames(part, timeline_fps))
-        .sum()
+pub fn timeline_duration_frames_from_parts(parts: &[StoryPartRow]) -> i64 {
+    parts.iter().map(part_span_frames).sum()
 }
 
 pub(crate) fn list_markers_rows(conn: &Connection) -> rusqlite::Result<Vec<StoryMarkerRow>> {
@@ -417,7 +411,7 @@ fn set_selected_slot_id(conn: &Connection, slot_id: &str) -> rusqlite::Result<()
 fn ensure_start_marker(conn: &Connection, timeline_fps: f64) -> rusqlite::Result<()> {
     let timeline_fps = require_timeline_fps_sql(timeline_fps)?;
     let parts = list_parts(conn)?;
-    let duration_frames = timeline_duration_frames_from_parts(&parts, timeline_fps);
+    let duration_frames = timeline_duration_frames_from_parts(&parts);
     if duration_frames <= 0 {
         conn.execute("DELETE FROM story_marker_slots", [])?;
         conn.execute("DELETE FROM story_markers", [])?;
@@ -512,7 +506,7 @@ fn ensure_end_marker(
     let last_part = parts.last();
     let origin_part_id = last_part.map(|part| part.part_id.as_str()).unwrap_or("");
     let origin_local_frame = last_part
-        .map(|part| part_span_frames(part, timeline_fps).max(0))
+        .map(|part| part_span_frames(part).max(0))
         .unwrap_or(0);
     let end_sec = round3(frame_to_seconds(duration_frames, timeline_fps));
     let end_tc = seconds_to_timecode(end_sec, timeline_fps);
@@ -585,7 +579,7 @@ pub fn recompute_marker_slots(conn: &Connection, timeline_fps: f64) -> rusqlite:
     backfill_marker_frames(conn, timeline_fps)?;
     ensure_start_marker(conn, timeline_fps)?;
     let parts = list_parts(conn)?;
-    let duration_frames = timeline_duration_frames_from_parts(&parts, timeline_fps);
+    let duration_frames = timeline_duration_frames_from_parts(&parts);
     ensure_end_marker(conn, timeline_fps, &parts, duration_frames)?;
     refresh_marker_sort_indices(conn)?;
 
@@ -786,10 +780,8 @@ pub fn delete_marker(conn: &Connection, marker_id: &str, timeline_fps: f64) -> R
         .iter()
         .find(|marker| marker.marker_id == marker_id)
         .ok_or_else(|| format!("marker not found: {marker_id}"))?;
-    let duration_frames = timeline_duration_frames_from_parts(
-        &list_parts(conn).map_err(|error| error.to_string())?,
-        timeline_fps,
-    );
+    let duration_frames =
+        timeline_duration_frames_from_parts(&list_parts(conn).map_err(|error| error.to_string())?);
     if marker.timeline_frame == 0 || marker.system_role == SYSTEM_MARKER_START {
         return Err("Početni M marker je zaključan.".into());
     }
@@ -841,10 +833,8 @@ pub fn update_marker_frame(
         return Err("timeline_frame must be >= 0".into());
     }
     let timeline_frame = timeline_frame.max(0);
-    let duration_frames = timeline_duration_frames_from_parts(
-        &list_parts(conn).map_err(|error| error.to_string())?,
-        timeline_fps,
-    );
+    let duration_frames =
+        timeline_duration_frames_from_parts(&list_parts(conn).map_err(|error| error.to_string())?);
     if timeline_frame > duration_frames {
         let duration = frame_to_seconds(duration_frames, timeline_fps);
         return Err(format!(
@@ -1019,14 +1009,10 @@ pub fn shift_markers_after_part_removal_frames(
     Ok(())
 }
 
-pub fn part_timeline_window_frames(
-    parts: &[StoryPartRow],
-    part_id: &str,
-    timeline_fps: f64,
-) -> Option<(i64, i64)> {
+pub fn part_timeline_window_frames(parts: &[StoryPartRow], part_id: &str) -> Option<(i64, i64)> {
     let mut cursor = 0;
     for part in parts {
-        let span = part_span_frames(part, timeline_fps).max(0);
+        let span = part_span_frames(part).max(0);
         if part.part_id == part_id {
             return Some((cursor, cursor + span));
         }
@@ -1051,13 +1037,12 @@ pub fn local_to_timeline_frame(
     parts: &[StoryPartRow],
     part_id: &str,
     local_frame: i64,
-    timeline_fps: f64,
 ) -> Result<i64, String> {
     let part_id = part_id.trim();
     if part_id.is_empty() {
         return Err("part_id required".into());
     }
-    let (start, end) = part_timeline_window_frames(parts, part_id, timeline_fps)
+    let (start, end) = part_timeline_window_frames(parts, part_id)
         .ok_or_else(|| format!("part not found: {part_id}"))?;
     let span = (end - start).max(0);
     let local = local_frame.max(0);
@@ -1070,7 +1055,6 @@ pub fn resolve_marker_timeline_frame(
     timeline_frame: Option<i64>,
     part_id: Option<&str>,
     local_frame: Option<i64>,
-    timeline_fps: f64,
 ) -> Result<(i64, String, Option<i64>), String> {
     if let Some(frame) = timeline_frame {
         if frame < 0 {
@@ -1083,7 +1067,7 @@ pub fn resolve_marker_timeline_frame(
         .filter(|p| !p.trim().is_empty())
         .ok_or_else(|| "timeline_frame or part_id required".to_string())?;
     let local = local_frame.unwrap_or(0);
-    let global = local_to_timeline_frame(parts, part_id, local, timeline_fps)?;
+    let global = local_to_timeline_frame(parts, part_id, local)?;
     Ok((global, part_id.trim().to_string(), Some(local)))
 }
 
@@ -1136,9 +1120,7 @@ pub fn delete_markers_for_part(
     timeline_fps: f64,
     parts_before_delete: &[StoryPartRow],
 ) -> rusqlite::Result<()> {
-    if let Some((start, end)) =
-        part_timeline_window_frames(parts_before_delete, part_id, timeline_fps)
-    {
+    if let Some((start, end)) = part_timeline_window_frames(parts_before_delete, part_id) {
         shift_markers_after_part_removal_frames(conn, start, end, timeline_fps)?;
     }
     Ok(())
@@ -1202,7 +1184,7 @@ mod tests {
     }
 
     #[test]
-    fn materializes_boundaries_on_timeline_fps_not_source_frame_count() {
+    fn materializes_boundaries_on_source_frame_count_not_timeline_fps() {
         let conn = setup_conn();
         insert_part(&conn, "a", 0, 50);
         insert_part(&conn, "b", 1, 50);
@@ -1212,13 +1194,13 @@ mod tests {
         let markers = list_markers(&conn).unwrap();
         assert!(markers
             .iter()
-            .any(|m| m.timeline_frame == 50 && m.system_role == SYSTEM_MARKER_END));
+            .any(|m| m.timeline_frame == 100 && m.system_role == SYSTEM_MARKER_END));
 
         let slots = list_marker_slots(&conn).unwrap();
         assert_eq!(slots.len(), 1);
         assert_eq!(slots[0].start_frame, 0);
-        assert_eq!(slots[0].end_frame, 50);
-        assert_eq!(slots[0].duration_frames, 50);
+        assert_eq!(slots[0].end_frame, 100);
+        assert_eq!(slots[0].duration_frames, 100);
     }
 
     #[test]

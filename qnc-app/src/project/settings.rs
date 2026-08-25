@@ -379,8 +379,7 @@ fn ui_advanced(
                 FieldCell::Combo {
                     label: "Format",
                     id: "pts_input_format",
-                    value: ProjectScreen::path_str(&eff, &["input", "format"])
-                        .pipe_default("HD 1080p50"),
+                    value: ProjectScreen::path_str(&eff, &["input", "format"]),
                     options: INPUT_FORMATS,
                     on_pick: FieldPick::Path("input.format"),
                 },
@@ -388,31 +387,29 @@ fn ui_advanced(
                     label: "Frame rate",
                     id: "pts_input_fps",
                     path: "input.fps",
-                    value: project_pts::fps_display(&eff, &["input", "fps"], 50.0),
+                    value: project_pts::fps_display_optional(&eff, &["input", "fps"]),
                 },
                 FieldCell::Int {
                     label: "Width",
                     path: "input.width",
-                    value: project_pts::path_i64(&eff, &["input", "width"], 1920),
+                    value: project_pts::int_display_optional(&eff, &["input", "width"]),
                 },
                 FieldCell::Int {
                     label: "Height",
                     path: "input.height",
-                    value: project_pts::path_i64(&eff, &["input", "height"], 1080),
+                    value: project_pts::int_display_optional(&eff, &["input", "height"]),
                 },
                 FieldCell::Combo {
                     label: "Field order",
                     id: "pts_input_field",
-                    value: ProjectScreen::path_str(&eff, &["input", "field_order"])
-                        .pipe_default("progressive"),
+                    value: ProjectScreen::path_str(&eff, &["input", "field_order"]),
                     options: project_pts::FIELD_ORDER,
                     on_pick: FieldPick::Path("input.field_order"),
                 },
                 FieldCell::Combo {
                     label: "Color space",
                     id: "pts_input_cs",
-                    value: ProjectScreen::path_str(&eff, &["input", "color_space"])
-                        .pipe_default("rec709"),
+                    value: ProjectScreen::path_str(&eff, &["input", "color_space"]),
                     options: project_pts::COLOR_SPACE,
                     on_pick: FieldPick::Path("input.color_space"),
                 },
@@ -451,10 +448,7 @@ fn ui_advanced(
     // —— EXPORT FORMAT / PRESET ——
     qnc_form::section(ui, inner_w, |ui| {
         qnc_form::group_title(ui, "Export format");
-        let mut preset = ProjectScreen::path_str(&eff, &["export", "preset"]);
-        if preset.is_empty() {
-            preset = "xdcam_hd422_50i".into();
-        }
+        let preset = ProjectScreen::path_str(&eff, &["export", "preset"]);
         let mut preset_opts: Vec<(String, String)> = project_pts::builtin_export_presets()
             .into_iter()
             .map(|(id, name, _)| (id.to_string(), name.to_string()))
@@ -489,8 +483,7 @@ fn ui_advanced(
                 FieldCell::Combo {
                     label: "Format",
                     id: "pts_export_format",
-                    value: ProjectScreen::path_str(&eff, &["export", "format"])
-                        .pipe_default("HD 1080i50"),
+                    value: ProjectScreen::path_str(&eff, &["export", "format"]),
                     options: INPUT_FORMATS,
                     on_pick: FieldPick::Path("export.format"),
                 },
@@ -498,47 +491,43 @@ fn ui_advanced(
                     label: "Frame rate",
                     id: "pts_export_fps",
                     path: "export.fps",
-                    value: project_pts::fps_display(&eff, &["export", "fps"], 25.0),
+                    value: project_pts::fps_display_optional(&eff, &["export", "fps"]),
                 },
                 FieldCell::Int {
                     label: "Width",
                     path: "export.width",
-                    value: project_pts::path_i64(&eff, &["export", "width"], 1920),
+                    value: project_pts::int_display_optional(&eff, &["export", "width"]),
                 },
                 FieldCell::Int {
                     label: "Height",
                     path: "export.height",
-                    value: project_pts::path_i64(&eff, &["export", "height"], 1080),
+                    value: project_pts::int_display_optional(&eff, &["export", "height"]),
                 },
                 FieldCell::Combo {
                     label: "Field order",
                     id: "pts_export_field",
-                    value: ProjectScreen::path_str(&eff, &["export", "field_order"])
-                        .pipe_default("upper_first"),
+                    value: ProjectScreen::path_str(&eff, &["export", "field_order"]),
                     options: project_pts::FIELD_ORDER,
                     on_pick: FieldPick::Path("export.field_order"),
                 },
                 FieldCell::Combo {
                     label: "Color space",
                     id: "pts_export_cs",
-                    value: ProjectScreen::path_str(&eff, &["export", "color_space"])
-                        .pipe_default("rec709"),
+                    value: ProjectScreen::path_str(&eff, &["export", "color_space"]),
                     options: project_pts::COLOR_SPACE,
                     on_pick: FieldPick::Path("export.color_space"),
                 },
                 FieldCell::Combo {
                     label: "Container",
                     id: "pts_export_container",
-                    value: ProjectScreen::path_str(&eff, &["export", "container"])
-                        .pipe_default("mxf_op1a"),
+                    value: ProjectScreen::path_str(&eff, &["export", "container"]),
                     options: project_pts::CONTAINERS,
                     on_pick: FieldPick::Path("export.container"),
                 },
                 FieldCell::Combo {
                     label: "Video codec",
                     id: "pts_export_codec",
-                    value: ProjectScreen::path_str(&eff, &["export", "video_codec"])
-                        .pipe_default("mpeg2_422_50mbit"),
+                    value: ProjectScreen::path_str(&eff, &["export", "video_codec"]),
                     options: project_pts::VIDEO_CODECS,
                     on_pick: FieldPick::Path("export.video_codec"),
                 },
@@ -546,15 +535,16 @@ fn ui_advanced(
                     label: "Audio",
                     id: "pts_export_arate",
                     path: "export.audio_sample_rate",
-                    value: project_pts::path_i64(&eff, &["export", "audio_sample_rate"], 48000)
-                        .to_string(),
+                    value: project_pts::int_display_optional(
+                        &eff,
+                        &["export", "audio_sample_rate"],
+                    ),
                 },
                 FieldCell::Fps {
                     label: "Channels",
                     id: "pts_export_ach",
                     path: "export.audio_channels",
-                    value: project_pts::path_i64(&eff, &["export", "audio_channels"], 2)
-                        .to_string(),
+                    value: project_pts::int_display_optional(&eff, &["export", "audio_channels"]),
                 },
             ];
             field_grid(ui, grid_w, &mut manual, action);
@@ -744,7 +734,7 @@ enum FieldCell<'a> {
     Int {
         label: &'a str,
         path: &'a str,
-        value: i64,
+        value: String,
     },
 }
 
@@ -804,7 +794,7 @@ fn field_grid(
                         field_fps_cell(ui, cell_w, label, id, path, value, action);
                     }
                     FieldCell::Int { label, path, value } => {
-                        field_int_cell(ui, cell_w, label, path, *value, action);
+                        field_int_cell(ui, cell_w, label, path, value, action);
                     }
                 }
                 i += 1;
@@ -889,10 +879,10 @@ fn field_int_cell(
     cell_w: f32,
     label: &str,
     path: &str,
-    current: i64,
+    value: &mut String,
     action: &mut ProjectAction,
 ) {
-    let mut text = current.to_string();
+    let mut text = value.clone();
     let before = text.clone();
     ui.allocate_ui_with_layout(
         Vec2::new(cell_w, 52.0),
@@ -913,4 +903,5 @@ fn field_int_cell(
             }
         },
     );
+    *value = text;
 }

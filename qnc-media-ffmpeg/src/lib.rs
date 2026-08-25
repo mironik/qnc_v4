@@ -1,5 +1,8 @@
+pub mod audio_wrap;
 pub mod filmstrip;
+pub mod poster;
 pub mod proxy;
+pub mod waveform;
 
 use std::collections::BTreeMap;
 use std::env;
@@ -19,12 +22,12 @@ use qnc_broadcast_player::{
 
 const RGB24_BYTES_PER_PIXEL: usize = 3;
 const PCM_S16LE_BYTES_PER_SAMPLE: usize = 2;
-const DEFAULT_VIDEO_PREFETCH_FRAMES: u16 = 1;
+const DEFAULT_VIDEO_PREFETCH_FRAMES: u16 = 24;
 const DEFAULT_SYNCHRONOUS_CACHE_FRAMES: u64 = 1;
-const DEFAULT_VIDEO_CACHE_FRAMES: usize = 32;
+const DEFAULT_VIDEO_CACHE_FRAMES: usize = 96;
 const DEFAULT_VIDEO_CACHE_BYTES: usize = 256 * 1024 * 1024;
-const DEFAULT_AUDIO_PREFETCH_FRAMES: u16 = 1;
-const DEFAULT_AUDIO_CACHE_FRAMES: usize = 64;
+const DEFAULT_AUDIO_PREFETCH_FRAMES: u16 = 32;
+const DEFAULT_AUDIO_CACHE_FRAMES: usize = 192;
 const DEFAULT_AUDIO_CACHE_BYTES: usize = 16 * 1024 * 1024;
 const DEFAULT_FFMPEG_READ_TIMEOUT: Duration = Duration::from_millis(10_000);
 const DEFAULT_FFMPEG_TOOL_TIMEOUT: Duration = Duration::from_millis(10_000);
@@ -1513,7 +1516,9 @@ impl FfmpegAudioOutput {
         let path = self.registry.source_path(&request.source_id)?.to_path_buf();
         let (start_frame, read_ahead_packets, audio_format) = {
             let session = self.audio_session(&request.source_id)?;
-            let start_frame = session.decode_frame_for_request(request.frame);
+            let Some(start_frame) = session.decode_frame_for_request(request.frame) else {
+                return Ok(());
+            };
             if session.can_reuse_stream_for(start_frame) {
                 return Ok(());
             }
@@ -1597,11 +1602,13 @@ impl FfmpegAudioOutput {
     fn decode_span(
         &self,
         request: &EngineFrameRequest,
-    ) -> Result<(u64, u64), BroadcastEngineError> {
+    ) -> Result<Option<(u64, u64)>, BroadcastEngineError> {
         let session = self.audio_session(&request.source_id)?;
-        let start_frame = session.decode_frame_for_request(request.frame);
+        let Some(start_frame) = session.decode_frame_for_request(request.frame) else {
+            return Ok(None);
+        };
         let end_frame = session.prefetch_end_frame(start_frame, self.options.audio_prefetch_frames);
-        Ok((start_frame, end_frame))
+        Ok(Some((start_frame, end_frame)))
     }
 
     fn cache_streamed_packet(
@@ -1639,7 +1646,9 @@ impl FfmpegAudioOutput {
         let max_cache_bytes = self.options.audio_cache_bytes;
         let end_frame = {
             let session = self.audio_session(&request.source_id)?;
-            let start_frame = session.decode_frame_for_request(request.frame);
+            let Some(start_frame) = session.decode_frame_for_request(request.frame) else {
+                return Ok(());
+            };
             session.prefetch_end_frame(start_frame, self.options.audio_prefetch_frames)
         };
         self.audio_session_mut(&request.source_id)?
@@ -1723,12 +1732,16 @@ impl FfmpegAudioDecodeOptions {
 struct FfmpegAudioSession {
     audio_format: AudioFormat,
     duration_frames: u64,
+    decode_frame_offset: i64,
     cache: BTreeMap<u64, FfmpegAudioPayload>,
     stream: Option<FfmpegAudioStream>,
 }
 
 impl FfmpegAudioSession {
-    fn new(source: &EngineSourceHandle) -> Result<Self, BroadcastEngineError> {
+    fn with_decode_frame_offset(
+        source: &EngineSourceHandle,
+        decode_frame_offset: i64,
+    ) -> Result<Self, BroadcastEngineError> {
         let audio_format = source.audio_format.clone().ok_or_else(|| {
             BroadcastEngineError::new(
                 BroadcastEngineErrorKind::Contract,
@@ -1739,20 +1752,29 @@ impl FfmpegAudioSession {
         Ok(Self {
             audio_format,
             duration_frames: source.duration_frames,
+            decode_frame_offset,
             cache: BTreeMap::new(),
             stream: None,
         })
     }
 
     fn payload_for_request(&self, request_frame: u64) -> Option<FfmpegAudioPayload> {
-        let decode_frame = self.decode_frame_for_request(request_frame);
+        let decode_frame = self.decode_frame_for_request(request_frame)?;
         let mut payload = self.cache.get(&decode_frame)?.clone();
         payload.frame = request_frame;
         Some(payload)
     }
 
-    fn decode_frame_for_request(&self, request_frame: u64) -> u64 {
-        request_frame.min(self.last_decodable_frame())
+    fn decode_frame_for_request(&self, request_frame: u64) -> Option<u64> {
+        let frame = i128::from(request_frame) + i128::from(self.decode_frame_offset);
+        if frame < 0 {
+            return None;
+        }
+        Some(
+            u64::try_from(frame)
+                .unwrap_or(u64::MAX)
+                .min(self.last_decodable_frame()),
+        )
     }
 
     fn last_decodable_frame(&self) -> u64 {
@@ -2422,6 +2444,20 @@ fn audio_packet(
     }
 }
 
+fn silent_audio_packet(
+    request: EngineFrameRequest,
+    audio_format: AudioFormat,
+) -> Result<AudioFramePacket<Vec<u8>>, BroadcastEngineError> {
+    let byte_len = audio_packet_byte_len_for_frame(request.frame, &audio_format, request.timebase)?;
+    Ok(AudioFramePacket {
+        source_id: request.source_id,
+        start_frame: request.frame,
+        frame_count: 1,
+        audio_format: Some(audio_format),
+        payload: vec![0; byte_len],
+    })
+}
+
 impl AudioOutputAdapter for FfmpegAudioOutput {
     type AudioPacket = Vec<u8>;
 
@@ -2432,9 +2468,21 @@ impl AudioOutputAdapter for FfmpegAudioOutput {
         if source.audio_format.is_none() {
             return Ok(Vec::new());
         }
-        self.registry.source_path(&source.source_id)?;
-        self.sessions
-            .insert(source.source_id.clone(), FfmpegAudioSession::new(source)?);
+        let path = self.registry.source_path(&source.source_id)?.to_path_buf();
+        let decode_frame_offset = if source.video_format.is_some() {
+            probe_av_stream_start_offset_frames(
+                &path,
+                &source.source_id,
+                &self.options.toolchain,
+                source.timebase,
+            )
+        } else {
+            0
+        };
+        self.sessions.insert(
+            source.source_id.clone(),
+            FfmpegAudioSession::with_decode_frame_offset(source, decode_frame_offset)?,
+        );
         Ok(Vec::new())
     }
 
@@ -2448,9 +2496,20 @@ impl AudioOutputAdapter for FfmpegAudioOutput {
             let audio_format = self.audio_session(&request.source_id)?.audio_format.clone();
             return Ok(audio_packet(request, audio_format, payload));
         }
+        if self
+            .audio_session(&request.source_id)?
+            .decode_frame_for_request(request.frame)
+            .is_none()
+        {
+            let audio_format = self.audio_session(&request.source_id)?.audio_format.clone();
+            return silent_audio_packet(request, audio_format);
+        }
 
         let path = self.registry.source_path(&request.source_id)?.to_path_buf();
-        let (decode_start_frame, prefetch_end_frame) = self.decode_span(&request)?;
+        let Some((decode_start_frame, prefetch_end_frame)) = self.decode_span(&request)? else {
+            let audio_format = self.audio_session(&request.source_id)?.audio_format.clone();
+            return silent_audio_packet(request, audio_format);
+        };
         self.cache_streamed_packet(&request, decode_start_frame, prefetch_end_frame, &path)?;
         let payload = self
             .cached_packet(&request.source_id, request.frame)
@@ -2623,6 +2682,60 @@ fn probe_audio_runtime(
         audio_format,
         duration_samples,
     }))
+}
+
+fn probe_av_stream_start_offset_frames(
+    path: &Path,
+    source_id: &str,
+    toolchain: &FfmpegToolchain,
+    timebase: Timebase,
+) -> i64 {
+    let Some(video_start_seconds) =
+        probe_stream_start_time_seconds(path, source_id, toolchain, "v:0")
+    else {
+        return 0;
+    };
+    let Some(audio_start_seconds) =
+        probe_stream_start_time_seconds(path, source_id, toolchain, "a:0")
+    else {
+        return 0;
+    };
+    stream_start_offset_frames(video_start_seconds, audio_start_seconds, timebase)
+}
+
+fn probe_stream_start_time_seconds(
+    path: &Path,
+    source_id: &str,
+    toolchain: &FfmpegToolchain,
+    stream_selector: &str,
+) -> Option<f64> {
+    probe_key_values(
+        path,
+        toolchain,
+        stream_selector,
+        "stream=start_time",
+        BroadcastEngineErrorKind::SourceOpen,
+        source_id,
+    )
+    .ok()
+    .flatten()
+    .and_then(|values| parse_optional_f64_probe_field(&values, "start_time"))
+}
+
+fn stream_start_offset_frames(
+    video_start_seconds: f64,
+    audio_start_seconds: f64,
+    timebase: Timebase,
+) -> i64 {
+    if !video_start_seconds.is_finite() || !audio_start_seconds.is_finite() {
+        return 0;
+    }
+    let fps = f64::from(timebase.frame_rate_num) / f64::from(timebase.frame_rate_den);
+    let frames = (video_start_seconds - audio_start_seconds) * fps;
+    if !frames.is_finite() {
+        return 0;
+    }
+    frames.round().clamp(i64::MIN as f64, i64::MAX as f64) as i64
 }
 
 fn probe_key_values(
@@ -2962,6 +3075,13 @@ fn parse_u16_probe_field(
 
 fn parse_optional_u64_probe_field(values: &BTreeMap<String, String>, key: &str) -> Option<u64> {
     values.get(key).and_then(|value| value.parse::<u64>().ok())
+}
+
+fn parse_optional_f64_probe_field(values: &BTreeMap<String, String>, key: &str) -> Option<f64> {
+    values.get(key).and_then(|value| {
+        let normalized = value.replace(',', ".");
+        normalized.parse::<f64>().ok()
+    })
 }
 
 fn parse_u32_ratio(value: &str) -> Option<(u32, u32)> {
@@ -3532,8 +3652,8 @@ mod tests {
     fn audio_session_maps_source_boundary_to_last_decodable_frame() {
         let output = audio_session(20);
 
-        assert_eq!(output.decode_frame_for_request(19), 19);
-        assert_eq!(output.decode_frame_for_request(20), 19);
+        assert_eq!(output.decode_frame_for_request(19), Some(19));
+        assert_eq!(output.decode_frame_for_request(20), Some(19));
     }
 
     #[test]
@@ -3674,6 +3794,44 @@ mod tests {
         assert_eq!(
             audio_packet_byte_len_for_frame(0, &audio_format, timebase).unwrap(),
             3840
+        );
+    }
+
+    #[test]
+    fn audio_session_outputs_no_decode_frame_before_late_audio_start() {
+        let session = audio_session_with_offset(20, -5);
+
+        assert_eq!(session.decode_frame_for_request(0), None);
+        assert_eq!(session.decode_frame_for_request(4), None);
+        assert_eq!(session.decode_frame_for_request(5), Some(0));
+        assert_eq!(session.decode_frame_for_request(6), Some(1));
+    }
+
+    #[test]
+    fn audio_session_advances_decode_frame_when_audio_starts_before_video() {
+        let session = audio_session_with_offset(20, 3);
+
+        assert_eq!(session.decode_frame_for_request(0), Some(3));
+        assert_eq!(session.decode_frame_for_request(16), Some(19));
+        assert_eq!(session.decode_frame_for_request(20), Some(19));
+    }
+
+    #[test]
+    fn stream_start_offset_maps_probe_seconds_to_source_frames() {
+        let timebase = Timebase::new(50, 1).unwrap();
+
+        assert_eq!(stream_start_offset_frames(0.0, 0.1, timebase), -5);
+        assert_eq!(stream_start_offset_frames(0.1, 0.0, timebase), 5);
+        assert_eq!(stream_start_offset_frames(0.0, 0.009, timebase), 0);
+    }
+
+    #[test]
+    fn parse_probe_start_time_accepts_decimal_comma() {
+        let values = BTreeMap::from([("start_time".to_string(), "0,120000".to_string())]);
+
+        assert_eq!(
+            parse_optional_f64_probe_field(&values, "start_time"),
+            Some(0.12)
         );
     }
 
@@ -3830,6 +3988,13 @@ mod tests {
     }
 
     fn audio_session(duration_frames: u64) -> FfmpegAudioSession {
+        audio_session_with_offset(duration_frames, 0)
+    }
+
+    fn audio_session_with_offset(
+        duration_frames: u64,
+        decode_frame_offset: i64,
+    ) -> FfmpegAudioSession {
         let source = EngineSourceHandle {
             source_id: "src".to_string(),
             source_revision: None,
@@ -3838,7 +4003,7 @@ mod tests {
             video_format: None,
             audio_format: Some(AudioFormat::new(48_000, 1).unwrap()),
         };
-        FfmpegAudioSession::new(&source).unwrap()
+        FfmpegAudioSession::with_decode_frame_offset(&source, decode_frame_offset).unwrap()
     }
 
     #[test]

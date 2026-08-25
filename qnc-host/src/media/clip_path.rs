@@ -70,75 +70,72 @@ pub fn resolve_filmstrip_media(
     choose_filmstrip_media(&project_proxy, &proxy, &source, &original, fallback)
 }
 
-/// Uvezeni klipovi s pronađenom medijskom datotekom (proxy/original).
-pub fn imported_clip_media_rows(
+pub fn resolve_poster_media(
     paths: &ProjectPaths,
     project_id: &str,
-) -> Result<Vec<(String, PathBuf)>, String> {
-    let conn = open_ingest(paths, project_id).map_err(|e| e.to_string())?;
-    let mut stmt = conn
-        .prepare(
-            "SELECT clip_id, project_proxy_path, proxy_path, source_path, original_path
+    clip_id: &str,
+) -> Option<PathBuf> {
+    let conn = open_ingest(paths, project_id).ok()?;
+    let row: Option<(String, String)> = conn
+        .query_row(
+            "SELECT proxy_path, project_proxy_path
              FROM ingest_assets
-             WHERE import_status IN ('imported', 'done')
-             ORDER BY clip_id",
+             WHERE clip_id = ?1
+             ORDER BY CASE import_status WHEN 'imported' THEN 0 WHEN 'done' THEN 1 ELSE 2 END,
+                      CASE WHEN TRIM(COALESCE(proxy_path, '')) != '' THEN 0 ELSE 1 END,
+                      source_id
+             LIMIT 1",
+            rusqlite::params![clip_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
         )
-        .map_err(|e| e.to_string())?;
-    let rows = stmt
-        .query_map([], |r| {
-            Ok((
-                r.get::<_, String>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, String>(2)?,
-                r.get::<_, String>(3)?,
-                r.get::<_, String>(4)?,
-            ))
-        })
-        .map_err(|e| e.to_string())?;
-    let mut out = Vec::new();
-    for row in rows {
-        let (clip_id, project_proxy, proxy, source, original) = row.map_err(|e| e.to_string())?;
-        if let Some(media) = first_existing_path(&[project_proxy, proxy, source, original]) {
-            out.push((clip_id, media));
-        }
-    }
-    Ok(out)
+        .ok();
+    let Some((proxy, project_proxy)) = row else {
+        return None;
+    };
+    existing_proxy_path(&proxy, true).or_else(|| existing_proxy_path(&project_proxy, true))
 }
 
-pub fn imported_filmstrip_media_rows(
+pub fn resolve_waveform_media(
     paths: &ProjectPaths,
     project_id: &str,
-) -> Result<Vec<(String, PathBuf)>, String> {
+    clip_id: &str,
+) -> Option<PathBuf> {
+    let conn = open_ingest(paths, project_id).ok()?;
+    let row: Option<(String, String, String, String)> = conn
+        .query_row(
+            "SELECT project_proxy_path, proxy_path, source_path, original_path
+             FROM ingest_assets
+             WHERE clip_id = ?1
+               AND import_status IN ('imported', 'done')
+             ORDER BY CASE import_status WHEN 'imported' THEN 0 WHEN 'done' THEN 1 ELSE 2 END,
+                      CASE WHEN TRIM(COALESCE(project_proxy_path, '')) != '' THEN 0 ELSE 1 END,
+                      source_id
+             LIMIT 1",
+            rusqlite::params![clip_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .ok();
+    let Some((project_proxy, proxy, source, original)) = row else {
+        return None;
+    };
+    first_existing_path(&[project_proxy, proxy, source, original])
+}
+
+pub fn imported_clip_ids(paths: &ProjectPaths, project_id: &str) -> Result<Vec<String>, String> {
     let conn = open_ingest(paths, project_id).map_err(|e| e.to_string())?;
     let mut stmt = conn
         .prepare(
-            "SELECT clip_id, project_proxy_path, proxy_path, source_path, original_path
+            "SELECT DISTINCT clip_id
              FROM ingest_assets
              WHERE import_status IN ('imported', 'done')
              ORDER BY clip_id",
         )
         .map_err(|e| e.to_string())?;
     let rows = stmt
-        .query_map([], |r| {
-            Ok((
-                r.get::<_, String>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, String>(2)?,
-                r.get::<_, String>(3)?,
-                r.get::<_, String>(4)?,
-            ))
-        })
+        .query_map([], |r| r.get::<_, String>(0))
         .map_err(|e| e.to_string())?;
-    let mut out = Vec::new();
-    for row in rows {
-        let (clip_id, project_proxy, proxy, source, original) = row.map_err(|e| e.to_string())?;
-        if let Some(media) =
-            choose_filmstrip_media(&project_proxy, &proxy, &source, &original, None)
-        {
-            out.push((clip_id, media));
-        }
-    }
-    Ok(out)
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())
 }
 
 #[cfg(test)]

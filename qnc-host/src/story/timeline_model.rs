@@ -62,11 +62,11 @@ fn build_wrap_timeline_model_from_conn(
     let markers = list_markers_rows(conn).map_err(|e| e.to_string())?;
     let slots = list_marker_slots_rows(conn).map_err(|e| e.to_string())?;
 
-    let segments = build_segments(&parts, &covers, timeline_fps);
+    let segments = build_segments(&parts, &covers);
     let duration_frames = if segments.is_empty() {
         0
     } else {
-        timeline_duration_frames_from_parts(&parts, timeline_fps)
+        timeline_duration_frames_from_parts(&parts)
     };
     let duration_sec = round3(parts.iter().map(part_span_seconds).sum());
 
@@ -126,16 +126,12 @@ pub fn build_source_timeline_model(
     )
 }
 
-fn build_segments(
-    parts: &[StoryPartRow],
-    covers: &[StoryCoverRow],
-    timeline_fps: f64,
-) -> Vec<TimelineSegment> {
+fn build_segments(parts: &[StoryPartRow], covers: &[StoryCoverRow]) -> Vec<TimelineSegment> {
     let mut segments = Vec::new();
     let mut global_start_frame = 0;
     let mut global_start_sec = 0.0;
     for part in parts {
-        let span_frames = part_span_frames(part, timeline_fps);
+        let span_frames = part_span_frames(part);
         let global_end_frame = global_start_frame + span_frames;
         let span = part_span_seconds(part);
         let global_end = global_start_sec + span;

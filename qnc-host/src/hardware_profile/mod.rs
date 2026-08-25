@@ -184,21 +184,6 @@ pub fn get() -> Option<&'static HardwareProfile> {
     PROFILE.get()
 }
 
-pub fn recommended_proxy_parallel() -> u32 {
-    // Prefer probed value; cap so Shell stays responsive, but allow 2–3 for GPU.
-    let n = get()
-        .map(|p| p.recommended_proxy_parallel)
-        .unwrap_or(2)
-        .max(1);
-    n.min(3)
-}
-
-pub fn proxy_encoder_label() -> String {
-    get()
-        .map(|p| p.proxy_encoder.clone())
-        .unwrap_or_else(|| "libx264".into())
-}
-
 fn load_or_probe(root: &Path) -> HardwareProfile {
     let data_dir = root.join("data");
     let conn = match shell_store::open(&data_dir) {

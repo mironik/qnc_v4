@@ -1,5 +1,7 @@
 use serde::Deserialize;
 
+use crate::api::EditorialSourceTimebase;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) enum LibraryTab {
     #[default]
@@ -37,6 +39,8 @@ pub(crate) struct StoryPart {
     #[serde(default)]
     pub fps: f64,
     #[serde(default)]
+    pub source_timebase: EditorialSourceTimebase,
+    #[serde(default)]
     pub duration_frames: i64,
     #[serde(default)]
     pub duration_label: String,
@@ -61,6 +65,8 @@ pub(crate) struct StoryShot {
     pub duration_sec: f64,
     #[serde(default)]
     pub fps: f64,
+    #[serde(default)]
+    pub source_timebase: EditorialSourceTimebase,
     #[serde(default)]
     pub in_frame: i64,
     #[serde(default)]
@@ -99,7 +105,7 @@ pub(crate) struct StoryShot {
     pub status_original: String,
     #[serde(default)]
     pub original_in_project: bool,
-    /// Absolute local proxy path for native player (from host snapshot).
+    /// Legacy snapshot compatibility. Active playback input is resolved through media gateway.
     #[serde(default)]
     pub play_path: String,
 }
@@ -133,6 +139,8 @@ pub(crate) struct StoryCover {
     pub source_out_frame: i64,
     #[serde(default)]
     pub source_fps: f64,
+    #[serde(default)]
+    pub source_timebase: EditorialSourceTimebase,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]

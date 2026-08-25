@@ -11,6 +11,12 @@
     "step_forward_frame": {
       "label": "Playhead +1 frame (točan rez IN/OUT)"
     },
+    "navigate_prev_object": {
+      "label": "Prethodni timeline objekt"
+    },
+    "navigate_next_object": {
+      "label": "Sljedeći timeline objekt"
+    },
     "step_prev_part": {
       "label": "Prethodni blok"
     },
@@ -83,6 +89,9 @@
     "select_marker": {
       "label": "Selektiraj M marker"
     },
+    "select_current_marker_slot": {
+      "label": "Selektiraj M–M slot pod playheadom"
+    },
     "focus_next": {
       "label": "Fokus naprijed"
     },
@@ -101,8 +110,11 @@
     "focus_empty_slot": {
       "label": "Fokus prvi prazni M–M slot (kopiraj trajanje)"
     },
-    "undo_last": {
-      "label": "Poništi zadnju Story mutaciju"
+    "undo_object": {
+      "label": "Poništi odabrani Story objekt"
+    },
+    "redo_object": {
+      "label": "Vrati poništeni Story objekt"
     },
     "toggle_cheatsheet": {
       "label": "Prikaži / sakrij tipkovnički pregled"
@@ -112,6 +124,9 @@
     },
     "project_open_selected": {
       "label": "Otvori odabrani projekt"
+    },
+    "activate_focused_item": {
+      "label": "Aktiviraj fokusirani element"
     }
   },
   "presets": {
@@ -240,6 +255,11 @@
             "shift": true
           }
         ],
+        "activate_focused_item": [
+          {
+            "key": "Enter"
+          }
+        ],
         "clear_focus": [
           {
             "key": "Escape"
@@ -275,6 +295,13 @@
             "ctrl": false
           }
         ],
+        "select_current_marker_slot": [
+          {
+            "code": "KeyS",
+            "ctrl": true,
+            "shift": false
+          }
+        ],
         "focus_empty_slot": [
           {
             "code": "KeyS",
@@ -282,27 +309,45 @@
             "ctrl": false
           }
         ],
-        "step_prev_marker_slot": [
+        "navigate_prev_object": [
           {
-            "key": "["
-          },
-          {
-            "code": "BracketLeft"
+            "code": "ArrowLeft",
+            "alt": true
           }
         ],
-        "step_next_marker_slot": [
+        "navigate_next_object": [
           {
-            "key": "]"
-          },
-          {
-            "code": "BracketRight"
+            "code": "ArrowRight",
+            "alt": true
           }
         ],
-        "undo_last": [
+        "undo_object": [
+          {
+            "code": "KeyU",
+            "ctrl": true,
+            "shift": false
+          },
           {
             "code": "KeyZ",
             "ctrl": true,
             "shift": false
+          }
+        ],
+        "redo_object": [
+          {
+            "code": "KeyR",
+            "ctrl": true,
+            "shift": false
+          },
+          {
+            "code": "KeyY",
+            "ctrl": true,
+            "shift": false
+          },
+          {
+            "code": "KeyZ",
+            "ctrl": true,
+            "shift": true
           }
         ],
         "toggle_cheatsheet": [
@@ -355,6 +400,16 @@
         ],
         "step_back_frame": [ { "code": "ArrowLeft", "key": "ArrowLeft" } ],
         "step_forward_frame": [ { "code": "ArrowRight", "key": "ArrowRight" } ],
+        "step_prev_part": [
+          {
+            "key": "ArrowUp"
+          }
+        ],
+        "step_next_part": [
+          {
+            "key": "ArrowDown"
+          }
+        ],
         "add_marker": [
           {
             "key": "m"
@@ -405,6 +460,13 @@
             "ctrl": false
           }
         ],
+        "select_current_marker_slot": [
+          {
+            "code": "KeyS",
+            "ctrl": true,
+            "shift": false
+          }
+        ],
         "focus_empty_slot": [
           {
             "code": "KeyS",
@@ -412,23 +474,19 @@
             "ctrl": false
           }
         ],
-        "step_prev_marker_slot": [
+        "navigate_prev_object": [
           {
-            "key": "["
-          },
-          {
-            "code": "BracketLeft"
+            "code": "ArrowLeft",
+            "alt": true
           }
         ],
-        "step_next_marker_slot": [
+        "navigate_next_object": [
           {
-            "key": "]"
-          },
-          {
-            "code": "BracketRight"
+            "code": "ArrowRight",
+            "alt": true
           }
         ],
-        "undo_last": [
+        "undo_object": [
           {
             "code": "KeyZ",
             "ctrl": true,
@@ -704,7 +762,7 @@
             "code": "BracketRight"
           }
         ],
-        "undo_last": [
+        "undo_object": [
           {
             "code": "KeyZ",
             "ctrl": true,
@@ -851,7 +909,7 @@
             "code": "BracketRight"
           }
         ],
-        "undo_last": [
+        "undo_object": [
           {
             "code": "KeyZ",
             "ctrl": true,
@@ -1127,7 +1185,7 @@
             "code": "BracketRight"
           }
         ],
-        "undo_last": [
+        "undo_object": [
           {
             "code": "KeyZ",
             "ctrl": true,
@@ -1257,7 +1315,7 @@
             "code": "BracketRight"
           }
         ],
-        "undo_last": [
+        "undo_object": [
           {
             "code": "KeyZ",
             "ctrl": true,
@@ -1533,7 +1591,7 @@
             "code": "BracketRight"
           }
         ],
-        "undo_last": [
+        "undo_object": [
           {
             "code": "KeyZ",
             "ctrl": true,
@@ -1663,7 +1721,7 @@
             "code": "BracketRight"
           }
         ],
-        "undo_last": [
+        "undo_object": [
           {
             "code": "KeyZ",
             "ctrl": true,
@@ -1939,7 +1997,7 @@
             "code": "BracketRight"
           }
         ],
-        "undo_last": [
+        "undo_object": [
           {
             "code": "KeyZ",
             "ctrl": true,
@@ -2086,7 +2144,7 @@
             "code": "BracketRight"
           }
         ],
-        "undo_last": [
+        "undo_object": [
           {
             "code": "KeyZ",
             "ctrl": true,
@@ -2359,7 +2417,7 @@
             "code": "BracketRight"
           }
         ],
-        "undo_last": [
+        "undo_object": [
           {
             "code": "KeyZ",
             "ctrl": true,
@@ -2486,7 +2544,7 @@
             "code": "BracketRight"
           }
         ],
-        "undo_last": [
+        "undo_object": [
           {
             "code": "KeyZ",
             "ctrl": true,

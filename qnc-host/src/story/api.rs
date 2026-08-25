@@ -4,7 +4,9 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use qnc_service_contracts::{ExportRequest, ServiceError};
+use qnc_service_contracts::{
+    ExportRequest, MediaAccessKind, MediaLocator, MediaResolveRequest, ServiceError,
+};
 use serde_json::{json, Value};
 
 use crate::app_state::AppState;
@@ -14,10 +16,10 @@ use crate::project::db::{export_dir_from_settings, project_settings_snapshot_fro
 use super::db::{
     commit_story, create_cover, create_marker, create_marker_from_frame,
     create_marker_from_part_frame, create_part, create_part_with_range, delete_cover,
-    delete_marker, delete_part, load_state, move_marker, reorder_part, select_cover,
+    delete_marker, delete_part, load_state, move_marker, redo_object, reorder_part, select_cover,
     select_marker_slot, select_part, select_shot, set_part_mark_in, set_part_mark_in_frame,
-    set_part_mark_out, set_part_mark_out_frame, update_cover, update_marker, update_marker_frame,
-    update_part, SegmentRangeInput,
+    set_part_mark_out, set_part_mark_out_frame, undo_object, update_cover, update_marker,
+    update_marker_frame, update_part, SegmentRangeInput,
 };
 use super::playlist::{build_editorial_playlist_with_broker, EditorialPlaylist};
 use super::timeline_model::{build_source_timeline_model, build_wrap_timeline_model_with_broker};
@@ -178,6 +180,16 @@ struct CoverIdBody {
 }
 
 #[derive(serde::Deserialize)]
+struct StoryObjectBody {
+    #[serde(default)]
+    project_id: String,
+    #[serde(default)]
+    object_type: String,
+    #[serde(default)]
+    object_id: String,
+}
+
+#[derive(serde::Deserialize)]
 struct UpdateCoverBody {
     #[serde(default)]
     project_id: String,
@@ -269,6 +281,8 @@ pub fn router() -> Router<AppState> {
         .route("/api/story/cover/update", post(api_cover_update))
         .route("/api/story/cover/delete", post(api_cover_delete))
         .route("/api/story/cover/select", post(api_cover_select))
+        .route("/api/story/object/undo", post(api_object_undo))
+        .route("/api/story/object/redo", post(api_object_redo))
         .route("/api/story/commit", post(api_commit))
         .route("/api/story/export/submit", post(api_export_submit))
         .route("/api/story/export/status", get(api_export_status))
@@ -705,6 +719,34 @@ async fn api_cover_select(
     Ok(Json(state))
 }
 
+async fn api_object_undo(
+    State(app): State<AppState>,
+    Json(body): Json<StoryObjectBody>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let pid = resolve_project_id(&app, &body.project_id)?;
+    let state = app
+        .project_db
+        .serialize_project_write(&pid, || {
+            undo_object(&app.project.paths, &pid, &body.object_type, &body.object_id)
+        })
+        .map_err(map_bad_request)?;
+    Ok(Json(state))
+}
+
+async fn api_object_redo(
+    State(app): State<AppState>,
+    Json(body): Json<StoryObjectBody>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let pid = resolve_project_id(&app, &body.project_id)?;
+    let state = app
+        .project_db
+        .serialize_project_write(&pid, || {
+            redo_object(&app.project.paths, &pid, &body.object_type, &body.object_id)
+        })
+        .map_err(map_bad_request)?;
+    Ok(Json(state))
+}
+
 async fn api_commit(
     State(app): State<AppState>,
     Json(body): Json<CommitBody>,
@@ -740,12 +782,7 @@ async fn api_export_submit(
         output_dir: export_dir_from_settings(&project_settings),
         project_settings,
     };
-    let job = app
-        .services
-        .export
-        .submit(request)
-        .await
-        .map_err(map_service_err)?;
+    let job = app.export.submit(request).await.map_err(map_service_err)?;
     serde_json::to_value(job)
         .map(Json)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
@@ -760,12 +797,7 @@ async fn api_export_status(
     if job_id.is_empty() {
         return Err((StatusCode::BAD_REQUEST, "job_id required".into()));
     }
-    let job = app
-        .services
-        .export
-        .status(job_id)
-        .await
-        .map_err(map_service_err)?;
+    let job = app.export.status(job_id).await.map_err(map_service_err)?;
     serde_json::to_value(job)
         .map(Json)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
@@ -780,11 +812,7 @@ async fn api_export_cancel(
     if job_id.is_empty() {
         return Err((StatusCode::BAD_REQUEST, "job_id required".into()));
     }
-    app.services
-        .export
-        .cancel(job_id)
-        .await
-        .map_err(map_service_err)?;
+    app.export.cancel(job_id).await.map_err(map_service_err)?;
     Ok(Json(json!({
         "job_id": job_id,
         "state": "cancelled",
@@ -808,21 +836,57 @@ async fn api_play_media(
     if clip.is_empty() {
         return Err((StatusCode::BAD_REQUEST, "clip_id required".into()));
     }
-    let media = crate::media::resolve_play_media(&app.project.paths, &pid, clip)
-        .map_err(map_bad_request)?;
-    let kind = match media.kind {
-        crate::media::PlayMediaKind::Proxy => "proxy",
-        crate::media::PlayMediaKind::Original => "original",
+    let media = app
+        .media_gateway
+        .resolve_sync(MediaResolveRequest {
+            project_id: pid.clone(),
+            clip_id: clip.to_string(),
+            access: MediaAccessKind::PlaybackProxy,
+            fallback: None,
+        })
+        .map_err(|error| map_bad_request(error.message))?;
+    let path = match &media.media.locator {
+        MediaLocator::LocalPath { path } => path.clone(),
+        MediaLocator::IntranetPath { .. } | MediaLocator::ManagedAsset { .. } => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "Story play media nije lokalno dostupno za ovaj host helper.".into(),
+            ));
+        }
     };
+    let clip_id = media.media.clip_id.clone();
+    let field_order = media
+        .metadata
+        .get("field_order")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let interlaced = media
+        .metadata
+        .get("interlaced")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let source_class = media
+        .metadata
+        .get("source_class")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let proxy_recipe = media
+        .metadata
+        .get("proxy_recipe")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
     Ok(Json(serde_json::json!({
         "project_id": pid,
-        "clip_id": media.clip_id,
-        "kind": kind,
-        "path": media.path.to_string_lossy(),
-        "field_order": media.field_order,
-        "interlaced": media.interlaced,
-        "source_class": media.source_class,
-        "proxy_recipe": media.proxy_recipe,
+        "clip_id": clip_id,
+        "kind": "proxy",
+        "path": path.to_string_lossy(),
+        "field_order": field_order,
+        "interlaced": interlaced,
+        "source_class": source_class,
+        "proxy_recipe": proxy_recipe,
     })))
 }
 

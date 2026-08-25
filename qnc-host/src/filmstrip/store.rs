@@ -4,8 +4,6 @@ use std::path::{Path, PathBuf};
 use rusqlite::{params, Connection};
 use serde_json::{json, Value};
 
-use crate::ingest::thumb::timeline_seek_seconds;
-use crate::locale_number::parse_decimal;
 use crate::project::db::{now_str, open_project_strict, ProjectPaths};
 
 #[derive(Clone, Debug)]
@@ -378,161 +376,6 @@ fn frame_file_valid(path: &Path) -> bool {
     path.is_file() && path.metadata().map(|m| m.len()).unwrap_or(0) > 0
 }
 
-fn parse_frame_filename(name: &str) -> Option<(usize, f64)> {
-    let stem = name
-        .strip_suffix(".jpg")
-        .or_else(|| name.strip_suffix(".JPG"))?;
-    let (idx_part, seek_part) = stem.split_once('_')?;
-    let index: usize = idx_part.parse().ok()?;
-    let seek = parse_decimal(&seek_part.replace('_', "."))?;
-    Some((index, seek))
-}
-
-fn discover_frames_on_disk(dir: &Path) -> Vec<FilmstripFrame> {
-    let mut out: Vec<FilmstripFrame> = Vec::new();
-    let Ok(read_dir) = fs::read_dir(dir) else {
-        return out;
-    };
-    for entry in read_dir.flatten() {
-        let path = entry.path();
-        if !frame_file_valid(&path) {
-            continue;
-        }
-        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
-            continue;
-        };
-        if let Some((index, seek_sec)) = parse_frame_filename(name) {
-            out.push(FilmstripFrame {
-                index,
-                seek_sec,
-                path,
-            });
-        }
-    }
-    out.sort_by_key(|f| f.index);
-    out
-}
-
-fn expected_default_frame_set(duration_sec: f64) -> Vec<f64> {
-    if duration_sec.is_finite() && duration_sec > 0.0 {
-        timeline_seek_seconds(duration_sec, super::DEFAULT_FILMSTRIP_FRAMES)
-    } else {
-        Vec::new()
-    }
-}
-
-fn keep_current_frame_positions(
-    mut frames: Vec<FilmstripFrame>,
-    expected: &[f64],
-) -> Vec<FilmstripFrame> {
-    if expected.is_empty() {
-        return frames;
-    }
-    frames.retain(|frame| {
-        expected
-            .get(frame.index)
-            .map(|seek| (frame.seek_sec - *seek).abs() <= 0.011)
-            .unwrap_or(false)
-    });
-    frames
-}
-
-fn has_complete_default_frame_set(frames: &[FilmstripFrame], expected: &[f64]) -> bool {
-    !expected.is_empty()
-        && (0..expected.len()).all(|index| {
-            frames.iter().any(|frame| {
-                frame.index == index && (frame.seek_sec - expected[index]).abs() <= 0.011
-            })
-        })
-}
-
-fn stored_frames_equal(stored: &[Value], frames: &[FilmstripFrame]) -> bool {
-    if stored.len() != frames.len() {
-        return false;
-    }
-    stored.iter().zip(frames.iter()).all(|(stored, frame)| {
-        stored.get("index").and_then(Value::as_i64) == Some(frame.index as i64)
-            && (stored
-                .get("seek_sec")
-                .and_then(Value::as_f64)
-                .unwrap_or(f64::NAN)
-                - frame.seek_sec)
-                .abs()
-                <= 0.011
-            && stored
-                .get("path")
-                .and_then(Value::as_str)
-                .map(Path::new)
-                .map(|path| path == frame.path.as_path() && frame_file_valid(path))
-                .unwrap_or(false)
-    })
-}
-
-fn filmstrip_state_matches(
-    paths: &ProjectPaths,
-    project_id: &str,
-    clip_id: &str,
-    status: &str,
-    frames: &[FilmstripFrame],
-) -> bool {
-    let Some(existing) = get_filmstrip(paths, project_id, clip_id) else {
-        return false;
-    };
-    if existing.get("status").and_then(Value::as_str) != Some(status) {
-        return false;
-    }
-    let Ok(stored) = list_frames_for_clip(paths, project_id, clip_id) else {
-        return false;
-    };
-    stored_frames_equal(&stored, frames)
-}
-
-/// Ako su JPG kadrovi na disku, a `filmstrip_frames` u bazi nije usklađen —
-/// registriraj ih. Djelomični set ostaje `building`; `ready` znači puni set.
-pub fn sync_filmstrip_from_disk(
-    paths: &ProjectPaths,
-    project_id: &str,
-    clip_id: &str,
-    duration_hint: f64,
-) -> Result<bool, String> {
-    let dir = filmstrip_clip_dir(paths, project_id, clip_id);
-    let discovered = discover_frames_on_disk(&dir);
-    if discovered.is_empty() {
-        return Ok(false);
-    }
-    let duration = duration_hint
-        .is_finite()
-        .then_some(duration_hint)
-        .filter(|duration| *duration > 0.0)
-        .or_else(|| {
-            get_filmstrip(paths, project_id, clip_id)
-                .and_then(|fs| fs.get("duration_sec").and_then(Value::as_f64))
-                .filter(|duration| *duration > 0.0)
-        })
-        .unwrap_or_else(|| {
-            discovered
-                .iter()
-                .map(|f| f.seek_sec)
-                .fold(0.0_f64, f64::max)
-                .max(1.0)
-        });
-    let expected = expected_default_frame_set(duration);
-    let frames = keep_current_frame_positions(discovered, &expected);
-    if frames.is_empty() {
-        return Ok(false);
-    }
-    let status = if has_complete_default_frame_set(&frames, &expected) {
-        "ready"
-    } else {
-        "building"
-    };
-    if filmstrip_state_matches(paths, project_id, clip_id, status, &frames) {
-        return Ok(false);
-    }
-    save_filmstrip_with_status(paths, project_id, clip_id, duration, &frames, "", status)?;
-    Ok(true)
-}
-
 fn write_frames(
     conn: &Connection,
     clip_id: &str,
@@ -731,7 +574,6 @@ pub fn frame_path_for_index(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ingest::thumb::timeline_seek_seconds;
     use crate::project::db::{
         ensure_project_dirs_at, open_global, open_project, project_dir_in_root,
     };
@@ -822,72 +664,6 @@ mod tests {
         );
         let fs = get_filmstrip(&paths, project_id, clip_id).unwrap();
         assert_eq!(fs.get("status").and_then(|v| v.as_str()), Some("ready"));
-        let _ = fs::remove_dir_all(&base);
-    }
-
-    #[test]
-    fn sync_from_disk_registers_existing_jpgs() {
-        let base = std::env::temp_dir().join(format!("qnc_filmstrip_sync_{}", std::process::id()));
-        let _ = fs::remove_dir_all(&base);
-        fs::create_dir_all(&base).unwrap();
-        let paths = test_paths(&base);
-        let project_id = "test_proj";
-        register_project(&paths, project_id);
-        let clip_id = "clip_b";
-        let dir = filmstrip_clip_dir(&paths, project_id, clip_id);
-        for (index, seek) in timeline_seek_seconds(30.0, crate::filmstrip::DEFAULT_FILMSTRIP_FRAMES)
-            .into_iter()
-            .enumerate()
-        {
-            let sec_label = crate::locale_number::format_decimal(seek, 2).replace('.', "_");
-            let path = dir.join(format!("{index:03}_{sec_label}.jpg"));
-            let mut f = fs::File::create(&path).unwrap();
-            f.write_all(b"jpeg").unwrap();
-        }
-        mark_filmstrip(&paths, project_id, clip_id, "building", "").unwrap();
-        assert!(list_frames_for_clip(&paths, project_id, clip_id)
-            .unwrap()
-            .is_empty());
-        assert!(sync_filmstrip_from_disk(&paths, project_id, clip_id, 30.0).unwrap());
-        let stored = list_frames_for_clip(&paths, project_id, clip_id).unwrap();
-        assert_eq!(
-            stored.len(),
-            crate::filmstrip::DEFAULT_FILMSTRIP_FRAMES as usize
-        );
-        let fs = get_filmstrip(&paths, project_id, clip_id).unwrap();
-        assert_eq!(fs.get("status").and_then(|v| v.as_str()), Some("ready"));
-        let _ = fs::remove_dir_all(&base);
-    }
-
-    #[test]
-    fn sync_from_disk_registers_partial_jpgs_as_building() {
-        let base =
-            std::env::temp_dir().join(format!("qnc_filmstrip_partial_sync_{}", std::process::id()));
-        let _ = fs::remove_dir_all(&base);
-        fs::create_dir_all(&base).unwrap();
-        let paths = test_paths(&base);
-        let project_id = "test_proj";
-        register_project(&paths, project_id);
-        let clip_id = "clip_partial";
-        let dir = filmstrip_clip_dir(&paths, project_id, clip_id);
-        for (index, seek) in timeline_seek_seconds(30.0, crate::filmstrip::DEFAULT_FILMSTRIP_FRAMES)
-            .into_iter()
-            .take(3)
-            .enumerate()
-        {
-            let sec_label = crate::locale_number::format_decimal(seek, 2).replace('.', "_");
-            let path = dir.join(format!("{index:03}_{sec_label}.jpg"));
-            let mut f = fs::File::create(&path).unwrap();
-            f.write_all(b"jpeg").unwrap();
-        }
-        mark_filmstrip(&paths, project_id, clip_id, "building", "").unwrap();
-
-        assert!(sync_filmstrip_from_disk(&paths, project_id, clip_id, 30.0).unwrap());
-
-        let stored = list_frames_for_clip(&paths, project_id, clip_id).unwrap();
-        assert_eq!(stored.len(), 3);
-        let fs = get_filmstrip(&paths, project_id, clip_id).unwrap();
-        assert_eq!(fs.get("status").and_then(|v| v.as_str()), Some("building"));
         let _ = fs::remove_dir_all(&base);
     }
 }

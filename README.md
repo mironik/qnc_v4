@@ -1,4 +1,4 @@
-# QNC — native (v0.5.0)
+# QNC — native (v0.5.0.1)
 
 Aktivna radna kopija: **`qnc-app` + `qnc-host`**. Web UI nije dio `qnc_v4`
 produkta i legacy `web-arhive/` folder nije prisutan u ovom treeu.
@@ -11,18 +11,60 @@ cd C:\Users\miron\Projects\qnc_v4
 .\run_app.ps1
 ```
 
-Host je **samo API** (`/api/...`). Nema `/app` HTML/JS.
+Host je **API + SQLite koordinator** (`/api/...`). Nema `/app` HTML/JS.
 
-Vanjski worker za teske artifact poslove pokrece se zasebno:
-
-```powershell
-.\run_worker.ps1
-```
+`run_host.ps1` automatski pokrece lokalni `qnc-worker` proces za teske artifact
+poslove (`proxy_generate`, `filmstrip`). Host ne izvršava artifact poslove
+lokalno u svom procesu.
 
 Default capabilities su `proxy_generate,filmstrip`; `QNC_WORKER_CAPABILITIES`
-moze zadati drugi popis za specijalizirane workere.
+moze zadati drugi popis za specijalizirane workere. Isti `qnc-worker` se koristi
+na lokalnoj radnoj stanici i na intranet worker stroju; placement se detektira
+iz `QNC_HOST_URL` / `--host-url`, a po potrebi se rucno zakljucava preko
+`QNC_WORKER_PLACEMENT` / `--placement`.
 
 LAN: `QNC_BIND_HOST=0.0.0.0` zahtijeva `QNC_TRUSTED_LAN=1`. Internet bez auth/proxy **nije** podržan.
+
+Media access ide kroz isti integration gateway model u svim okruzenjima. Lokalni
+filesystem/NAS adapter i enterprise migracijski proxy prema postojecem
+MAM/ingest/archive sustavu su razlicite implementacije istog ugovora. Taj sloj
+je neinvazivan i read-through po defaultu; postojeća TV infrastruktura ostaje
+vlasnik svojih baza, storage pravila i produkcijskog toka.
+
+## Deployment konfiguracija
+
+`config.toml` definira ciljnu topologiju, ali ne uvodi drugi kodni put:
+
+```toml
+deployment = "single_workstation"
+
+[integration.gateway]
+kind = "local_fs"
+read_only = true
+
+# enterprise_proxy primjer:
+# endpoint = "http://mam-gateway.local/qnc"
+#
+# [integration.gateway.routes]
+# playback_proxy = "/media/{access}/{project_id}/{clip_id}"
+# original_master = "/media/{access}/{project_id}/{clip_id}"
+```
+
+Vrijednosti za `deployment`:
+
+- `single_workstation` — novinar/laptop, app + host + worker na istom stroju.
+- `shared_worker` — mala produkcija, laptopi montiraju, jedan jaci stroj radi background poslove.
+- `enterprise_gateway` — TV intranet, QNC ide kroz gateway/proxy prema postojecim sustavima.
+- `internet_project` — projekti/metapodaci online, mediji ostaju lokalno kod korisnika.
+
+Vrijednosti za `integration.gateway.kind`:
+
+- `local_fs` — lokalni disk ili lokalno montiran medij.
+- `shared_fs` — zajednicki NAS/share za vise radnih stanica.
+- `enterprise_proxy` — neinvazivni proxy/gateway prema MAM/ingest/archive sustavu.
+
+Manualni override je dopusten za deployment/proizvodne topologije:
+`QNC_DEPLOYMENT` i `QNC_INTEGRATION_GATEWAY_KIND`.
 
 ## Struktura
 
@@ -49,10 +91,20 @@ LAN: `QNC_BIND_HOST=0.0.0.0` zahtijeva `QNC_TRUSTED_LAN=1`. Internet bez auth/pr
 | `media_pool` (Rust) | shared helperi za Ingest/Story |
 | design-tools HTTP | API only (nema web UI) |
 
+## v0.5.0.1 — Stability backup
+
+- JobService heartbeat accepts every leased artifact job, including `media_probe`.
+- Playback media resolve persists probed `fps/duration/source_timebase` back to SQLite.
+- Story/MA source selection waits for resolver metadata when snapshots are incomplete.
+- Cover creation uses the selected source/virtual range by default; manual IN/OUT are overrides.
+
 ## v0.5.0 — Service adapter checkpoint
 
 - Media service contracts are introduced as the neutral boundary for media, ASR, search and AI adapters.
 - Filmstrip, proxy generation, waveform and duration/probe background paths use the configured media processor boundary.
+- `proxy_generate` and `filmstrip` now have explicit ownership through JobService. One `qnc-worker` binary self-detects local workstation vs intranet shared-media placement and allows a manual placement override.
+- Integration is represented as one read-through media gateway scaffold for local filesystem/NAS and enterprise MAM/ingest/archive proxy adapters, not direct writes into existing systems.
+- Deployment is now a typed runtime config: `single_workstation`, `shared_worker`, `enterprise_gateway`, `internet_project`.
 - Local workstation remains the active target; intranet/internet modes stay future adapter targets.
 
 ## v0.4.7.2 — Story stability / background throttle snapshot

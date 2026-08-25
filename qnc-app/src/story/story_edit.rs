@@ -1,6 +1,7 @@
 //! Native Story edit target helpers.
 
 use super::{MarkerSlot, StoryCover};
+use crate::player_contract::BroadcastSourceTimebase;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct CoverTarget {
@@ -13,6 +14,7 @@ pub(super) struct CoverSourceRange {
     pub in_frame: i64,
     pub out_frame: i64,
     pub fps: f64,
+    pub source_timebase: BroadcastSourceTimebase,
 }
 
 pub(super) fn quick_cover_target(
@@ -63,20 +65,21 @@ pub(super) fn overwrite_cover_target(
 
 pub(super) fn cover_source_range(
     selected_clip_id: &str,
-    mark_in_set: bool,
-    mark_out_set: bool,
+    _mark_in_set: bool,
+    _mark_out_set: bool,
     source_in_frame: i64,
     source_out_frame: i64,
     source_fps: Option<f64>,
+    source_timebase: Option<BroadcastSourceTimebase>,
 ) -> Result<CoverSourceRange, String> {
     let clip_id = selected_clip_id.trim();
     if clip_id.is_empty() {
         return Err("Odaberi source klip za pokrivalicu".into());
     }
     let fps = source_fps.ok_or_else(|| "Source FPS još nije potvrđen".to_string())?;
-    if !mark_in_set || !mark_out_set {
-        return Err("Pokrivalica treba IN/OUT na source klipu".into());
-    }
+    let source_timebase = source_timebase
+        .filter(|timebase| timebase.is_valid())
+        .ok_or_else(|| "Source timebase još nije potvrđen".to_string())?;
     let in_frame = source_in_frame.max(0);
     let out_frame = source_out_frame.max(in_frame + 1);
     if out_frame <= in_frame {
@@ -88,6 +91,7 @@ pub(super) fn cover_source_range(
         in_frame,
         out_frame,
         fps,
+        source_timebase,
     })
 }
 
@@ -209,19 +213,62 @@ mod tests {
     }
 
     #[test]
-    fn cover_source_range_requires_source_marks() {
-        let err = cover_source_range("clip_a", true, false, 10, 20, Some(50.0)).unwrap_err();
+    fn cover_source_range_uses_selected_source_range_without_manual_marks() {
+        let range = cover_source_range(
+            "clip_a",
+            false,
+            false,
+            10,
+            20,
+            Some(50.0),
+            BroadcastSourceTimebase::from_i64(50, 1),
+        )
+        .unwrap();
 
-        assert!(err.contains("IN/OUT"));
+        assert_eq!(range.in_frame, 10);
+        assert_eq!(range.out_frame, 20);
+    }
+
+    #[test]
+    fn cover_source_range_accepts_out_only_override() {
+        let range = cover_source_range(
+            "clip_a",
+            false,
+            true,
+            10,
+            40,
+            Some(50.0),
+            BroadcastSourceTimebase::from_i64(50, 1),
+        )
+        .unwrap();
+
+        assert_eq!(range.in_frame, 10);
+        assert_eq!(range.out_frame, 40);
     }
 
     #[test]
     fn cover_source_range_keeps_source_fps_frames() {
-        let range = cover_source_range("clip_a", true, true, 100, 160, Some(50.0)).unwrap();
+        let range = cover_source_range(
+            "clip_a",
+            true,
+            true,
+            100,
+            160,
+            Some(50.0),
+            BroadcastSourceTimebase::from_i64(50, 1),
+        )
+        .unwrap();
 
         assert_eq!(range.clip_id, "clip_a");
         assert_eq!(range.in_frame, 100);
         assert_eq!(range.out_frame, 160);
         assert_eq!(range.fps, 50.0);
+        assert_eq!(
+            range.source_timebase,
+            BroadcastSourceTimebase {
+                fps_num: 50,
+                fps_den: 1,
+            }
+        );
     }
 }

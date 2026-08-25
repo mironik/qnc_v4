@@ -22,6 +22,8 @@ pub(crate) enum EditorialEditKind {
     SelectCover,
     CreateCover,
     DeleteCover,
+    UndoObject,
+    RedoObject,
 }
 
 impl EditorialEditKind {
@@ -41,6 +43,8 @@ impl EditorialEditKind {
             Self::SelectCover => "cover.select",
             Self::CreateCover => "cover.create",
             Self::DeleteCover => "cover.delete",
+            Self::UndoObject => "object.undo",
+            Self::RedoObject => "object.redo",
         }
     }
 
@@ -60,6 +64,8 @@ impl EditorialEditKind {
             "cover.select" => Self::SelectCover,
             "cover.create" => Self::CreateCover,
             "cover.delete" => Self::DeleteCover,
+            "object.undo" => Self::UndoObject,
+            "object.redo" => Self::RedoObject,
             _ => return None,
         })
     }
@@ -346,6 +352,67 @@ impl EditorialEditComponent {
         )
     }
 
+    pub fn delete_cover(
+        instance_id: &str,
+        request_id: u64,
+        project_id: &str,
+        cover_id: &str,
+    ) -> ComponentBackendCommand {
+        Self::post(
+            instance_id,
+            request_id,
+            project_id,
+            EditorialEditKind::DeleteCover,
+            cover_id,
+            "/api/story/cover/delete",
+            json!({ "project_id": project_id, "cover_id": cover_id }),
+        )
+    }
+
+    pub fn undo_object(
+        instance_id: &str,
+        request_id: u64,
+        project_id: &str,
+        object_type: &str,
+        object_id: &str,
+    ) -> ComponentBackendCommand {
+        Self::post(
+            instance_id,
+            request_id,
+            project_id,
+            EditorialEditKind::UndoObject,
+            &object_key(object_type, object_id),
+            "/api/story/object/undo",
+            json!({
+                "project_id": project_id,
+                "object_type": object_type,
+                "object_id": object_id,
+            }),
+        )
+    }
+
+    pub fn redo_object(
+        instance_id: &str,
+        request_id: u64,
+        project_id: &str,
+        object_type: &str,
+        object_id: &str,
+    ) -> ComponentBackendCommand {
+        Self::post(
+            instance_id,
+            request_id,
+            project_id,
+            EditorialEditKind::RedoObject,
+            &object_key(object_type, object_id),
+            "/api/story/object/redo",
+            json!({
+                "project_id": project_id,
+                "object_type": object_type,
+                "object_id": object_id,
+            }),
+        )
+    }
+
     pub fn accepts_event(event: &ComponentBackendEvent) -> bool {
         event.component_id == COMPONENT_ID
             && event.port_id == PORT_MUTATION
@@ -399,6 +466,10 @@ impl EditorialEditComponent {
 
 fn request_key(instance_id: &str, project_id: &str, request_id: u64, detail: &str) -> String {
     format!("{instance_id}{REQUEST_SEP}{project_id}{REQUEST_SEP}{request_id}{REQUEST_SEP}{detail}")
+}
+
+fn object_key(object_type: &str, object_id: &str) -> String {
+    format!("{}:{}", object_type.trim(), object_id.trim())
 }
 
 fn split_request_key(value: &str) -> Option<(String, String, u64, String)> {

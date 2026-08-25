@@ -4,9 +4,12 @@
 //! It only maps between a global program axis and source-frame ranges stored in
 //! the editorial playlist.
 
-use crate::api::{EditorialPlaylist, EditorialPlaylistCover, EditorialPlaylistSegment};
+use crate::api::{
+    EditorialPlaylist, EditorialPlaylistCover, EditorialPlaylistSegment, EditorialSourceTimebase,
+};
 use crate::editorial::types::{MarkerSlot, StoryCover, StoryMarker};
 use crate::frame_time::normalize_fps;
+use crate::player_contract::BroadcastSourceTimebase;
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct SegmentProgramModel {
@@ -34,6 +37,7 @@ pub(crate) struct SegmentProgramSegment {
     pub source_in_frame: i64,
     pub source_out_frame: i64,
     pub source_fps: f64,
+    pub source_timebase: BroadcastSourceTimebase,
     pub streamable: bool,
 }
 
@@ -47,6 +51,7 @@ pub(crate) struct SegmentProgramCover {
     pub source_in_frame: i64,
     pub source_out_frame: i64,
     pub source_fps: f64,
+    pub source_timebase: BroadcastSourceTimebase,
     pub streamable: bool,
 }
 
@@ -61,6 +66,20 @@ pub(crate) struct SegmentProgramMarkerSlot {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SegmentProgramMarker {
     pub marker_id: String,
+    pub frame: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SegmentProgramNavigationKind {
+    Segment,
+    MarkerSlot,
+    Marker,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SegmentProgramNavigationTarget {
+    pub kind: SegmentProgramNavigationKind,
+    pub id: String,
     pub frame: i64,
 }
 
@@ -259,6 +278,25 @@ impl SegmentProgramModel {
             .find(|slot| slot.slot_id == slot_id)
     }
 
+    pub(crate) fn marker_slot_at_program_frame(
+        &self,
+        program_frame: i64,
+    ) -> Option<&SegmentProgramMarkerSlot> {
+        let frame = program_frame.max(0);
+        self.marker_slots
+            .iter()
+            .enumerate()
+            .find_map(|(index, slot)| {
+                if slot.slot_id.trim().is_empty() {
+                    return None;
+                }
+                let start = slot.start_frame.max(0);
+                let end = slot.end_frame.max(start + 1);
+                let is_last = index + 1 == self.marker_slots.len();
+                (frame >= start && (frame < end || is_last && frame == end)).then_some(slot)
+            })
+    }
+
     pub(crate) fn adjacent_marker_slot(
         &self,
         selected_slot_id: &str,
@@ -294,6 +332,70 @@ impl SegmentProgramModel {
             (current_index + 1).min(self.marker_slots.len().saturating_sub(1))
         };
         (next != current_index).then(|| &self.marker_slots[next])
+    }
+
+    pub(crate) fn adjacent_navigation_target(
+        &self,
+        selected_part_id: &str,
+        selected_slot_id: &str,
+        selected_marker_id: &str,
+        program_frame: i64,
+        direction: i32,
+    ) -> Option<SegmentProgramNavigationTarget> {
+        if direction == 0 {
+            return None;
+        }
+        if !selected_marker_id.trim().is_empty() {
+            let marker = self.adjacent_marker(selected_marker_id, program_frame, direction)?;
+            return Some(SegmentProgramNavigationTarget {
+                kind: SegmentProgramNavigationKind::Marker,
+                id: marker.marker_id.clone(),
+                frame: marker.frame,
+            });
+        }
+        if !selected_slot_id.trim().is_empty() {
+            let slot = self.adjacent_marker_slot(selected_slot_id, program_frame, direction)?;
+            return Some(SegmentProgramNavigationTarget {
+                kind: SegmentProgramNavigationKind::MarkerSlot,
+                id: slot.slot_id.clone(),
+                frame: slot.start_frame,
+            });
+        }
+        let segment = self.adjacent_part(selected_part_id, program_frame, direction)?;
+        Some(SegmentProgramNavigationTarget {
+            kind: SegmentProgramNavigationKind::Segment,
+            id: segment.part_id.clone(),
+            frame: segment.global_start_frame,
+        })
+    }
+
+    pub(crate) fn adjacent_marker(
+        &self,
+        selected_marker_id: &str,
+        program_frame: i64,
+        direction: i32,
+    ) -> Option<&SegmentProgramMarker> {
+        if self.markers.is_empty() || direction == 0 {
+            return None;
+        }
+        let current_index = self
+            .markers
+            .iter()
+            .position(|marker| {
+                !selected_marker_id.trim().is_empty() && marker.marker_id == selected_marker_id
+            })
+            .or_else(|| {
+                let frame = program_frame.max(0);
+                self.markers.iter().position(|marker| marker.frame >= frame)
+            })?;
+        let next = if direction < 0 {
+            current_index.checked_sub(1)?
+        } else {
+            current_index
+                .checked_add(1)
+                .filter(|next| *next < self.markers.len())?
+        };
+        self.markers.get(next).filter(|marker| marker.frame > 0)
     }
 }
 
@@ -338,6 +440,7 @@ impl SegmentProgramSegment {
             source_in_frame: segment.source_in_frame.max(0),
             source_out_frame: segment.source_out_frame.max(segment.source_in_frame + 1),
             source_fps: segment.source_fps,
+            source_timebase: source_timebase_from_editorial(segment.source_timebase),
             streamable: segment.streamable,
         }
     }
@@ -357,6 +460,7 @@ impl SegmentProgramCover {
             source_in_frame: source_in,
             source_out_frame: cover.source_out_frame.max(source_in + 1),
             source_fps: cover.source_fps,
+            source_timebase: source_timebase_from_editorial(cover.source_timebase),
             streamable: cover.streamable,
         }
     }
@@ -379,9 +483,17 @@ impl SegmentProgramCover {
             source_in_frame: source_in,
             source_out_frame: source_out,
             source_fps: cover.source_fps,
+            source_timebase: source_timebase_from_editorial(cover.source_timebase),
             streamable: !cover.clip_id.trim().is_empty(),
         }
     }
+}
+
+fn source_timebase_from_editorial(
+    source_timebase: EditorialSourceTimebase,
+) -> BroadcastSourceTimebase {
+    BroadcastSourceTimebase::from_i64(source_timebase.fps_num, source_timebase.fps_den)
+        .unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -1009,6 +1121,7 @@ mod tests {
                     source_fps: 50.0,
                     streamable: true,
                     source: Default::default(),
+                    ..EditorialPlaylistCover::default()
                 }],
                 ..EditorialPlaylistSegment::default()
             }],
@@ -1164,9 +1277,104 @@ mod tests {
         );
         assert_eq!(
             program
+                .marker_slot_at_program_frame(10)
+                .map(|slot| slot.slot_id.as_str()),
+            Some("slot_a")
+        );
+        assert_eq!(
+            program
+                .marker_slot_at_program_frame(40)
+                .map(|slot| slot.slot_id.as_str()),
+            Some("slot_b")
+        );
+        assert_eq!(
+            program
+                .marker_slot_at_program_frame(100)
+                .map(|slot| slot.slot_id.as_str()),
+            Some("slot_b")
+        );
+        assert_eq!(
+            program
                 .first_empty_marker_slot()
                 .map(|slot| slot.slot_id.as_str()),
             Some("slot_b")
         );
+    }
+
+    #[test]
+    fn program_model_navigates_active_timeline_object_kind() {
+        let playlist = EditorialPlaylist {
+            project_id: "p".into(),
+            timeline_fps: 50.0,
+            duration_frames: 100,
+            segments: vec![
+                EditorialPlaylistSegment {
+                    part_id: "part_a".into(),
+                    global_start_frame: 0,
+                    global_end_frame: 40,
+                    duration_frames: 40,
+                    ..EditorialPlaylistSegment::default()
+                },
+                EditorialPlaylistSegment {
+                    part_id: "part_b".into(),
+                    global_start_frame: 40,
+                    global_end_frame: 100,
+                    duration_frames: 60,
+                    ..EditorialPlaylistSegment::default()
+                },
+            ],
+            ..EditorialPlaylist::default()
+        };
+        let slots = vec![
+            MarkerSlot {
+                slot_id: "slot_a".into(),
+                start_frame: 0,
+                end_frame: 40,
+                ..MarkerSlot::default()
+            },
+            MarkerSlot {
+                slot_id: "slot_b".into(),
+                start_frame: 40,
+                end_frame: 100,
+                ..MarkerSlot::default()
+            },
+        ];
+        let markers = vec![
+            StoryMarker {
+                marker_id: "marker_a".into(),
+                timeline_frame: 70,
+                ..StoryMarker::default()
+            },
+            StoryMarker {
+                marker_id: "marker_b".into(),
+                timeline_frame: 90,
+                ..StoryMarker::default()
+            },
+        ];
+        let program = SegmentProgramModel::from_playlist(Some(&playlist), &slots, &[], &markers);
+
+        let target = program
+            .adjacent_navigation_target("", "", "", 0, 1)
+            .expect("next segment from start");
+        assert_eq!(target.kind, SegmentProgramNavigationKind::Segment);
+        assert_eq!(target.id, "part_b");
+
+        let target = program
+            .adjacent_navigation_target("part_a", "", "", 0, 1)
+            .expect("next segment after selected segment");
+        assert_eq!(target.kind, SegmentProgramNavigationKind::Segment);
+        assert_eq!(target.id, "part_b");
+
+        let target = program
+            .adjacent_navigation_target("", "slot_a", "", 0, 1)
+            .expect("next object after selected slot");
+        assert_eq!(target.kind, SegmentProgramNavigationKind::MarkerSlot);
+        assert_eq!(target.id, "slot_b");
+
+        let target = program
+            .adjacent_navigation_target("", "", "marker_b", 90, -1)
+            .expect("previous object before selected marker");
+        assert_eq!(target.kind, SegmentProgramNavigationKind::Marker);
+        assert_eq!(target.id, "marker_a");
     }
 }

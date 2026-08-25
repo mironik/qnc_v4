@@ -1,7 +1,9 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use qnc_service_contracts::RuntimeProfile;
+use qnc_service_contracts::{
+    DeploymentMode, IntegrationGatewayKind, IntegrationGatewayRoutes, RuntimeProfile,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -31,6 +33,12 @@ pub struct NetworkPreset {
 pub struct RuntimeConfig {
     #[serde(default = "default_runtime_profile")]
     pub profile: RuntimeProfile,
+    #[serde(default = "default_deployment_mode")]
+    pub deployment: DeploymentMode,
+    #[serde(default)]
+    pub workers: WorkerRuntimeConfig,
+    #[serde(default)]
+    pub integration: IntegrationRuntimeConfig,
     #[serde(default = "default_media_service_config")]
     pub media: ServiceBackendConfig,
     #[serde(default = "default_disabled_service_config")]
@@ -57,12 +65,64 @@ pub struct ServiceBackendConfig {
     pub model_path: Option<String>,
 }
 
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct WorkerRuntimeConfig {}
+
+impl WorkerRuntimeConfig {
+    fn normalized(self) -> Self {
+        self
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct IntegrationRuntimeConfig {
+    #[serde(default)]
+    pub gateway: IntegrationGatewayConfig,
+}
+
+impl Default for IntegrationRuntimeConfig {
+    fn default() -> Self {
+        Self {
+            gateway: IntegrationGatewayConfig::default(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct IntegrationGatewayConfig {
+    #[serde(default = "default_integration_gateway_kind")]
+    pub kind: IntegrationGatewayKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<String>,
+    #[serde(default)]
+    pub routes: IntegrationGatewayRoutes,
+    #[serde(default = "default_true")]
+    pub read_only: bool,
+}
+
+impl Default for IntegrationGatewayConfig {
+    fn default() -> Self {
+        Self {
+            kind: default_integration_gateway_kind(),
+            endpoint: None,
+            routes: IntegrationGatewayRoutes::default(),
+            read_only: true,
+        }
+    }
+}
+
 #[derive(Debug, Default, Deserialize)]
 struct ConfigTomlFile {
     #[serde(default)]
     profile: Option<RuntimeProfile>,
     #[serde(default)]
+    deployment: Option<DeploymentMode>,
+    #[serde(default)]
     runtime: Option<RuntimeTomlSection>,
+    #[serde(default)]
+    workers: Option<WorkerRuntimeConfig>,
+    #[serde(default)]
+    integration: Option<IntegrationRuntimeConfig>,
     #[serde(default)]
     media: Option<ServiceBackendConfig>,
     #[serde(default)]
@@ -79,6 +139,8 @@ struct ConfigTomlFile {
 struct RuntimeTomlSection {
     #[serde(default)]
     profile: Option<RuntimeProfile>,
+    #[serde(default)]
+    deployment: Option<DeploymentMode>,
 }
 
 fn default_port() -> u16 {
@@ -97,12 +159,24 @@ fn default_runtime_profile() -> RuntimeProfile {
     RuntimeProfile::Light
 }
 
+fn default_deployment_mode() -> DeploymentMode {
+    DeploymentMode::SingleWorkstation
+}
+
+fn default_integration_gateway_kind() -> IntegrationGatewayKind {
+    IntegrationGatewayKind::LocalFs
+}
+
 fn default_media_service_config() -> ServiceBackendConfig {
     service_config_or("local_ffmpeg", None)
 }
 
 fn default_disabled_service_config() -> ServiceBackendConfig {
     service_config_or("disabled", None)
+}
+
+fn default_true() -> bool {
+    true
 }
 
 fn service_config_or(
@@ -120,6 +194,9 @@ impl Default for RuntimeConfig {
     fn default() -> Self {
         Self {
             profile: default_runtime_profile(),
+            deployment: default_deployment_mode(),
+            workers: WorkerRuntimeConfig::default(),
+            integration: IntegrationRuntimeConfig::default(),
             media: default_media_service_config(),
             transcription: default_disabled_service_config(),
             search: default_disabled_service_config(),
@@ -170,24 +247,22 @@ impl AppConfig {
 
 pub fn load_runtime_config(root: &Path) -> RuntimeConfig {
     let path = root.join("config.toml");
-    let raw = match fs::read_to_string(&path) {
-        Ok(raw) => raw,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return RuntimeConfig::default();
-        }
+    let mut config = match fs::read_to_string(&path) {
+        Ok(raw) => match parse_runtime_config_toml(&raw) {
+            Ok(config) => config,
+            Err(error) => {
+                tracing::warn!("config.toml nije valjan: {error}");
+                RuntimeConfig::default()
+            }
+        },
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => RuntimeConfig::default(),
         Err(error) => {
             tracing::warn!("config.toml nije procitan: {error}");
-            return RuntimeConfig::default();
-        }
-    };
-
-    match parse_runtime_config_toml(&raw) {
-        Ok(config) => config,
-        Err(error) => {
-            tracing::warn!("config.toml nije valjan: {error}");
             RuntimeConfig::default()
         }
-    }
+    };
+    apply_runtime_env_overrides(&mut config);
+    config
 }
 
 fn parse_runtime_config_toml(raw: &str) -> Result<RuntimeConfig, String> {
@@ -198,15 +273,84 @@ fn parse_runtime_config_toml(raw: &str) -> Result<RuntimeConfig, String> {
         .and_then(|runtime| runtime.profile)
         .or(file.profile)
         .unwrap_or_else(default_runtime_profile);
+    let deployment = file
+        .runtime
+        .as_ref()
+        .and_then(|runtime| runtime.deployment)
+        .or(file.deployment)
+        .unwrap_or_else(default_deployment_mode);
 
+    let workers = file.workers.unwrap_or_default().normalized();
+    let integration = file.integration.unwrap_or_default();
     Ok(RuntimeConfig {
         profile,
+        deployment,
+        workers,
+        integration,
         media: service_config_or("local_ffmpeg", file.media),
         transcription: service_config_or("disabled", file.transcription),
         search: service_config_or("disabled", file.search),
         ai: service_config_or("disabled", file.ai),
         export: service_config_or("disabled", file.export),
     })
+}
+
+fn apply_runtime_env_overrides(config: &mut RuntimeConfig) {
+    config.workers = config.workers.clone().normalized();
+    if let Ok(raw) = std::env::var("QNC_DEPLOYMENT") {
+        if let Some(deployment) = parse_deployment_mode(&raw) {
+            config.deployment = deployment;
+        } else {
+            tracing::warn!("QNC_DEPLOYMENT '{raw}' nije valjan; koristim config.toml/default");
+        }
+    }
+    if let Ok(raw) = std::env::var("QNC_INTEGRATION_GATEWAY_KIND") {
+        if let Some(kind) = parse_integration_gateway_kind(&raw) {
+            config.integration.gateway.kind = kind;
+        } else {
+            tracing::warn!(
+                "QNC_INTEGRATION_GATEWAY_KIND '{raw}' nije valjan; koristim config.toml/default"
+            );
+        }
+    }
+}
+
+fn parse_deployment_mode(raw: &str) -> Option<DeploymentMode> {
+    match normalize_config_key(raw).as_str() {
+        "" | "auto" | "local" | "portable" | "workstation" | "single" | "single_workstation" => {
+            Some(DeploymentMode::SingleWorkstation)
+        }
+        "shared_worker" | "local_worker" | "shared_production" | "small_production" => {
+            Some(DeploymentMode::SharedWorker)
+        }
+        "enterprise" | "enterprise_gateway" | "intranet" | "tv_intranet" => {
+            Some(DeploymentMode::EnterpriseGateway)
+        }
+        "internet" | "internet_project" | "tester" | "internet_tester" => {
+            Some(DeploymentMode::InternetProject)
+        }
+        _ => None,
+    }
+}
+
+fn parse_integration_gateway_kind(raw: &str) -> Option<IntegrationGatewayKind> {
+    match normalize_config_key(raw).as_str() {
+        "" | "auto" | "local" | "local_fs" | "filesystem" | "fs" => {
+            Some(IntegrationGatewayKind::LocalFs)
+        }
+        "shared" | "shared_fs" | "nas" | "shared_media" => Some(IntegrationGatewayKind::SharedFs),
+        "enterprise" | "enterprise_proxy" | "mam_proxy" | "intranet_proxy" => {
+            Some(IntegrationGatewayKind::EnterpriseProxy)
+        }
+        _ => None,
+    }
+}
+
+fn normalize_config_key(raw: &str) -> String {
+    raw.trim()
+        .to_ascii_lowercase()
+        .replace('-', "_")
+        .replace(' ', "_")
 }
 
 /// HTTP bind address. Default `127.0.0.1`; set `QNC_BIND_HOST=0.0.0.0` for LAN
@@ -230,12 +374,16 @@ pub fn configured_bind_host() -> String {
 }
 
 fn env_flag_true(name: &str) -> bool {
+    env_flag(name).unwrap_or(false)
+}
+
+fn env_flag(name: &str) -> Option<bool> {
     match std::env::var(name) {
         Ok(v) => {
             let v = v.to_lowercase();
-            v == "1" || v == "true" || v == "yes"
+            Some(v == "1" || v == "true" || v == "yes" || v == "on")
         }
-        Err(_) => false,
+        Err(_) => None,
     }
 }
 
@@ -367,11 +515,17 @@ mod tests {
         let config = parse_runtime_config_toml("").unwrap();
 
         assert_eq!(config.profile, RuntimeProfile::Light);
+        assert_eq!(config.deployment, DeploymentMode::SingleWorkstation);
         assert_eq!(config.media.backend, "local_ffmpeg");
         assert_eq!(config.transcription.backend, "disabled");
         assert_eq!(config.search.backend, "disabled");
         assert_eq!(config.ai.backend, "disabled");
         assert_eq!(config.export.backend, "disabled");
+        assert_eq!(
+            config.integration.gateway.kind,
+            IntegrationGatewayKind::LocalFs
+        );
+        assert!(config.integration.gateway.read_only);
     }
 
     #[test]
@@ -379,6 +533,7 @@ mod tests {
         let config = parse_runtime_config_toml(
             r#"
             profile = "local_ai"
+            deployment = "shared_worker"
 
             [media]
             backend = "local_ffmpeg"
@@ -399,6 +554,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(config.profile, RuntimeProfile::LocalAi);
+        assert_eq!(config.deployment, DeploymentMode::SharedWorker);
         assert_eq!(config.media.backend, "local_ffmpeg");
         assert_eq!(config.transcription.backend, "whisper_cpp");
         assert_eq!(
@@ -419,6 +575,7 @@ mod tests {
 
             [runtime]
             profile = "enterprise"
+            deployment = "enterprise_gateway"
 
             [media]
             backend = "remote_rest"
@@ -428,10 +585,80 @@ mod tests {
         .unwrap();
 
         assert_eq!(config.profile, RuntimeProfile::Enterprise);
+        assert_eq!(config.deployment, DeploymentMode::EnterpriseGateway);
         assert_eq!(config.media.backend, "remote_rest");
         assert_eq!(
             config.media.endpoint.as_deref(),
             Some("http://qnc-media.local:9000")
+        );
+    }
+
+    #[test]
+    fn runtime_config_accepts_empty_workers_section() {
+        let config = parse_runtime_config_toml(
+            r#"
+            [workers]
+            "#,
+        )
+        .unwrap();
+
+        let _ = config.workers;
+    }
+
+    #[test]
+    fn runtime_config_reads_integration_gateway() {
+        let config = parse_runtime_config_toml(
+            r#"
+            [integration.gateway]
+            kind = "enterprise_proxy"
+            endpoint = "http://mam-gateway.local/qnc"
+
+            [integration.gateway.routes]
+            playback_proxy = "/play/{project_id}/{clip_id}"
+            original_master = "/master/{project_id}/{clip_id}"
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            config.integration.gateway.kind,
+            IntegrationGatewayKind::EnterpriseProxy
+        );
+        assert_eq!(
+            config.integration.gateway.endpoint.as_deref(),
+            Some("http://mam-gateway.local/qnc")
+        );
+        assert_eq!(
+            config.integration.gateway.routes.playback_proxy.as_deref(),
+            Some("/play/{project_id}/{clip_id}")
+        );
+        assert_eq!(
+            config.integration.gateway.routes.original_master.as_deref(),
+            Some("/master/{project_id}/{clip_id}")
+        );
+        assert!(
+            config.integration.gateway.read_only,
+            "integration gateway must default to read-only"
+        );
+    }
+
+    #[test]
+    fn runtime_config_parsers_accept_manual_aliases() {
+        assert_eq!(
+            parse_deployment_mode("small-production"),
+            Some(DeploymentMode::SharedWorker)
+        );
+        assert_eq!(
+            parse_deployment_mode("tv intranet"),
+            Some(DeploymentMode::EnterpriseGateway)
+        );
+        assert_eq!(
+            parse_integration_gateway_kind("NAS"),
+            Some(IntegrationGatewayKind::SharedFs)
+        );
+        assert_eq!(
+            parse_integration_gateway_kind("mam-proxy"),
+            Some(IntegrationGatewayKind::EnterpriseProxy)
         );
     }
 }

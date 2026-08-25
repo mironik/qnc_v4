@@ -1,4 +1,8 @@
-//! Canonical editorial playlist — single projection for play, export XML, export EDL.
+//! Raw editorial playlist — the montage result stored in source coordinates.
+//!
+//! This is not the Broadcast Player input. Preview playback derives a flat
+//! playlist input from this structure, while export can later relink the same
+//! source-frame ranges to full-resolution originals.
 //!
 //! Reads montage rows from SQLite; no ffprobe in the hot path.
 
@@ -26,6 +30,25 @@ pub enum StreamRef {
     VirtualShot { virtual_shot_id: String },
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SourceTimebase {
+    pub fps_num: i64,
+    pub fps_den: i64,
+}
+
+impl SourceTimebase {
+    fn from_parts(fps_num: i64, fps_den: i64) -> Self {
+        Self {
+            fps_num: fps_num.max(0),
+            fps_den: fps_den.max(1),
+        }
+    }
+
+    fn is_valid(self) -> bool {
+        self.fps_num > 0 && self.fps_den > 0
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct EditorialCover {
     pub cover_id: String,
@@ -45,6 +68,7 @@ pub struct EditorialCover {
     pub source_in_frame: i64,
     pub source_out_frame: i64,
     pub source_fps: f64,
+    pub source_timebase: SourceTimebase,
     pub source_in_sec: f64,
     pub source_out_sec: f64,
     /// When cover timeline starts before segment global start (ton under cover).
@@ -73,6 +97,7 @@ pub struct EditorialSegment {
     pub source_in_frame: i64,
     pub source_out_frame: i64,
     pub source_fps: f64,
+    pub source_timebase: SourceTimebase,
     pub streamable: bool,
     pub source: StreamRef,
     pub covers: Vec<EditorialCover>,
@@ -197,6 +222,7 @@ fn map_covers_for_segment(
             source_in_frame,
             source_out_frame,
             source_fps: trim.source_fps,
+            source_timebase: SourceTimebase::from_parts(cover.source_fps_num, cover.source_fps_den),
             source_in_sec: if is_valid_fps(trim.source_fps) {
                 round3(frame_to_seconds(source_in_frame, trim.source_fps))
             } else {
@@ -234,7 +260,7 @@ fn build_segments(
     let mut global_start_frame = 0;
     let mut global_start_sec = 0.0;
     for part in parts {
-        let span_frames = part_span_frames(part, timeline_fps);
+        let span_frames = part_span_frames(part);
         let global_end_frame = global_start_frame + span_frames;
         let span = part_span_seconds(part);
         let global_end = global_start_sec + span;
@@ -261,6 +287,7 @@ fn build_segments(
             source_in_frame: part.in_frame.max(0),
             source_out_frame: part.out_frame.max(part.in_frame + 1),
             source_fps: part.fps,
+            source_timebase: SourceTimebase::from_parts(part.source_fps_num, part.source_fps_den),
             streamable: !clip_id.is_empty(),
             source: StreamRef::Part {
                 part_id: part.part_id.clone(),
@@ -279,6 +306,26 @@ fn story_program_source_fps(parts: &[StoryPartRow]) -> f64 {
         .map(|part| part.fps)
         .find(|fps| is_valid_fps(*fps))
         .unwrap_or(0.0)
+}
+
+fn validate_source_timebases(segments: &[EditorialSegment]) -> Result<(), String> {
+    for segment in segments {
+        if segment.streamable && !segment.source_timebase.is_valid() {
+            return Err(format!(
+                "Segment '{}' nema originalni source timebase; ponovi import/probe.",
+                segment.part_id
+            ));
+        }
+        for cover in &segment.covers {
+            if cover.streamable && !cover.source_timebase.is_valid() {
+                return Err(format!(
+                    "Pokrivalica '{}' nema originalni source timebase; ponovi import/probe.",
+                    cover.cover_id
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Build the canonical editorial playlist from project DB rows.
@@ -320,10 +367,11 @@ fn build_editorial_playlist_from_conn(
     let timeline_fps = story_program_source_fps(&parts);
     let covers = list_covers(conn).map_err(|e| e.to_string())?;
     let segments = build_segments(&parts, &covers, timeline_fps);
+    validate_source_timebases(&segments)?;
     let duration_frames = if segments.is_empty() {
         0
     } else {
-        timeline_duration_frames_from_parts(&parts, timeline_fps)
+        timeline_duration_frames_from_parts(&parts)
     };
     let duration_sec = if duration_frames <= 0 {
         0.0
@@ -361,11 +409,12 @@ mod tests {
             "INSERT INTO virtual_shots
                 (shot_id, clip_id, kind, source_shot_id, locked, display_name, source, quality,
                  duration_seconds, in_seconds, out_seconds, fps, source_fps, timeline_fps,
+                 source_fps_num, source_fps_den,
                  in_frame, out_frame, duration_frames, timeline_duration_frames,
                  duration_label, duration_color_key, in_tc, out_tc, description, category_key,
                  created_at, updated_at)
              VALUES ('shot_a', 'clip_a', 'virtual', '', 0, '', 'manual', 'ok', 2.0, 1.0, 3.0,
-                     25.0, 25.0, 25.0, 25, 75, 50, 50, '2:00', 'under_3',
+                     25.0, 25.0, 25.0, 25, 1, 25, 75, 50, 50, '2:00', 'under_3',
                      '00:00:01:00', '00:00:03:00', 'Opis', 'manual_cut', 'epoch_1', 'epoch_1')",
             [],
         )
@@ -391,11 +440,12 @@ mod tests {
             "INSERT INTO virtual_shots
                 (shot_id, clip_id, kind, source_shot_id, locked, display_name, source, quality,
                  duration_seconds, in_seconds, out_seconds, fps, source_fps, timeline_fps,
+                 source_fps_num, source_fps_den,
                  in_frame, out_frame, duration_frames, timeline_duration_frames,
                  duration_label, duration_color_key, in_tc, out_tc, description, category_key,
                  created_at, updated_at)
              VALUES (?1, ?2, 'virtual', '', 0, '', 'manual', 'ok', ?3, ?4, ?5,
-                     ?6, ?6, ?6, ?7, ?8, ?9, ?9, 'frames', 'under_3',
+                     ?6, ?6, ?6, ?7, ?8, ?9, ?10, ?11, ?11, 'frames', 'under_3',
                      '', '', 'Opis', 'manual_cut', 'epoch_1', 'epoch_1')",
             rusqlite::params![
                 shot_id,
@@ -404,6 +454,8 @@ mod tests {
                 in_seconds,
                 out_seconds,
                 fps,
+                fps.round() as i64,
+                1,
                 in_frame,
                 out_frame,
                 duration_frames
@@ -586,6 +638,13 @@ mod tests {
         assert_eq!(cover.source_out_frame, 200);
         assert_eq!(cover.source_in_sec, 2.0);
         assert_eq!(cover.source_out_sec, 4.0);
+        assert_eq!(
+            cover.source_timebase,
+            SourceTimebase {
+                fps_num: 50,
+                fps_den: 1
+            }
+        );
         let _ = std::fs::remove_dir_all(&base);
     }
 
@@ -632,7 +691,7 @@ mod tests {
     }
 
     #[test]
-    fn build_editorial_playlist_mixed_source_fps_uses_program_timeline_frames() {
+    fn build_editorial_playlist_mixed_source_fps_keeps_source_frame_counts() {
         let base =
             std::env::temp_dir().join(format!("qnc_playlist_mixed_fps_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
@@ -644,22 +703,22 @@ mod tests {
         conn.execute(
             "INSERT INTO story_parts
                 (part_id, kind, sort_index, title, text, clip_id, virtual_shot_id,
-                 in_tc, out_tc, in_seconds, out_seconds, fps,
+                 in_tc, out_tc, in_seconds, out_seconds, fps, source_fps_num, source_fps_den,
                  in_frame, out_frame, duration_frames,
                  duration_label, duration_color_key, created_at, updated_at)
              VALUES ('part_25', 'tonovi', 0, '', '', 'clip_a', '',
-                     '', '', 0, 1, 25, 0, 25, 25, '1:00', 'under_3', 't', 't')",
+                     '', '', 0, 1, 25, 25, 1, 0, 25, 25, '1:00', 'under_3', 't', 't')",
             [],
         )
         .unwrap();
         conn.execute(
             "INSERT INTO story_parts
                 (part_id, kind, sort_index, title, text, clip_id, virtual_shot_id,
-                 in_tc, out_tc, in_seconds, out_seconds, fps,
+                 in_tc, out_tc, in_seconds, out_seconds, fps, source_fps_num, source_fps_den,
                  in_frame, out_frame, duration_frames,
                  duration_label, duration_color_key, created_at, updated_at)
              VALUES ('part_50', 'tonovi', 1, '', '', 'clip_b', '',
-                     '', '', 0, 1, 50, 0, 50, 50, '1:00', 'under_3', 't', 't')",
+                     '', '', 0, 1, 50, 50, 1, 0, 50, 50, '1:00', 'under_3', 't', 't')",
             [],
         )
         .unwrap();
@@ -668,14 +727,21 @@ mod tests {
         let plan = build_editorial_playlist(&paths, project_id).unwrap();
 
         assert_eq!(plan.timeline_fps, 25.0);
-        assert_eq!(plan.duration_frames, 50);
+        assert_eq!(plan.duration_frames, 75);
         assert_eq!(plan.duration_sec, 2.0);
         assert_eq!(plan.segments.len(), 2);
         assert_eq!(plan.segments[0].duration_frames, 25);
         assert_eq!(plan.segments[1].global_start_frame, 25);
-        assert_eq!(plan.segments[1].global_end_frame, 50);
-        assert_eq!(plan.segments[1].duration_frames, 25);
+        assert_eq!(plan.segments[1].global_end_frame, 75);
+        assert_eq!(plan.segments[1].duration_frames, 50);
         assert_eq!(plan.segments[1].source_fps, 50.0);
+        assert_eq!(
+            plan.segments[1].source_timebase,
+            SourceTimebase {
+                fps_num: 50,
+                fps_den: 1
+            }
+        );
         let _ = std::fs::remove_dir_all(&base);
     }
 
@@ -692,11 +758,11 @@ mod tests {
         conn.execute(
             "INSERT INTO story_parts
                 (part_id, kind, sort_index, title, text, clip_id, virtual_shot_id,
-                 in_tc, out_tc, in_seconds, out_seconds, fps,
+                 in_tc, out_tc, in_seconds, out_seconds, fps, source_fps_num, source_fps_den,
                  in_frame, out_frame, duration_frames,
                  duration_label, duration_color_key, created_at, updated_at)
              VALUES ('part_manual', 'tonovi', 0, '', '', 'clip_x', '',
-                     '', '', 0, 3, 25, 0, 75, 75, '3:00', 'under_3', 't', 't')",
+                     '', '', 0, 3, 25, 25, 1, 0, 75, 75, '3:00', 'under_3', 't', 't')",
             [],
         )
         .unwrap();

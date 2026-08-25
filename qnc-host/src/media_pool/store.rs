@@ -1,8 +1,6 @@
 use serde_json::{json, Value};
 
-use crate::filmstrip::{
-    get_filmstrip, list_frames_for_clip, pad_frames_to_default, sync_filmstrip_from_disk,
-};
+use crate::filmstrip::{get_filmstrip, list_frames_for_clip, pad_frames_to_default};
 use crate::project::db::{ensure_project_dirs, now_str, ProjectPaths};
 use crate::waveform::snapshot as waveform_snapshot;
 
@@ -76,7 +74,6 @@ pub fn list_clips_enriched(paths: &ProjectPaths, project_id: &str) -> Result<Val
             "duration_sec": duration,
             "fps": fps,
         });
-        sync_filmstrip_from_disk(paths, project_id, &clip_id, duration).ok();
         if let Some(fs) = get_filmstrip(paths, project_id, &clip_id) {
             let st = fs
                 .get("status")

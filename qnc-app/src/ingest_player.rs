@@ -3,10 +3,14 @@
 
 use eframe::egui::ColorImage;
 
+use crate::components::{PlaybackMediaResolution, PlaybackMediaResolverComponent};
 use crate::frame_time::{frame_to_seconds, seconds_to_frame};
 use crate::ingest::{IngestAction, IngestScreen};
+use crate::playback_routing::PlaybackTransportIntent;
 use crate::player_bridge::PlayerClient;
-use crate::player_contract::{BroadcastHostSourceRef, FrameNumber};
+use crate::player_contract::{BroadcastHostSourceRef, BroadcastSourceTimebase, FrameNumber};
+
+const INGEST_PLAYBACK_INSTANCE_ID: &str = "ingest";
 
 impl IngestScreen {
     pub fn playback_source_ref(&self) -> Option<&BroadcastHostSourceRef> {
@@ -78,12 +82,18 @@ impl IngestScreen {
 
     pub(crate) fn transport_cue_frame(&self) -> Option<i64> {
         self.selected_source_ref.as_ref()?;
+        self.playback_media_path()?;
         Some(self.virtual_frame.max(0))
     }
 
     pub fn reset_player_session(&mut self) {
         self.selected_play_path.clear();
+        self.selected_play_input_clip_id.clear();
+        self.pending_play_input_clip_id.clear();
+        self.pending_play_after_resolve = false;
+        self.pending_backend_commands.clear();
         self.selected_source_ref = None;
+        self.selected_source_timebase = BroadcastSourceTimebase::default();
         self.playing = false;
         self.virtual_frame = 0;
     }
@@ -95,14 +105,20 @@ impl IngestScreen {
         self.preview_clip_id = clip_id.to_string();
         self.virtual_frame = 0;
         self.playing = false;
+        self.pending_play_after_resolve = false;
 
-        let Some((fps, has_audio, channels, duration)) = self
+        let Some((source_timebase, has_audio, channels, duration)) = self
             .state
             .as_ref()
             .and_then(|st| st.clips.iter().find(|c| c.clip_id == clip_id))
             .and_then(|c| {
-                (c.fps.is_finite() && c.fps > 0.0).then_some((
-                    c.fps,
+                let source_timebase = BroadcastSourceTimebase::from_i64(
+                    c.source_timebase.fps_num,
+                    c.source_timebase.fps_den,
+                )
+                .or_else(|| timebase_from_probe_fps(c.fps))?;
+                Some((
+                    source_timebase,
                     c.has_audio,
                     if c.audio_channels > 0 {
                         c.audio_channels
@@ -120,15 +136,18 @@ impl IngestScreen {
             })
         else {
             self.selected_source_fps = 0.0;
+            self.selected_source_timebase = BroadcastSourceTimebase::default();
             self.selected_source_has_audio = false;
             self.selected_source_audio_channels = 0;
             self.selected_source_ref = None;
-            self.player_status = format!("Klip '{clip_id}' nema potvrđen source FPS");
-            self.resolve_play_path(clip_id);
+            self.player_status = format!("Klip '{clip_id}' nema potvrđen source timebase");
+            self.request_playback_input(project_id, clip_id);
             return;
         };
 
+        let fps = source_timebase.fps().unwrap_or(0.0);
         self.selected_source_fps = fps;
+        self.selected_source_timebase = source_timebase;
         self.selected_source_has_audio = has_audio;
         self.selected_source_audio_channels = channels;
         let duration_frames = seconds_to_frame(duration, fps).max(1);
@@ -143,37 +162,213 @@ impl IngestScreen {
         )
         .ok();
 
-        self.resolve_play_path(clip_id);
+        self.request_playback_input(project_id, clip_id);
     }
 
-    fn resolve_play_path(&mut self, clip_id: &str) {
+    pub(crate) fn ensure_preview_playback_ready(&mut self, project_id: &str) {
+        if self.playing {
+            return;
+        }
+        let clip_id = self.preview_clip_id.trim().to_string();
+        if clip_id.is_empty() {
+            return;
+        }
+        let source_ready = self.selected_source_ref.as_ref().is_some_and(|source_ref| {
+            source_ref.project_id == project_id
+                && source_ref.clip_id == clip_id
+                && self.selected_source_timebase.is_valid()
+                && self.selected_source_fps.is_finite()
+                && self.selected_source_fps > 0.0
+        });
+        let path_ready = {
+            let p = self.selected_play_path.trim();
+            self.selected_play_input_clip_id == clip_id && !p.is_empty()
+        };
+        if source_ready && path_ready {
+            return;
+        }
+        self.activate_preview_clip(project_id, &clip_id);
+    }
+
+    pub(crate) fn request_play_after_resolve(&mut self) {
+        if self.preview_clip_id.trim().is_empty() {
+            return;
+        }
+        self.pending_play_after_resolve = true;
+    }
+
+    fn request_playback_input(&mut self, project_id: &str, clip_id: &str) {
+        let project_id = project_id.trim();
+        let clip_id = clip_id.trim();
+        if project_id.is_empty() || clip_id.is_empty() {
+            self.selected_play_path.clear();
+            self.selected_play_input_clip_id.clear();
+            self.pending_play_input_clip_id.clear();
+            return;
+        }
+        if self.selected_play_input_clip_id == clip_id && !self.selected_play_path.trim().is_empty()
+        {
+            self.player_status = format!("Play · {clip_id}");
+            return;
+        }
+        if self.pending_play_input_clip_id == clip_id {
+            self.player_status = format!("Play · {clip_id} (media resolve)");
+            return;
+        }
         self.selected_play_path.clear();
-        let Some(clip) = self
-            .state
-            .as_ref()
-            .and_then(|st| st.clips.iter().find(|c| c.clip_id == clip_id))
+        self.selected_play_input_clip_id.clear();
+        self.pending_play_input_clip_id = clip_id.to_string();
+        self.pending_backend_commands
+            .push(PlaybackMediaResolverComponent::resolve_playback_proxy(
+                INGEST_PLAYBACK_INSTANCE_ID,
+                project_id,
+                clip_id,
+            ));
+        self.player_status = format!("Play · {clip_id} (media resolve)");
+    }
+
+    pub fn apply_playback_media_resolution(
+        &mut self,
+        project_id: &str,
+        clip_id: &str,
+        resolution: PlaybackMediaResolution,
+    ) -> PlaybackTransportIntent {
+        if !self.playback_project_matches(project_id) || self.preview_clip_id != clip_id {
+            return PlaybackTransportIntent::None;
+        }
+        self.apply_resolved_playback_metadata(project_id, clip_id, &resolution);
+        if self.pending_play_input_clip_id == clip_id {
+            self.pending_play_input_clip_id.clear();
+        }
+        let play_after_resolve = self.pending_play_after_resolve;
+        self.pending_play_after_resolve = false;
+        self.selected_play_path = resolution.media_input.trim().to_string();
+        self.selected_play_input_clip_id = clip_id.to_string();
+        self.player_status = format!("Play · {clip_id} ({})", resolution.locator_kind);
+        if self.transport_cue_frame().is_none() {
+            return PlaybackTransportIntent::None;
+        }
+        if play_after_resolve {
+            PlaybackTransportIntent::TogglePlay
+        } else {
+            PlaybackTransportIntent::CueFrame(self.virtual_frame.max(0))
+        }
+    }
+
+    fn apply_resolved_playback_metadata(
+        &mut self,
+        project_id: &str,
+        clip_id: &str,
+        resolution: &PlaybackMediaResolution,
+    ) {
+        let Some(source_timebase) = resolution
+            .source_timebase
+            .filter(|timebase| timebase.is_valid())
         else {
-            self.player_status = format!("Nema klipa · {clip_id}");
             return;
         };
-        for (candidate, label) in [
-            (clip.proxy_path.as_str(), "card proxy"),
-            (clip.original_path.as_str(), "card original"),
-            (clip.source_path.as_str(), "card source"),
-            (clip.project_proxy_path.as_str(), "project proxy"),
-        ] {
-            let p = candidate.trim();
-            if p.is_empty() {
-                continue;
+        let Some(source_fps) = source_timebase.fps().filter(|fps| *fps > 0.0) else {
+            return;
+        };
+        let duration_frames = resolution
+            .duration_frames
+            .or_else(|| {
+                resolution
+                    .duration_sec
+                    .filter(|duration| duration.is_finite() && *duration > 0.0)
+                    .map(|duration| seconds_to_frame(duration, source_fps).max(1))
+            })
+            .filter(|frames| *frames > 0);
+        let Some(duration_frames) = duration_frames else {
+            return;
+        };
+        let duration_sec = resolution
+            .duration_sec
+            .filter(|duration| duration.is_finite() && *duration > 0.0)
+            .unwrap_or_else(|| frame_to_seconds(duration_frames, source_fps));
+        self.selected_source_fps = source_fps;
+        self.selected_source_timebase = source_timebase;
+        self.selected_source_has_audio = resolution.has_audio.unwrap_or(false);
+        self.selected_source_audio_channels = resolution.audio_channels.unwrap_or_else(|| {
+            if self.selected_source_has_audio {
+                2
+            } else {
+                0
             }
-            let path = std::path::Path::new(p);
-            if path.is_file() {
-                self.selected_play_path = p.to_string();
-                self.player_status = format!("Play · {clip_id} ({label})");
-                return;
-            }
+        });
+        self.selected_source_ref = BroadcastHostSourceRef::from_frame_fields(
+            project_id,
+            clip_id,
+            clip_id,
+            clip_id,
+            Some(FrameNumber(0)),
+            Some(FrameNumber(duration_frames)),
+            FrameNumber(duration_frames),
+        )
+        .ok();
+        self.merge_resolved_playback_metadata_into_state(
+            clip_id,
+            source_timebase,
+            source_fps,
+            duration_sec,
+            resolution.has_audio,
+            resolution.audio_channels,
+        );
+    }
+
+    fn merge_resolved_playback_metadata_into_state(
+        &mut self,
+        clip_id: &str,
+        source_timebase: BroadcastSourceTimebase,
+        source_fps: f64,
+        duration_sec: f64,
+        has_audio: Option<bool>,
+        audio_channels: Option<u8>,
+    ) {
+        let Some(state) = self.state.as_mut() else {
+            return;
+        };
+        let Some(clip) = state.clips.iter_mut().find(|clip| clip.clip_id == clip_id) else {
+            return;
+        };
+        clip.fps = source_fps;
+        clip.source_timebase = crate::api::EditorialSourceTimebase {
+            fps_num: i64::from(source_timebase.fps_num),
+            fps_den: i64::from(source_timebase.fps_den),
+        };
+        if duration_sec.is_finite() && duration_sec > 0.0 {
+            clip.duration_sec = duration_sec;
         }
-        self.player_status = format!("Nema play path na sourceu · {clip_id}");
+        if let Some(has_audio) = has_audio {
+            clip.has_audio = has_audio;
+        }
+        if let Some(audio_channels) = audio_channels.filter(|channels| *channels > 0) {
+            clip.audio_channels = audio_channels;
+        }
+    }
+
+    pub fn set_playback_media_resolution_error(
+        &mut self,
+        project_id: &str,
+        clip_id: &str,
+        error: impl Into<String>,
+    ) {
+        if !self.playback_project_matches(project_id) || self.preview_clip_id != clip_id {
+            return;
+        }
+        if self.pending_play_input_clip_id == clip_id {
+            self.pending_play_input_clip_id.clear();
+        }
+        self.pending_play_after_resolve = false;
+        self.selected_play_path.clear();
+        self.selected_play_input_clip_id.clear();
+        self.player_status = error.into();
+    }
+
+    fn playback_project_matches(&self, project_id: &str) -> bool {
+        let project_id = project_id.trim();
+        !project_id.is_empty()
+            && (self.loaded_for_project == project_id || self.project_id == project_id)
     }
 
     #[allow(dead_code)]
@@ -194,6 +389,47 @@ impl IngestScreen {
     }
 }
 
+fn timebase_from_probe_fps(fps: f64) -> Option<BroadcastSourceTimebase> {
+    if !fps.is_finite() || fps <= 0.0 {
+        return None;
+    }
+    let common = [
+        (24000.0 / 1001.0, 24000, 1001),
+        (30000.0 / 1001.0, 30000, 1001),
+        (60000.0 / 1001.0, 60000, 1001),
+    ];
+    for (value, num, den) in common {
+        if (fps - value).abs() < 0.01 {
+            return Some(BroadcastSourceTimebase {
+                fps_num: num,
+                fps_den: den,
+            });
+        }
+    }
+    let rounded = fps.round();
+    if (fps - rounded).abs() < 0.001 {
+        return BroadcastSourceTimebase::from_i64(rounded as i64, 1);
+    }
+    let den = 1000i64;
+    let num = (fps * den as f64).round() as i64;
+    if num <= 0 {
+        return None;
+    }
+    let gcd = gcd_i64(num, den);
+    BroadcastSourceTimebase::from_i64(num / gcd, den / gcd)
+}
+
+fn gcd_i64(mut a: i64, mut b: i64) -> i64 {
+    a = a.abs();
+    b = b.abs();
+    while b != 0 {
+        let r = a % b;
+        a = b;
+        b = r;
+    }
+    a.max(1)
+}
+
 impl PlayerClient for IngestScreen {
     fn playback_source_ref(&self) -> Option<BroadcastHostSourceRef> {
         self.selected_source_ref.clone()
@@ -210,6 +446,12 @@ impl PlayerClient for IngestScreen {
 
     fn playback_source_fps(&self) -> f64 {
         self.selected_source_fps
+    }
+
+    fn playback_source_timebase(&self) -> Option<BroadcastSourceTimebase> {
+        self.selected_source_timebase
+            .is_valid()
+            .then_some(self.selected_source_timebase)
     }
 
     fn playback_source_has_audio(&self) -> bool {
@@ -229,7 +471,7 @@ impl PlayerClient for IngestScreen {
     }
 
     fn missing_path_message(&self) -> String {
-        "Nema play path na sourceu (kartica / folder) — odaberi klip s medijem".into()
+        "Ingest play input nije spreman — čekam media resolver".into()
     }
 
     fn set_player_preview_active(&mut self, _active: bool) {}

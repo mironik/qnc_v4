@@ -2,6 +2,7 @@ mod api;
 mod covers;
 mod db;
 mod markers;
+mod object_history;
 mod playlist;
 mod timeline_model;
 

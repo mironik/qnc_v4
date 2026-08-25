@@ -459,18 +459,6 @@ pub fn resolve_card_media_root(scan_root: &Path) -> PathBuf {
     scan_root
 }
 
-/// Proces 2: samo proxy na kartici / u projektu — nikad MXF.
-pub fn proxy_poster_source_path(meta: &Value) -> Option<PathBuf> {
-    for key in ["proxy_path", "project_proxy_path"] {
-        if let Some(p) = path_from_meta(meta, key) {
-            if p.is_file() {
-                return Some(p);
-            }
-        }
-    }
-    None
-}
-
 pub fn is_breaking_news(project: &Value) -> bool {
     if project
         .get("template_id")
@@ -974,16 +962,19 @@ mod tests {
 
     /// Test-only: proxy → original → source fallback when THM/JPG poster is unavailable.
     fn poster_video_source_path(meta: &Value) -> Option<PathBuf> {
-        proxy_poster_source_path(meta).or_else(|| {
-            for key in ["original_path", "source_path"] {
-                if let Some(p) = path_from_meta(meta, key) {
-                    if p.is_file() {
-                        return Some(p);
-                    }
+        for key in [
+            "proxy_path",
+            "project_proxy_path",
+            "original_path",
+            "source_path",
+        ] {
+            if let Some(p) = path_from_meta(meta, key) {
+                if p.is_file() {
+                    return Some(p);
                 }
             }
-            None
-        })
+        }
+        None
     }
 
     fn touch(dir: &Path, name: &str) -> PathBuf {

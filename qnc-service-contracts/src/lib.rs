@@ -12,6 +12,11 @@ pub type ServiceResult<T> = Result<T, ServiceError>;
 
 pub const JOB_TYPE_FILMSTRIP: &str = "filmstrip";
 pub const JOB_SOURCE_FILMSTRIP: &str = "filmstrip";
+pub const JOB_TYPE_WAVEFORM: &str = "waveform";
+pub const JOB_SOURCE_WAVEFORM: &str = "waveform";
+pub const JOB_TYPE_THUMB_PROXY: &str = "thumb_proxy";
+pub const JOB_TYPE_AUDIO_WRAP: &str = "audio_wrap";
+pub const JOB_TYPE_MEDIA_PROBE: &str = "media_probe";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -19,6 +24,53 @@ pub enum RuntimeProfile {
     Light,
     LocalAi,
     Enterprise,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeploymentMode {
+    SingleWorkstation,
+    SharedWorker,
+    EnterpriseGateway,
+    InternetProject,
+}
+
+impl DeploymentMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::SingleWorkstation => "single_workstation",
+            Self::SharedWorker => "shared_worker",
+            Self::EnterpriseGateway => "enterprise_gateway",
+            Self::InternetProject => "internet_project",
+        }
+    }
+}
+
+impl Default for DeploymentMode {
+    fn default() -> Self {
+        Self::SingleWorkstation
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IntegrationGatewayKind {
+    LocalFs,
+    SharedFs,
+    EnterpriseProxy,
+}
+
+impl Default for IntegrationGatewayKind {
+    fn default() -> Self {
+        Self::LocalFs
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkerPlacement {
+    LocalWorkstation,
+    IntranetSharedMedia,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -81,18 +133,80 @@ pub enum ScanMode {
     Unknown,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MediaRef {
     pub clip_id: String,
     pub locator: MediaLocator,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum MediaLocator {
     LocalPath { path: PathBuf },
     IntranetPath { uri: String },
     ManagedAsset { asset_id: String },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MediaAccessKind {
+    PlaybackProxy,
+    OriginalMaster,
+    FilmstripSource,
+    PosterSource,
+    WaveformSource,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IntegrationGatewayRoutes {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub playback_proxy: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub original_master: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filmstrip_source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub poster_source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub waveform_source: Option<String>,
+}
+
+impl IntegrationGatewayRoutes {
+    pub fn route_for(&self, access: MediaAccessKind) -> Option<&str> {
+        match access {
+            MediaAccessKind::PlaybackProxy => self.playback_proxy.as_deref(),
+            MediaAccessKind::OriginalMaster => self.original_master.as_deref(),
+            MediaAccessKind::FilmstripSource => self.filmstrip_source.as_deref(),
+            MediaAccessKind::PosterSource => self.poster_source.as_deref(),
+            MediaAccessKind::WaveformSource => self.waveform_source.as_deref(),
+        }
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MediaResolveRequest {
+    pub project_id: String,
+    pub clip_id: String,
+    pub access: MediaAccessKind,
+    #[serde(default)]
+    pub fallback: Option<MediaLocator>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MediaResolveResponse {
+    pub media: MediaRef,
+    pub access: MediaAccessKind,
+    pub gateway_kind: IntegrationGatewayKind,
+    pub read_only: bool,
+    #[serde(default)]
+    pub metadata: serde_json::Value,
+}
+
+#[async_trait]
+pub trait MediaGateway: Send + Sync {
+    async fn resolve(&self, request: MediaResolveRequest) -> ServiceResult<MediaResolveResponse>;
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -143,6 +257,18 @@ pub struct PosterExtractRequest {
     pub input: MediaRef,
     pub output_path: PathBuf,
     pub seek_sec: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PosterJobPayload {
+    pub media_path: PathBuf,
+    pub output_path: PathBuf,
+    pub seek_sec: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PosterJobResult {
+    pub output_path: PathBuf,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -206,6 +332,55 @@ pub struct WaveformPeaks {
     pub a1_peaks: Vec<f32>,
     pub a2_peaks: Vec<f32>,
     pub warning: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WaveformJobPayload {
+    pub media_path: PathBuf,
+    pub peak_buckets: usize,
+    pub sample_rate_hz: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WaveformJobResult {
+    pub a1_peaks: Vec<f32>,
+    pub a2_peaks: Vec<f32>,
+    pub warning: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AudioWrapJobItem {
+    pub fps: f64,
+    pub output_path: PathBuf,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AudioWrapJobPayload {
+    pub media_path: PathBuf,
+    pub wraps: Vec<AudioWrapJobItem>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AudioWrapJobArtifact {
+    pub fps: f64,
+    pub output_path: PathBuf,
+    #[serde(default)]
+    pub probe: Option<MediaProbe>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AudioWrapJobResult {
+    pub wraps: Vec<AudioWrapJobArtifact>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MediaProbeJobPayload {
+    pub media_path: PathBuf,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MediaProbeJobResult {
+    pub probe: MediaProbe,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -309,6 +484,8 @@ pub trait AIOrchestrator: Send + Sync {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JobClaimRequest {
     pub worker_id: String,
+    #[serde(default)]
+    pub placement: Option<WorkerPlacement>,
     #[serde(default)]
     pub project_id: Option<String>,
     #[serde(default)]

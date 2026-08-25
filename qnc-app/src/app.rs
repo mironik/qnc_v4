@@ -10,11 +10,13 @@ use crate::component_errors::{ComponentErrorBoundary, ComponentErrorKey};
 use crate::component_runtime::{ComponentBackendCommand, ComponentBackendRuntime};
 use crate::components::{
     EditorialEditComponent, EditorialEditData, EditorialEditKind, EditorialStateComponent,
-    EditorialStateData, FilesystemListComponent, ProjectCatalogComponent, ProjectCommandComponent,
-    ProjectCommandData, ProjectCommandKind, ProjectRegistryComponent, ShellStateComponent,
-    ShellStateData, ShortcutBindingsComponent, ShortcutBindingsData, SourceImportCommandComponent,
-    SourceImportCommandKind, SourceImportSelectionComponent, SourceImportStateComponent,
-    SourceImportStateKind, SourceImportStatusComponent, ThemePickerComponent,
+    EditorialStateData, FilesystemListComponent, PlaybackMediaResolution,
+    PlaybackMediaResolverComponent, ProjectCatalogComponent, ProjectCommandComponent,
+    ProjectCommandData, ProjectCommandKind, ProjectExportProfileComponent,
+    ProjectRegistryComponent, ShellStateComponent, ShellStateData, ShortcutBindingsComponent,
+    ShortcutBindingsData, SourceImportCommandComponent, SourceImportCommandKind,
+    SourceImportSelectionComponent, SourceImportStateComponent, SourceImportStateKind,
+    SourceImportStatusComponent, ThemePickerComponent,
 };
 use crate::composition::{ScreenComposition, WorkflowScreen};
 use crate::ingest::IngestScreen;
@@ -36,7 +38,7 @@ const EDITORIAL_INSTANCE_MEDIA_ASSIST: &str = "media_assist";
 const EDITORIAL_INSTANCE_IMPORT_STATUS: &str = "source_import_status";
 const SHORTCUT_INSTANCE_INGEST: &str = "ingest";
 const SHORTCUT_INSTANCE_PROJECT: &str = "project";
-const BACKGROUND_PLAYBACK_HEARTBEAT: Duration = Duration::from_secs(1);
+const BACKGROUND_PLAYBACK_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Phase {
@@ -281,17 +283,18 @@ impl QncApp {
             return;
         }
         let active = self.phase == Phase::Workspace && self.playback.blocks_background_work();
+        let now = Instant::now();
         let heartbeat_due = active
-            && self.background_playback_active_sent == Some(active)
+            && self.background_playback_active_sent == Some(true)
             && self
                 .background_playback_last_submit
-                .map(|last| last.elapsed() >= BACKGROUND_PLAYBACK_HEARTBEAT)
+                .map(|last| now.duration_since(last) >= BACKGROUND_PLAYBACK_HEARTBEAT_INTERVAL)
                 .unwrap_or(true);
         if self.background_playback_active_sent == Some(active) && !heartbeat_due {
             return;
         }
         let command = ShellStateComponent::background_playback(active);
-        let submitted_at = Instant::now();
+        let submitted_at = now;
         match self.submit_component_backend_command(command, ctx) {
             Ok(_) => {
                 self.background_playback_active_sent = Some(active);
@@ -455,10 +458,29 @@ impl QncApp {
     ) {
         match action {
             crate::ingest::IngestAction::CueFrame(frame) => {
+                if !pid.trim().is_empty() {
+                    self.ingest.ensure_preview_playback_ready(pid);
+                    self.submit_ingest_backend_commands(Some(ctx.clone()));
+                }
+                if !self.playback_transport_available() {
+                    self.ingest
+                        .apply_player_error(self.ingest_playback_not_ready_message());
+                    return;
+                }
                 self.playback_transport_cue_frame(frame);
                 return;
             }
             crate::ingest::IngestAction::TogglePlay => {
+                if !pid.trim().is_empty() {
+                    self.ingest.ensure_preview_playback_ready(pid);
+                    self.submit_ingest_backend_commands(Some(ctx.clone()));
+                }
+                if !self.playback_transport_available() {
+                    self.ingest.request_play_after_resolve();
+                    self.ingest
+                        .apply_player_error(self.ingest_playback_not_ready_message());
+                    return;
+                }
                 self.playback_transport_toggle();
                 return;
             }
@@ -566,6 +588,19 @@ impl QncApp {
                 );
                 return;
             }
+            crate::ingest::IngestAction::ApproveProxyPosters(clip_ids) => {
+                if clip_ids.is_empty() {
+                    self.error = Some("Nema klipova bez postera s kartice.".into());
+                    return;
+                }
+                self.source_import_status.mark_possible_work(pid);
+                self.submit_source_import_command(
+                    pid,
+                    SourceImportCommandComponent::approve_proxy_posters(pid, &clip_ids),
+                    Some(ctx.clone()),
+                );
+                return;
+            }
             crate::ingest::IngestAction::Toggle(clip_id) => {
                 let previous = self.ingest.toggle_clip_selection_local(&clip_id);
                 if previous.is_some() {
@@ -592,11 +627,23 @@ impl QncApp {
         if let Err(e) = self.ingest.dispatch(&self.host, pid, action) {
             self.error = Some(e);
         } else {
+            self.submit_ingest_backend_commands(Some(ctx.clone()));
             if cue_after_dispatch {
                 if let Some(frame) = self.ingest.transport_cue_frame() {
                     self.playback_transport_cue_frame(frame);
                 }
             }
+        }
+    }
+
+    fn ingest_playback_not_ready_message(&self) -> String {
+        let status = self.ingest.player_status.trim();
+        if !status.is_empty() {
+            status.to_string()
+        } else if self.ingest.preview_clip_id.trim().is_empty() {
+            "Odaberi klip prije play".into()
+        } else {
+            "Ingest play input nije spreman".into()
         }
     }
 
@@ -768,6 +815,14 @@ impl QncApp {
         for command in commands {
             if let Err(e) = self.submit_component_backend_command(command, ctx.clone()) {
                 self.set_editorial_edit_error(instance_id, "", EditorialEditKind::Commit, e);
+            }
+        }
+    }
+
+    fn submit_ingest_backend_commands(&mut self, ctx: Option<egui::Context>) {
+        for command in self.ingest.drain_backend_commands() {
+            if let Err(e) = self.submit_component_backend_command(command, ctx.clone()) {
+                self.ingest.apply_player_error(e);
             }
         }
     }
@@ -1247,20 +1302,15 @@ impl QncApp {
                     .and_then(|u| u.get("effective_settings"))
                     .cloned()
                     .unwrap_or(Value::Null);
-                let patch = crate::project_pts::export_preset_override_patch(&eff, &preset_id);
-                let command = ProjectCommandComponent::merge_settings_override(
+                let command = ProjectExportProfileComponent::apply_preset(
                     self.next_project_request_id(),
-                    "export.preset.apply",
-                    patch,
+                    &eff,
+                    &preset_id,
                 );
                 self.submit_project_command(command, Some(ctx.clone()));
             }
             ProjectAction::SaveExportPreset => {
                 let name = self.project_ui.export_preset_draft_name.trim().to_string();
-                if name.is_empty() {
-                    self.error = Some("Unesi naziv preseta.".into());
-                    return;
-                }
                 let eff = self
                     .project_ui
                     .ui_state
@@ -1268,64 +1318,17 @@ impl QncApp {
                     .and_then(|u| u.get("effective_settings"))
                     .cloned()
                     .unwrap_or(Value::Null);
-                let cur = eff.get("export").cloned().unwrap_or(Value::Null);
-                let id = crate::project_pts::slug_preset_id(&name);
-                let preset = serde_json::json!({
-                    "id": id,
-                    "name": name,
-                    "values": {
-                        "format": cur.get("format").and_then(|v| v.as_str()).unwrap_or("HD 1080i50"),
-                        "fps": crate::project_pts::path_num(&eff, &["export", "fps"]).unwrap_or(25.0),
-                        "width": crate::project_pts::path_i64(&eff, &["export", "width"], 1920),
-                        "height": crate::project_pts::path_i64(&eff, &["export", "height"], 1080),
-                        "field_order": cur.get("field_order").and_then(|v| v.as_str()).unwrap_or("upper_first"),
-                        "color_space": cur.get("color_space").and_then(|v| v.as_str()).unwrap_or("rec709"),
-                        "container": cur.get("container").and_then(|v| v.as_str()).unwrap_or("mxf_op1a"),
-                        "video_codec": cur.get("video_codec").and_then(|v| v.as_str()).unwrap_or("mpeg2_422_50mbit"),
-                        "audio_sample_rate": crate::project_pts::path_i64(&eff, &["export", "audio_sample_rate"], 48000),
-                        "audio_channels": crate::project_pts::path_i64(&eff, &["export", "audio_channels"], 2),
-                    }
-                });
-                let values_for_validation = preset.get("values").cloned().unwrap_or(Value::Null);
-                if let Err(error) =
-                    crate::project_pts::validate_export_profile(&id, &name, &values_for_validation)
-                {
-                    self.error = Some(error);
-                    return;
-                }
-                let mut existing: Vec<Value> = cur
-                    .get("custom_presets")
-                    .and_then(|v| v.as_array())
-                    .cloned()
-                    .unwrap_or_default();
-                let preset_id = preset
-                    .get("id")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                if let Some(slot) = existing
-                    .iter_mut()
-                    .find(|p| p.get("id").and_then(|v| v.as_str()) == Some(preset_id.as_str()))
-                {
-                    *slot = preset.clone();
-                } else {
-                    existing.push(preset.clone());
-                }
-                let values = preset.get("values").cloned().unwrap_or(Value::Null);
-                let mut export = serde_json::json!({
-                    "custom_presets": existing,
-                    "preset": preset_id,
-                });
-                if let (Some(obj), Some(vals)) = (export.as_object_mut(), values.as_object()) {
-                    for (k, v) in vals {
-                        obj.insert(k.clone(), v.clone());
-                    }
-                }
-                let command = ProjectCommandComponent::merge_settings_override(
+                let command = match ProjectExportProfileComponent::save_custom_preset(
                     self.next_project_request_id(),
-                    "export.preset.save",
-                    serde_json::json!({ "export": export }),
-                );
+                    &eff,
+                    &name,
+                ) {
+                    Ok(command) => command,
+                    Err(error) => {
+                        self.error = Some(error);
+                        return;
+                    }
+                };
                 self.submit_project_command(command, Some(ctx.clone()));
             }
             ProjectAction::DeleteTemplate(template_id) => {
@@ -1786,6 +1789,30 @@ impl QncApp {
                         self.set_editorial_state_error(&instance_id, &project_id, e);
                     }
                 }
+            } else if PlaybackMediaResolverComponent::accepts_event(&event) {
+                let Some((instance_id, project_id, clip_id, result)) =
+                    PlaybackMediaResolverComponent::into_media_resolution(event)
+                else {
+                    continue;
+                };
+                match result {
+                    Ok(data) => {
+                        self.clear_component_error(&error_key);
+                        let intent = self.apply_playback_media_resolution(
+                            &instance_id,
+                            &project_id,
+                            &clip_id,
+                            data,
+                        );
+                        if intent != PlaybackTransportIntent::None {
+                            self.playback_transport_intent(intent);
+                        }
+                    }
+                    Err(e) => {
+                        let e = self.record_component_error(error_key, e);
+                        self.set_playback_media_error(&instance_id, &project_id, &clip_id, e);
+                    }
+                }
             } else if ShortcutBindingsComponent::accepts_event(&event) {
                 let Some((instance_id, scope, port_id, result)) =
                     ShortcutBindingsComponent::into_data(event)
@@ -1849,8 +1876,9 @@ impl QncApp {
                     continue;
                 };
                 match result {
-                    Ok(_state) => {
+                    Ok(state) => {
                         self.clear_component_error(&error_key);
+                        self.ingest.apply_status_state(state);
                     }
                     Err(e) => {
                         let e = self.record_component_error(error_key, e);
@@ -2042,6 +2070,55 @@ impl QncApp {
         self.load_editorial_timeline_model(&instance_id, &project_id, ctx);
     }
 
+    fn apply_playback_media_resolution(
+        &mut self,
+        instance_id: &str,
+        project_id: &str,
+        clip_id: &str,
+        data: PlaybackMediaResolution,
+    ) -> PlaybackTransportIntent {
+        match instance_id {
+            EDITORIAL_INSTANCE_STORY => self
+                .story
+                .apply_playback_media_resolution(project_id, clip_id, data),
+            EDITORIAL_INSTANCE_MEDIA_ASSIST => self
+                .media_assist
+                .apply_playback_media_resolution(project_id, clip_id, data),
+            SHORTCUT_INSTANCE_INGEST => {
+                let intent = self
+                    .ingest
+                    .apply_playback_media_resolution(project_id, clip_id, data);
+                if self.screen == Screen::Ingest {
+                    intent
+                } else {
+                    PlaybackTransportIntent::None
+                }
+            }
+            _ => PlaybackTransportIntent::None,
+        }
+    }
+
+    fn set_playback_media_error(
+        &mut self,
+        instance_id: &str,
+        project_id: &str,
+        clip_id: &str,
+        error: impl Into<String>,
+    ) {
+        match instance_id {
+            EDITORIAL_INSTANCE_STORY => self
+                .story
+                .set_playback_media_resolution_error(project_id, clip_id, error),
+            EDITORIAL_INSTANCE_MEDIA_ASSIST => self
+                .media_assist
+                .set_playback_media_resolution_error(project_id, clip_id, error),
+            SHORTCUT_INSTANCE_INGEST => self
+                .ingest
+                .set_playback_media_resolution_error(project_id, clip_id, error),
+            _ => self.error = Some(error.into()),
+        }
+    }
+
     fn apply_shortcut_bindings_data(&mut self, data: ShortcutBindingsData) {
         match data {
             ShortcutBindingsData::Catalog {
@@ -2104,9 +2181,21 @@ impl QncApp {
                     .unwrap_or_else(|| state.selected_clip_ids.len() as u64);
                 format!("Uvoz u bazi: {queued} klip(ova).")
             }
+            SourceImportCommandKind::ApproveProxyPosters => {
+                let count = state
+                    .clips
+                    .iter()
+                    .filter(|clip| matches!(clip.thumb_status.as_str(), "pending" | "processing"))
+                    .count();
+                format!("Posteri iz proxya odobreni: {count} klip(ova).")
+            }
         };
         self.ingest.apply_import_command_state(state, message);
         self.apply_source_import_status_snapshot(&status_state, ctx);
+        if kind == SourceImportCommandKind::ApproveProxyPosters {
+            self.source_import_status
+                .mark_possible_work(&status_state.project_id);
+        }
         if kind == SourceImportCommandKind::ImportSelected {
             self.source_import_status
                 .mark_possible_work(&status_state.project_id);
@@ -2298,8 +2387,13 @@ impl eframe::App for QncApp {
             self.media_assist.tick(&self.host, ctx);
         } else if ingest_active {
             let actions = self.ingest.handle_shortcuts(ctx);
+            let pid = self
+                .open_project
+                .as_ref()
+                .map(|project| project.project_id.clone())
+                .unwrap_or_default();
             for action in actions {
-                self.dispatch_ingest("", action, ctx);
+                self.dispatch_ingest(&pid, action, ctx);
             }
             self.tick_playback(ctx);
         } else if project_active && self.project_ui.shortcuts_ready() {
@@ -2515,15 +2609,7 @@ impl eframe::App for QncApp {
                         .unwrap_or_default();
                     let action = self.ingest.ui_timeline_dock(ui, &self.playback);
                     if !pid.is_empty() {
-                        match action {
-                            crate::ingest::IngestAction::CueFrame(frame) => {
-                                self.playback_transport_cue_frame(frame);
-                            }
-                            crate::ingest::IngestAction::TogglePlay => {
-                                self.playback_transport_toggle();
-                            }
-                            other => self.dispatch_ingest(&pid, other, ctx),
-                        }
+                        self.dispatch_ingest(&pid, action, ctx);
                     }
                 });
         }

@@ -30,7 +30,10 @@ impl QncApp {
         match self.screen {
             Screen::Story => self.story.playback_transport_available(),
             Screen::MediaAssist => self.media_assist.playback_source_ref().is_some(),
-            Screen::Ingest => self.ingest.playback_source_ref().is_some(),
+            Screen::Ingest => {
+                self.ingest.playback_source_ref().is_some()
+                    && self.ingest.playback_media_path().is_some()
+            }
             _ => false,
         }
     }

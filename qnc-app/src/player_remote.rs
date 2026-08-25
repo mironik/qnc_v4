@@ -6,6 +6,7 @@
 //! runtime owns frame position and transport state.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::env;
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread;
@@ -39,7 +40,9 @@ use qnc_player_output::{
 use qnc_player_runtime::{BroadcastPlayerRuntime, PlayerRuntimeCommand};
 use serde_json::Value;
 
-use crate::player_contract::{BroadcastHostSourceRef, BroadcastSourceKind, FrameNumber};
+use crate::player_contract::{
+    BroadcastHostSourceRef, BroadcastSourceKind, BroadcastSourceTimebase, FrameNumber,
+};
 
 type FfmpegPlayerAudioOutput = AudioOutputWithSink<
     FfmpegAudioOutput,
@@ -59,6 +62,11 @@ type PlayerTransport = TransportEngine<
 
 type PlayerRuntime = BroadcastPlayerRuntime<PlayerTransport>;
 
+const SOURCE_VIDEO_PREFETCH_FRAMES: u16 = 24;
+const SOURCE_VIDEO_CACHE_FRAMES: usize = 96;
+const SOURCE_AUDIO_PREFETCH_FRAMES: u16 = 32;
+const SOURCE_AUDIO_CACHE_FRAMES: usize = 192;
+const SOURCE_DECODE_BURST_FRAMES: usize = 6;
 const PLAYLIST_VIDEO_PREFETCH_FRAMES: u16 = 16;
 const PLAYLIST_VIDEO_CACHE_FRAMES: usize = 48;
 const PLAYLIST_AUDIO_PREFETCH_FRAMES: u16 = 16;
@@ -68,6 +76,7 @@ const PLAYLIST_SOURCE_WARMUP_LOOKAHEAD_FRAMES: CoreFrameNumber = 120;
 const PLAYLIST_SOURCE_WARMUP_MAX_SOURCES: usize = 2;
 const PLAYLIST_PREVIEW_WIDTH: u32 = 640;
 const PLAYLIST_PREVIEW_HEIGHT: u32 = 360;
+const QNC_PLAYER_HWACCEL_ENV: &str = "QNC_PLAYER_HWACCEL";
 
 /// UI open payload - media identity for the modular player runtime.
 #[derive(Debug, Clone)]
@@ -75,6 +84,7 @@ pub struct BroadcastPlayerOpenRequest {
     pub source_ref: BroadcastHostSourceRef,
     pub media_input: String,
     pub source_fps: f64,
+    pub source_timebase: BroadcastSourceTimebase,
     pub has_audio: bool,
     pub audio_channels: u8,
     pub start_source_frame: FrameNumber,
@@ -105,6 +115,7 @@ pub struct BroadcastProgramSource {
     pub source_ref: BroadcastHostSourceRef,
     pub media_input: String,
     pub source_fps: f64,
+    pub source_timebase: BroadcastSourceTimebase,
     pub has_video: bool,
     pub has_audio: bool,
     pub audio_channels: u8,
@@ -372,14 +383,13 @@ struct PlayerProgramSource {
     spec: BroadcastProgramSource,
     record_in_frame: CoreFrameNumber,
     record_out_frame: CoreFrameNumber,
-    timeline_fps: f64,
     source: SourceRuntime,
     range: CoreFrameRange,
 }
 
 #[derive(Clone, Debug)]
-struct ProgramFramePlan {
-    video_layers: Vec<PlayerProgramSource>,
+struct ProgramFrameResult {
+    video: Option<PlayerProgramSource>,
     audio_buses: Vec<ProgramAudioBus>,
 }
 
@@ -389,11 +399,7 @@ struct ProgramAudioBus {
     source: PlayerProgramSource,
 }
 
-impl ProgramFramePlan {
-    fn visible_video_layer(&self) -> Option<&PlayerProgramSource> {
-        self.video_layers.last()
-    }
-
+impl ProgramFrameResult {
     fn audio_bus(&self, output_channel: u8) -> Option<&PlayerProgramSource> {
         self.audio_buses
             .iter()
@@ -463,25 +469,16 @@ impl VideoDecodeAdapter for PlaylistInputVideoDecode {
         request: EngineFrameRequest,
     ) -> Result<DecodedVideoFrame<Self::VideoFrame>, BroadcastEngineError> {
         self.require_playlist_source(request.source_id.as_str())?;
-        let plan = self.program.frame_plan(request.frame);
-        if plan.visible_video_layer().is_none() {
+        let result = self.program.frame_result(request.frame);
+        let Some(program_source) = result.video.as_ref() else {
             return self.black_frame(request.frame);
         };
-        self.request_upcoming_video_warmups(request.frame, &plan)?;
+        self.request_upcoming_video_warmups(request.frame, &result)?;
 
-        let mut visible_frame = None;
-        for program_source in &plan.video_layers {
-            let _ = self.ensure_video_source_prepared(program_source)?;
-            let source_frame = program_source.source_frame_for_program_frame(request.frame);
-            let source_request =
-                EngineFrameRequest::new(&source_handle(program_source), source_frame)?;
-            let frame = self.inner.decode_video_frame(source_request)?;
-            visible_frame = Some((program_source, frame));
-        }
-
-        let Some((_, mut frame)) = visible_frame else {
-            return self.black_frame(request.frame);
-        };
+        let _ = self.ensure_video_source_prepared(program_source)?;
+        let source_frame = program_source.source_frame_for_program_frame(request.frame);
+        let source_request = EngineFrameRequest::new(&source_handle(program_source), source_frame)?;
+        let mut frame = self.inner.decode_video_frame(source_request)?;
         frame.source_id = self.source_id.clone();
         frame.frame = request.frame;
         frame.video_format = Some(self.video_format.clone());
@@ -508,13 +505,13 @@ impl PlaylistInputVideoDecode {
     fn request_upcoming_video_warmups(
         &mut self,
         program_frame: CoreFrameNumber,
-        plan: &ProgramFramePlan,
+        result: &ProgramFrameResult,
     ) -> Result<(), BroadcastEngineError> {
-        let active_sources = plan
-            .video_layers
-            .iter()
-            .map(|source| source.source.source_id.clone())
-            .collect::<BTreeSet<_>>();
+        let active_sources = result
+            .video
+            .as_ref()
+            .map(|source| BTreeSet::from([source.source.source_id.clone()]))
+            .unwrap_or_default();
         for point in playlist_upcoming_start_points(
             &self.program,
             program_frame,
@@ -597,13 +594,13 @@ impl AudioOutputAdapter for PlaylistInputAudioOutput {
         request: EngineFrameRequest,
     ) -> Result<AudioFramePacket<Self::AudioPacket>, BroadcastEngineError> {
         self.require_playlist_source(request.source_id.as_str())?;
-        let plan = self.program.frame_plan(request.frame);
-        if plan.audio_buses.is_empty() {
+        let result = self.program.frame_result(request.frame);
+        if result.audio_buses.is_empty() {
             return self.silence_packet(request.frame);
         }
-        self.request_upcoming_audio_warmups(request.frame, &plan)?;
+        self.request_upcoming_audio_warmups(request.frame, &result)?;
         let mut packet = self.silence_packet(request.frame)?;
-        if let Some(program_source) = plan.audio_bus(PROGRAM_AUDIO_OUTPUT_CH1) {
+        if let Some(program_source) = result.audio_bus(PROGRAM_AUDIO_OUTPUT_CH1) {
             let _ = self.ensure_audio_source_prepared(program_source)?;
             let source_frame = program_source.source_frame_for_program_frame(request.frame);
             let source_request =
@@ -611,7 +608,7 @@ impl AudioOutputAdapter for PlaylistInputAudioOutput {
             let source_packet = self.inner.render_audio_for_frame(source_request)?;
             copy_pcm_s16le_channel(&source_packet, &mut packet, 0)?;
         }
-        if let Some(program_source) = plan.audio_bus(PROGRAM_AUDIO_OUTPUT_CH2) {
+        if let Some(program_source) = result.audio_bus(PROGRAM_AUDIO_OUTPUT_CH2) {
             let _ = self.ensure_audio_source_prepared(program_source)?;
             let source_frame = program_source.source_frame_for_program_frame(request.frame);
             let source_request =
@@ -652,9 +649,9 @@ impl PlaylistInputAudioOutput {
     fn request_upcoming_audio_warmups(
         &mut self,
         program_frame: CoreFrameNumber,
-        plan: &ProgramFramePlan,
+        result: &ProgramFrameResult,
     ) -> Result<(), BroadcastEngineError> {
-        let active_sources = plan
+        let active_sources = result
             .audio_buses
             .iter()
             .map(|bus| bus.source.source.source_id.clone())
@@ -725,10 +722,7 @@ impl PlayerDecodePolicy {
 
     fn from_hardware_profile(profile: &Value) -> Self {
         let media_decode = profile.get("media_decode");
-        let recommended_backend = media_decode
-            .and_then(|media| media.get("recommended_backend"))
-            .and_then(Value::as_str)
-            .and_then(normalize_decode_backend);
+        let recommended_backend = local_player_decode_backend();
         let video_prefetch_frames =
             media_decode.and_then(|media| positive_u16_field(media, "video_prefetch_frames"));
         let video_cache_frames =
@@ -823,7 +817,6 @@ struct SourceReadyBounds {
 }
 
 const STILL_SEEK_DEBOUNCE: Duration = Duration::from_millis(80);
-const SOURCE_DECODE_BURST_FRAMES: usize = 4;
 
 impl Default for PlayerRemote {
     fn default() -> Self {
@@ -916,6 +909,7 @@ impl PlayerRemote {
             prev.source_ref == request.source_ref
                 && prev.media_input == request.media_input
                 && approx(prev.source_fps, request.source_fps)
+                && prev.source_timebase == request.source_timebase
                 && prev.has_audio == request.has_audio
                 && prev.audio_channels == request.audio_channels
         })
@@ -1766,6 +1760,7 @@ fn build_runtime_session(
         probe_source_runtime_with_toolchain(&media_path, source_id.clone(), &toolchain)
             .map_err(|error| error.to_string())?
             .source;
+    source.timebase = core_timebase_from_source_timebase(request.source_timebase)?;
 
     let field_label = source
         .video_format
@@ -1878,7 +1873,6 @@ fn build_program_runtime_session(
         for (source_index, source) in item.sources.iter().enumerate() {
             let source_id = source_ids.allocate(request, item, source, item_index, source_index);
             sources.push(build_program_source_runtime(
-                request,
                 item,
                 source,
                 source_id,
@@ -2018,7 +2012,6 @@ fn configure_program_runtime_session(
 }
 
 fn build_program_source_runtime(
-    request: &BroadcastProgramOpenRequest,
     item: &BroadcastProgramItem,
     source_spec: &BroadcastProgramSource,
     source_id: String,
@@ -2033,6 +2026,7 @@ fn build_program_source_runtime(
     let mut source =
         probe_program_source_runtime(source_id.clone(), &media_path, toolchain, probe_cache)?
             .source;
+    source.timebase = core_timebase_from_source_timebase(source_spec.source_timebase)?;
     if !source_spec.has_video {
         source.video_format = None;
     }
@@ -2059,10 +2053,19 @@ fn build_program_source_runtime(
         spec: source_spec.clone(),
         record_in_frame,
         record_out_frame,
-        timeline_fps: request.timeline_fps,
         source,
         range,
     })
+}
+
+fn core_timebase_from_source_timebase(
+    source_timebase: BroadcastSourceTimebase,
+) -> Result<CoreTimebase, String> {
+    if !source_timebase.is_valid() {
+        return Err("Program source nema valjan source timebase".into());
+    }
+    CoreTimebase::new(source_timebase.fps_num, source_timebase.fps_den)
+        .map_err(|err| err.to_string())
 }
 
 fn playlist_input_source(
@@ -2197,12 +2200,17 @@ fn video_decode_options(
         .with_toolchain(toolchain)
         .with_hardware_decode(hardware_decode)
         .with_decode_policy(policy.adapter_decode_policy());
-    if let Some(prefetch_frames) = policy.video_prefetch_frames {
-        options = options.with_video_prefetch_frames(prefetch_frames);
-    }
-    if let Some(cache_frames) = policy.video_cache_frames {
-        options = options.with_video_cache_frames(cache_frames);
-    }
+    let prefetch_frames = policy
+        .video_prefetch_frames
+        .unwrap_or(SOURCE_VIDEO_PREFETCH_FRAMES)
+        .max(SOURCE_VIDEO_PREFETCH_FRAMES);
+    let cache_frames = policy
+        .video_cache_frames
+        .unwrap_or(SOURCE_VIDEO_CACHE_FRAMES)
+        .max(SOURCE_VIDEO_CACHE_FRAMES);
+    options = options
+        .with_video_prefetch_frames(prefetch_frames)
+        .with_video_cache_frames(cache_frames);
     options
 }
 
@@ -2211,12 +2219,17 @@ fn audio_decode_options(
     policy: &PlayerDecodePolicy,
 ) -> FfmpegAudioDecodeOptions {
     let mut options = FfmpegAudioDecodeOptions::default().with_toolchain(toolchain);
-    if let Some(prefetch_frames) = policy.audio_prefetch_frames {
-        options = options.with_audio_prefetch_frames(prefetch_frames);
-    }
-    if let Some(cache_frames) = policy.audio_cache_frames {
-        options = options.with_audio_cache_frames(cache_frames);
-    }
+    let prefetch_frames = policy
+        .audio_prefetch_frames
+        .unwrap_or(SOURCE_AUDIO_PREFETCH_FRAMES)
+        .max(SOURCE_AUDIO_PREFETCH_FRAMES);
+    let cache_frames = policy
+        .audio_cache_frames
+        .unwrap_or(SOURCE_AUDIO_CACHE_FRAMES)
+        .max(SOURCE_AUDIO_CACHE_FRAMES);
+    options = options
+        .with_audio_prefetch_frames(prefetch_frames)
+        .with_audio_cache_frames(cache_frames);
     options
 }
 
@@ -2265,7 +2278,13 @@ fn hardware_decode_from_policy(
     let Some(value) = policy.recommended_backend.as_deref() else {
         return (FfmpegHardwareDecode::Software, None);
     };
-    hardware_decode_from_backend_label(value, "hardware_profile.media_decode")
+    hardware_decode_from_backend_label(value, QNC_PLAYER_HWACCEL_ENV)
+}
+
+fn local_player_decode_backend() -> Option<String> {
+    env::var(QNC_PLAYER_HWACCEL_ENV)
+        .ok()
+        .and_then(|value| normalize_decode_backend(&value))
 }
 
 fn hardware_decode_from_backend_label(
@@ -2480,7 +2499,6 @@ fn same_program_request(
 ) -> bool {
     left.program_id == right.program_id
         && left.project_id == right.project_id
-        && (left.timeline_fps - right.timeline_fps).abs() < 0.01
         && left.duration_frames == right.duration_frames
         && left.items == right.items
 }
@@ -2608,13 +2626,13 @@ fn program_source_media_track_key(
     source: &BroadcastProgramSource,
 ) -> String {
     let media_input = media_input_identity(source.media_input.as_str());
-    let fps = fps_identity(source.source_fps);
+    let timebase = source_timebase_identity(source.source_timebase);
     let tracks = program_source_track_identity(source);
     [
         request.project_id.as_str(),
         source.source_ref.clip_id.as_str(),
         media_input.as_str(),
-        fps.as_str(),
+        timebase.as_str(),
         tracks.as_str(),
     ]
     .into_iter()
@@ -2644,11 +2662,11 @@ fn media_input_identity(media_input: &str) -> String {
         .to_ascii_lowercase()
 }
 
-fn fps_identity(fps: f64) -> String {
-    if fps.is_finite() && fps > 0.0 {
-        format!("{fps:.6}")
+fn source_timebase_identity(timebase: BroadcastSourceTimebase) -> String {
+    if timebase.is_valid() {
+        format!("{}/{}", timebase.fps_num, timebase.fps_den)
     } else {
-        "fps-unknown".into()
+        "timebase-unknown".into()
     }
 }
 
@@ -2661,39 +2679,22 @@ impl PlayerProgramState {
         self.source_at_program_frame_matching(program_frame, |_| true)
     }
 
-    fn frame_plan(&self, program_frame: CoreFrameNumber) -> ProgramFramePlan {
-        ProgramFramePlan {
-            video_layers: self
-                .video_sources_at_program_frame(program_frame)
-                .into_iter()
-                .cloned()
-                .collect(),
+    fn frame_result(&self, program_frame: CoreFrameNumber) -> ProgramFrameResult {
+        ProgramFrameResult {
+            video: self.video_result_at_program_frame(program_frame).cloned(),
             audio_buses: self.audio_buses_at_program_frame(program_frame),
         }
     }
 
-    #[cfg(test)]
-    fn video_source_at_program_frame(
+    fn video_result_at_program_frame(
         &self,
         program_frame: CoreFrameNumber,
     ) -> Option<&PlayerProgramSource> {
-        self.video_sources_at_program_frame(program_frame)
-            .into_iter()
-            .last()
-    }
-
-    fn video_sources_at_program_frame(
-        &self,
-        program_frame: CoreFrameNumber,
-    ) -> Vec<&PlayerProgramSource> {
-        self.item_at_program_frame(program_frame)
-            .map(|item| {
-                item.sources
-                    .iter()
-                    .filter(|source| source.has_video())
-                    .collect()
-            })
-            .unwrap_or_default()
+        self.item_at_program_frame(program_frame)?
+            .sources
+            .iter()
+            .rev()
+            .find(|source| source.has_video())
     }
 
     #[cfg(test)]
@@ -2812,13 +2813,8 @@ impl PlayerProgramSource {
             .min(record_out.saturating_sub(1))
             .max(record_in)
             .saturating_sub(record_in);
-        let source_offset = source_offset_for_program_frame_core(
-            local_program_frame,
-            self.timeline_fps,
-            self.spec.source_fps,
-        );
         source_start
-            .saturating_add(source_offset)
+            .saturating_add(local_program_frame)
             .min(source_end.saturating_sub(1))
     }
 }
@@ -2984,14 +2980,6 @@ fn seconds_at_frame(frame: CoreFrameNumber, timebase: CoreTimebase) -> f64 {
     frame as f64 * f64::from(timebase.frame_rate_den) / f64::from(timebase.frame_rate_num)
 }
 
-fn source_offset_for_program_frame_core(
-    local_program_frame: CoreFrameNumber,
-    _timeline_fps: f64,
-    _source_fps: f64,
-) -> CoreFrameNumber {
-    local_program_frame
-}
-
 fn clamp_core_frame(frame: CoreFrameNumber, range: CoreFrameRange) -> CoreFrameNumber {
     frame.clamp(range.start_frame, range.end_frame)
 }
@@ -3036,6 +3024,10 @@ mod tests {
             .unwrap(),
             media_input: "media.mov".into(),
             source_fps: 50.0,
+            source_timebase: BroadcastSourceTimebase {
+                fps_num: 50,
+                fps_den: 1,
+            },
             has_audio: true,
             audio_channels: 2,
             start_source_frame: FrameNumber(in_frame),
@@ -3102,6 +3094,10 @@ mod tests {
             source_ref,
             media_input: "media.mov".into(),
             source_fps: 50.0,
+            source_timebase: BroadcastSourceTimebase {
+                fps_num: 50,
+                fps_den: 1,
+            },
             has_audio: false,
             audio_channels: 0,
             start_source_frame: FrameNumber(0),
@@ -3206,7 +3202,7 @@ mod tests {
     }
 
     #[test]
-    fn decode_policy_reads_runtime_hardware_profile_backend() {
+    fn decode_policy_ignores_host_runtime_backend_for_client_player() {
         let runtime = serde_json::json!({
             "hardware_profile": {
                 "media_decode": {
@@ -3229,7 +3225,7 @@ mod tests {
 
         let policy = PlayerDecodePolicy::from_runtime(&runtime);
 
-        assert_eq!(policy.recommended_backend.as_deref(), Some("d3d11va"));
+        assert_eq!(policy.recommended_backend, None);
         assert_eq!(policy.video_prefetch_frames, Some(6));
         assert_eq!(policy.video_cache_frames, Some(40));
         assert_eq!(policy.audio_prefetch_frames, Some(5));
@@ -3238,7 +3234,7 @@ mod tests {
     }
 
     #[test]
-    fn decode_policy_builds_adapter_options_from_runtime_profile() {
+    fn decode_policy_clamps_host_runtime_options_to_client_playback_floor() {
         let runtime = serde_json::json!({
             "hardware_profile": {
                 "media_decode": {
@@ -3263,11 +3259,17 @@ mod tests {
             video_decode_options(toolchain.clone(), FfmpegHardwareDecode::Software, &policy);
         let audio_options = audio_decode_options(toolchain, &policy);
 
-        assert_eq!(video_options.video_prefetch_frames, 6);
-        assert_eq!(video_options.video_cache_frames, 40);
+        assert_eq!(
+            video_options.video_prefetch_frames,
+            SOURCE_VIDEO_PREFETCH_FRAMES
+        );
+        assert_eq!(video_options.video_cache_frames, SOURCE_VIDEO_CACHE_FRAMES);
         assert_eq!(video_options.decode_policy.video_prefetch_rules().len(), 1);
-        assert_eq!(audio_options.audio_prefetch_frames, 5);
-        assert_eq!(audio_options.audio_cache_frames, 80);
+        assert_eq!(
+            audio_options.audio_prefetch_frames,
+            SOURCE_AUDIO_PREFETCH_FRAMES
+        );
+        assert_eq!(audio_options.audio_cache_frames, SOURCE_AUDIO_CACHE_FRAMES);
     }
 
     #[test]
@@ -3317,8 +3319,8 @@ mod tests {
     }
 
     #[test]
-    fn source_and_playlist_use_small_streaming_decode_burst() {
-        assert_eq!(SOURCE_DECODE_BURST_FRAMES, 4);
+    fn source_and_playlist_decode_bursts_are_separate() {
+        assert_eq!(SOURCE_DECODE_BURST_FRAMES, 6);
         assert_eq!(PLAYLIST_DECODE_BURST_FRAMES, 4);
     }
 
@@ -3409,8 +3411,22 @@ mod tests {
         clip_id: &str,
     ) -> PlayerProgramSource {
         program_source_with_fps(
-            source_id, record_in, record_out, source_in, source_out, clip_id, 50.0, 50.0,
+            source_id, record_in, record_out, source_in, source_out, clip_id, 50.0,
         )
+    }
+
+    fn source_timebase_from_test_fps(source_fps: f64) -> BroadcastSourceTimebase {
+        if approx(source_fps, 59.94) {
+            BroadcastSourceTimebase {
+                fps_num: 60_000,
+                fps_den: 1_001,
+            }
+        } else {
+            BroadcastSourceTimebase {
+                fps_num: source_fps.round().max(1.0) as u32,
+                fps_den: 1,
+            }
+        }
     }
 
     fn program_source_with_fps(
@@ -3420,7 +3436,6 @@ mod tests {
         source_in: i64,
         source_out: i64,
         clip_id: &str,
-        timeline_fps: f64,
         source_fps: f64,
     ) -> PlayerProgramSource {
         let source_ref = BroadcastHostSourceRef::from_frame_fields(
@@ -3438,6 +3453,7 @@ mod tests {
                 source_ref,
                 media_input: format!("C:/qnc/proxy/{clip_id}.mp4"),
                 source_fps,
+                source_timebase: source_timebase_from_test_fps(source_fps),
                 has_video: true,
                 has_audio: true,
                 audio_channels: 2,
@@ -3445,7 +3461,6 @@ mod tests {
             },
             record_in_frame: record_in as CoreFrameNumber,
             record_out_frame: record_out as CoreFrameNumber,
-            timeline_fps,
             source: SourceRuntime::new(source_id, 500, core_timebase_from_fps(source_fps).unwrap())
                 .unwrap()
                 .with_video_format(
@@ -3456,13 +3471,6 @@ mod tests {
             range: CoreFrameRange::new(source_in as CoreFrameNumber, source_out as CoreFrameNumber)
                 .unwrap(),
         }
-    }
-
-    fn video_only(mut source: PlayerProgramSource) -> PlayerProgramSource {
-        source.spec.has_audio = false;
-        source.spec.audio_output_channel = None;
-        source.source.audio_format = None;
-        source
     }
 
     fn audio_ch1_only(mut source: PlayerProgramSource) -> PlayerProgramSource {
@@ -3561,7 +3569,7 @@ mod tests {
     #[test]
     fn program_source_maps_record_frame_to_source_frame() {
         let program = two_take_program_state();
-        let second = program.video_source_at_program_frame(60).unwrap();
+        let second = program.video_result_at_program_frame(60).unwrap();
 
         assert_eq!(
             program.source_at_program_frame(60).map(|source| source
@@ -3575,7 +3583,7 @@ mod tests {
     }
 
     #[test]
-    fn flat_playlist_resolves_video_layers_and_audio_buses() {
+    fn flat_playlist_resolves_playable_video_result_and_audio_buses() {
         let program = PlayerProgramState {
             timebase: CoreTimebase::new(50, 1).unwrap(),
             duration_frames: 50,
@@ -3591,7 +3599,14 @@ mod tests {
                     10,
                     20,
                     vec![
-                        program_source("part_a_under_cover", 10, 20, 110, 120, "clip_a"),
+                        audio_ch1_only(program_source(
+                            "part_a_under_cover",
+                            10,
+                            20,
+                            110,
+                            120,
+                            "clip_a",
+                        )),
                         audio_ch2(program_source("cover_a", 10, 20, 40, 50, "clip_b")),
                     ],
                 ),
@@ -3610,35 +3625,26 @@ mod tests {
 
         assert_eq!(
             program
-                .video_source_at_program_frame(12)
+                .video_result_at_program_frame(12)
                 .map(|source| source.spec.source_ref.virtual_shot_id.as_str()),
             Some("cover_a")
         );
-        let cover_plan = program.frame_plan(12);
-        assert_eq!(cover_plan.video_layers.len(), 2);
+        let cover_result = program.frame_result(12);
         assert_eq!(
-            cover_plan.video_layers[0]
-                .spec
-                .source_ref
-                .virtual_shot_id
-                .as_str(),
-            "part_a_under_cover"
-        );
-        assert_eq!(
-            cover_plan.visible_video_layer().map(|source| source
+            cover_result.video.as_ref().map(|source| source
                 .spec
                 .source_ref
                 .virtual_shot_id
                 .as_str()),
             Some("cover_a")
         );
-        assert_eq!(cover_plan.audio_buses.len(), 2);
+        assert_eq!(cover_result.audio_buses.len(), 2);
         assert_eq!(
-            cover_plan.audio_buses[0].output_channel,
+            cover_result.audio_buses[0].output_channel,
             PROGRAM_AUDIO_OUTPUT_CH1
         );
         assert_eq!(
-            cover_plan.audio_buses[0]
+            cover_result.audio_buses[0]
                 .source
                 .spec
                 .source_ref
@@ -3647,11 +3653,11 @@ mod tests {
             "part_a_under_cover"
         );
         assert_eq!(
-            cover_plan.audio_buses[1].output_channel,
+            cover_result.audio_buses[1].output_channel,
             PROGRAM_AUDIO_OUTPUT_CH2
         );
         assert_eq!(
-            cover_plan.audio_buses[1]
+            cover_result.audio_buses[1]
                 .source
                 .spec
                 .source_ref
@@ -3659,24 +3665,12 @@ mod tests {
                 .as_str(),
             "cover_a"
         );
-        let cover_video_sources = program.video_sources_at_program_frame(19);
-        assert_eq!(cover_video_sources.len(), 2);
+        let cover_video_result = program.video_result_at_program_frame(19).unwrap();
         assert_eq!(
-            cover_video_sources[0].spec.source_ref.virtual_shot_id,
-            "part_a_under_cover"
-        );
-        assert_eq!(
-            cover_video_sources[1].spec.source_ref.virtual_shot_id,
+            cover_video_result.spec.source_ref.virtual_shot_id,
             "cover_a"
         );
-        assert_eq!(
-            cover_video_sources[0].source_frame_for_program_frame(19),
-            119
-        );
-        assert_eq!(
-            cover_video_sources[1].source_frame_for_program_frame(19),
-            49
-        );
+        assert_eq!(cover_video_result.source_frame_for_program_frame(19), 49);
         assert_eq!(
             program
                 .audio_source_at_program_frame(12, PROGRAM_AUDIO_OUTPUT_CH1)
@@ -3691,7 +3685,7 @@ mod tests {
         );
         assert_eq!(
             program
-                .video_source_at_program_frame(20)
+                .video_result_at_program_frame(20)
                 .map(|source| source.spec.source_ref.virtual_shot_id.as_str()),
             Some("part_a_post")
         );
@@ -3710,20 +3704,27 @@ mod tests {
         assert!(program
             .audio_source_at_program_frame(20, PROGRAM_AUDIO_OUTPUT_CH2)
             .is_none());
-        let cover_out_plan = program.frame_plan(19);
-        let after_cover_plan = program.frame_plan(20);
+        let cover_out_result = program.frame_result(19);
+        let after_cover_result = program.frame_result(20);
         assert_eq!(
-            cover_out_plan.video_layers[0].source_frame_for_program_frame(19),
-            119
+            cover_out_result
+                .video
+                .as_ref()
+                .unwrap()
+                .source_frame_for_program_frame(19),
+            49
         );
         assert_eq!(
-            after_cover_plan.video_layers[0].source_frame_for_program_frame(20),
+            after_cover_result
+                .video
+                .as_ref()
+                .unwrap()
+                .source_frame_for_program_frame(20),
             120
         );
-        assert_eq!(after_cover_plan.video_layers.len(), 1);
-        assert_eq!(after_cover_plan.audio_buses.len(), 1);
+        assert_eq!(after_cover_result.audio_buses.len(), 1);
         assert_eq!(
-            after_cover_plan.audio_buses[0].output_channel,
+            after_cover_result.audio_buses[0].output_channel,
             PROGRAM_AUDIO_OUTPUT_CH1
         );
     }
@@ -3765,14 +3766,13 @@ mod tests {
 
     #[test]
     fn program_source_keeps_mixed_fps_source_frames_contiguous() {
-        let fast_source =
-            program_source_with_fps("part_fast", 0, 50, 100, 150, "clip_fast", 50.0, 59.94);
+        let fast_source = program_source_with_fps("part_fast", 0, 50, 100, 150, "clip_fast", 59.94);
         assert_eq!(fast_source.source_frame_for_program_frame(0), 100);
         assert_eq!(fast_source.source_frame_for_program_frame(1), 101);
         assert_eq!(fast_source.source_frame_for_program_frame(49), 149);
 
         let alternate_source =
-            program_source_with_fps("part_alt", 0, 50, 100, 150, "clip_alt", 59.94, 50.0);
+            program_source_with_fps("part_alt", 0, 50, 100, 150, "clip_alt", 50.0);
         assert_eq!(alternate_source.source_frame_for_program_frame(0), 100);
         assert_eq!(alternate_source.source_frame_for_program_frame(1), 101);
         assert_eq!(alternate_source.source_frame_for_program_frame(49), 149);
@@ -3807,6 +3807,10 @@ mod tests {
                 .unwrap(),
                 media_input: media_input.into(),
                 source_fps: 50.0,
+                source_timebase: BroadcastSourceTimebase {
+                    fps_num: 50,
+                    fps_den: 1,
+                },
                 has_video: true,
                 has_audio: true,
                 audio_channels: 2,
@@ -3948,28 +3952,25 @@ mod tests {
     }
 
     #[test]
-    fn program_timebase_prefers_probed_video_source_timebase() {
-        let mut program = PlayerProgramState {
-            timebase: CoreTimebase::new(50, 1).unwrap(),
-            duration_frames: 50,
-            items: vec![program_item(
-                "item_a",
+    fn program_timebase_uses_source_probe_not_timeline_fps() {
+        let items = vec![program_item(
+            "item_a",
+            0,
+            60,
+            vec![program_source_with_fps(
+                "part_fast",
                 0,
-                50,
-                vec![
-                    video_only(program_source("video_source", 0, 50, 100, 150, "clip_a")),
-                    audio_ch1_only(program_source("audio_source", 0, 50, 100, 150, "clip_a")),
-                ],
+                60,
+                100,
+                160,
+                "clip_fast",
+                59.94,
             )],
-        };
-        let probed_video_timebase = CoreTimebase::new(60, 1).unwrap();
-        let stale_audio_timebase = CoreTimebase::new(30, 1).unwrap();
-        program.items[0].sources[0].source.timebase = probed_video_timebase;
-        program.items[0].sources[1].source.timebase = stale_audio_timebase;
+        )];
 
         assert_eq!(
-            program_timebase_from_items(&program.items),
-            Some(probed_video_timebase)
+            program_timebase_from_items(&items),
+            Some(CoreTimebase::new(60_000, 1_001).unwrap())
         );
     }
 

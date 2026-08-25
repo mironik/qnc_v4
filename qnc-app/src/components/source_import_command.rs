@@ -6,10 +6,12 @@ const PORT_BROWSE: &str = "browse";
 const PORT_DISCOVER: &str = "discover";
 const PORT_OPTIONS: &str = "options";
 const PORT_IMPORT: &str = "import";
+const PORT_THUMBS: &str = "thumbs";
 const OP_BROWSE: &str = "browse";
 const OP_DISCOVER: &str = "discover";
 const OP_SET_ARCHIVE: &str = "options.archive_original";
 const OP_IMPORT_SELECTED: &str = "import.selected";
+const OP_APPROVE_PROXY_POSTERS: &str = "thumbs.approve_proxy_posters";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SourceImportCommandKind {
@@ -17,6 +19,7 @@ pub(crate) enum SourceImportCommandKind {
     Discover,
     SetArchive,
     ImportSelected,
+    ApproveProxyPosters,
 }
 
 impl SourceImportCommandKind {
@@ -26,6 +29,7 @@ impl SourceImportCommandKind {
             OP_DISCOVER => Some(Self::Discover),
             OP_SET_ARCHIVE => Some(Self::SetArchive),
             OP_IMPORT_SELECTED => Some(Self::ImportSelected),
+            OP_APPROVE_PROXY_POSTERS => Some(Self::ApproveProxyPosters),
             _ => None,
         }
     }
@@ -87,11 +91,22 @@ impl SourceImportCommandComponent {
         .with_timeout(HostRequestTimeout::Long)
     }
 
+    pub fn approve_proxy_posters(project_id: &str, clip_ids: &[String]) -> ComponentBackendCommand {
+        ComponentBackendCommand::post(
+            COMPONENT_ID,
+            PORT_THUMBS,
+            OP_APPROVE_PROXY_POSTERS,
+            project_id,
+            "/api/ingest/thumbs/from-proxy",
+            serde_json::json!({ "project_id": project_id, "clip_ids": clip_ids }),
+        )
+    }
+
     pub fn accepts_event(event: &ComponentBackendEvent) -> bool {
         event.component_id == COMPONENT_ID
             && matches!(
                 event.port_id.as_str(),
-                PORT_BROWSE | PORT_DISCOVER | PORT_OPTIONS | PORT_IMPORT
+                PORT_BROWSE | PORT_DISCOVER | PORT_OPTIONS | PORT_IMPORT | PORT_THUMBS
             )
             && SourceImportCommandKind::from_operation(&event.operation_id).is_some()
     }
@@ -142,6 +157,20 @@ mod tests {
         assert_eq!(archive.port_id, PORT_OPTIONS);
         assert_eq!(import.port_id, PORT_IMPORT);
         assert_ne!(archive.port_id, import.port_id);
+    }
+
+    #[test]
+    fn approve_proxy_posters_is_explicit_thumb_command() {
+        let command = SourceImportCommandComponent::approve_proxy_posters(
+            "p1",
+            &["clip_a".into(), "clip_b".into()],
+        );
+        assert_eq!(command.port_id, PORT_THUMBS);
+        assert_eq!(command.operation_id, OP_APPROVE_PROXY_POSTERS);
+        assert_eq!(command.path, "/api/ingest/thumbs/from-proxy");
+        let payload = command.payload.expect("payload");
+        let ids = payload["clip_ids"].as_array().expect("clip_ids");
+        assert_eq!(ids.len(), 2);
     }
 
     #[test]

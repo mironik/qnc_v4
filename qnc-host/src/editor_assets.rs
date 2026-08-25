@@ -14,7 +14,7 @@ use serde_json::{json, Value};
 use crate::app_state::AppState;
 use crate::filmstrip::{
     frame_path_for_index, frame_path_for_seek, get_filmstrip, manifest_cache_key, manifest_for_api,
-    sync_filmstrip_from_disk, PLACEHOLDER_JPEG,
+    PLACEHOLDER_JPEG,
 };
 use crate::frame_time::{rational_fps, require_fps};
 use crate::ingest::db::resolve_ingest_poster_path;
@@ -23,7 +23,6 @@ use crate::ingest::thumb::{
     resolve_ffmpeg,
 };
 use crate::locale_number::format_decimal;
-use crate::media::resolve_play_media;
 use crate::media_pool::{list_clips_enriched, mark_filmstrip_building, resolve_stored_clip_fps};
 use crate::virtual_shots::{
     add_virtual_shot, add_virtual_shot_from_frames, cover_path_for_shot, derive_virtual_shot,
@@ -31,6 +30,7 @@ use crate::virtual_shots::{
     update_virtual_shot_from_frames, virtual_shot_frames,
 };
 use crate::waveform::{ready as waveform_ready, snapshot as waveform_snapshot};
+use qnc_service_contracts::{MediaAccessKind, MediaLocator, MediaResolveRequest};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum VirtualStreamKind {
@@ -229,8 +229,7 @@ async fn api_media(
 ) -> Result<Response, (StatusCode, String)> {
     let pid = resolve_project_id(&app, &q.project_id)?;
     let clip_id = required_clip_id(&q.clip_id)?;
-    let path = resolve_play_media(&app.project.paths, &pid, clip_id)
-        .map(|m| m.path)
+    let path = resolve_editor_media_path(&app, &pid, clip_id, MediaAccessKind::PlaybackProxy)
         .map_err(|proxy_err| (StatusCode::NOT_FOUND, proxy_err))?;
     let size = tokio::fs::metadata(&path)
         .await
@@ -304,8 +303,7 @@ async fn api_virtual_stream(
             "Virtualni stream ne smije biti dulji od 15 minuta.".into(),
         ));
     }
-    let proxy = resolve_play_media(&app.project.paths, &pid, &clip_id)
-        .map(|m| m.path)
+    let proxy = resolve_editor_media_path(&app, &pid, &clip_id, MediaAccessKind::PlaybackProxy)
         .map_err(|e| (StatusCode::NOT_FOUND, e))?;
     let cache_root = std::env::temp_dir()
         .join("qnc")
@@ -371,12 +369,8 @@ async fn api_thumbnail(
         }
     }
 
-    let source = match resolve_play_media(&app.project.paths, &pid, clip_id) {
-        Ok(m) => m.path,
-        Err(proxy_err) => crate::media::resolve_original_media(&app.project.paths, &pid, clip_id)
-            .map(|m| m.path)
-            .map_err(|_| (StatusCode::NOT_FOUND, proxy_err))?,
-    };
+    let source = resolve_editor_proxy_or_original_path(&app, &pid, clip_id)
+        .map_err(|error| (StatusCode::NOT_FOUND, error))?;
     let tmp = std::env::temp_dir().join(format!(
         "qnc_editor_{}_{}_{}.jpg",
         if preview { "preview" } else { "thumb" },
@@ -413,10 +407,6 @@ async fn api_filmstrip(
             return Ok(Json(cached));
         }
     }
-    let duration_hint = get_filmstrip(&app.project.paths, &pid, clip_id)
-        .and_then(|value| value.get("duration_sec").and_then(Value::as_f64))
-        .unwrap_or(0.0);
-    let _ = sync_filmstrip_from_disk(&app.project.paths, &pid, clip_id, duration_hint);
     let manifest = manifest_for_api(&app.project.paths, &pid, clip_id, namespace);
     if manifest
         .get("filmstrip")
@@ -470,9 +460,7 @@ async fn api_timeline_build(
         let status = existing.get("status").and_then(Value::as_str).unwrap_or("");
         if status == "ready" {
             if !waveform_ready(&app.project.paths, &pid, clip_id) {
-                if let Some(path) = requested_media_path(&app, &pid, clip_id, &body.media_path) {
-                    app.waveform.enqueue(&pid, clip_id, &path);
-                }
+                enqueue_editor_waveform(&app, &pid, clip_id, None);
             }
             return Ok(Json(json!({
                 "status": "ready",
@@ -497,7 +485,7 @@ async fn api_timeline_build(
     mark_filmstrip_building(&app.project.paths, &pid, clip_id).map_err(internal)?;
     app.filmstrip
         .enqueue_priority(&pid, clip_id, &media, frames);
-    app.waveform.enqueue(&pid, clip_id, &media);
+    enqueue_editor_waveform(&app, &pid, clip_id, Some(&media));
     Ok(Json(json!({ "status": "queued", "clip_id": clip_id })))
 }
 
@@ -608,26 +596,86 @@ fn requested_media_path(
     } else {
         None
     };
-    if let Some(path) = crate::media::resolve_filmstrip_media(
-        &app.project.paths,
-        project_id,
-        clip_id,
-        requested_path.as_deref(),
-    ) {
+    if let Some(path) =
+        resolve_editor_filmstrip_media(app, project_id, clip_id, requested_path.as_ref())
+    {
         return Some(path);
     }
     if !requested.trim().is_empty() {
         return requested_path;
     }
-    resolve_play_media(&app.project.paths, project_id, clip_id)
+    resolve_editor_proxy_or_original_path(app, project_id, clip_id)
         .ok()
-        .map(|m| m.path)
-        .or_else(|| {
-            crate::media::resolve_original_media(&app.project.paths, project_id, clip_id)
-                .ok()
-                .map(|m| m.path)
-        })
         .filter(|path| path.is_file())
+}
+
+fn resolve_editor_filmstrip_media(
+    app: &AppState,
+    project_id: &str,
+    clip_id: &str,
+    requested_path: Option<&PathBuf>,
+) -> Option<PathBuf> {
+    let fallback = requested_path.map(|path| MediaLocator::LocalPath { path: path.clone() });
+    let resolved = app
+        .media_gateway
+        .resolve_sync(MediaResolveRequest {
+            project_id: project_id.to_string(),
+            clip_id: clip_id.to_string(),
+            access: MediaAccessKind::FilmstripSource,
+            fallback,
+        })
+        .ok()?;
+    match resolved.media.locator {
+        MediaLocator::LocalPath { path } => Some(path),
+        MediaLocator::IntranetPath { .. } | MediaLocator::ManagedAsset { .. } => None,
+    }
+}
+
+fn resolve_editor_proxy_or_original_path(
+    app: &AppState,
+    project_id: &str,
+    clip_id: &str,
+) -> Result<PathBuf, String> {
+    match resolve_editor_media_path(app, project_id, clip_id, MediaAccessKind::PlaybackProxy) {
+        Ok(path) => Ok(path),
+        Err(proxy_err) => {
+            resolve_editor_media_path(app, project_id, clip_id, MediaAccessKind::OriginalMaster)
+                .map_err(|_| proxy_err)
+        }
+    }
+}
+
+fn enqueue_editor_waveform(
+    app: &AppState,
+    project_id: &str,
+    clip_id: &str,
+    fallback: Option<&PathBuf>,
+) {
+    let _ = fallback;
+    app.waveform.enqueue_job(project_id, clip_id);
+}
+
+fn resolve_editor_media_path(
+    app: &AppState,
+    project_id: &str,
+    clip_id: &str,
+    access: MediaAccessKind,
+) -> Result<PathBuf, String> {
+    let resolved = app
+        .media_gateway
+        .resolve_sync(MediaResolveRequest {
+            project_id: project_id.to_string(),
+            clip_id: clip_id.to_string(),
+            access,
+            fallback: None,
+        })
+        .map_err(|error| error.message)?;
+    match resolved.media.locator {
+        MediaLocator::LocalPath { path } => Ok(path),
+        MediaLocator::IntranetPath { .. } | MediaLocator::ManagedAsset { .. } => Err(format!(
+            "{access:?} nije lokalno dostupno za ovaj host helper."
+        )),
+    }
 }
 
 fn resolve_project_id(app: &AppState, project_id: &str) -> Result<String, (StatusCode, String)> {

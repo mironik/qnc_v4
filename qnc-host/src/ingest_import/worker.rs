@@ -11,29 +11,27 @@ use tracing::{info, warn};
 use crate::background_work::BackgroundWorkGate;
 use crate::filmstrip::{FilmstripWorker, DEFAULT_FILMSTRIP_FRAMES};
 use crate::ingest::asset_row::IngestAssetRow;
-use crate::ingest::audio_wrap::{
-    audio_copy_dest, audio_project_dir, complete_imported_audio_clip,
-    probe_audio_import_media_blocking,
-};
+use crate::ingest::audio_wrap::{audio_copy_dest, audio_project_dir, complete_imported_audio_clip};
 use crate::ingest::db::{
     ingest_asset_meta, mark_ingest_job_error, mark_ingest_job_processing, open_ingest,
     queue_ingest_job, reset_processing_ingest_jobs_for_type,
 };
-use crate::ingest::import_finish::{complete_imported_clip, probe_import_media_blocking};
-use crate::ingest::store::{ingest_archive_original_enabled, row_import_error};
+use crate::ingest::import_finish::complete_imported_clip;
+use crate::ingest::store::{
+    ingest_archive_original_enabled, queue_clip_media_probe_job, row_import_error,
+};
 use crate::ingest_audio_wrap::AudioWrapWorker;
-use crate::ingest_posters::PosterWorker;
 use crate::ingest_proxy::ProxyGenerateWorker;
 use crate::media::{
     card_original_on_card, import_source_path, is_audio_media_file, is_breaking_news,
-    proxy_policy_copy, resolve_filmstrip_media, resolve_import_plan, use_house_media,
-    ImportMediaMode,
+    proxy_policy_copy, resolve_import_plan, use_house_media, ImportMediaMode, ProjectMediaGateway,
 };
 use crate::project::db::{
     bump_project_data_revision, ensure_project_dirs, project_settings_snapshot, ProjectPaths,
 };
 use crate::project::{list_project_ids, ProjectDbBroker};
-use qnc_service_contracts::MediaProcessor;
+use crate::waveform::WaveformWorker;
+use qnc_service_contracts::{MediaAccessKind, MediaLocator, MediaResolveRequest};
 
 /// Samostalan uvoz — copy/link/archive original. Generate proxy delegira na `ingest_proxy` worker.
 #[derive(Clone)]
@@ -42,10 +40,10 @@ pub struct ImportWorker {
     project_db: ProjectDbBroker,
     proxy: Arc<ProxyGenerateWorker>,
     filmstrip: Arc<FilmstripWorker>,
-    posters: Arc<PosterWorker>,
+    waveform: Arc<WaveformWorker>,
     audio_wrap: Arc<AudioWrapWorker>,
     background: BackgroundWorkGate,
-    media_processor: Arc<dyn MediaProcessor>,
+    media_gateway: ProjectMediaGateway,
     pending: Arc<Mutex<HashSet<String>>>,
     blocked: Arc<Mutex<HashSet<String>>>,
 }
@@ -65,20 +63,20 @@ impl ImportWorker {
         project_db: ProjectDbBroker,
         proxy: Arc<ProxyGenerateWorker>,
         filmstrip: Arc<FilmstripWorker>,
-        posters: Arc<PosterWorker>,
+        waveform: Arc<WaveformWorker>,
         audio_wrap: Arc<AudioWrapWorker>,
         background: BackgroundWorkGate,
-        media_processor: Arc<dyn MediaProcessor>,
+        media_gateway: ProjectMediaGateway,
     ) -> Self {
         Self {
             paths,
             project_db,
             proxy,
             filmstrip,
-            posters,
+            waveform,
             audio_wrap,
             background,
-            media_processor,
+            media_gateway,
             pending: Arc::new(Mutex::new(HashSet::new())),
             blocked: Arc::new(Mutex::new(HashSet::new())),
         }
@@ -241,22 +239,7 @@ impl ImportWorker {
                         row.clip_id,
                         path.display()
                     );
-                    let (duration_sec, fps, resolution, codec) = probe_import_media_blocking(
-                        self.media_processor.clone(),
-                        &row.clip_id,
-                        path,
-                    )
-                    .map(|p| (p.duration_sec, p.fps, p.resolution, p.codec))
-                    .unwrap_or((0.0, 0.0, String::new(), String::new()));
-                    self.mark_original_ready(
-                        project_id,
-                        &row,
-                        path,
-                        duration_sec,
-                        fps,
-                        &resolution,
-                        &codec,
-                    )?;
+                    self.mark_original_ready(project_id, &row, path)?;
                 }
             }
 
@@ -368,10 +351,6 @@ impl ImportWorker {
         project_id: &str,
         row: &IngestAssetRow,
         path: &Path,
-        duration_sec: f64,
-        fps: f64,
-        resolution: &str,
-        codec: &str,
     ) -> Result<(), String> {
         self.project_db.serialize_project_write(project_id, || {
             let conn = open_ingest(&self.paths, project_id).map_err(|e| e.to_string())?;
@@ -379,21 +358,9 @@ impl ImportWorker {
                 "UPDATE ingest_assets SET
                     import_status = 'original_ready',
                     original_path = ?3,
-                    read_from_card = 0,
-                    duration_sec = CASE WHEN ?4 > 0 THEN ?4 ELSE duration_sec END,
-                    fps = CASE WHEN ?5 > 0 THEN ?5 ELSE fps END,
-                    resolution = CASE WHEN ?6 = '' THEN resolution ELSE ?6 END,
-                    codec = CASE WHEN ?7 = '' THEN codec ELSE ?7 END
+                    read_from_card = 0
                  WHERE source_id = ?1 AND clip_id = ?2",
-                params![
-                    row.source_id,
-                    row.clip_id,
-                    path.to_string_lossy().as_ref(),
-                    duration_sec,
-                    fps,
-                    resolution,
-                    codec,
-                ],
+                params![row.source_id, row.clip_id, path.to_string_lossy().as_ref()],
             )
             .map_err(|e| e.to_string())?;
             bump_project_data_revision(&conn, "ingest").map_err(|e| e.to_string())?;
@@ -461,22 +428,19 @@ impl ImportWorker {
         });
     }
 
-    fn clip_needs_poster(&self, project_id: &str, row: &IngestAssetRow) -> bool {
-        self.project_db
-            .serialize_project_write(project_id, || {
-                let conn = open_ingest(&self.paths, project_id).map_err(|e| e.to_string())?;
-                let needs = conn
-                    .query_row(
-                        "SELECT thumb_status FROM ingest_assets
-                         WHERE source_id = ?1 AND clip_id = ?2",
-                        params![row.source_id, row.clip_id],
-                        |r| r.get::<_, String>(0),
-                    )
-                    .map(|s| matches!(s.as_str(), "no_card_thumb" | "pending" | "error"))
-                    .unwrap_or(false);
-                Ok(needs)
-            })
-            .unwrap_or(false)
+    fn enqueue_video_probe(&self, project_id: &str, row: &IngestAssetRow) {
+        if let Err(error) = queue_clip_media_probe_job(
+            &self.paths,
+            &self.project_db,
+            project_id,
+            &row.source_id,
+            &row.clip_id,
+        ) {
+            warn!(
+                "ingest import: media probe queue failed project={} clip={} err={}",
+                project_id, row.clip_id, error
+            );
+        }
     }
 }
 
@@ -497,8 +461,6 @@ fn import_breaking_clip(
         .map(|p| p.to_string_lossy().to_string())
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| row.original_path.clone());
-    let probe =
-        probe_import_media_blocking(worker.media_processor.clone(), &row.clip_id, &dest_or_link);
     worker.project_db.serialize_project_write(project_id, || {
         complete_imported_clip(
             &worker.paths,
@@ -510,16 +472,13 @@ fn import_breaking_clip(
             read_from_card,
             read_from_card,
             &original_path,
-            probe.as_ref(),
+            None,
         )
     })?;
-    let filmstrip_media = resolve_filmstrip_media(
-        &worker.paths,
-        project_id,
-        &row.clip_id,
-        Some(dest_or_link.as_path()),
-    );
-    if let Some(media) = filmstrip_media {
+    worker.enqueue_video_probe(project_id, row);
+    if let Some(media) =
+        resolve_import_filmstrip_media(worker, project_id, &row.clip_id, Some(&dest_or_link))
+    {
         worker
             .filmstrip
             .enqueue(project_id, &row.clip_id, &media, DEFAULT_FILMSTRIP_FRAMES);
@@ -627,8 +586,6 @@ fn import_audio_copy_only(
         row.clip_id,
         dest.display()
     );
-    let probe =
-        probe_audio_import_media_blocking(worker.media_processor.clone(), &row.clip_id, &dest);
     worker.project_db.serialize_project_write(project_id, || {
         complete_imported_audio_clip(
             &worker.paths,
@@ -640,7 +597,7 @@ fn import_audio_copy_only(
             false,
             false,
             &original_path,
-            probe.as_ref(),
+            None,
         )
     })?;
     worker.ensure_root_virtual_shots(project_id);
@@ -666,8 +623,6 @@ fn finish_copy_import(
         .map(|p| p.to_string_lossy().to_string())
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| row.original_path.clone());
-    let probe =
-        probe_import_media_blocking(worker.media_processor.clone(), &row.clip_id, media_path);
     worker.project_db.serialize_project_write(project_id, || {
         complete_imported_clip(
             &worker.paths,
@@ -679,33 +634,57 @@ fn finish_copy_import(
             read_from_card,
             card_locked,
             &original_path,
-            probe.as_ref(),
+            None,
         )
     })?;
+    if !source_was_audio {
+        worker.enqueue_video_probe(project_id, row);
+    }
     // Skip filmstrip for audio wraps (black video only) — source_was_audio.
-    let filmstrip_media =
-        resolve_filmstrip_media(&worker.paths, project_id, &row.clip_id, Some(media_path));
     if !source_was_audio
         && !crate::filmstrip::filmstrip_ready(&worker.paths, project_id, &row.clip_id)
-        && filmstrip_media.is_some()
     {
-        let media = filmstrip_media.unwrap();
-        worker
-            .filmstrip
-            .enqueue(project_id, &row.clip_id, &media, DEFAULT_FILMSTRIP_FRAMES);
+        if let Some(media) =
+            resolve_import_filmstrip_media(worker, project_id, &row.clip_id, Some(media_path))
+        {
+            worker
+                .filmstrip
+                .enqueue(project_id, &row.clip_id, &media, DEFAULT_FILMSTRIP_FRAMES);
+        }
     }
-    // Card copy/link done — if no THM/JPG, generate poster from project media.
-    let needs_poster = worker.clip_needs_poster(project_id, row);
-    if needs_poster {
-        worker
-            .posters
-            .enqueue_proxy_generate(project_id, &[row.clip_id.clone()]);
+    if !source_was_audio && !crate::waveform::ready(&worker.paths, project_id, &row.clip_id) {
+        worker.waveform.enqueue_job(project_id, &row.clip_id);
     }
+    // Poster generation from proxy is intentionally left out of this step.
     // Video fps landed in DB — wake audio wrap for any pending VO.
     if !source_was_audio {
         worker.audio_wrap.enqueue(project_id);
     }
     Ok(())
+}
+
+fn resolve_import_filmstrip_media(
+    worker: &ImportWorker,
+    project_id: &str,
+    clip_id: &str,
+    fallback: Option<&Path>,
+) -> Option<PathBuf> {
+    let fallback = fallback.map(|path| MediaLocator::LocalPath {
+        path: path.to_path_buf(),
+    });
+    let resolved = worker
+        .media_gateway
+        .resolve_sync(MediaResolveRequest {
+            project_id: project_id.to_string(),
+            clip_id: clip_id.to_string(),
+            access: MediaAccessKind::FilmstripSource,
+            fallback,
+        })
+        .ok()?;
+    match resolved.media.locator {
+        MediaLocator::LocalPath { path } => Some(path),
+        MediaLocator::IntranetPath { .. } | MediaLocator::ManagedAsset { .. } => None,
+    }
 }
 
 fn import_breaking_card(

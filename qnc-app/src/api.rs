@@ -278,6 +278,8 @@ pub struct IngestClip {
     #[serde(default)]
     pub fps: f64,
     #[serde(default)]
+    pub source_timebase: EditorialSourceTimebase,
+    #[serde(default)]
     pub has_audio: bool,
     #[serde(default)]
     pub audio_channels: u8,
@@ -315,6 +317,8 @@ pub struct IngestClip {
     pub thumb_url: String,
     #[serde(default)]
     pub thumb_status: String,
+    #[serde(default)]
+    pub thumb_error: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -332,6 +336,8 @@ pub struct IngestState {
     pub clips: Vec<IngestClip>,
     #[serde(default)]
     pub selected_clip_ids: Vec<String>,
+    #[serde(default)]
+    pub selection_revision: u64,
     #[serde(default)]
     pub archive_original: bool,
     #[serde(default)]
@@ -477,6 +483,15 @@ pub struct EditorialPlaylistSource {
     pub virtual_shot_id: String,
 }
 
+#[derive(Debug, Clone, Copy, Deserialize, Default, PartialEq, Eq)]
+#[allow(dead_code)]
+pub struct EditorialSourceTimebase {
+    #[serde(default)]
+    pub fps_num: i64,
+    #[serde(default)]
+    pub fps_den: i64,
+}
+
 #[derive(Debug, Clone, Deserialize, Default)]
 #[allow(dead_code)]
 pub struct EditorialPlaylistCover {
@@ -495,6 +510,8 @@ pub struct EditorialPlaylistCover {
     pub source_out_frame: i64,
     #[serde(default)]
     pub source_fps: f64,
+    #[serde(default)]
+    pub source_timebase: EditorialSourceTimebase,
     #[serde(default)]
     pub streamable: bool,
     #[serde(default)]
@@ -531,6 +548,8 @@ pub struct EditorialPlaylistSegment {
     pub source_out_frame: i64,
     #[serde(default)]
     pub source_fps: f64,
+    #[serde(default)]
+    pub source_timebase: EditorialSourceTimebase,
     #[serde(default)]
     pub streamable: bool,
     #[serde(default)]

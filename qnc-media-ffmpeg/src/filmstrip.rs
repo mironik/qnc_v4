@@ -56,7 +56,7 @@ pub fn build_filmstrip_frame_artifacts_at_paths_with_options(
             let _ok = match result {
                 Ok(()) if frame_file_ready(&frame.output_path) => true,
                 _ => {
-                    extract_poster_jpeg_at_seek_cpu_with_options(
+                    extract_poster_jpeg_at_seek_with_options(
                         source,
                         &frame.output_path,
                         frame.seek_sec,
@@ -109,7 +109,7 @@ fn extract_filmstrip_frames_at_seeks_with_options(
         return frames
             .iter()
             .map(|frame| {
-                extract_poster_jpeg_at_seek_cpu_with_options(
+                extract_poster_jpeg_at_seek_with_options(
                     source,
                     &frame.output_path,
                     frame.seek_sec,
@@ -153,7 +153,7 @@ fn extract_filmstrip_frames_at_seeks_with_options(
             return frames
                 .iter()
                 .map(|frame| {
-                    extract_poster_jpeg_at_seek_cpu_with_options(
+                    extract_poster_jpeg_at_seek_with_options(
                         source,
                         &frame.output_path,
                         frame.seek_sec,
@@ -167,7 +167,7 @@ fn extract_filmstrip_frames_at_seeks_with_options(
             return frames
                 .iter()
                 .map(|frame| {
-                    extract_poster_jpeg_at_seek_cpu_with_options(
+                    extract_poster_jpeg_at_seek_with_options(
                         source,
                         &frame.output_path,
                         frame.seek_sec,
@@ -185,7 +185,7 @@ fn extract_filmstrip_frames_at_seeks_with_options(
             if frame_file_ready(&frame.output_path) {
                 Ok(())
             } else {
-                extract_poster_jpeg_at_seek_cpu_with_options(
+                extract_poster_jpeg_at_seek_with_options(
                     source,
                     &frame.output_path,
                     frame.seek_sec,
@@ -197,7 +197,7 @@ fn extract_filmstrip_frames_at_seeks_with_options(
         .collect()
 }
 
-fn extract_poster_jpeg_at_seek_cpu_with_options(
+fn extract_poster_jpeg_at_seek_with_options(
     source: &Path,
     dest: &Path,
     seek_sec: f64,

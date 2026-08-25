@@ -53,6 +53,7 @@ pub(super) fn show(ui: &mut egui::Ui, input: SourceEditorInput<'_>) -> SourceEdi
             archive_original: false,
             ai_mining: false,
             import_enabled: false,
+            proxy_poster_approval_count: 0,
             ingest_status: "",
             expanded_audio: input.expanded_audio,
         },
@@ -69,6 +70,7 @@ pub(super) fn show(ui: &mut egui::Ui, input: SourceEditorInput<'_>) -> SourceEdi
         | SourceDockAction::ClearSelection
         | SourceDockAction::Reload
         | SourceDockAction::SetArchive(_)
-        | SourceDockAction::SetAiMining(_) => SourceEditorAction::None,
+        | SourceDockAction::SetAiMining(_)
+        | SourceDockAction::ApproveProxyPosters => SourceEditorAction::None,
     }
 }

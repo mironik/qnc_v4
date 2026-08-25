@@ -8,17 +8,15 @@ use std::time::{Duration, Instant};
 use tracing::{info, warn};
 
 use crate::background_work::BackgroundWorkGate;
-use crate::ingest::audio_wrap::process_project_audio_wraps;
+use crate::ingest::audio_wrap::queue_project_audio_wrap_jobs;
 use crate::project::db::ProjectPaths;
 use crate::project::{list_project_ids, ProjectDbBroker};
-use qnc_service_contracts::MediaProcessor;
 
 #[derive(Clone)]
 pub struct AudioWrapWorker {
     paths: ProjectPaths,
     project_db: ProjectDbBroker,
     background: BackgroundWorkGate,
-    media_processor: Arc<dyn MediaProcessor>,
     pending: Arc<Mutex<HashSet<String>>>,
     blocked: Arc<Mutex<HashSet<String>>>,
 }
@@ -28,13 +26,11 @@ impl AudioWrapWorker {
         paths: ProjectPaths,
         project_db: ProjectDbBroker,
         background: BackgroundWorkGate,
-        media_processor: Arc<dyn MediaProcessor>,
     ) -> Self {
         Self {
             paths,
             project_db,
             background,
-            media_processor,
             pending: Arc::new(Mutex::new(HashSet::new())),
             blocked: Arc::new(Mutex::new(HashSet::new())),
         }
@@ -114,18 +110,11 @@ impl AudioWrapWorker {
                     if self.is_blocked(&project_id) {
                         continue;
                     }
-                    let worker = self.clone();
-                    let pid = project_id.clone();
-                    let result = process_project_audio_wraps(
-                        &worker.paths,
-                        &worker.project_db,
-                        worker.media_processor.clone(),
-                        &pid,
-                    )
-                    .await;
+                    let result =
+                        queue_project_audio_wrap_jobs(&self.paths, &self.project_db, &project_id);
                     match result {
                         Ok(n) if n > 0 => {
-                            info!("ingest audio wrap: project={} built={}", project_id, n)
+                            info!("ingest audio wrap: project={} queued={}", project_id, n)
                         }
                         Ok(_) => {}
                         Err(e) => warn!("ingest audio wrap: project={} err={}", project_id, e),

@@ -220,8 +220,14 @@ pub enum SegmentTimelineProgramIntent {
     /// to do with it; this component does not play or seek media.
     CueProgramFrame(i64),
     ToggleAudioExpand(SegmentAudioExpansion),
-    SelectMarkerSlot(String),
-    SelectCover(String),
+    SelectMarkerSlot {
+        slot_id: String,
+        program_frame: i64,
+    },
+    SelectCover {
+        cover_id: String,
+        program_frame: i64,
+    },
     SelectMarker {
         marker_id: String,
         program_frame: i64,
@@ -723,10 +729,24 @@ fn program_intent_from_timeline_interact(
         };
     }
     if let Some(cover_id) = interact.select_cover {
-        return SegmentTimelineProgramIntent::SelectCover(cover_id);
+        let program_frame = interact
+            .select_cover_frame
+            .map(|frame| row.program_frame_from_local(frame))
+            .unwrap_or_else(|| row.start_frame());
+        return SegmentTimelineProgramIntent::SelectCover {
+            cover_id,
+            program_frame,
+        };
     }
     if let Some(slot_id) = interact.select_marker_slot {
-        return SegmentTimelineProgramIntent::SelectMarkerSlot(slot_id);
+        let program_frame = interact
+            .select_marker_slot_frame
+            .map(|frame| row.program_frame_from_local(frame))
+            .unwrap_or_else(|| row.start_frame());
+        return SegmentTimelineProgramIntent::SelectMarkerSlot {
+            slot_id,
+            program_frame,
+        };
     }
     if let Some(frame) = interact.seek_frame {
         return SegmentTimelineProgramIntent::CueProgramFrame(row.program_frame_from_local(frame));
@@ -1089,6 +1109,36 @@ mod tests {
             SegmentTimelineProgramIntent::SelectMarker {
                 marker_id: "m_mid".into(),
                 program_frame: 80,
+            }
+        );
+        assert_eq!(
+            program_intent_from_timeline_interact(
+                TimelineInteract {
+                    select_marker_slot: Some("slot_mid".into()),
+                    select_marker_slot_frame: Some(7),
+                    ..TimelineInteract::default()
+                },
+                row,
+                &markers,
+            ),
+            SegmentTimelineProgramIntent::SelectMarkerSlot {
+                slot_id: "slot_mid".into(),
+                program_frame: 57,
+            }
+        );
+        assert_eq!(
+            program_intent_from_timeline_interact(
+                TimelineInteract {
+                    select_cover: Some("cover_mid".into()),
+                    select_cover_frame: Some(9),
+                    ..TimelineInteract::default()
+                },
+                row,
+                &markers,
+            ),
+            SegmentTimelineProgramIntent::SelectCover {
+                cover_id: "cover_mid".into(),
+                program_frame: 59,
             }
         );
     }

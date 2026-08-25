@@ -1,11 +1,13 @@
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use qnc_service_contracts::{
     MediaLocator, MediaProbe as ServiceMediaProbe, MediaProcessor, MediaRef, ScanMode,
+    JOB_TYPE_MEDIA_PROBE,
 };
-use rusqlite::params;
+use rusqlite::{params, OptionalExtension};
 use serde_json::{json, Value};
 
 use crate::media::{
@@ -19,9 +21,10 @@ use crate::project::db::{
 use crate::project::ProjectDbBroker;
 
 use super::db::{
-    backfill_virtual_names_for_selected, ensure_ingest_dirs, get_meta, mark_ingest_job_done,
-    mark_ingest_job_error, mark_ingest_job_processing, open_ingest, poster_exists,
-    queue_ingest_job, set_meta, set_thumb_status, thumbnail_path, thumbnail_url,
+    backfill_virtual_names_for_selected, ensure_ingest_dirs, get_meta,
+    ingest_job_has_active_external_lease, mark_ingest_job_done, mark_ingest_job_error,
+    mark_ingest_job_processing, open_ingest, poster_exists, queue_ingest_job, set_meta,
+    set_thumb_status, thumbnail_path, thumbnail_url,
 };
 use super::proxy_source::{classify_tv_source, recipe_for_source};
 use super::scanner;
@@ -31,6 +34,13 @@ const META_SELECTION_REVISION: &str = "selection_revision";
 
 type DurationProbeRow = (String, String, String, String, String);
 type DurationProbeResult = (String, super::thumb::MediaProbe, PathBuf);
+
+fn now_unix_ms_i64() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as i64)
+        .unwrap_or(0)
+}
 
 pub fn ingest_archive_original_default(_project: &Value) -> bool {
     // Default: isključeno — korisnik ručno uključuje „Kopiraj original u projekt”.
@@ -112,6 +122,8 @@ fn row_to_clip(
         .get::<_, Option<String>>("thumb_error")?
         .unwrap_or_default();
     let import_status: String = row.get("import_status")?;
+    let source_fps_num = row.get::<_, i64>("source_fps_num").unwrap_or(0);
+    let source_fps_den = row.get::<_, i64>("source_fps_den").unwrap_or(1);
     let mut clip = json!({
         "clip_id": clip_id,
         "name": row.get::<_, String>("name")?,
@@ -120,6 +132,12 @@ fn row_to_clip(
         "resolution": row.get::<_, String>("resolution")?,
         "codec": row.get::<_, String>("codec")?,
         "fps": row.get::<_, f64>("fps")?,
+        "source_fps_num": source_fps_num,
+        "source_fps_den": source_fps_den,
+        "source_timebase": {
+            "fps_num": source_fps_num,
+            "fps_den": source_fps_den,
+        },
         "has_audio": row.get::<_, i64>("has_audio").unwrap_or(0) != 0,
         "audio_channels": row.get::<_, i64>("audio_channels").unwrap_or(0),
         "field_order": row.get::<_, String>("field_order").unwrap_or_default(),
@@ -352,6 +370,7 @@ pub fn discover(
 
 /// Pozadinski ffprobe trajanje: broker serializira SQLite snapshot/finalni upis,
 /// a media probe radi izvan DB locka.
+#[allow(dead_code)] // retained for adapter tests; production duration probe is JobService/qnc-worker.
 pub async fn probe_missing_durations_with_broker(
     paths: &ProjectPaths,
     project_db: &ProjectDbBroker,
@@ -409,6 +428,111 @@ pub fn needs_duration_probe_conn(conn: &rusqlite::Connection) -> rusqlite::Resul
     Ok(count_missing_durations(&conn, &source_id)? > 0)
 }
 
+pub fn queue_missing_duration_probe_jobs(
+    paths: &ProjectPaths,
+    project_db: &ProjectDbBroker,
+    project_id: &str,
+) -> Result<usize, String> {
+    let pid = project_id.trim();
+    if pid.is_empty() {
+        return Err("project_id required".into());
+    }
+    let now_ms = now_unix_ms_i64();
+    project_db.serialize_project_write(pid, || {
+        let conn = open_ingest(paths, pid).map_err(|e| e.to_string())?;
+        let source_id = get_meta(&conn, "active_source_id", "local").map_err(|e| e.to_string())?;
+        set_meta(&conn, "durations_probe", "processing").map_err(|e| e.to_string())?;
+        let rows = load_missing_media_probe_rows(&conn, &source_id).map_err(|e| e.to_string())?;
+        let mut queued = 0usize;
+        let mut active = 0usize;
+        for (clip_id, source_path, original_path, proxy_path, project_proxy_path) in rows {
+            if ingest_job_has_active_external_lease(
+                &conn,
+                JOB_TYPE_MEDIA_PROBE,
+                &source_id,
+                &clip_id,
+                now_ms,
+            )
+            .map_err(|e| e.to_string())?
+            {
+                active += 1;
+                continue;
+            }
+            let has_media = [project_proxy_path, proxy_path, original_path, source_path]
+                .into_iter()
+                .map(|s| s.trim().to_string())
+                .any(|s| !s.is_empty() && PathBuf::from(s).is_file());
+            if !has_media {
+                continue;
+            }
+            queue_ingest_job(&conn, JOB_TYPE_MEDIA_PROBE, &source_id, &clip_id)
+                .map_err(|e| e.to_string())?;
+            queued += 1;
+        }
+        if queued == 0 && active == 0 {
+            finish_duration_probe_if_idle_conn(&conn, &source_id).map_err(|e| e.to_string())?;
+        }
+        Ok(queued)
+    })
+}
+
+pub fn queue_clip_media_probe_job(
+    paths: &ProjectPaths,
+    project_db: &ProjectDbBroker,
+    project_id: &str,
+    source_id: &str,
+    clip_id: &str,
+) -> Result<bool, String> {
+    let pid = project_id.trim();
+    let sid = source_id.trim();
+    let cid = clip_id.trim();
+    if pid.is_empty() || sid.is_empty() || cid.is_empty() {
+        return Err("project_id/source_id/clip_id required".into());
+    }
+    let now_ms = now_unix_ms_i64();
+    project_db.serialize_project_write(pid, || {
+        let conn = open_ingest(paths, pid).map_err(|e| e.to_string())?;
+        set_meta(&conn, "durations_probe", "processing").map_err(|e| e.to_string())?;
+        if ingest_job_has_active_external_lease(&conn, JOB_TYPE_MEDIA_PROBE, sid, cid, now_ms)
+            .map_err(|e| e.to_string())?
+        {
+            return Ok(false);
+        }
+        let row = conn
+            .query_row(
+                "SELECT source_path, original_path, proxy_path, project_proxy_path
+                 FROM ingest_assets
+                 WHERE source_id = ?1 AND clip_id = ?2
+                   AND (duration_sec IS NULL OR duration_sec <= 0)",
+                params![sid, cid],
+                |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                        r.get::<_, String>(3)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|e| e.to_string())?;
+        let Some((source_path, original_path, proxy_path, project_proxy_path)) = row else {
+            finish_duration_probe_if_idle_conn(&conn, sid).map_err(|e| e.to_string())?;
+            return Ok(false);
+        };
+        let has_media = [project_proxy_path, proxy_path, original_path, source_path]
+            .into_iter()
+            .map(|s| s.trim().to_string())
+            .any(|s| !s.is_empty() && PathBuf::from(s).is_file());
+        if !has_media {
+            finish_duration_probe_if_idle_conn(&conn, sid).map_err(|e| e.to_string())?;
+            return Ok(false);
+        }
+        queue_ingest_job(&conn, JOB_TYPE_MEDIA_PROBE, sid, cid).map_err(|e| e.to_string())?;
+        Ok(true)
+    })
+}
+
 fn load_missing_media_probe_rows(
     conn: &rusqlite::Connection,
     source_id: &str,
@@ -425,6 +549,7 @@ fn load_missing_media_probe_rows(
     mapped.collect::<Result<_, _>>()
 }
 
+#[allow(dead_code)] // unit-test helper; production media probe is JobService/qnc-worker.
 async fn run_media_probe_batch(
     media_processor: Arc<dyn MediaProcessor>,
     project_id: &str,
@@ -529,7 +654,9 @@ fn write_media_probe_results(
                 field_order = ?9,
                 interlaced = ?10,
                 source_class = ?11,
-                proxy_recipe = ?12
+                proxy_recipe = ?12,
+                source_fps_num = CASE WHEN ?13 > 0 THEN ?13 ELSE source_fps_num END,
+                source_fps_den = CASE WHEN ?14 > 0 THEN ?14 ELSE source_fps_den END
              WHERE source_id = ?1 AND clip_id = ?2",
             params![
                 source_id,
@@ -544,6 +671,8 @@ fn write_media_probe_results(
                 if probe.interlaced { 1 } else { 0 },
                 source_class.label(),
                 proxy_recipe.id(),
+                probe.fps_num,
+                probe.fps_den,
             ],
         )?;
         filled += 1;
@@ -551,6 +680,63 @@ fn write_media_probe_results(
     Ok(filled)
 }
 
+pub fn record_media_probe_result(
+    paths: &ProjectPaths,
+    project_db: &ProjectDbBroker,
+    project_id: &str,
+    source_id: &str,
+    clip_id: &str,
+    probe: ServiceMediaProbe,
+) -> Result<(), String> {
+    let probe = ingest_probe_from_service(probe)
+        .ok_or_else(|| format!("media probe invalid for clip_id={clip_id}"))?;
+    project_db.serialize_project_write(project_id, || {
+        let conn = open_ingest(paths, project_id).map_err(|e| e.to_string())?;
+        write_media_probe_results(
+            &conn,
+            source_id,
+            vec![(clip_id.to_string(), probe, PathBuf::new())],
+        )
+        .map_err(|e| e.to_string())?;
+        finish_duration_probe_if_idle_conn(&conn, source_id).map_err(|e| e.to_string())?;
+        bump_project_data_revision(&conn, "ingest").map_err(|e| e.to_string())?;
+        Ok(())
+    })
+}
+
+pub fn finish_duration_probe_if_idle(
+    paths: &ProjectPaths,
+    project_db: &ProjectDbBroker,
+    project_id: &str,
+    source_id: &str,
+) -> Result<(), String> {
+    project_db.serialize_project_write(project_id, || {
+        let conn = open_ingest(paths, project_id).map_err(|e| e.to_string())?;
+        finish_duration_probe_if_idle_conn(&conn, source_id).map_err(|e| e.to_string())?;
+        Ok(())
+    })
+}
+
+pub fn finish_duration_probe_if_idle_conn(
+    conn: &rusqlite::Connection,
+    source_id: &str,
+) -> rusqlite::Result<()> {
+    let active: i64 = conn.query_row(
+        "SELECT COUNT(*)
+         FROM ingest_jobs
+         WHERE job_type = ?1
+           AND source_id = ?2
+           AND status IN ('queued', 'processing')",
+        params![JOB_TYPE_MEDIA_PROBE, source_id],
+        |row| row.get(0),
+    )?;
+    if active == 0 {
+        set_meta(conn, "durations_probe", "done")?;
+    }
+    Ok(())
+}
+
+#[allow(dead_code)] // unit-test helper; production media probe is JobService/qnc-worker.
 fn media_ref(clip_id: &str, media: &std::path::Path) -> MediaRef {
     MediaRef {
         clip_id: clip_id.to_string(),
@@ -579,6 +765,8 @@ pub(crate) fn ingest_probe_from_service(
     Some(super::thumb::MediaProbe {
         duration_sec,
         fps,
+        fps_num: probe.timebase.fps_num as i64,
+        fps_den: probe.timebase.fps_den as i64,
         resolution,
         codec: probe.codec,
         has_audio: probe.has_audio,
@@ -773,6 +961,10 @@ pub fn load_state(paths: &ProjectPaths, project_id: &str) -> rusqlite::Result<Va
         .collect();
     let jobs = list_ingest_jobs(&conn)?;
     let durations_pending = durations_still_pending(&conn, &active_source)?;
+    let selection_revision = get_meta(&conn, META_SELECTION_REVISION, "0")?
+        .trim()
+        .parse::<u64>()
+        .unwrap_or(0);
     Ok(json!({
         "status": "ok",
         "project_id": pid,
@@ -785,6 +977,7 @@ pub fn load_state(paths: &ProjectPaths, project_id: &str) -> rusqlite::Result<Va
         "clips": clips,
         "jobs": jobs,
         "selected_clip_ids": selected,
+        "selection_revision": selection_revision,
         "archive_original": archive_original,
         "archive_original_available": ingest_archive_original_available(&project),
         "durations_pending": durations_pending,
@@ -1463,6 +1656,58 @@ mod archive_original_tests {
     }
 
     #[test]
+    fn queue_clip_media_probe_job_queues_single_clip_without_local_probe() {
+        let base = std::env::temp_dir().join(format!(
+            "qnc_clip_media_probe_queue_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let paths = test_paths(&base);
+        let project_id = "proj_clip_media_probe_queue";
+        let media = base.join("clip_a_proxy.mp4");
+        std::fs::write(&media, b"fake-proxy").unwrap();
+        let conn = open_ingest(&paths, project_id).expect("ingest db");
+        conn.execute(
+            "INSERT INTO ingest_assets
+                (source_id, clip_id, name, media_id, duration_sec, project_proxy_path)
+             VALUES ('local', 'clip_a', 'clip_a', 'clip_a', 0, ?1)",
+            rusqlite::params![media.to_string_lossy().to_string()],
+        )
+        .unwrap();
+        drop(conn);
+
+        let broker = ProjectDbBroker::new(paths.clone());
+        let queued =
+            queue_clip_media_probe_job(&paths, &broker, project_id, "local", "clip_a").unwrap();
+
+        assert!(queued);
+        let conn = open_ingest(&paths, project_id).expect("ingest db");
+        let job: (String, String, String, String) = conn
+            .query_row(
+                "SELECT job_type, source_id, clip_id, status
+                 FROM ingest_jobs
+                 WHERE job_type = ?1 AND source_id = 'local' AND clip_id = 'clip_a'",
+                rusqlite::params![JOB_TYPE_MEDIA_PROBE],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(job.0, JOB_TYPE_MEDIA_PROBE);
+        assert_eq!(job.1, "local");
+        assert_eq!(job.2, "clip_a");
+        assert_eq!(job.3, "queued");
+        assert_eq!(
+            get_meta(&conn, "durations_probe", "").unwrap(),
+            "processing"
+        );
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
     fn save_selection_revision_rejects_stale_async_write() {
         let base =
             std::env::temp_dir().join(format!("qnc_selection_revision_{}", std::process::id()));
@@ -1510,6 +1755,13 @@ mod archive_original_tests {
         assert_eq!(
             get_meta(&conn, META_SELECTION_REVISION, "0").unwrap(),
             "2".to_string()
+        );
+        let state = load_state(&paths, project_id).expect("state");
+        assert_eq!(
+            state
+                .get("selection_revision")
+                .and_then(|value| value.as_u64()),
+            Some(2)
         );
         let _ = std::fs::remove_dir_all(&base);
     }

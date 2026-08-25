@@ -94,6 +94,35 @@ projektu za projektnu istinu, te runtime cache samo za brze, ne-trajne statuse.
 - Cilj nije više različitih aplikacija, nego jedna workstation aplikacija koja
   zna raditi u različitim okruženjima: lokalni laptop/radna stanica,
   TV intranet s centralnim ingestom/NAS-om, i kasnije internet/tester mode.
+- Deployment topologija mora biti tipizirana konfiguracija, ne ad hoc string u
+  formi ili workeru. Dozvoljene vrijednosti su `single_workstation`,
+  `shared_worker`, `enterprise_gateway` i `internet_project`. Manualni
+  config/env override je dopušten za produkcijske topologije, ali ne smije
+  stvoriti drugi izvršni put.
+- Mode/topologija u kojoj aplikacija radi određuje odakle se uzimaju ingest
+  fajlovi: lokalni disk/kartica u `single_workstation`, dijeljeni storage/NAS u
+  `shared_worker`, postojeći TV ingest/MAM/archive proxy u
+  `enterprise_gateway`, te samo lokalni korisnički mediji uz mrežne
+  projekte/metapodatke u `internet_project`. Taj izbor pripada
+  config/gateway/source-adapter sloju, ne formama.
+- Media access mora koristiti isti integration gateway model u lokalnom,
+  intranet i buducem internet/tester okruzenju. Lokalni filesystem/NAS adapter
+  je samo jedna implementacija tog gatewaya; enterprise MAM/ingest/archive
+  proxy je druga. Ne uvoditi poseban lokalni put koji zaobilazi isti ugovor.
+- `integration.gateway.kind` je kanonska konfiguracija pristupa medijima.
+  Dozvoljene vrijednosti su `local_fs`, `shared_fs` i `enterprise_proxy`.
+  UI, Story, timeline, player i export ne smiju granati poslovnu logiku prema
+  tim vrijednostima; njima se upravlja u host/worker/gateway/resolver sloju.
+- Vanjske media/gateway rute ovise o okruženju i dolaze iz konfiguracije
+  (`integration.gateway.endpoint` i `integration.gateway.routes`). Kod smije
+  imati samo stabilne interne host API contracte; ne hardkodirati enterprise,
+  MAM, NAS ili proxy routeove u formama, playeru ili workerima.
+- TV intranet / enterprise migracija mora biti neinvazivna i postupna.
+  Postojeci MAM/ingest/archive/playout sustavi ostaju vlasnici svojih baza,
+  storage pravila i produkcijskog toka. QNC im smije pristupati kroz neutralni
+  integration gateway/proxy adapter koji je inicijalno read-through/read-only,
+  cacheira ili mapira postojece izvore u QNC virtualne kadrove i ne smije
+  zaustaviti, zakljucati ili opteretiti postojecu infrastrukturu.
 - Mediji nikad nisu na internetu. Internet/tester mode smije prenositi projekt,
   bazu/metapodatke, edit decision, korisničko stanje i lake snapshote, ali
   originalni media, proxy, filmstrip i waveform ostaju lokalno kod korisnika
@@ -108,6 +137,9 @@ projektu za projektnu istinu, te runtime cache samo za brze, ne-trajne statuse.
   generation je fallback samo za klipove koji nemaju postojeći proxy.
 - Camera thumbnail je zakon: ako THM/JPG/poster postoji na kartici/NAS-u, on se
   kopira kao poster i ne smije se generirati FFmpeg poster bez potrebe.
+- Originalni master se ne uvozi implicitno. Kopira se/linka samo kad je klip
+  oznacen i kad je ukljucena odgovarajuca import/original opcija; resolver ga
+  smije vratiti samo kao vec postojecu DB/storage referencu, ne kao novi import.
 - Prvi korak svakog artifact workera je provjera kartice/NAS metapodataka i
   stvarnih fajlova. Ako proxy, thumbnail, audio ili drugi trazeni pomocni
   artefakt vec postoji na kameri/kartici/NAS-u, koristi se taj artefakt; tek
@@ -115,14 +147,25 @@ projektu za projektnu istinu, te runtime cache samo za brze, ne-trajne statuse.
 - Import se osvjezava po klipu, ne po batchu: cim pojedini klip dobije proxy,
   thumb, filmstrip frame ili waveform status, host zapisuje status za taj klip,
   a UI smije prikazati taj napredak bez cekanja zavrsetka cijele kartice.
-- Pipeline je po klipu i po dependencyju: proxy copy/generate zavrsava atomskim
-  ready statusom, zatim za isti klip mogu krenuti filmstrip, waveform i
-  fallback poster. Partial fajl ne smije biti playback/decode istina i ne smije
-  predstavljati cijeli filmstrip.
+- Import pipeline je step-by-step za QNC/breaking-news montazu: za jedan klip
+  najprije se koristi/kopira proxy s kartice/NAS-a ili se generira proxy ako
+  proxy ne postoji; zatim se za taj klip odmah pokrece filmstrip i klip postaje
+  montazno/playback upotrebljiv bez cekanja pomocnih UI artefakata. Ne gasiti
+  pozadinske procese apsolutno: dijeliti ih u QoS trake. Proxy/generate je
+  teska traka i ne smije masovno zauzeti GPU/disk; filmstrip je prioritetni UI
+  artefakt; waveform je sekundarni UI artefakt i smije raditi u pozadini dok ne
+  postoji playback/proxy pressure. Partial fajl ne smije biti playback/decode
+  istina i ne smije predstavljati cijeli filmstrip.
 - Buduci vanjski workeri ne smiju uvoditi paralelni queue niti direktan SQLite
   javni model. Kanonski red je postojeci `ingest_jobs`, a vanjski procesi
   komuniciraju kroz host `JobService` API (`claim`, `heartbeat`, `complete`,
   `fail`) i `ProjectDbBroker`.
+- Postoji jedna worker aplikacija: `qnc-worker`. Isti binarni worker koristi se
+  na lokalnoj radnoj stanici i na intranet worker stroju; placement/capability
+  dolaze iz worker self-probea i claim metadata, uz dopusten rucni
+  configuration/env override za produkcijske topologije. Taj override ne smije
+  stvoriti drugi izvrsni model. Host-local artifact execution ne postoji kao
+  podrzani model i ne smije se vracati kroz config, env var, skriptu ili test.
 - Produkcijski artifact job (`proxy_generate`, filmstrip, waveform, poster,
   audio wrap) ne smije biti dodan u external claim allowlist dok istodobno ne
   postoje worker handler i host-side result applier koji zapisuje isti SQLite
@@ -130,9 +173,11 @@ projektu za projektnu istinu, te runtime cache samo za brze, ne-trajne statuse.
   prije claima mora ponovno dokazati da kamera/kartica/NAS nema postojeci
   proxy; u suprotnom se proxy kopira/linka i generate se ne pokrece. Bez toga
   vanjski proces moze oznaciti posao gotovim bez stvarnog artefakta.
-- Dok je playback aktivan ili se tek otvara/priprema input, teški workeri ne
-  smiju claimati posao. Host `playback_active`/background gate ima prednost nad
-  recoveryjem, proxyjem, filmstripom, waveformom i ostalim pozadinskim poslom.
+- Playback ima najviši prioritet, ali pozadinski poslovi se ne gase
+  apsolutno. Worker scheduler mora koristiti QoS/resursne laneove: disk/GPU/CPU
+  poslovi koji bi ugrozili broadcast player ne smiju startati u istom resursnom
+  laneu, dok lagani status/copy/UI artefakti mogu nastaviti kad policy kaže da
+  ne diraju play resurse.
 - `Import/Uvezi` ostaje zakljucani DB-first ugovor dok se izricito ne napravi
   zaseban migracijski korak. Worker split pocinje oko samostalnih artefakt
   poslova, ne izmjenama Ingest forme.
@@ -189,3 +234,21 @@ projektu za projektnu istinu, te runtime cache samo za brze, ne-trajne statuse.
 - Timeline, Segment i Program UI su pasivni: prikazuju virtualne rangeove i
   emitiraju frame/selection intent. Playlist/EDL builder pretvara te virtualne
   kadrove u jedan broadcast-player input; UI elementi sami ne playaju media.
+- QNC keyboard shortcut model je zakljucan kao vlastiti jednostavni preset.
+  EDIUS, Resolve, Premiere, Final Cut i Avid presetovi ostaju originalni i ne
+  smiju nasljedivati QNC-specific tipke. Shortcuti dolaze iz
+  `seed/keyboard-shortcuts.json` i SQLite korisnickih postavki, ne iz
+  hardkodiranih chordova u Rust kodu.
+- QNC shortcut semantika: `Shift` dodaje element, `Ctrl` selektira trenutni
+  element/točku, `Left/Right` pomiče selektirani fokus ili playhead za jedan
+  frame, `Up/Down` bira prethodni/sljedeći segment u aktivnom panelu, a
+  `Alt+Left/Right` navigira aktivnu timeline komponentu. `Alt+Left/Right` ne
+  prolazi kroz sve objekte u jednoj dugoj listi; bez selekcije ide po
+  segmentima/cutovima kao brz osnovni tok, a kad je odabran slot ili marker
+  ostaje u toj vrsti objekta. Text input fokus uvijek ima prednost nad
+  montažnim shortcutima.
+- Aplikacija mora biti operabilna bez miša. Svaki panel koji prikazuje
+  odabir/listu/timeline mora imati eksplicitni keyboard focus, vidljiv fokusirani
+  element i neutralne akcije za `Tab`/`Shift+Tab`, strelice i aktivaciju
+  fokusiranog elementa. Aktivni panel se ne smije zaključivati heuristikom iz
+  zadnjeg view moda ili zadnjeg mouse clicka.

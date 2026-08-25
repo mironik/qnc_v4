@@ -29,6 +29,8 @@ pub struct SourceDockInput<'a> {
     pub archive_original: bool,
     pub ai_mining: bool,
     pub import_enabled: bool,
+    /// Number of imported clips that need explicit poster generation consent.
+    pub proxy_poster_approval_count: usize,
     /// e.g. "8 uvezeno · 10/81" — shown in ingest header (right side).
     pub ingest_status: &'a str,
     /// Which A1/A2 lane is expanded (web kodak toggle).
@@ -50,6 +52,7 @@ pub enum SourceDockAction {
     Reload,
     SetArchive(bool),
     SetAiMining(bool),
+    ApproveProxyPosters,
 }
 
 /// Horizontal inset shared by workspace columns and the bottom timeline dock.
@@ -193,6 +196,23 @@ pub fn show(ui: &mut egui::Ui, input: SourceDockInput<'_>) -> SourceDockAction {
                             }
                             if qnc_theme::action_btn(ui, "Osvježi").clicked() {
                                 action = SourceDockAction::Reload;
+                            }
+                            if input.proxy_poster_approval_count > 0 {
+                                let label = format!(
+                                    "Generiraj postere ({})",
+                                    input.proxy_poster_approval_count
+                                );
+                                if qnc_theme::action_btn(ui, &label)
+                                    .on_hover_text("Odobri generiranje postera iz proxya")
+                                    .clicked()
+                                {
+                                    action = SourceDockAction::ApproveProxyPosters;
+                                }
+                                ui.label(
+                                    RichText::new("Nema postera na kartici")
+                                        .size(qnc_theme::FONT_UI)
+                                        .color(MUTED),
+                                );
                             }
                             let uvezi = ui.add_enabled_ui(input.import_enabled, |ui| {
                                 qnc_theme::primary_btn(ui, "Uvezi")

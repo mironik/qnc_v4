@@ -80,6 +80,8 @@ mod tests {
         MediaProbe {
             duration_sec: 10.0,
             fps,
+            fps_num: fps.round() as i64,
+            fps_den: 1,
             resolution: "1920x1080".into(),
             codec: "h264".into(),
             has_audio: true,

@@ -39,8 +39,8 @@ pub(crate) enum SegmentPanelAction {
     None,
     SeekTimelineFrame(i64),
     MarkerCover(marker_cover_panel::MarkerCoverAction),
-    SelectMarkerSlot(String),
-    SelectCover(String),
+    SelectMarkerSlot { slot_id: String, frame: i64 },
+    SelectCover { cover_id: String, frame: i64 },
     SelectMarker { marker_id: String, frame: i64 },
 }
 
@@ -322,12 +322,20 @@ fn segment_action_from_timeline_intent(intent: SegmentTimelineProgramIntent) -> 
         SegmentTimelineProgramIntent::CueProgramFrame(program_frame) => {
             SegmentPanelAction::SeekTimelineFrame(program_frame)
         }
-        SegmentTimelineProgramIntent::SelectMarkerSlot(slot_id) => {
-            SegmentPanelAction::SelectMarkerSlot(slot_id)
-        }
-        SegmentTimelineProgramIntent::SelectCover(cover_id) => {
-            SegmentPanelAction::SelectCover(cover_id)
-        }
+        SegmentTimelineProgramIntent::SelectMarkerSlot {
+            slot_id,
+            program_frame,
+        } => SegmentPanelAction::SelectMarkerSlot {
+            slot_id,
+            frame: program_frame,
+        },
+        SegmentTimelineProgramIntent::SelectCover {
+            cover_id,
+            program_frame,
+        } => SegmentPanelAction::SelectCover {
+            cover_id,
+            frame: program_frame,
+        },
         SegmentTimelineProgramIntent::SelectMarker {
             marker_id,
             program_frame,
@@ -459,16 +467,24 @@ mod tests {
     #[test]
     fn timeline_layer_intents_preserve_db_ids_and_program_frames() {
         assert_eq!(
-            segment_action_from_timeline_intent(SegmentTimelineProgramIntent::SelectMarkerSlot(
-                "slot_a".into()
-            ),),
-            SegmentPanelAction::SelectMarkerSlot("slot_a".into())
+            segment_action_from_timeline_intent(SegmentTimelineProgramIntent::SelectMarkerSlot {
+                slot_id: "slot_a".into(),
+                program_frame: 44,
+            }),
+            SegmentPanelAction::SelectMarkerSlot {
+                slot_id: "slot_a".into(),
+                frame: 44,
+            }
         );
         assert_eq!(
-            segment_action_from_timeline_intent(SegmentTimelineProgramIntent::SelectCover(
-                "cover_a".into()
-            ),),
-            SegmentPanelAction::SelectCover("cover_a".into())
+            segment_action_from_timeline_intent(SegmentTimelineProgramIntent::SelectCover {
+                cover_id: "cover_a".into(),
+                program_frame: 22,
+            }),
+            SegmentPanelAction::SelectCover {
+                cover_id: "cover_a".into(),
+                frame: 22,
+            }
         );
         assert_eq!(
             segment_action_from_timeline_intent(SegmentTimelineProgramIntent::SelectMarker {

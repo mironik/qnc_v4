@@ -41,7 +41,8 @@ pub fn read_imported_clips(paths: &ProjectPaths, project_id: &str) -> Result<Vec
                     fps, resolution, codec, virtual_name,
                     COALESCE(has_audio, 0), COALESCE(audio_channels, 0),
                     COALESCE(field_order, ''), COALESCE(interlaced, 0),
-                    COALESCE(source_class, ''), COALESCE(proxy_recipe, '')
+                    COALESCE(source_class, ''), COALESCE(proxy_recipe, ''),
+                    COALESCE(source_fps_num, 0), COALESCE(source_fps_den, 1)
              FROM ingest_assets
              WHERE import_status = 'imported'
              ORDER BY clip_id",
@@ -70,6 +71,8 @@ pub fn read_imported_clips(paths: &ProjectPaths, project_id: &str) -> Result<Vec
             let interlaced = row.get::<_, i64>(22).unwrap_or(0) != 0;
             let source_class = row.get::<_, String>(23).unwrap_or_default();
             let proxy_recipe = row.get::<_, String>(24).unwrap_or_default();
+            let source_fps_num = row.get::<_, i64>(25).unwrap_or(0);
+            let source_fps_den = row.get::<_, i64>(26).unwrap_or(1);
             let meta = ingest_asset_meta(&IngestAssetMetaInput {
                 source_path: source_path.clone(),
                 original_path: original_path.clone(),
@@ -94,6 +97,12 @@ pub fn read_imported_clips(paths: &ProjectPaths, project_id: &str) -> Result<Vec
                 "file_extension": file_extension,
                 "duration_sec": row.get::<_, f64>(2)?,
                 "fps": fps,
+                "source_fps_num": source_fps_num,
+                "source_fps_den": source_fps_den,
+                "source_timebase": {
+                    "fps_num": source_fps_num,
+                    "fps_den": source_fps_den,
+                },
                 "metadata_ready": fps.is_finite() && fps > 0.0,
                 "resolution": resolution,
                 "codec": codec,
@@ -241,6 +250,8 @@ fn repair_proxy_asset_index(
 struct IngestClipProbeRow {
     source_id: String,
     fps: f64,
+    source_fps_num: i64,
+    source_fps_den: i64,
     has_audio: bool,
     audio_channels: u8,
     _duration_sec: f64,
@@ -262,7 +273,8 @@ fn load_ingest_clip_row(
         "SELECT source_id, fps, COALESCE(has_audio, 0), COALESCE(audio_channels, 0),
                 duration_sec, project_proxy_path, proxy_path,
                 COALESCE(field_order, ''), COALESCE(interlaced, 0),
-                COALESCE(source_class, ''), COALESCE(proxy_recipe, '')
+                COALESCE(source_class, ''), COALESCE(proxy_recipe, ''),
+                COALESCE(source_fps_num, 0), COALESCE(source_fps_den, 1)
          FROM ingest_assets
          WHERE clip_id = ?1 AND import_status = 'imported'
          ORDER BY CASE WHEN source_id = 'project_proxy_repair' THEN 1 ELSE 0 END
@@ -281,10 +293,31 @@ fn load_ingest_clip_row(
                 interlaced: row.get::<_, i64>(8)? != 0,
                 source_class: row.get(9)?,
                 proxy_recipe: row.get(10)?,
+                source_fps_num: row.get(11)?,
+                source_fps_den: row.get(12)?,
             })
         },
     )
     .map_err(|_| format!("Uvezeni klip '{clip_id}' nije pronađen u projektnoj bazi."))
+}
+
+/// Original/probe timebase lookup: read the stored rational pair from SQLite.
+pub fn resolve_stored_clip_timebase(
+    paths: &ProjectPaths,
+    project_id: &str,
+    clip_id: &str,
+) -> Result<(i64, i64), String> {
+    let clip_id = clip_id.trim();
+    if clip_id.is_empty() {
+        return Err("clip_id je prazan".into());
+    }
+    let row = load_ingest_clip_row(paths, project_id, clip_id)?;
+    if row.source_fps_num > 0 && row.source_fps_den > 0 {
+        return Ok((row.source_fps_num, row.source_fps_den));
+    }
+    Err(format!(
+        "Klip '{clip_id}' nema valjan source timebase u ingest bazi; pričekaj import/probe worker."
+    ))
 }
 
 /// Hot-path source FPS lookup: read the already imported/probed value from SQLite only.
@@ -336,7 +369,9 @@ fn persist_clip_probe(
             field_order = ?9,
             interlaced = ?10,
             source_class = ?11,
-            proxy_recipe = ?12
+            proxy_recipe = ?12,
+            source_fps_num = CASE WHEN ?13 > 0 THEN ?13 ELSE source_fps_num END,
+            source_fps_den = CASE WHEN ?14 > 0 THEN ?14 ELSE source_fps_den END
          WHERE source_id = ?1 AND clip_id = ?2",
         params![
             source_id,
@@ -351,6 +386,8 @@ fn persist_clip_probe(
             if probe.interlaced { 1 } else { 0 },
             source_class.label(),
             proxy_recipe.id(),
+            probe.fps_num,
+            probe.fps_den,
         ],
     )
     .map_err(|e| e.to_string())?;

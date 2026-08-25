@@ -247,6 +247,8 @@ pub fn media_duration_sec(source: &Path) -> Option<f64> {
 pub struct MediaProbe {
     pub duration_sec: f64,
     pub fps: f64,
+    pub fps_num: i64,
+    pub fps_den: i64,
     pub resolution: String,
     pub codec: String,
     pub has_audio: bool,
@@ -333,17 +335,17 @@ pub fn probe_media(source: &Path) -> Option<MediaProbe> {
         .unwrap_or("")
         .trim()
         .to_string();
-    let fps = stream
+    let (fps, fps_num, fps_den) = stream
         .and_then(|s| s.get("avg_frame_rate"))
         .and_then(|v| v.as_str())
-        .and_then(parse_frame_rate)
+        .and_then(parse_frame_rate_parts)
         .or_else(|| {
             stream
                 .and_then(|s| s.get("r_frame_rate"))
                 .and_then(|v| v.as_str())
-                .and_then(parse_frame_rate)
+                .and_then(parse_frame_rate_parts)
         })
-        .unwrap_or(0.0);
+        .unwrap_or((0.0, 0, 1));
     let field_order = stream
         .and_then(|s| s.get("field_order"))
         .and_then(|v| v.as_str())
@@ -370,6 +372,8 @@ pub fn probe_media(source: &Path) -> Option<MediaProbe> {
     Some(MediaProbe {
         duration_sec,
         fps,
+        fps_num,
+        fps_den,
         resolution,
         codec,
         has_audio: audio_channels > 0,
@@ -404,20 +408,31 @@ pub fn media_has_audio_stream(source: &Path) -> Option<bool> {
     Some(!String::from_utf8_lossy(&output.stdout).trim().is_empty())
 }
 
-fn parse_frame_rate(text: &str) -> Option<f64> {
+fn parse_frame_rate_parts(text: &str) -> Option<(f64, i64, i64)> {
     let t = text.trim();
     if t.is_empty() || t == "0/0" || t.eq_ignore_ascii_case("n/a") {
         return None;
     }
     if let Some((num, den)) = t.split_once('/') {
-        let n: f64 = num.trim().parse().ok()?;
-        let d: f64 = den.trim().parse().ok()?;
-        if n > 0.0 && d > 0.0 {
-            return Some(n / d);
+        let n: i64 = num.trim().parse().ok()?;
+        let d: i64 = den.trim().parse().ok()?;
+        if n > 0 && d > 0 {
+            return Some((n as f64 / d as f64, n, d));
         }
         return None;
     }
-    parse_decimal(t).filter(|v| *v > 0.0)
+    let fps = parse_decimal(t).filter(|v| *v > 0.0)?;
+    let rounded = fps.round();
+    if (fps - rounded).abs() < 0.000_001 {
+        Some((fps, rounded as i64, 1))
+    } else {
+        Some((fps, (fps * 1000.0).round() as i64, 1000))
+    }
+}
+
+#[cfg(test)]
+fn parse_frame_rate(text: &str) -> Option<f64> {
+    parse_frame_rate_parts(text).map(|(fps, _, _)| fps)
 }
 
 #[cfg(test)]
@@ -428,6 +443,14 @@ mod tests {
     fn parse_frame_rate_fraction() {
         assert!((parse_frame_rate("50/1").unwrap() - 50.0).abs() < 0.001);
         assert!((parse_frame_rate("30000/1001").unwrap() - 29.97).abs() < 0.01);
+    }
+
+    #[test]
+    fn parse_frame_rate_preserves_fraction() {
+        assert_eq!(
+            super::parse_frame_rate_parts("30000/1001").unwrap(),
+            (30000.0 / 1001.0, 30000, 1001)
+        );
     }
 
     #[test]

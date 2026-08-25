@@ -23,11 +23,20 @@ impl BackgroundWorkGate {
     }
 
     pub fn playback_active(&self) -> bool {
-        if !self.playback_active.load(Ordering::Acquire) {
+        self.playback_active_at(now_ms())
+    }
+
+    fn playback_active_at(&self, now_ms: u64) -> bool {
+        let seen = self.playback_seen_ms.load(Ordering::Acquire);
+        if seen == 0 {
             return false;
         }
-        let seen = self.playback_seen_ms.load(Ordering::Acquire);
-        seen > 0 && now_ms().saturating_sub(seen) <= PLAYBACK_ACTIVE_LEASE_MS
+        let elapsed = now_ms.saturating_sub(seen);
+        if self.playback_active.load(Ordering::Acquire) {
+            elapsed <= PLAYBACK_ACTIVE_LEASE_MS
+        } else {
+            false
+        }
     }
 }
 
@@ -36,4 +45,28 @@ fn now_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn playback_gate_releases_immediately_after_inactive_signal() {
+        let gate = BackgroundWorkGate::new();
+        gate.playback_seen_ms.store(1_000, Ordering::Release);
+        gate.playback_active.store(false, Ordering::Release);
+
+        assert!(!gate.playback_active_at(1_000));
+    }
+
+    #[test]
+    fn playback_gate_active_signal_uses_short_lease() {
+        let gate = BackgroundWorkGate::new();
+        gate.playback_seen_ms.store(1_000, Ordering::Release);
+        gate.playback_active.store(true, Ordering::Release);
+
+        assert!(gate.playback_active_at(1_000 + PLAYBACK_ACTIVE_LEASE_MS));
+        assert!(!gate.playback_active_at(1_001 + PLAYBACK_ACTIVE_LEASE_MS));
+    }
 }

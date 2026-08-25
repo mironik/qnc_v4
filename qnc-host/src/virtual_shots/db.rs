@@ -658,7 +658,14 @@ fn sync_virtual_shot_source_fps(
             ],
         )
         .map_err(|e| e.to_string())?;
-        set_shot_rational_fps(conn, &shot_id, dual.source_fps, dual.timeline_fps)?;
+        set_shot_source_timebase(
+            conn,
+            &shot_id,
+            paths,
+            project_id,
+            &clip_id,
+            dual.timeline_fps,
+        )?;
     }
     Ok(())
 }
@@ -673,14 +680,17 @@ fn dual_fps_for_virtual_shot(
     dual_fps_snapshot(in_frame, out_frame, source_fps, source_fps)
 }
 
-/// Persist rational source/timeline FPS (broadcast truth) for a shot.
-fn set_shot_rational_fps(
+/// Persist original probe source timebase plus current timeline display timebase.
+fn set_shot_source_timebase(
     conn: &Connection,
     shot_id: &str,
-    source_fps: f64,
+    paths: &ProjectPaths,
+    project_id: &str,
+    clip_id: &str,
     timeline_fps: f64,
 ) -> Result<(), String> {
-    let (s_num, s_den) = rational_fps(source_fps);
+    let (s_num, s_den) =
+        crate::media_pool::resolve_stored_clip_timebase(paths, project_id, clip_id)?;
     let (t_num, t_den) = rational_fps(timeline_fps);
     conn.execute(
         "UPDATE virtual_shots
@@ -1003,7 +1013,14 @@ pub fn add_virtual_shot_from_frames(
         ],
     )
     .map_err(|e| e.to_string())?;
-    set_shot_rational_fps(&conn, &shot_id, dual.source_fps, dual.timeline_fps)?;
+    set_shot_source_timebase(
+        &conn,
+        &shot_id,
+        paths,
+        project_id,
+        clip_id,
+        dual.timeline_fps,
+    )?;
     Ok(json!({
         "id": shot_id,
         "shot_id": shot_id,
@@ -1359,7 +1376,14 @@ fn finalize_root_virtual_shot(
         )
         .map_err(|e| e.to_string())?;
     }
-    set_shot_rational_fps(conn, &shot_id, dual.source_fps, dual.timeline_fps)?;
+    set_shot_source_timebase(
+        conn,
+        &shot_id,
+        paths,
+        project_id,
+        clip_id,
+        dual.timeline_fps,
+    )?;
     Ok(json!({
         "shot_id": shot_id,
         "kind": "import_root",
@@ -1596,7 +1620,14 @@ pub fn update_virtual_shot_from_frames(
         ],
     )
     .map_err(|e| e.to_string())?;
-    set_shot_rational_fps(&conn, shot_id.trim(), dual.source_fps, dual.timeline_fps)?;
+    set_shot_source_timebase(
+        &conn,
+        shot_id.trim(),
+        paths,
+        project_id,
+        &clip_id,
+        dual.timeline_fps,
+    )?;
     list_virtual_shots(paths, project_id)?
         .into_iter()
         .find(|shot| shot.get("id").and_then(Value::as_str) == Some(shot_id.trim()))

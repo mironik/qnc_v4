@@ -106,14 +106,19 @@ pub fn path_num(effective: &Value, path: &[&str]) -> Option<f64> {
         .or_else(|| cur.as_str().and_then(parse_decimal))
 }
 
-pub fn path_i64(effective: &Value, path: &[&str], default: i64) -> i64 {
+pub fn fps_display_optional(effective: &Value, path: &[&str]) -> String {
     path_num(effective, path)
-        .map(|n| n.round() as i64)
-        .unwrap_or(default)
+        .map(fps_value_display)
+        .unwrap_or_default()
 }
 
-pub fn fps_display(effective: &Value, path: &[&str], default: f64) -> String {
-    let n = path_num(effective, path).unwrap_or(default);
+pub fn int_display_optional(effective: &Value, path: &[&str]) -> String {
+    path_num(effective, path)
+        .map(|value| (value.round() as i64).to_string())
+        .unwrap_or_default()
+}
+
+fn fps_value_display(n: f64) -> String {
     if (n - n.round()).abs() < 0.001 {
         format!("{}", n.round() as i64)
     } else {
@@ -215,5 +220,15 @@ mod tests {
 
         assert!(!export_profile_is_forbidden_pal_progressive(&values));
         assert!(validate_export_profile("xdcam_hd422_50i", "XDCAM HD422 50i", &values).is_ok());
+    }
+
+    #[test]
+    fn optional_fps_display_does_not_invent_missing_value() {
+        let empty = json!({});
+        let fps = json!({ "export": { "fps": "50,0" } });
+
+        assert_eq!(fps_display_optional(&empty, &["export", "fps"]), "");
+        assert_eq!(fps_display_optional(&fps, &["export", "fps"]), "50");
+        assert_eq!(int_display_optional(&empty, &["export", "width"]), "");
     }
 }

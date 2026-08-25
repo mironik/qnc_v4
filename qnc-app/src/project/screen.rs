@@ -9,7 +9,7 @@ use serde_json::Value;
 use crate::api::{FsEntry, KeyboardPresetRow, ModuleRow, ProjectRow, TemplateRow};
 use crate::components::ProjectCatalogData;
 use crate::qnc_location_browser::{clean_location_path, LocationSourceKind};
-use crate::shortcuts::{StoryBindings, PROJECT_SHORTCUT_SCOPE};
+use crate::shortcuts::{keyboard_input_is_reserved, StoryBindings, PROJECT_SHORTCUT_SCOPE};
 
 use super::empty_story_layout;
 use super::project_list;
@@ -146,6 +146,9 @@ pub enum ProjectAction {
 impl ProjectScreen {
     pub fn handle_shortcuts(&mut self, ctx: &egui::Context) -> ProjectAction {
         if !self.shortcuts_ready() {
+            return ProjectAction::None;
+        }
+        if keyboard_input_is_reserved(ctx) {
             return ProjectAction::None;
         }
         ctx.input(|input| {

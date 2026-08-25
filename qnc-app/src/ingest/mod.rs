@@ -12,12 +12,13 @@ use eframe::egui::{self, TextureHandle, TextureOptions};
 use serde_json::Value;
 
 use crate::api::{FsEntry, FsList, HostClient, IngestClip, IngestState};
+use crate::component_runtime::ComponentBackendCommand;
 use crate::editorial::media_pool::{self, MediaPoolAction};
 use crate::editorial::types::LibraryTab;
 use crate::frame_time::{frame_to_seconds, seconds_to_frame};
 use crate::media_assets::{self, AsyncImageAssetLoader, ImageAssetKey};
 use crate::playback_stack::PlaybackStack;
-use crate::player_contract::BroadcastHostSourceRef;
+use crate::player_contract::{BroadcastHostSourceRef, BroadcastSourceTimebase};
 use crate::qnc_filmstrip_background::FilmFrame;
 use crate::qnc_location_browser::clean_location_path;
 use crate::qnc_source_dock::{self, SourceDockAction, SourceDockInput};
@@ -54,14 +55,18 @@ pub struct IngestScreen {
     dir_browser: DirBrowserKind,
     // Broadcast player projection (PlayerRemote via app).
     pub(crate) selected_play_path: String,
+    pub(crate) selected_play_input_clip_id: String,
+    pub(crate) pending_play_input_clip_id: String,
+    pub(crate) pending_play_after_resolve: bool,
     pub(crate) selected_source_ref: Option<BroadcastHostSourceRef>,
     pub(crate) selected_source_fps: f64,
+    pub(crate) selected_source_timebase: BroadcastSourceTimebase,
     pub(crate) selected_source_has_audio: bool,
     pub(crate) selected_source_audio_channels: u8,
     pub(crate) virtual_frame: i64,
     pub(crate) playing: bool,
     pub(crate) player_status: String,
-    project_id: String,
+    pub(crate) project_id: String,
     /// Web kodak: click A1/A2 label expands that wave lane.
     expanded_audio: ExpandedAudio,
     /// Same pool-head tabs as Story / Media Assist (`media_pool::show_head`).
@@ -74,6 +79,7 @@ pub struct IngestScreen {
     shortcut_catalog: Option<Value>,
     shortcut_user: Option<Value>,
     selection_revision: u64,
+    pub(crate) pending_backend_commands: Vec<ComponentBackendCommand>,
 }
 
 pub enum IngestAction {
@@ -93,6 +99,7 @@ pub enum IngestAction {
     SelectAll,
     ClearSelection,
     ImportSelected,
+    ApproveProxyPosters(Vec<String>),
     Toggle(String),
     #[allow(dead_code)]
     FocusPreview(String),
@@ -126,8 +133,12 @@ impl Default for IngestScreen {
             dir_busy: false,
             dir_browser: DirBrowserKind::default(),
             selected_play_path: String::new(),
+            selected_play_input_clip_id: String::new(),
+            pending_play_input_clip_id: String::new(),
+            pending_play_after_resolve: false,
             selected_source_ref: None,
             selected_source_fps: 0.0,
+            selected_source_timebase: BroadcastSourceTimebase::default(),
             selected_source_has_audio: false,
             selected_source_audio_channels: 0,
             virtual_frame: 0,
@@ -143,6 +154,7 @@ impl Default for IngestScreen {
             shortcut_catalog: None,
             shortcut_user: None,
             selection_revision: 0,
+            pending_backend_commands: Vec::new(),
         }
     }
 }
@@ -157,7 +169,7 @@ impl IngestScreen {
         }
         let mut actions = Vec::new();
         // play_pause / step_back_frame / step_forward_frame from catalog only.
-        for action in playback_controls::shortcut_actions(ctx, &self.bindings) {
+        for action in playback_controls::shortcut_actions_with_widget_focus(ctx, &self.bindings) {
             match action {
                 PlaybackAction::TogglePlay => actions.push(IngestAction::TogglePlay),
                 PlaybackAction::SeekFrames(frames) => actions.push(self.nudge_frames(frames)),
@@ -169,6 +181,10 @@ impl IngestScreen {
 
     pub fn needs_shortcuts_load(&self) -> bool {
         !self.shortcuts_loaded && !self.shortcuts_loading
+    }
+
+    pub fn drain_backend_commands(&mut self) -> Vec<ComponentBackendCommand> {
+        std::mem::take(&mut self.pending_backend_commands)
     }
 
     pub fn begin_shortcuts_load(&mut self, expected_results: usize) {
@@ -260,17 +276,43 @@ impl IngestScreen {
     }
 
     pub fn apply(&mut self, st: IngestState) {
+        let mut st = st;
         if !st.browse_path.is_empty() {
             self.path_edit = st.browse_path.clone();
         }
         self.archive_local = st.archive_original;
-        if self.preview_clip_id.is_empty() {
-            if let Some(first) = st.clips.first() {
-                self.preview_clip_id = first.clip_id.clone();
-            }
+        let project_id = if !st.project_id.trim().is_empty() {
+            st.project_id.clone()
+        } else {
+            self.project_id.clone()
+        };
+        let next_preview = if self.preview_clip_id.is_empty()
+            || !st
+                .clips
+                .iter()
+                .any(|clip| clip.clip_id == self.preview_clip_id)
+        {
+            st.clips.first().map(|first| first.clip_id.clone())
+        } else {
+            Some(self.preview_clip_id.clone())
+        };
+        let preview_changed = next_preview
+            .as_ref()
+            .is_some_and(|clip_id| *clip_id != self.preview_clip_id);
+        if st.selection_revision < self.selection_revision {
+            preserve_local_clip_selection(self.state.as_ref(), &mut st);
+        } else {
+            self.selection_revision = st.selection_revision;
         }
         self.state = Some(st);
         self.last_poll = Some(Instant::now());
+        if let Some(clip_id) = next_preview {
+            if preview_changed {
+                self.activate_preview_clip(&project_id, &clip_id);
+            } else {
+                self.ensure_preview_playback_ready(&project_id);
+            }
+        }
     }
 
     pub fn begin_state_load(&mut self, project_id: &str) {
@@ -465,10 +507,8 @@ impl IngestScreen {
             matches!(
                 c.import_status.as_str(),
                 "queued" | "processing" | "generating_proxy" | "original_ready"
-            ) || (matches!(
-                c.thumb_status.as_str(),
-                "pending" | "no_card_thumb" | "processing"
-            ) && !self.poster_textures.contains_key(&c.clip_id))
+            ) || (matches!(c.thumb_status.as_str(), "pending" | "processing")
+                && !self.poster_textures.contains_key(&c.clip_id))
         })
     }
 
@@ -800,6 +840,7 @@ impl IngestScreen {
             .as_ref()
             .map(|s| s.selected_clip_ids.len())
             .unwrap_or(0);
+        let proxy_poster_clip_ids = self.proxy_poster_approval_clip_ids();
         let (sel, total, imp, pending) = self.summary();
         let status = if pending > 0 {
             format!("{imp} uvezeno · {pending} u tijeku · {sel}/{total}")
@@ -890,6 +931,7 @@ impl IngestScreen {
                 archive_original: self.archive_local,
                 ai_mining: self.ai_mining,
                 import_enabled: !self.command_busy && selected_n > 0,
+                proxy_poster_approval_count: proxy_poster_clip_ids.len(),
                 ingest_status: &status,
                 expanded_audio: self.expanded_audio,
             },
@@ -910,10 +952,26 @@ impl IngestScreen {
                 self.ai_mining = v;
                 IngestAction::None
             }
+            SourceDockAction::ApproveProxyPosters => {
+                IngestAction::ApproveProxyPosters(proxy_poster_clip_ids)
+            }
             SourceDockAction::SaveVirtualShot
             | SourceDockAction::CreatePart(_)
             | SourceDockAction::CreateCover => IngestAction::None,
         }
+    }
+
+    pub fn proxy_poster_approval_clip_ids(&self) -> Vec<String> {
+        self.state
+            .as_ref()
+            .map(|st| {
+                st.clips
+                    .iter()
+                    .filter(|clip| clip.thumb_status.as_str() == "no_card_thumb")
+                    .map(|clip| clip.clip_id.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     fn summary(&self) -> (usize, usize, usize, usize) {
@@ -968,6 +1026,7 @@ impl IngestScreen {
             | IngestAction::SelectAll
             | IngestAction::ClearSelection
             | IngestAction::SetArchive(_)
+            | IngestAction::ApproveProxyPosters(_)
             | IngestAction::ImportSelected => Ok(()),
             IngestAction::CancelDir => {
                 self.cancel_dir_browser();
@@ -995,6 +1054,23 @@ fn rebuild_selected_clip_ids(st: &mut IngestState) {
         .filter(|clip| clip.selected)
         .map(|clip| clip.clip_id.clone())
         .collect();
+}
+
+fn preserve_local_clip_selection(current: Option<&IngestState>, incoming: &mut IngestState) {
+    let Some(current) = current else {
+        return;
+    };
+    let selected_by_clip: HashMap<&str, bool> = current
+        .clips
+        .iter()
+        .map(|clip| (clip.clip_id.as_str(), clip.selected))
+        .collect();
+    for clip in &mut incoming.clips {
+        if let Some(selected) = selected_by_clip.get(clip.clip_id.as_str()).copied() {
+            clip.selected = selected;
+        }
+    }
+    rebuild_selected_clip_ids(incoming);
 }
 
 fn format_duration(sec: f64) -> String {
@@ -1036,6 +1112,8 @@ fn format_tc(sec: f64, fps: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::components::PlaybackMediaResolution;
+    use crate::playback_routing::PlaybackTransportIntent;
 
     fn clip(clip_id: &str, selected: bool) -> IngestClip {
         IngestClip {
@@ -1043,6 +1121,80 @@ mod tests {
             selected,
             ..Default::default()
         }
+    }
+
+    fn playable_clip(clip_id: &str, proxy_path: String) -> IngestClip {
+        IngestClip {
+            clip_id: clip_id.to_string(),
+            name: clip_id.to_string(),
+            duration_sec: 2.0,
+            fps: 50.0,
+            source_timebase: crate::api::EditorialSourceTimebase {
+                fps_num: 50,
+                fps_den: 1,
+            },
+            has_audio: true,
+            audio_channels: 2,
+            proxy_path,
+            ..Default::default()
+        }
+    }
+
+    fn resolve_input(path: &str) -> PlaybackMediaResolution {
+        PlaybackMediaResolution {
+            media_input: path.into(),
+            locator_kind: "local",
+            source_timebase: None,
+            duration_sec: None,
+            duration_frames: None,
+            has_audio: None,
+            audio_channels: None,
+        }
+    }
+
+    fn resolved_probe_input(path: &str) -> PlaybackMediaResolution {
+        PlaybackMediaResolution {
+            media_input: path.into(),
+            locator_kind: "local",
+            source_timebase: Some(crate::player_contract::BroadcastSourceTimebase {
+                fps_num: 50,
+                fps_den: 1,
+            }),
+            duration_sec: Some(2.0),
+            duration_frames: Some(100),
+            has_audio: Some(true),
+            audio_channels: Some(2),
+        }
+    }
+
+    fn take_media_resolve_command(screen: &mut IngestScreen, project_id: &str, clip_id: &str) {
+        let commands = screen.drain_backend_commands();
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0].path, "/api/media/resolve");
+        assert_eq!(
+            commands[0]
+                .payload
+                .as_ref()
+                .and_then(|payload| payload.get("project_id"))
+                .and_then(Value::as_str),
+            Some(project_id)
+        );
+        assert_eq!(
+            commands[0]
+                .payload
+                .as_ref()
+                .and_then(|payload| payload.get("clip_id"))
+                .and_then(Value::as_str),
+            Some(clip_id)
+        );
+        assert_eq!(
+            commands[0]
+                .payload
+                .as_ref()
+                .and_then(|payload| payload.get("access"))
+                .and_then(Value::as_str),
+            Some("playback_proxy")
+        );
     }
 
     fn screen_with_selection(selection: &[(&str, bool)]) -> IngestScreen {
@@ -1126,6 +1278,294 @@ mod tests {
     }
 
     #[test]
+    fn apply_syncs_selection_revision_from_server() {
+        let mut screen = IngestScreen::default();
+
+        screen.apply(IngestState {
+            project_id: "p1".into(),
+            selection_revision: 41,
+            clips: vec![clip("a", true)],
+            selected_clip_ids: vec!["a".into()],
+            ..Default::default()
+        });
+
+        assert_eq!(screen.selection_revision(), 41);
+        assert_eq!(screen.selected_clip_ids(), vec!["a".to_string()]);
+    }
+
+    #[test]
+    fn stale_poll_does_not_overwrite_newer_local_selection() {
+        let mut screen = IngestScreen::default();
+        screen.apply(IngestState {
+            project_id: "p1".into(),
+            selection_revision: 10,
+            clips: vec![clip("a", false), clip("b", false)],
+            ..Default::default()
+        });
+
+        assert_eq!(screen.toggle_clip_selection_local("a"), Some(false));
+        assert_eq!(screen.selection_revision(), 11);
+        screen.apply_polled_state(IngestState {
+            project_id: "p1".into(),
+            selection_revision: 10,
+            clips: vec![clip("a", false), clip("b", false)],
+            ..Default::default()
+        });
+
+        assert_eq!(screen.selection_revision(), 11);
+        assert_eq!(screen.selected_clip_ids(), vec!["a".to_string()]);
+    }
+
+    #[test]
+    fn apply_activates_first_preview_clip_and_requests_playback_resolve() {
+        let mut clip = playable_clip("clip_1", "legacy-card-proxy.mp4".into());
+        clip.original_path = "legacy-original.mxf".into();
+        clip.source_path = "legacy-source.mxf".into();
+        clip.project_proxy_path = "legacy-project-proxy.mp4".into();
+        let mut screen = IngestScreen {
+            project_id: "p1".into(),
+            ..Default::default()
+        };
+
+        screen.apply(IngestState {
+            project_id: "p1".into(),
+            clips: vec![clip],
+            ..Default::default()
+        });
+
+        assert_eq!(screen.preview_clip_id, "clip_1");
+        assert!(screen.playback_source_ref().is_some());
+        assert_eq!(screen.playback_media_path(), None);
+        take_media_resolve_command(&mut screen, "p1", "clip_1");
+
+        let intent = screen.apply_playback_media_resolution(
+            "p1",
+            "clip_1",
+            resolve_input("C:/qnc/resolved/clip_1.mp4"),
+        );
+        assert_eq!(
+            screen.playback_media_path().as_deref(),
+            Some("C:/qnc/resolved/clip_1.mp4")
+        );
+        assert_eq!(intent, PlaybackTransportIntent::CueFrame(0));
+        assert_eq!(screen.selected_source_fps, 50.0);
+    }
+
+    #[test]
+    fn ingest_playback_waits_for_gateway_when_card_proxy_is_missing() {
+        let mut clip = playable_clip("clip_1", String::new());
+        clip.original_path = "legacy-card-original.mxf".into();
+        clip.source_path = "legacy-card-source.mxf".into();
+        clip.project_proxy_path = "legacy-project-proxy.mp4".into();
+        let mut screen = IngestScreen {
+            project_id: "p1".into(),
+            ..Default::default()
+        };
+
+        screen.apply(IngestState {
+            project_id: "p1".into(),
+            clips: vec![clip],
+            ..Default::default()
+        });
+
+        assert!(screen.playback_source_ref().is_some());
+        assert_eq!(screen.playback_media_path(), None);
+        assert!(screen.player_status.contains("media resolve"));
+        take_media_resolve_command(&mut screen, "p1", "clip_1");
+    }
+
+    #[test]
+    fn ingest_playback_accepts_gateway_project_proxy_result() {
+        let mut clip = playable_clip("clip_1", String::new());
+        clip.project_proxy_path = "legacy-project-proxy.mp4".into();
+        let mut screen = IngestScreen {
+            project_id: "p1".into(),
+            ..Default::default()
+        };
+
+        screen.apply(IngestState {
+            project_id: "p1".into(),
+            clips: vec![clip],
+            ..Default::default()
+        });
+
+        assert!(screen.playback_source_ref().is_some());
+        assert_eq!(screen.playback_media_path(), None);
+        take_media_resolve_command(&mut screen, "p1", "clip_1");
+
+        let intent = screen.apply_playback_media_resolution(
+            "p1",
+            "clip_1",
+            resolve_input("C:/qnc/resolved/project_proxy.mp4"),
+        );
+        assert_eq!(
+            screen.playback_media_path().as_deref(),
+            Some("C:/qnc/resolved/project_proxy.mp4")
+        );
+        assert_eq!(intent, PlaybackTransportIntent::CueFrame(0));
+    }
+
+    #[test]
+    fn poll_completes_preview_playback_after_probe_timebase_arrives() {
+        let mut initial = playable_clip("clip_1", "legacy-proxy.mp4".into());
+        initial.source_timebase = crate::api::EditorialSourceTimebase::default();
+        initial.fps = 0.0;
+        let mut screen = IngestScreen {
+            project_id: "p1".into(),
+            ..Default::default()
+        };
+
+        screen.apply(IngestState {
+            project_id: "p1".into(),
+            clips: vec![initial],
+            ..Default::default()
+        });
+        assert_eq!(screen.preview_clip_id, "clip_1");
+        assert!(screen.playback_source_ref().is_none());
+        assert_eq!(screen.playback_media_path(), None);
+        take_media_resolve_command(&mut screen, "p1", "clip_1");
+
+        screen.apply(IngestState {
+            project_id: "p1".into(),
+            clips: vec![playable_clip("clip_1", "legacy-proxy.mp4".into())],
+            ..Default::default()
+        });
+
+        assert_eq!(screen.preview_clip_id, "clip_1");
+        assert!(screen.playback_source_ref().is_some());
+        assert_eq!(screen.playback_media_path(), None);
+        assert!(screen.drain_backend_commands().is_empty());
+
+        let intent = screen.apply_playback_media_resolution(
+            "p1",
+            "clip_1",
+            resolve_input("C:/qnc/resolved/delayed_timebase.mp4"),
+        );
+        assert_eq!(
+            screen.playback_media_path().as_deref(),
+            Some("C:/qnc/resolved/delayed_timebase.mp4")
+        );
+        assert_eq!(intent, PlaybackTransportIntent::CueFrame(0));
+        assert_eq!(screen.selected_source_fps, 50.0);
+    }
+
+    #[test]
+    fn ingest_playback_uses_probe_fps_when_structured_timebase_is_missing() {
+        let mut clip = playable_clip("clip_1", "legacy-proxy.mp4".into());
+        clip.source_timebase = crate::api::EditorialSourceTimebase::default();
+        clip.fps = 50.0;
+        let mut screen = IngestScreen {
+            project_id: "p1".into(),
+            ..Default::default()
+        };
+
+        screen.apply(IngestState {
+            project_id: "p1".into(),
+            clips: vec![clip],
+            ..Default::default()
+        });
+
+        assert!(screen.playback_source_ref().is_some());
+        assert_eq!(screen.selected_source_fps, 50.0);
+        assert_eq!(screen.playback_media_path(), None);
+        take_media_resolve_command(&mut screen, "p1", "clip_1");
+
+        let intent = screen.apply_playback_media_resolution(
+            "p1",
+            "clip_1",
+            resolve_input("C:/qnc/resolved/probe_fps_only.mp4"),
+        );
+        assert_eq!(
+            screen.playback_media_path().as_deref(),
+            Some("C:/qnc/resolved/probe_fps_only.mp4")
+        );
+        assert_eq!(intent, PlaybackTransportIntent::CueFrame(0));
+    }
+
+    #[test]
+    fn ingest_playback_uses_resolved_probe_when_state_probe_is_missing() {
+        let mut clip = playable_clip("clip_1", "legacy-proxy.mp4".into());
+        clip.source_timebase = crate::api::EditorialSourceTimebase::default();
+        clip.fps = 0.0;
+        clip.duration_sec = 0.0;
+        clip.has_audio = false;
+        clip.audio_channels = 0;
+        let mut screen = IngestScreen {
+            project_id: "p1".into(),
+            ..Default::default()
+        };
+
+        screen.apply(IngestState {
+            project_id: "p1".into(),
+            clips: vec![clip],
+            ..Default::default()
+        });
+
+        assert_eq!(screen.preview_clip_id, "clip_1");
+        assert!(screen.playback_source_ref().is_none());
+        take_media_resolve_command(&mut screen, "p1", "clip_1");
+
+        let intent = screen.apply_playback_media_resolution(
+            "p1",
+            "clip_1",
+            resolved_probe_input("C:/qnc/resolved/card_proxy.mp4"),
+        );
+
+        assert_eq!(intent, PlaybackTransportIntent::CueFrame(0));
+        assert_eq!(
+            screen.playback_media_path().as_deref(),
+            Some("C:/qnc/resolved/card_proxy.mp4")
+        );
+        assert!(screen.playback_source_ref().is_some());
+        assert_eq!(screen.selected_source_fps, 50.0);
+        assert_eq!(screen.selected_source_audio_channels, 2);
+        let updated_clip = screen
+            .state
+            .as_ref()
+            .and_then(|state| state.clips.iter().find(|clip| clip.clip_id == "clip_1"))
+            .expect("updated clip");
+        assert_eq!(updated_clip.fps, 50.0);
+        assert_eq!(updated_clip.source_timebase.fps_num, 50);
+        assert_eq!(updated_clip.source_timebase.fps_den, 1);
+        assert_eq!(updated_clip.duration_sec, 2.0);
+        assert!(updated_clip.has_audio);
+        assert_eq!(updated_clip.audio_channels, 2);
+    }
+
+    #[test]
+    fn ingest_play_request_waiting_for_resolve_starts_after_resolution() {
+        let mut clip = playable_clip("clip_1", "legacy-proxy.mp4".into());
+        clip.source_timebase = crate::api::EditorialSourceTimebase::default();
+        clip.fps = 0.0;
+        clip.duration_sec = 0.0;
+        let mut screen = IngestScreen {
+            project_id: "p1".into(),
+            ..Default::default()
+        };
+
+        screen.apply(IngestState {
+            project_id: "p1".into(),
+            clips: vec![clip],
+            ..Default::default()
+        });
+        take_media_resolve_command(&mut screen, "p1", "clip_1");
+
+        screen.request_play_after_resolve();
+        let intent = screen.apply_playback_media_resolution(
+            "p1",
+            "clip_1",
+            resolved_probe_input("C:/qnc/resolved/card_proxy.mp4"),
+        );
+
+        assert_eq!(intent, PlaybackTransportIntent::TogglePlay);
+        assert!(screen.playback_source_ref().is_some());
+        assert_eq!(
+            screen.playback_media_path().as_deref(),
+            Some("C:/qnc/resolved/card_proxy.mp4")
+        );
+    }
+
+    #[test]
     fn apply_status_state_preserves_browse_path_and_project_scope() {
         let mut screen = IngestScreen {
             path_edit: "C:\\card".into(),
@@ -1156,6 +1596,38 @@ mod tests {
                 .map(|clip| clip.clip_id.as_str()),
             Some("local")
         );
+    }
+
+    #[test]
+    fn no_card_thumb_prompts_without_polling_until_user_approval() {
+        let mut screen = IngestScreen {
+            state: Some(IngestState {
+                clips: vec![IngestClip {
+                    clip_id: "missing_poster".into(),
+                    thumb_status: "no_card_thumb".into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            screen.proxy_poster_approval_clip_ids(),
+            vec!["missing_poster".to_string()]
+        );
+        assert!(!screen.needs_poll());
+
+        screen
+            .state
+            .as_mut()
+            .unwrap()
+            .clips
+            .first_mut()
+            .unwrap()
+            .thumb_status = "pending".into();
+
+        assert!(screen.needs_poll());
     }
 
     #[test]

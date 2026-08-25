@@ -3,13 +3,14 @@
 
 use eframe::egui::ColorImage;
 
-use crate::player_contract::{BroadcastHostSourceRef, FrameNumber};
+use crate::player_contract::{BroadcastHostSourceRef, BroadcastSourceTimebase, FrameNumber};
 use crate::qnc_broadcast_player::{BroadcastPlayerOpenRequest, BroadcastPlayerRx, PlayerEvent};
 
 pub trait PlayerClient {
     fn playback_source_ref(&self) -> Option<BroadcastHostSourceRef>;
     fn playback_media_path(&self) -> Option<String>;
     fn playback_source_fps(&self) -> f64;
+    fn playback_source_timebase(&self) -> Option<BroadcastSourceTimebase>;
     fn playback_source_has_audio(&self) -> bool;
     fn playback_source_audio_channels(&self) -> u8;
 
@@ -42,10 +43,15 @@ pub fn build_open_request(
     if !source_fps.is_finite() || source_fps <= 0.0 {
         return Err("Source FPS nije potvrđen probe metapodacima.".into());
     }
+    let source_timebase = client
+        .playback_source_timebase()
+        .filter(|timebase| timebase.is_valid())
+        .ok_or_else(|| "Source timebase nije potvrđen probe metapodacima.".to_string())?;
     Ok(BroadcastPlayerOpenRequest {
         source_ref,
         media_input,
         source_fps,
+        source_timebase,
         has_audio: client.playback_source_has_audio(),
         audio_channels: client.playback_source_audio_channels(),
         start_source_frame: FrameNumber(0),
@@ -131,6 +137,10 @@ mod tests {
             self.fps
         }
 
+        fn playback_source_timebase(&self) -> Option<BroadcastSourceTimebase> {
+            BroadcastSourceTimebase::from_i64(self.fps.round() as i64, 1)
+        }
+
         fn playback_source_has_audio(&self) -> bool {
             true
         }
@@ -186,6 +196,13 @@ mod tests {
         let request = build_open_request(&client).unwrap();
 
         assert_eq!(request.source_fps, 50.0);
+        assert_eq!(
+            request.source_timebase,
+            BroadcastSourceTimebase {
+                fps_num: 50,
+                fps_den: 1,
+            }
+        );
         assert_eq!(request.source_ref.clip_id, "clip");
     }
 }

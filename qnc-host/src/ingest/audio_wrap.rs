@@ -7,23 +7,22 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use qnc_service_contracts::{
-    AudioProbe, AudioProbeRequest, AudioWrapRequest, MediaLocator, MediaProcessor, MediaRef,
-    ServiceError,
+    AudioProbe, AudioWrapRequest, MediaLocator, MediaProcessor, MediaRef, ServiceError,
+    JOB_TYPE_AUDIO_WRAP,
 };
 use rusqlite::params;
 use serde_json::{json, Value};
-use tracing::{info, warn};
+use tracing::warn;
 
-use crate::frame_time::{normalize_fps, rational_fps, require_fps, DEFAULT_FPS};
-use crate::ingest::db::open_ingest;
+use crate::frame_time::{normalize_fps, DEFAULT_FPS};
+use crate::ingest::db::{ingest_job_has_active_external_lease, open_ingest, queue_ingest_job};
 use crate::ingest::project_media::sanitize_clip_id;
 use crate::ingest::proxy_source::{classify_tv_source, recipe_for_source};
 use crate::ingest::store::ingest_probe_from_service;
-use crate::ingest::thumb::resolve_ffmpeg;
 use crate::media::is_audio_media_file;
 use crate::project::db::{bump_project_data_revision, project_effective_settings, ProjectPaths};
 use crate::project::ProjectDbBroker;
@@ -116,7 +115,7 @@ pub fn audio_wrap_dest_for_fps(proxy_dir: &Path, clip_id: &str, fps: f64) -> Pat
     proxy_dir.join(format!("{}_{}.mp4", sanitize_clip_id(clip_id), tag))
 }
 
-fn fps_path_tag(fps: f64) -> String {
+pub(crate) fn fps_path_tag(fps: f64) -> String {
     let n = normalize_fps(fps);
     if n <= 0.0 {
         return "unknown".into();
@@ -151,39 +150,46 @@ pub fn snap_fps_to_region(fps: f64, region: BroadcastRegion) -> Option<f64> {
 }
 
 /// Distinct wrap rates needed, from **DB** video `fps` rows only.
+#[allow(dead_code)] // retained for adapter tests; production audio-wrap is JobService/qnc-worker.
 pub fn needed_wrap_rates_from_db(
     paths: &ProjectPaths,
     project_db: &ProjectDbBroker,
     project_id: &str,
     region: BroadcastRegion,
 ) -> Vec<f64> {
-    let Ok(rows) = project_db.serialize_project_write(project_id, || {
-        let conn = open_ingest(paths, project_id).map_err(|error| error.to_string())?;
-        let mut stmt = conn
-            .prepare(
-                "SELECT source_path, original_path, proxy_path, project_proxy_path, fps
-                 FROM ingest_assets
-                 WHERE fps IS NOT NULL AND fps > 0
-                   AND import_status IN ('imported', 'done', 'detected', 'generating_proxy')",
-            )
-            .map_err(|error| error.to_string())?;
-        let rows = stmt
-            .query_map([], |r| {
-                Ok((
-                    r.get::<_, String>(0)?,
-                    r.get::<_, String>(1)?,
-                    r.get::<_, String>(2)?,
-                    r.get::<_, String>(3)?,
-                    r.get::<_, f64>(4)?,
-                ))
-            })
-            .map_err(|error| error.to_string())?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|error| error.to_string())?;
-        Ok(rows)
-    }) else {
-        return Vec::new();
-    };
+    project_db
+        .serialize_project_write(project_id, || {
+            let conn = open_ingest(paths, project_id).map_err(|error| error.to_string())?;
+            needed_wrap_rates_from_conn(&conn, region)
+        })
+        .unwrap_or_default()
+}
+
+pub fn needed_wrap_rates_from_conn(
+    conn: &rusqlite::Connection,
+    region: BroadcastRegion,
+) -> Result<Vec<f64>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT source_path, original_path, proxy_path, project_proxy_path, fps
+             FROM ingest_assets
+             WHERE fps IS NOT NULL AND fps > 0
+               AND import_status IN ('imported', 'done', 'detected', 'generating_proxy')",
+        )
+        .map_err(|error| error.to_string())?;
+    let rows = stmt
+        .query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, f64>(4)?,
+            ))
+        })
+        .map_err(|error| error.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?;
 
     let mut rates = HashSet::new();
     for (src, orig, proxy, proj, fps) in rows {
@@ -203,11 +209,18 @@ pub fn needed_wrap_rates_from_db(
     }
     let mut out: Vec<f64> = rates.into_iter().map(|k| k as f64 / 1000.0).collect();
     out.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    out
+    Ok(out)
 }
 
 fn fps_key(fps: f64) -> i64 {
     (normalize_fps(fps) * 1000.0).round() as i64
+}
+
+fn now_unix_ms_i64() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as i64)
+        .unwrap_or(0)
 }
 
 pub fn read_audio_meta(conn: &rusqlite::Connection, source_id: &str, clip_id: &str) -> Value {
@@ -228,6 +241,35 @@ pub fn audio_project_path_from_meta(meta: &Value) -> Option<PathBuf> {
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(PathBuf::from)
+}
+
+pub(crate) fn resolve_audio_source_for_asset(
+    audio_dir: &Path,
+    clip_id: &str,
+    original_path: &str,
+    source_path: &str,
+    meta: &Value,
+) -> Option<PathBuf> {
+    audio_project_path_from_meta(meta)
+        .filter(|p| p.is_file())
+        .or_else(|| {
+            for s in [original_path, source_path] {
+                let p = PathBuf::from(s.trim());
+                if p.is_file() && is_audio_media_file(&p) {
+                    return Some(p);
+                }
+            }
+            std::fs::read_dir(audio_dir).ok().and_then(|rd| {
+                rd.flatten().map(|e| e.path()).find(|p| {
+                    p.is_file()
+                        && is_audio_media_file(p)
+                        && p.file_stem()
+                            .and_then(|s| s.to_str())
+                            .map(|s| s.eq_ignore_ascii_case(&sanitize_clip_id(clip_id)))
+                            .unwrap_or(false)
+                })
+            })
+        })
 }
 
 pub fn audio_wraps_from_meta(meta: &Value) -> HashMap<String, String> {
@@ -315,6 +357,95 @@ pub fn complete_imported_audio_clip(
         .map_err(|e| e.to_string())?;
     bump_project_data_revision(&conn, "ingest").map_err(|e| e.to_string())?;
     Ok(())
+}
+
+pub fn queue_project_audio_wrap_jobs(
+    paths: &ProjectPaths,
+    project_db: &ProjectDbBroker,
+    project_id: &str,
+) -> Result<usize, String> {
+    let settings = project_effective_settings(paths, project_id);
+    let region = broadcast_region_from_settings(&settings);
+    let audio_dir = audio_project_dir(paths, project_id);
+    let now_ms = now_unix_ms_i64();
+
+    project_db.serialize_project_write(project_id, || {
+        let conn = open_ingest(paths, project_id).map_err(|e| e.to_string())?;
+        let needed = needed_wrap_rates_from_conn(&conn, region)?;
+        if needed.is_empty() {
+            return Ok(0);
+        }
+        let mut stmt = conn
+            .prepare(
+                "SELECT source_id, clip_id, original_path, source_path, metadata_json
+                 FROM ingest_assets
+                 WHERE import_status IN ('imported', 'done')",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, String>(4)?,
+                ))
+            })
+            .map_err(|e| e.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?;
+
+        let mut queued = 0usize;
+        for (sid, clip_id, original_path, source_path, meta_raw) in rows {
+            if ingest_job_has_active_external_lease(
+                &conn,
+                JOB_TYPE_AUDIO_WRAP,
+                &sid,
+                &clip_id,
+                now_ms,
+            )
+            .map_err(|e| e.to_string())?
+            {
+                continue;
+            }
+            let meta: Value = serde_json::from_str(&meta_raw).unwrap_or_else(|_| json!({}));
+            let has_audio_meta = meta
+                .get("audio_project_path")
+                .and_then(|v| v.as_str())
+                .is_some();
+            let Some(audio_src) = resolve_audio_source_for_asset(
+                &audio_dir,
+                &clip_id,
+                &original_path,
+                &source_path,
+                &meta,
+            ) else {
+                continue;
+            };
+            if !has_audio_meta && !is_audio_media_file(&audio_src) {
+                continue;
+            }
+
+            let wraps = audio_wraps_from_meta(&meta);
+            let missing = needed.iter().any(|rate| {
+                let tag = fps_path_tag(*rate);
+                if let Some(existing) = wraps.get(&tag) {
+                    if PathBuf::from(existing).is_file() {
+                        return false;
+                    }
+                }
+                true
+            });
+            if !missing {
+                continue;
+            }
+            queue_ingest_job(&conn, JOB_TYPE_AUDIO_WRAP, &sid, &clip_id)
+                .map_err(|e| e.to_string())?;
+            queued += 1;
+        }
+        Ok(queued)
+    })
 }
 
 /// Record one wrap path in metadata; set `project_proxy_path` to preferred wrap.
@@ -414,6 +545,33 @@ pub fn record_audio_wrap(
     })
 }
 
+pub fn mark_audio_wrap_error(
+    paths: &ProjectPaths,
+    project_db: &ProjectDbBroker,
+    project_id: &str,
+    source_id: &str,
+    clip_id: &str,
+    error: &str,
+) -> Result<(), String> {
+    project_db.serialize_project_write(project_id, || {
+        let conn = open_ingest(paths, project_id).map_err(|e| e.to_string())?;
+        let mut meta = read_audio_meta(&conn, source_id, clip_id);
+        if let Some(obj) = meta.as_object_mut() {
+            obj.insert("audio_wrap_status".into(), json!("error"));
+            obj.insert("audio_wrap_error".into(), json!(error));
+        }
+        conn.execute(
+            "UPDATE ingest_assets
+             SET metadata_json = ?3
+             WHERE source_id = ?1 AND clip_id = ?2",
+            params![source_id, clip_id, meta.to_string()],
+        )
+        .map_err(|e| e.to_string())?;
+        bump_project_data_revision(&conn, "ingest").map_err(|e| e.to_string())?;
+        Ok(())
+    })
+}
+
 fn prefer_wrap_path(wraps: &HashMap<String, String>, region: BroadcastRegion) -> Option<String> {
     let default_tag = fps_path_tag(region.default_rate());
     if let Some(p) = wraps.get(&default_tag) {
@@ -449,92 +607,7 @@ pub fn resolve_audio_wrap_for_fps(
     prefer_wrap_path(&wraps, region).map(PathBuf::from)
 }
 
-pub fn wrap_audio_with_timecode(source: &Path, dest: &Path, fps: f64) -> Result<(), String> {
-    if !source.is_file() {
-        return Err(format!("audio izvor ne postoji: {}", source.display()));
-    }
-    let ffmpeg = resolve_ffmpeg().ok_or_else(|| "ffmpeg nije dostupan".to_string())?;
-    let fps = require_fps(fps, "audio wrap fps")?;
-    let (num, den) = rational_fps(fps);
-    let rate = if den == 1 {
-        format!("{num}")
-    } else {
-        format!("{num}/{den}")
-    };
-
-    if let Some(parent) = dest.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-    }
-
-    let color = format!("color=c=black:s=1920x1080:r={rate}");
-    let output = Command::new(&ffmpeg)
-        .args([
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-y",
-            "-f",
-            "lavfi",
-            "-i",
-            &color,
-            "-i",
-        ])
-        .arg(source)
-        .args([
-            "-map",
-            "0:v:0",
-            "-map",
-            "1:a:0?",
-            "-c:v",
-            "libx264",
-            "-pix_fmt",
-            "yuv420p",
-            "-tune",
-            "stillimage",
-            "-crf",
-            "28",
-            "-c:a",
-            "aac",
-            "-b:a",
-            "192k",
-            "-shortest",
-            "-timecode",
-            "00:00:00:00",
-            "-movflags",
-            "+faststart",
-        ])
-        .arg(dest)
-        .output()
-        .map_err(|e| format!("ffmpeg audio wrap start: {e}"))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        warn!(
-            "ingest audio wrap failed: source={} dest={} err={}",
-            source.display(),
-            dest.display(),
-            stderr.trim()
-        );
-        return Err(format!(
-            "audio wrap (timecode) nije uspio: {}",
-            stderr.trim()
-        ));
-    }
-    if !dest.is_file() || dest.metadata().map(|m| m.len()).unwrap_or(0) == 0 {
-        return Err(format!(
-            "audio wrap nije napisao datoteku: {}",
-            dest.display()
-        ));
-    }
-    info!(
-        "ingest audio wrap: source={} dest={} fps={}",
-        source.display(),
-        dest.display(),
-        fps
-    );
-    Ok(())
-}
-
+#[allow(dead_code)] // unit-test helper; production audio-wrap is JobService/qnc-worker.
 async fn probe_wrap_media(
     media_processor: Arc<dyn MediaProcessor>,
     clip_id: &str,
@@ -554,53 +627,6 @@ async fn probe_wrap_media(
     }
 }
 
-pub async fn probe_audio_import_media(
-    media_processor: Arc<dyn MediaProcessor>,
-    clip_id: &str,
-    media: &Path,
-) -> Option<AudioProbe> {
-    if !media.is_file() {
-        return None;
-    }
-    match media_processor
-        .probe_audio(AudioProbeRequest {
-            input: media_ref(clip_id, media),
-        })
-        .await
-    {
-        Ok(probe) => Some(probe),
-        Err(error) => {
-            warn!(
-                "ingest audio import probe failed: clip={} path={} err={}",
-                clip_id,
-                media.display(),
-                service_error_message(error)
-            );
-            None
-        }
-    }
-}
-
-pub fn probe_audio_import_media_blocking(
-    media_processor: Arc<dyn MediaProcessor>,
-    clip_id: &str,
-    media: &Path,
-) -> Option<AudioProbe> {
-    let handle = match tokio::runtime::Handle::try_current() {
-        Ok(handle) => handle,
-        Err(error) => {
-            warn!(
-                "ingest audio import probe skipped: clip={} path={} no runtime: {}",
-                clip_id,
-                media.display(),
-                error
-            );
-            return None;
-        }
-    };
-    handle.block_on(probe_audio_import_media(media_processor, clip_id, media))
-}
-
 fn media_ref(clip_id: &str, media: &Path) -> MediaRef {
     MediaRef {
         clip_id: clip_id.to_string(),
@@ -615,6 +641,7 @@ fn service_error_message(error: ServiceError) -> String {
 }
 
 /// Process one project: for each imported audio, build missing wraps for DB video rates.
+#[allow(dead_code)] // retained for adapter tests; production audio-wrap is JobService/qnc-worker.
 pub async fn process_project_audio_wraps(
     paths: &ProjectPaths,
     project_db: &ProjectDbBroker,

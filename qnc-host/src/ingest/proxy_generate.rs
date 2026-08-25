@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+#[cfg(test)]
 use std::time::Instant;
 
 use qnc_media_ffmpeg::proxy::{
@@ -6,6 +7,7 @@ use qnc_media_ffmpeg::proxy::{
     TvSourceClass,
 };
 use qnc_media_ffmpeg::FfmpegToolchain;
+#[cfg(test)]
 use tracing::info;
 
 use crate::ingest::thumb::{resolve_ffmpeg, resolve_ffprobe};
@@ -99,6 +101,7 @@ pub fn proxy_recipe_policy_snapshot() -> serde_json::Value {
 }
 
 /// Terenski proxy prema tipu izvora. Aktivni FFmpeg model zivi u qnc-media-ffmpeg.
+#[cfg(test)]
 pub fn generate_field_proxy(source: &Path, dest: &Path) -> Result<(), String> {
     let options = proxy_options();
     let source_probe = proxy::probe_media_with_options(source, &options)?;

@@ -5,7 +5,6 @@ use std::time::Duration;
 use tracing::{info, warn};
 
 use crate::ingest::thumb_process::copy_thumbs_from_card;
-use crate::ingest_posters::PosterWorker;
 use crate::project::db::ProjectPaths;
 use crate::project::{list_project_ids, ProjectDbBroker};
 
@@ -14,21 +13,15 @@ use crate::project::{list_project_ids, ProjectDbBroker};
 pub struct CardThumbWorker {
     paths: ProjectPaths,
     project_db: ProjectDbBroker,
-    posters: Arc<PosterWorker>,
     pending: Arc<Mutex<HashSet<String>>>,
     blocked: Arc<Mutex<HashSet<String>>>,
 }
 
 impl CardThumbWorker {
-    pub fn new(
-        paths: ProjectPaths,
-        project_db: ProjectDbBroker,
-        posters: Arc<PosterWorker>,
-    ) -> Self {
+    pub fn new(paths: ProjectPaths, project_db: ProjectDbBroker) -> Self {
         Self {
             paths,
             project_db,
-            posters,
             pending: Arc::new(Mutex::new(HashSet::new())),
             blocked: Arc::new(Mutex::new(HashSet::new())),
         }
@@ -130,8 +123,11 @@ impl CardThumbWorker {
         }
         let result = copy_thumbs_from_card(&self.paths, &self.project_db, project_id)?;
         if !result.no_thumb_clip_ids.is_empty() {
-            self.posters
-                .enqueue_proxy_generate(project_id, &result.no_thumb_clip_ids);
+            info!(
+                "ingest card thumbs: project={} missing_posters={}",
+                project_id,
+                result.no_thumb_clip_ids.len()
+            );
         }
         Ok(result.copied)
     }

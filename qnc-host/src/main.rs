@@ -75,62 +75,61 @@ async fn main() {
         }
     }
     let modules = Arc::new(RwLock::new(ModuleStore::load(&root.join("data"))));
-    let services = services::build_registry(&config.runtime);
+    let export = services::build_export_engine(&config.runtime.export);
     let project_state = project::ProjectState::new(&root, &config);
+    let media_gateway = media::ProjectMediaGateway::with_routes(
+        project_state.paths.clone(),
+        config.runtime.integration.gateway.kind,
+        config.runtime.integration.gateway.read_only,
+        config.runtime.integration.gateway.endpoint.clone(),
+        config.runtime.integration.gateway.routes.clone(),
+    );
     let project_db = project_state.db_broker();
     let background_work = background_work::BackgroundWorkGate::new();
+    info!("artifact workers: jobservice");
     let ingest_posters = Arc::new(ingest_posters::PosterWorker::new(
         project_state.paths.clone(),
         project_db.clone(),
         background_work.clone(),
-        services.media.clone(),
     ));
     let filmstrip = Arc::new(filmstrip::FilmstripWorker::new(
         project_state.paths.clone(),
         project_db.clone(),
         background_work.clone(),
-        services.media.clone(),
     ));
     let waveform = Arc::new(waveform::WaveformWorker::new(
         project_state.paths.clone(),
         project_db.clone(),
         background_work.clone(),
-        services.media.clone(),
     ));
     let ingest_audio_wrap = Arc::new(ingest_audio_wrap::AudioWrapWorker::new(
         project_state.paths.clone(),
         project_db.clone(),
         background_work.clone(),
-        services.media.clone(),
     ));
     let ingest_proxy = Arc::new(ingest_proxy::ProxyGenerateWorker::new(
         project_state.paths.clone(),
         project_db.clone(),
-        filmstrip.clone(),
-        ingest_posters.clone(),
         background_work.clone(),
-        services.media.clone(),
     ));
     let ingest_import = Arc::new(ingest_import::ImportWorker::new(
         project_state.paths.clone(),
         project_db.clone(),
         ingest_proxy.clone(),
         filmstrip.clone(),
-        ingest_posters.clone(),
+        waveform.clone(),
         ingest_audio_wrap.clone(),
         background_work.clone(),
-        services.media.clone(),
+        media_gateway.clone(),
     ));
     let ingest_card_thumbs = Arc::new(ingest_card_thumbs::CardThumbWorker::new(
         project_state.paths.clone(),
         project_db.clone(),
-        ingest_posters.clone(),
     ));
     let ingest_durations = Arc::new(ingest_durations::DurationWorker::new(
         project_state.paths.clone(),
         project_db.clone(),
         background_work.clone(),
-        services.media.clone(),
     ));
     info!("background recovery: deferred to worker idle loops");
     ingest_posters.clone().spawn();
@@ -183,7 +182,8 @@ async fn main() {
         config: config.clone(),
         background_work,
         modules,
-        services,
+        export,
+        media_gateway,
         project: project_state,
         project_db,
         ingest_card_thumbs,
@@ -230,6 +230,7 @@ async fn main() {
         .route("/gui", get(api_root))
         .merge(project::router())
         .merge(ingest::router())
+        .merge(media::router())
         .merge(story::router())
         .merge(jobs::router())
         .merge(routes::design_tools::router())

@@ -1,15 +1,11 @@
 //! Zajednički završetak uvoza jednog klipa — koriste import i proxy workeri.
 
 use std::path::Path;
-use std::sync::Arc;
 
-use qnc_service_contracts::{MediaLocator, MediaProcessor, MediaRef, ServiceError};
 use rusqlite::params;
-use tracing::warn;
 
 use crate::ingest::db::{mark_ingest_job_done, open_ingest, thumbnail_path};
 use crate::ingest::proxy_source::{classify_tv_source, recipe_for_source};
-use crate::ingest::store::ingest_probe_from_service;
 use crate::ingest::thumb::MediaProbe;
 use crate::project::db::{bump_project_data_revision, ProjectPaths};
 
@@ -49,6 +45,8 @@ pub fn complete_imported_clip(
         interlaced,
         source_class,
         proxy_recipe,
+        fps_num,
+        fps_den,
     ) = probe
         .map(|p| {
             let source_class = classify_tv_source(p);
@@ -64,6 +62,8 @@ pub fn complete_imported_clip(
                 p.interlaced,
                 source_class.label().to_string(),
                 proxy_recipe.id().to_string(),
+                p.fps_num,
+                p.fps_den,
             )
         })
         .unwrap_or((
@@ -77,6 +77,8 @@ pub fn complete_imported_clip(
             false,
             String::new(),
             String::new(),
+            0,
+            1,
         ));
     conn.execute(
         "UPDATE ingest_assets SET
@@ -99,6 +101,8 @@ pub fn complete_imported_clip(
             interlaced = ?17,
             source_class = ?18,
             proxy_recipe = ?19,
+            source_fps_num = ?20,
+            source_fps_den = ?21,
             metadata_json = '{}'
          WHERE source_id = ?1 AND clip_id = ?2",
         params![
@@ -121,64 +125,14 @@ pub fn complete_imported_clip(
             if interlaced { 1 } else { 0 },
             source_class,
             proxy_recipe,
+            fps_num,
+            fps_den,
         ],
     )
     .map_err(|e| e.to_string())?;
     mark_ingest_job_done(&conn, "import", source_id, clip_id).map_err(|e| e.to_string())?;
     bump_project_data_revision(&conn, "ingest").map_err(|e| e.to_string())?;
     Ok(())
-}
-
-pub async fn probe_import_media(
-    media_processor: Arc<dyn MediaProcessor>,
-    clip_id: &str,
-    media: &Path,
-) -> Option<MediaProbe> {
-    if !media.is_file() {
-        return None;
-    }
-    let input = MediaRef {
-        clip_id: clip_id.to_string(),
-        locator: MediaLocator::LocalPath {
-            path: media.to_path_buf(),
-        },
-    };
-    match media_processor.probe(&input).await {
-        Ok(probe) => ingest_probe_from_service(probe),
-        Err(error) => {
-            warn!(
-                "ingest import probe failed: clip={} path={} err={}",
-                clip_id,
-                media.display(),
-                service_error_message(error)
-            );
-            None
-        }
-    }
-}
-
-pub fn probe_import_media_blocking(
-    media_processor: Arc<dyn MediaProcessor>,
-    clip_id: &str,
-    media: &Path,
-) -> Option<MediaProbe> {
-    let handle = match tokio::runtime::Handle::try_current() {
-        Ok(handle) => handle,
-        Err(error) => {
-            warn!(
-                "ingest import probe skipped: clip={} path={} no runtime: {}",
-                clip_id,
-                media.display(),
-                error
-            );
-            return None;
-        }
-    };
-    handle.block_on(probe_import_media(media_processor, clip_id, media))
-}
-
-fn service_error_message(error: ServiceError) -> String {
-    format!("{}: {}", error.code, error.message)
 }
 
 #[cfg(test)]
@@ -225,6 +179,8 @@ mod tests {
         let probe = MediaProbe {
             duration_sec: 12.5,
             fps: 50.0,
+            fps_num: 50,
+            fps_den: 1,
             resolution: "1920x1080".into(),
             codec: "h264".into(),
             has_audio: true,
@@ -248,10 +204,23 @@ mod tests {
         .unwrap();
 
         let conn = open_ingest(&paths, project_id).expect("ingest db");
-        let row: (String, f64, f64, String, String, i64, i64, String, String) = conn
+        let row: (
+            String,
+            f64,
+            f64,
+            String,
+            String,
+            i64,
+            i64,
+            String,
+            String,
+            i64,
+            i64,
+        ) = conn
             .query_row(
                 "SELECT import_status, duration_sec, fps, resolution, codec,
-                        has_audio, audio_channels, source_class, proxy_recipe
+                        has_audio, audio_channels, source_class, proxy_recipe,
+                        source_fps_num, source_fps_den
                  FROM ingest_assets
                  WHERE source_id = 'card' AND clip_id = 'clip_a'",
                 [],
@@ -266,6 +235,8 @@ mod tests {
                         row.get(6)?,
                         row.get(7)?,
                         row.get(8)?,
+                        row.get(9)?,
+                        row.get(10)?,
                     ))
                 },
             )
@@ -280,6 +251,8 @@ mod tests {
         assert_eq!(row.6, 2);
         assert_eq!(row.7, "pal_50p");
         assert_eq!(row.8, "h264_native");
+        assert_eq!(row.9, 50);
+        assert_eq!(row.10, 1);
 
         let _ = fs::remove_dir_all(&base);
     }

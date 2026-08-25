@@ -54,6 +54,8 @@ pub(crate) struct MediaPoolStripInput<'a> {
     pub library_tab: LibraryTab,
     pub height: f32,
     pub selected_shot_id: &'a str,
+    pub focused_shot_id: &'a str,
+    pub panel_focused: bool,
     pub selected_clip_id: &'a str,
     pub all_clips: &'a [StoryShot],
     pub virtual_shots: &'a [StoryShot],
@@ -84,6 +86,8 @@ pub(crate) struct MediaPoolCardRow<'a> {
 pub(crate) struct MediaPoolCardGridInput<'a> {
     pub height: f32,
     pub selected_id: &'a str,
+    pub focused_id: &'a str,
+    pub panel_focused: bool,
     pub cards: &'a [MediaPoolCardRow<'a>],
     pub thumb_textures: &'a HashMap<String, TextureHandle>,
     pub tc: &'a dyn Fn(f64) -> String,
@@ -202,6 +206,8 @@ pub(crate) fn show_ingest_strip(
             &MediaPoolCardGridInput {
                 height: ui.available_height().max(0.0),
                 selected_id: selected_clip_id,
+                focused_id: selected_clip_id,
+                panel_focused: false,
                 cards: &rows,
                 thumb_textures,
                 tc,
@@ -260,6 +266,11 @@ pub(crate) fn show_card_grid(
             let row_stride = metrics.card_h + metrics.gap;
             let first_row = (viewport.top() / row_stride).floor().max(0.0) as usize;
             let last_row = ((viewport.bottom() / row_stride).ceil() as usize + 1).min(total_rows);
+            let focus_id = if input.panel_focused && !input.focused_id.trim().is_empty() {
+                input.focused_id
+            } else {
+                input.selected_id
+            };
 
             ui.add_space(first_row as f32 * row_stride);
             for row_idx in first_row..last_row {
@@ -268,8 +279,7 @@ pub(crate) fn show_card_grid(
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = metrics.gap;
                     for card in &cards[start..end] {
-                        let focused =
-                            card.id == input.selected_id || card.thumb_id == input.selected_id;
+                        let focused = card.id == focus_id || card.thumb_id == focus_id;
                         let thumb = input.thumb_textures.get(card.thumb_id).cloned();
                         let (rect, resp) = ui.allocate_exact_size(
                             Vec2::new(metrics.card_w, metrics.card_h),
@@ -367,6 +377,8 @@ fn shot_cards(ui: &mut egui::Ui, input: &MediaPoolStripInput<'_>) -> MediaPoolAc
         &MediaPoolCardGridInput {
             height: ui.available_height().max(0.0),
             selected_id: input.selected_shot_id,
+            focused_id: input.focused_shot_id,
+            panel_focused: input.panel_focused,
             cards: &rows,
             thumb_textures: input.thumb_textures,
             tc: input.tc,

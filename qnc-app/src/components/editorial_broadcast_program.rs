@@ -1,19 +1,20 @@
-//! Playlist-input playback request builder.
+//! Derived playlist-input playback request builder.
 //!
-//! This component owns EDL construction for playlist-input playout. UI forms
-//! provide snapshots; the Broadcast Player owns transport once the playlist
-//! input is opened.
+//! It converts the raw editorial playlist projection into one flat preview
+//! input for the Broadcast Player. It does not own export or the montage data
+//! model; full-resolution relink metadata stays in the raw playlist.
 
 use crate::editorial::segment_program::{
     SegmentProgramCover, SegmentProgramModel, SegmentProgramSegment,
 };
 use crate::editorial::types::{StoryCover, StoryShot};
 use crate::frame_time::normalize_fps;
-use crate::player_contract::{BroadcastHostSourceRef, FrameNumber};
+use crate::player_contract::{BroadcastHostSourceRef, BroadcastSourceTimebase, FrameNumber};
 use crate::player_remote::{
     BroadcastProgramItem, BroadcastProgramOpenRequest, BroadcastProgramSource,
     PROGRAM_AUDIO_OUTPUT_CH1, PROGRAM_AUDIO_OUTPUT_CH2,
 };
+use std::collections::HashMap;
 
 pub(crate) struct EditorialProgramPlaybackComponent;
 
@@ -24,6 +25,7 @@ pub(crate) struct EditorialProgramPlaybackInput<'a> {
     pub program: &'a SegmentProgramModel,
     pub covers: &'a [StoryCover],
     pub clips: &'a [StoryShot],
+    pub playback_inputs: &'a HashMap<String, String>,
 }
 
 impl EditorialProgramPlaybackComponent {
@@ -46,9 +48,12 @@ impl EditorialProgramPlaybackComponent {
 
         let mut items = Vec::new();
         for program_range in input.program.segments() {
-            for item in
-                ItemBuilder::from_program_range(program_range, input.program.covers(), input.clips)?
-            {
+            for item in ItemBuilder::from_program_range(
+                program_range,
+                input.program.covers(),
+                input.clips,
+                input.playback_inputs,
+            )? {
                 items.push(item.finish(project_id)?);
             }
         }
@@ -71,6 +76,19 @@ impl EditorialProgramPlaybackComponent {
             items,
         })
     }
+
+    pub(crate) fn required_playback_clip_ids(program: &SegmentProgramModel) -> Vec<String> {
+        let mut ids = Vec::new();
+        for segment in program.segments() {
+            push_clip_id(&mut ids, &segment.clip_id);
+        }
+        for cover in program.covers() {
+            if cover.streamable {
+                push_clip_id(&mut ids, &cover.clip_id);
+            }
+        }
+        ids
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -89,6 +107,7 @@ struct MediaBuilder {
     source_in_frame: i64,
     source_out_frame: i64,
     source_fps: f64,
+    source_timebase: BroadcastSourceTimebase,
     source_duration_frames: i64,
     media_input: String,
     has_video: bool,
@@ -102,20 +121,24 @@ impl ItemBuilder {
         segment: &SegmentProgramSegment,
         covers: &[SegmentProgramCover],
         clips: &[StoryShot],
+        playback_inputs: &HashMap<String, String>,
     ) -> Result<Vec<Self>, String> {
         let clip_id = segment.clip_id.trim();
         if clip_id.is_empty() {
             return Err("EDL red nema clip_id".into());
         }
         let clip = clip_by_id(clips, clip_id)?;
-        let source_fps = resolve_source_fps(clip, segment.source_fps)?;
+        let source_timebase = resolve_source_timebase(segment.source_timebase, clip_id)?;
+        let source_fps = source_timebase
+            .fps()
+            .ok_or_else(|| format!("Clip '{clip_id}' nema valjan source timebase"))?;
         let is_off = segment.kind.trim().eq_ignore_ascii_case("offovi");
         let segment_start = segment.global_start_frame.max(0);
         let segment_end = segment.global_end_frame.max(segment_start + 1);
         let source_in_frame = segment.source_in_frame.max(0);
         let source_out_frame = segment.source_out_frame.max(source_in_frame + 1);
         let source_duration_frames = clip.duration_frames.max(source_out_frame).max(1);
-        let media_input = clip.play_path.trim().to_string();
+        let media_input = playback_input_for_clip(playback_inputs, clip_id)?;
         let has_base_audio = if is_off { true } else { clip.has_audio };
         let mut items = Vec::new();
 
@@ -132,6 +155,7 @@ impl ItemBuilder {
                     segment,
                     clip,
                     source_fps,
+                    source_timebase,
                     source_duration_frames,
                     &media_input,
                     has_base_audio,
@@ -147,6 +171,7 @@ impl ItemBuilder {
                     segment,
                     clip,
                     source_fps,
+                    source_timebase,
                     source_duration_frames,
                     &media_input,
                     false,
@@ -159,6 +184,7 @@ impl ItemBuilder {
             sources.push(MediaBuilder::from_cover_chunk(
                 cover,
                 clips,
+                playback_inputs,
                 true,
                 Some(PROGRAM_AUDIO_OUTPUT_CH2),
                 cover_start,
@@ -179,6 +205,7 @@ impl ItemBuilder {
                 segment,
                 clip,
                 source_fps,
+                source_timebase,
                 source_duration_frames,
                 &media_input,
                 has_base_audio,
@@ -195,6 +222,7 @@ impl ItemBuilder {
         segment: &SegmentProgramSegment,
         clip: &StoryShot,
         source_fps: f64,
+        source_timebase: BroadcastSourceTimebase,
         source_duration_frames: i64,
         media_input: &str,
         has_base_audio: bool,
@@ -208,6 +236,7 @@ impl ItemBuilder {
                 segment,
                 clip,
                 source_fps,
+                source_timebase,
                 source_duration_frames,
                 media_input,
                 true,
@@ -222,6 +251,7 @@ impl ItemBuilder {
                 segment,
                 clip,
                 source_fps,
+                source_timebase,
                 source_duration_frames,
                 media_input,
                 false,
@@ -258,6 +288,7 @@ impl MediaBuilder {
         segment: &SegmentProgramSegment,
         clip: &StoryShot,
         source_fps: f64,
+        source_timebase: BroadcastSourceTimebase,
         source_duration_frames: i64,
         media_input: &str,
         has_video: bool,
@@ -280,6 +311,7 @@ impl MediaBuilder {
             source_in_frame,
             source_out_frame,
             source_fps,
+            source_timebase,
             source_duration_frames,
             media_input: media_input.to_string(),
             has_video,
@@ -292,6 +324,7 @@ impl MediaBuilder {
     fn from_cover_chunk(
         cover: &SegmentProgramCover,
         clips: &[StoryShot],
+        playback_inputs: &HashMap<String, String>,
         has_video: bool,
         audio_output_channel: Option<u8>,
         record_in_frame: i64,
@@ -302,7 +335,10 @@ impl MediaBuilder {
             return Err("EDL cover nema clip_id".into());
         }
         let clip = clip_by_id(clips, clip_id)?;
-        let source_fps = resolve_source_fps(clip, cover.source_fps)?;
+        let source_timebase = resolve_source_timebase(cover.source_timebase, clip_id)?;
+        let source_fps = source_timebase
+            .fps()
+            .ok_or_else(|| format!("Clip '{clip_id}' nema valjan source timebase"))?;
         let (source_in_frame, source_out_frame) = source_range_for_record_chunk(
             cover.source_in_frame,
             cover.source_out_frame,
@@ -317,8 +353,9 @@ impl MediaBuilder {
             source_in_frame,
             source_out_frame,
             source_fps,
+            source_timebase,
             source_duration_frames: clip.duration_frames.max(source_out_frame).max(1),
-            media_input: clip.play_path.trim().to_string(),
+            media_input: playback_input_for_clip(playback_inputs, clip_id)?,
             has_video,
             has_audio: clip.has_audio,
             audio_channels: audio_channels_for(clip.has_audio, clip),
@@ -328,7 +365,7 @@ impl MediaBuilder {
 
     fn finish(self, project_id: &str) -> Result<BroadcastProgramSource, String> {
         if self.media_input.trim().is_empty() {
-            return Err(format!("Proxy path prazan · {}", self.clip_id));
+            return Err(format!("Playback input prazan · {}", self.clip_id));
         }
         let source_in = self.source_in_frame.max(0);
         let source_out = self.source_out_frame.max(source_in + 1);
@@ -346,6 +383,7 @@ impl MediaBuilder {
             source_ref,
             media_input: self.media_input,
             source_fps: self.source_fps,
+            source_timebase: self.source_timebase,
             has_video: self.has_video,
             has_audio: self.has_audio,
             audio_channels: self.audio_channels,
@@ -400,12 +438,33 @@ fn clip_by_id<'a>(clips: &'a [StoryShot], clip_id: &str) -> Result<&'a StoryShot
         .ok_or_else(|| format!("Clip nije u snapshotu · {clip_id}"))
 }
 
-fn resolve_source_fps(clip: &StoryShot, source_fps: f64) -> Result<f64, String> {
-    (source_fps.is_finite() && source_fps > 0.0)
-        .then_some(source_fps)
-        .or_else(|| (clip.fps.is_finite() && clip.fps > 0.0).then_some(clip.fps))
-        .map(normalize_fps)
-        .ok_or_else(|| format!("Clip '{}' nema valjan FPS", clip.clip_id))
+fn playback_input_for_clip(
+    playback_inputs: &HashMap<String, String>,
+    clip_id: &str,
+) -> Result<String, String> {
+    playback_inputs
+        .get(clip_id.trim())
+        .map(|input| input.trim())
+        .filter(|input| !input.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| format!("Playback input nije riješen · {clip_id}"))
+}
+
+fn push_clip_id(ids: &mut Vec<String>, clip_id: &str) {
+    let clip_id = clip_id.trim();
+    if !clip_id.is_empty() && !ids.iter().any(|existing| existing == clip_id) {
+        ids.push(clip_id.to_string());
+    }
+}
+
+fn resolve_source_timebase(
+    source_timebase: BroadcastSourceTimebase,
+    clip_id: &str,
+) -> Result<BroadcastSourceTimebase, String> {
+    source_timebase
+        .is_valid()
+        .then_some(source_timebase)
+        .ok_or_else(|| format!("Clip '{clip_id}' nema valjan source timebase"))
 }
 
 fn audio_channels_for(has_audio: bool, clip: &StoryShot) -> u8 {
@@ -498,6 +557,7 @@ fn same_program_source_track(
     left.source_ref.project_id == right.source_ref.project_id
         && left.source_ref.clip_id == right.source_ref.clip_id
         && media_input_key(&left.media_input) == media_input_key(&right.media_input)
+        && left.source_timebase == right.source_timebase
         && approx_fps(left.source_fps, right.source_fps)
         && left.has_video == right.has_video
         && left.has_audio == right.has_audio
@@ -529,17 +589,40 @@ fn non_empty_or(value: &str, fallback: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::{EditorialPlaylist, EditorialPlaylistCover, EditorialPlaylistSegment};
+    use crate::api::{
+        EditorialPlaylist, EditorialPlaylistCover, EditorialPlaylistSegment,
+        EditorialSourceTimebase,
+    };
 
     fn clip(id: &str) -> StoryShot {
         StoryShot {
             clip_id: id.into(),
             fps: 50.0,
             duration_frames: 300,
-            play_path: format!("C:/qnc/proxy/{id}.mp4"),
+            play_path: format!("legacy-snapshot-play-path://{id}"),
             has_audio: true,
             audio_channels: 2,
             ..StoryShot::default()
+        }
+    }
+
+    fn playback_inputs(ids: &[&str]) -> HashMap<String, String> {
+        ids.iter()
+            .map(|id| (id.to_string(), format!("C:/qnc/resolved/{id}.mp4")))
+            .collect()
+    }
+
+    fn tb50() -> EditorialSourceTimebase {
+        EditorialSourceTimebase {
+            fps_num: 50,
+            fps_den: 1,
+        }
+    }
+
+    fn tb5994() -> EditorialSourceTimebase {
+        EditorialSourceTimebase {
+            fps_num: 60_000,
+            fps_den: 1_001,
         }
     }
 
@@ -586,6 +669,7 @@ mod tests {
                 source_in_frame: 100,
                 source_out_frame: 150,
                 source_fps: 59.94,
+                source_timebase: tb5994(),
                 streamable: true,
                 ..EditorialPlaylistSegment::default()
             },
@@ -599,6 +683,7 @@ mod tests {
                 source_in_frame: 200,
                 source_out_frame: 250,
                 source_fps: 59.94,
+                source_timebase: tb5994(),
                 streamable: true,
                 ..EditorialPlaylistSegment::default()
             },
@@ -612,6 +697,7 @@ mod tests {
                 program: &program,
                 covers: &[],
                 clips: &[clip("clip_a")],
+                playback_inputs: &playback_inputs(&["clip_a"]),
             })
             .unwrap();
 
@@ -622,6 +708,7 @@ mod tests {
         assert_eq!(item.record_out_frame, FrameNumber(100));
         assert_eq!(item.sources.len(), 2);
         let video = video_source(item);
+        assert_eq!(video.media_input, "C:/qnc/resolved/clip_a.mp4");
         assert_eq!(video.source_ref.in_frame, Some(FrameNumber(200)));
         assert_eq!(video.source_ref.out_frame, Some(FrameNumber(250)));
         assert!(video.has_video);
@@ -633,6 +720,39 @@ mod tests {
         assert!(!audio.has_video);
         assert!(audio.has_audio);
         assert_eq!(audio.audio_output_channel, Some(PROGRAM_AUDIO_OUTPUT_CH1));
+    }
+
+    #[test]
+    fn program_request_requires_resolved_playback_input() {
+        let program = program(vec![EditorialPlaylistSegment {
+            part_id: "part_a".into(),
+            kind: "tonovi".into(),
+            clip_id: "clip_a".into(),
+            global_start_frame: 0,
+            global_end_frame: 50,
+            duration_frames: 50,
+            source_in_frame: 100,
+            source_out_frame: 150,
+            source_fps: 50.0,
+            source_timebase: tb50(),
+            streamable: true,
+            ..EditorialPlaylistSegment::default()
+        }]);
+        let empty_inputs = HashMap::new();
+
+        let error =
+            EditorialProgramPlaybackComponent::build_program(EditorialProgramPlaybackInput {
+                project_id: "p",
+                program_id: "story",
+                start_program_frame: 0,
+                program: &program,
+                covers: &[],
+                clips: &[clip("clip_a")],
+                playback_inputs: &empty_inputs,
+            })
+            .unwrap_err();
+
+        assert_eq!(error, "Playback input nije riješen · clip_a");
     }
 
     #[test]
@@ -648,6 +768,7 @@ mod tests {
                 source_in_frame: 100,
                 source_out_frame: 150,
                 source_fps: 50.0,
+                source_timebase: tb50(),
                 streamable: true,
                 ..EditorialPlaylistSegment::default()
             },
@@ -661,6 +782,7 @@ mod tests {
                 source_in_frame: 150,
                 source_out_frame: 200,
                 source_fps: 50.0,
+                source_timebase: tb50(),
                 streamable: true,
                 ..EditorialPlaylistSegment::default()
             },
@@ -674,6 +796,7 @@ mod tests {
                 source_in_frame: 200,
                 source_out_frame: 250,
                 source_fps: 50.0,
+                source_timebase: tb50(),
                 streamable: true,
                 ..EditorialPlaylistSegment::default()
             },
@@ -687,6 +810,7 @@ mod tests {
                 program: &program,
                 covers: &[],
                 clips: &[clip("clip_a")],
+                playback_inputs: &playback_inputs(&["clip_a"]),
             })
             .unwrap();
 
@@ -721,6 +845,7 @@ mod tests {
             source_in_frame: 10,
             source_out_frame: 60,
             source_fps: 50.0,
+            source_timebase: tb50(),
             streamable: true,
             ..EditorialPlaylistSegment::default()
         }]);
@@ -733,6 +858,7 @@ mod tests {
                 program: &program,
                 covers: &[],
                 clips: &[clip("clip_a")],
+                playback_inputs: &playback_inputs(&["clip_a"]),
             })
             .unwrap();
 
@@ -756,6 +882,7 @@ mod tests {
             source_in_frame: 100,
             source_out_frame: 150,
             source_fps: 50.0,
+            source_timebase: tb50(),
             streamable: true,
             covers: vec![EditorialPlaylistCover {
                 cover_id: "cover_a".into(),
@@ -766,8 +893,10 @@ mod tests {
                 source_in_frame: 40,
                 source_out_frame: 50,
                 source_fps: 50.0,
+                source_timebase: tb50(),
                 streamable: true,
                 source: Default::default(),
+                ..EditorialPlaylistCover::default()
             }],
             ..EditorialPlaylistSegment::default()
         }]);
@@ -780,6 +909,7 @@ mod tests {
                 program: &program,
                 covers: &[],
                 clips: &[clip("clip_a"), clip("clip_b")],
+                playback_inputs: &playback_inputs(&["clip_a", "clip_b"]),
             })
             .unwrap();
 
@@ -877,6 +1007,7 @@ mod tests {
                 source_in_frame: 100,
                 source_out_frame: 150,
                 source_fps: 50.0,
+                source_timebase: tb50(),
                 streamable: true,
                 covers: vec![EditorialPlaylistCover {
                     cover_id: "cover_a".into(),
@@ -887,8 +1018,10 @@ mod tests {
                     source_in_frame: 10,
                     source_out_frame: 30,
                     source_fps: 50.0,
+                    source_timebase: tb50(),
                     streamable: true,
                     source: Default::default(),
+                    ..EditorialPlaylistCover::default()
                 }],
                 ..EditorialPlaylistSegment::default()
             },
@@ -902,6 +1035,7 @@ mod tests {
                 source_in_frame: 150,
                 source_out_frame: 200,
                 source_fps: 50.0,
+                source_timebase: tb50(),
                 streamable: true,
                 covers: vec![EditorialPlaylistCover {
                     cover_id: "cover_a".into(),
@@ -912,8 +1046,10 @@ mod tests {
                     source_in_frame: 10,
                     source_out_frame: 30,
                     source_fps: 50.0,
+                    source_timebase: tb50(),
                     streamable: true,
                     source: Default::default(),
+                    ..EditorialPlaylistCover::default()
                 }],
                 ..EditorialPlaylistSegment::default()
             },
@@ -927,6 +1063,7 @@ mod tests {
                 program: &program,
                 covers: &[],
                 clips: &[clip("clip_a"), clip("clip_b")],
+                playback_inputs: &playback_inputs(&["clip_a", "clip_b"]),
             })
             .unwrap();
 
@@ -969,6 +1106,7 @@ mod tests {
             source_in_frame: 100,
             source_out_frame: 150,
             source_fps: 50.0,
+            source_timebase: tb50(),
             streamable: true,
             covers: vec![EditorialPlaylistCover {
                 cover_id: "cover_fast".into(),
@@ -979,8 +1117,10 @@ mod tests {
                 source_in_frame: 40,
                 source_out_frame: 80,
                 source_fps: 59.94,
+                source_timebase: tb5994(),
                 streamable: true,
                 source: Default::default(),
+                ..EditorialPlaylistCover::default()
             }],
             ..EditorialPlaylistSegment::default()
         }]);
@@ -993,12 +1133,20 @@ mod tests {
                 program: &program,
                 covers: &[],
                 clips: &[clip("clip_a"), clip("clip_b")],
+                playback_inputs: &playback_inputs(&["clip_a", "clip_b"]),
             })
             .unwrap();
 
         let cover_video = video_source(&request.items[1]);
         assert_eq!(cover_video.source_ref.clip_id, "clip_b");
-        assert_eq!(cover_video.source_fps, 59.94);
+        assert!((cover_video.source_fps - (60_000.0 / 1_001.0)).abs() < 0.000_001);
+        assert_eq!(
+            cover_video.source_timebase,
+            BroadcastSourceTimebase {
+                fps_num: 60_000,
+                fps_den: 1_001,
+            }
+        );
         assert_eq!(cover_video.source_ref.in_frame, Some(FrameNumber(40)));
     }
 }

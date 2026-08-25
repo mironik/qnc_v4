@@ -6,10 +6,9 @@ use tracing::{info, warn};
 
 use crate::background_work::BackgroundWorkGate;
 use crate::ingest::db::{open_ingest, set_meta};
-use crate::ingest::store::{needs_duration_probe_conn, probe_missing_durations_with_broker};
+use crate::ingest::store::{needs_duration_probe_conn, queue_missing_duration_probe_jobs};
 use crate::project::db::ProjectPaths;
 use crate::project::{list_project_ids, ProjectDbBroker};
-use qnc_service_contracts::MediaProcessor;
 
 /// Samostalan worker — ffprobe trajanja u pozadini (ne blokira discover/import).
 #[derive(Clone)]
@@ -17,7 +16,6 @@ pub struct DurationWorker {
     paths: ProjectPaths,
     project_db: ProjectDbBroker,
     background: BackgroundWorkGate,
-    media_processor: Arc<dyn MediaProcessor>,
     pending: Arc<Mutex<HashSet<String>>>,
     blocked: Arc<Mutex<HashSet<String>>>,
 }
@@ -27,13 +25,11 @@ impl DurationWorker {
         paths: ProjectPaths,
         project_db: ProjectDbBroker,
         background: BackgroundWorkGate,
-        media_processor: Arc<dyn MediaProcessor>,
     ) -> Self {
         Self {
             paths,
             project_db,
             background,
-            media_processor,
             pending: Arc::new(Mutex::new(HashSet::new())),
             blocked: Arc::new(Mutex::new(HashSet::new())),
         }
@@ -140,12 +136,6 @@ impl DurationWorker {
         if self.is_blocked(project_id) {
             return Ok(0);
         }
-        probe_missing_durations_with_broker(
-            &self.paths,
-            &self.project_db,
-            self.media_processor.clone(),
-            project_id,
-        )
-        .await
+        queue_missing_duration_probe_jobs(&self.paths, &self.project_db, project_id)
     }
 }

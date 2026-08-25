@@ -9,7 +9,7 @@ use qnc_service_contracts::{
     ProxyBuildRequest, ScanMode, ServiceError, ServiceResult, WaveformPeaks, WaveformRequest,
 };
 
-use crate::ingest::{audio_wrap, proxy_generate, thumb};
+use crate::ingest::{proxy_generate, thumb};
 
 #[derive(Debug, Default, Clone)]
 pub struct LocalFfmpegMediaProcessor;
@@ -176,17 +176,11 @@ impl MediaProcessor for LocalFfmpegMediaProcessor {
         .await
     }
 
-    async fn build_audio_wrap(&self, request: AudioWrapRequest) -> ServiceResult<ArtifactRef> {
-        let source = local_media_path(&request.input)?;
-        let output_path = request.output_path;
-        let fps = request.fps;
-
-        run_blocking("build_audio_wrap", move || {
-            audio_wrap::wrap_audio_with_timecode(&source, &output_path, fps)
-                .map_err(|message| ServiceError::new("audio_wrap_failed", message))?;
-            Ok(artifact(output_path))
-        })
-        .await
+    async fn build_audio_wrap(&self, _request: AudioWrapRequest) -> ServiceResult<ArtifactRef> {
+        Err(ServiceError::new(
+            "audio_wrap_requires_worker",
+            "Audio wrap is executed by qnc-worker through JobService.",
+        ))
     }
 
     async fn build_waveform(&self, request: WaveformRequest) -> ServiceResult<WaveformPeaks> {

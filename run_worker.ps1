@@ -3,7 +3,7 @@ $ErrorActionPreference = "Stop"
 $Root = Split-Path -Parent $MyInvocation.MyCommand.Path
 $env:QNC_ROOT = $Root
 $HostUrl = if ($env:QNC_HOST_URL) { $env:QNC_HOST_URL } else { "http://127.0.0.1:8001" }
-$CapabilitiesRaw = if ($env:QNC_WORKER_CAPABILITIES) { $env:QNC_WORKER_CAPABILITIES } else { "proxy_generate,filmstrip" }
+$CapabilitiesRaw = if ($env:QNC_WORKER_CAPABILITIES) { $env:QNC_WORKER_CAPABILITIES } else { "proxy_generate,filmstrip,waveform,thumb_proxy,audio_wrap,media_probe" }
 $Capabilities = $CapabilitiesRaw -split "," | ForEach-Object { $_.Trim() } | Where-Object { $_ }
 
 # Reuse the same local target tree as run_host.ps1.
@@ -53,5 +53,10 @@ foreach ($Capability in $Capabilities) {
 Write-Host "QNC worker: $Bin"
 Write-Host "Host URL: $HostUrl"
 Write-Host "Capabilities: $($Capabilities -join ', ')"
+if ($env:QNC_WORKER_PLACEMENT) {
+    Write-Host "Placement: manual $env:QNC_WORKER_PLACEMENT"
+} else {
+    Write-Host "Placement: qnc-worker auto-detects local workstation vs intranet shared-media from Host URL"
+}
 Write-Host "Priority: $([System.Diagnostics.Process]::GetCurrentProcess().PriorityClass)"
 & $Bin @WorkerArgs

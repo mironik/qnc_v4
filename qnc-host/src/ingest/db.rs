@@ -51,6 +51,8 @@ fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
             resolution TEXT NOT NULL DEFAULT '',
             codec TEXT NOT NULL DEFAULT '',
             fps REAL NOT NULL DEFAULT 0,
+            source_fps_num INTEGER NOT NULL DEFAULT 0,
+            source_fps_den INTEGER NOT NULL DEFAULT 1,
             field_order TEXT NOT NULL DEFAULT '',
             interlaced INTEGER NOT NULL DEFAULT 0,
             source_class TEXT NOT NULL DEFAULT '',
@@ -480,6 +482,18 @@ fn migrate_ingest_metadata_columns(conn: &Connection) -> rusqlite::Result<()> {
             [],
         );
     }
+    if !column_exists(conn, "ingest_assets", "source_fps_num") {
+        let _ = conn.execute(
+            "ALTER TABLE ingest_assets ADD COLUMN source_fps_num INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
+    }
+    if !column_exists(conn, "ingest_assets", "source_fps_den") {
+        let _ = conn.execute(
+            "ALTER TABLE ingest_assets ADD COLUMN source_fps_den INTEGER NOT NULL DEFAULT 1",
+            [],
+        );
+    }
     Ok(())
 }
 
@@ -651,6 +665,78 @@ pub fn set_meta(conn: &Connection, key: &str, value: &str) -> rusqlite::Result<(
 
 pub fn parse_json(raw: &str, fallback: Value) -> Value {
     serde_json::from_str(raw).unwrap_or(fallback)
+}
+
+pub const META_POSTER_PROXY_APPROVED: &str = "poster_proxy_approved";
+
+pub fn poster_proxy_generation_approved(meta: &Value) -> bool {
+    meta.get(META_POSTER_PROXY_APPROVED)
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+pub fn poster_proxy_generation_approved_for_asset(
+    conn: &Connection,
+    source_id: &str,
+    clip_id: &str,
+) -> rusqlite::Result<bool> {
+    let raw = match conn.query_row(
+        "SELECT COALESCE(metadata_json, '{}')
+         FROM ingest_assets
+         WHERE source_id = ?1 AND clip_id = ?2",
+        params![source_id, clip_id],
+        |row| row.get::<_, String>(0),
+    ) {
+        Ok(raw) => raw,
+        Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    Ok(poster_proxy_generation_approved(&parse_json(
+        &raw,
+        Value::Object(serde_json::Map::new()),
+    )))
+}
+
+pub fn set_poster_proxy_generation_approved(
+    conn: &Connection,
+    source_id: &str,
+    clip_id: &str,
+    approved: bool,
+) -> rusqlite::Result<bool> {
+    let raw = match conn.query_row(
+        "SELECT COALESCE(metadata_json, '{}')
+         FROM ingest_assets
+         WHERE source_id = ?1 AND clip_id = ?2",
+        params![source_id, clip_id],
+        |row| row.get::<_, String>(0),
+    ) {
+        Ok(raw) => raw,
+        Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    let mut meta = parse_json(&raw, Value::Object(serde_json::Map::new()));
+    if !meta.is_object() {
+        meta = Value::Object(serde_json::Map::new());
+    }
+    if let Some(obj) = meta.as_object_mut() {
+        if approved {
+            obj.insert(META_POSTER_PROXY_APPROVED.into(), Value::Bool(true));
+        } else {
+            obj.remove(META_POSTER_PROXY_APPROVED);
+        }
+    }
+    let raw = meta
+        .as_object()
+        .filter(|obj| !obj.is_empty())
+        .map(|_| meta.to_string())
+        .unwrap_or_else(|| "{}".to_string());
+    conn.execute(
+        "UPDATE ingest_assets
+         SET metadata_json = ?3
+         WHERE source_id = ?1 AND clip_id = ?2",
+        params![source_id, clip_id, raw],
+    )?;
+    Ok(true)
 }
 
 pub struct IngestAssetMetaInput {

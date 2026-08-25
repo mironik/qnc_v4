@@ -523,7 +523,7 @@ fn same_playlist_program(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::player_contract::{BroadcastHostSourceRef, FrameNumber};
+    use crate::player_contract::{BroadcastHostSourceRef, BroadcastSourceTimebase, FrameNumber};
     use crate::player_remote::{
         BroadcastPlayerOpenRequest, BroadcastProgramItem, BroadcastProgramOpenRequest,
         BroadcastProgramSource, PlayerEvent, PROGRAM_AUDIO_OUTPUT_CH1,
@@ -543,6 +543,10 @@ mod tests {
             .unwrap(),
             media_input: "media.mov".into(),
             source_fps: 50.0,
+            source_timebase: BroadcastSourceTimebase {
+                fps_num: 50,
+                fps_den: 1,
+            },
             has_audio: true,
             audio_channels: 2,
             start_source_frame: FrameNumber(10),
@@ -577,6 +581,10 @@ mod tests {
                     source_ref: source_ref("part_a", 10, 110),
                     media_input: "media.mov".into(),
                     source_fps: 50.0,
+                    source_timebase: BroadcastSourceTimebase {
+                        fps_num: 50,
+                        fps_den: 1,
+                    },
                     has_video: true,
                     has_audio: true,
                     audio_channels: 2,

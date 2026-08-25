@@ -1,21 +1,26 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+#[cfg(test)]
 use qnc_service_contracts::{
     AIOrchestrator, AiRequest, AiResponse, ArtifactRef, AudioProbe, AudioProbeRequest,
-    AudioWrapRequest, ExportEngine, ExportJob, ExportJobState, ExportRequest, ExtractRangeRequest,
-    FilmstripFrameArtifact, FilmstripRequest, FrameExtractRequest, MediaProbe, MediaProcessor,
-    MediaRef, PosterExtractRequest, ProxyBuildRequest, SearchDocument, SearchEngine, SearchHit,
-    SearchRequest, ServiceError, ServiceRegistry, ServiceResult, Transcript, TranscriptionEngine,
-    TranscriptionRequest, WaveformPeaks, WaveformRequest,
+    AudioWrapRequest, ExtractRangeRequest, FilmstripFrameArtifact, FilmstripRequest,
+    FrameExtractRequest, MediaProbe, MediaProcessor, MediaRef, PosterExtractRequest,
+    ProxyBuildRequest, SearchDocument, SearchEngine, SearchHit, SearchRequest, ServiceRegistry,
+    Transcript, TranscriptionEngine, TranscriptionRequest, WaveformPeaks, WaveformRequest,
+};
+use qnc_service_contracts::{
+    ExportEngine, ExportJob, ExportJobState, ExportRequest, ServiceError, ServiceResult,
 };
 use serde_json::{json, Value};
 
 use crate::config::{RuntimeConfig, ServiceBackendConfig};
 
 use super::export_process::ExternalProcessExportEngine;
+#[cfg(test)]
 use super::media_ffmpeg::LocalFfmpegMediaProcessor;
 
+#[cfg(test)]
 pub fn build_registry(config: &RuntimeConfig) -> ServiceRegistry {
     ServiceRegistry {
         media: build_media_processor(&config.media),
@@ -29,6 +34,18 @@ pub fn build_registry(config: &RuntimeConfig) -> ServiceRegistry {
 pub fn describe_runtime(config: &RuntimeConfig) -> Value {
     json!({
         "profile": config.profile,
+        "deployment": config.deployment,
+        "workers": {
+            "artifact_owner": "jobservice",
+        },
+        "integration": {
+            "gateway": {
+                "kind": config.integration.gateway.kind,
+                "endpoint": config.integration.gateway.endpoint,
+                "read_only": config.integration.gateway.read_only,
+                "contract": "read_through_non_invasive_media_gateway",
+            },
+        },
         "services": {
             "media": describe_media_backend(&config.media),
             "transcription": describe_optional_backend(
@@ -43,6 +60,7 @@ pub fn describe_runtime(config: &RuntimeConfig) -> Value {
     })
 }
 
+#[cfg(test)]
 fn build_media_processor(config: &ServiceBackendConfig) -> Arc<dyn MediaProcessor> {
     let backend = normalized_backend(config, "local_ffmpeg");
     match backend.as_str() {
@@ -51,6 +69,7 @@ fn build_media_processor(config: &ServiceBackendConfig) -> Arc<dyn MediaProcesso
     }
 }
 
+#[cfg(test)]
 fn build_transcription_engine(config: &ServiceBackendConfig) -> Arc<dyn TranscriptionEngine> {
     let backend = normalized_backend(config, "disabled");
     match backend.as_str() {
@@ -59,6 +78,7 @@ fn build_transcription_engine(config: &ServiceBackendConfig) -> Arc<dyn Transcri
     }
 }
 
+#[cfg(test)]
 fn build_search_engine(config: &ServiceBackendConfig) -> Arc<dyn SearchEngine> {
     let backend = normalized_backend(config, "disabled");
     match backend.as_str() {
@@ -67,6 +87,7 @@ fn build_search_engine(config: &ServiceBackendConfig) -> Arc<dyn SearchEngine> {
     }
 }
 
+#[cfg(test)]
 fn build_ai_orchestrator(config: &ServiceBackendConfig) -> Arc<dyn AIOrchestrator> {
     let backend = normalized_backend(config, "disabled");
     match backend.as_str() {
@@ -75,7 +96,7 @@ fn build_ai_orchestrator(config: &ServiceBackendConfig) -> Arc<dyn AIOrchestrato
     }
 }
 
-fn build_export_engine(config: &ServiceBackendConfig) -> Arc<dyn ExportEngine> {
+pub fn build_export_engine(config: &ServiceBackendConfig) -> Arc<dyn ExportEngine> {
     let backend = normalized_backend(config, "disabled");
     match backend.as_str() {
         "disabled" | "none" | "off" => Arc::new(DisabledExportEngine),
@@ -216,11 +237,13 @@ fn configured_command(config: &ServiceBackendConfig) -> Option<String> {
         .map(str::to_string)
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone)]
 struct UnavailableMediaProcessor {
     backend: String,
 }
 
+#[cfg(test)]
 impl UnavailableMediaProcessor {
     fn new(backend: String) -> Self {
         Self { backend }
@@ -231,6 +254,7 @@ impl UnavailableMediaProcessor {
     }
 }
 
+#[cfg(test)]
 #[async_trait]
 impl MediaProcessor for UnavailableMediaProcessor {
     async fn probe(&self, _input: &MediaRef) -> ServiceResult<MediaProbe> {
@@ -273,9 +297,11 @@ impl MediaProcessor for UnavailableMediaProcessor {
     }
 }
 
+#[cfg(test)]
 #[derive(Debug, Default, Clone)]
 struct DisabledTranscriptionEngine;
 
+#[cfg(test)]
 #[async_trait]
 impl TranscriptionEngine for DisabledTranscriptionEngine {
     async fn transcribe(&self, _request: TranscriptionRequest) -> ServiceResult<Transcript> {
@@ -286,17 +312,20 @@ impl TranscriptionEngine for DisabledTranscriptionEngine {
     }
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone)]
 struct UnavailableTranscriptionEngine {
     backend: String,
 }
 
+#[cfg(test)]
 impl UnavailableTranscriptionEngine {
     fn new(backend: String) -> Self {
         Self { backend }
     }
 }
 
+#[cfg(test)]
 #[async_trait]
 impl TranscriptionEngine for UnavailableTranscriptionEngine {
     async fn transcribe(&self, _request: TranscriptionRequest) -> ServiceResult<Transcript> {
@@ -308,9 +337,11 @@ impl TranscriptionEngine for UnavailableTranscriptionEngine {
     }
 }
 
+#[cfg(test)]
 #[derive(Debug, Default, Clone)]
 struct DisabledSearchEngine;
 
+#[cfg(test)]
 #[async_trait]
 impl SearchEngine for DisabledSearchEngine {
     async fn index_document(&self, _document: SearchDocument) -> ServiceResult<()> {
@@ -326,17 +357,20 @@ impl SearchEngine for DisabledSearchEngine {
     }
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone)]
 struct UnavailableSearchEngine {
     backend: String,
 }
 
+#[cfg(test)]
 impl UnavailableSearchEngine {
     fn new(backend: String) -> Self {
         Self { backend }
     }
 }
 
+#[cfg(test)]
 #[async_trait]
 impl SearchEngine for UnavailableSearchEngine {
     async fn index_document(&self, _document: SearchDocument) -> ServiceResult<()> {
@@ -364,9 +398,11 @@ impl SearchEngine for UnavailableSearchEngine {
     }
 }
 
+#[cfg(test)]
 #[derive(Debug, Default, Clone)]
 struct DisabledAiOrchestrator;
 
+#[cfg(test)]
 #[async_trait]
 impl AIOrchestrator for DisabledAiOrchestrator {
     async fn run(&self, _request: AiRequest) -> ServiceResult<AiResponse> {
@@ -374,17 +410,20 @@ impl AIOrchestrator for DisabledAiOrchestrator {
     }
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone)]
 struct UnavailableAiOrchestrator {
     backend: String,
 }
 
+#[cfg(test)]
 impl UnavailableAiOrchestrator {
     fn new(backend: String) -> Self {
         Self { backend }
     }
 }
 
+#[cfg(test)]
 #[async_trait]
 impl AIOrchestrator for UnavailableAiOrchestrator {
     async fn run(&self, _request: AiRequest) -> ServiceResult<AiResponse> {
@@ -523,6 +562,9 @@ mod tests {
     ) -> RuntimeConfig {
         RuntimeConfig {
             profile: RuntimeProfile::Light,
+            deployment: Default::default(),
+            workers: Default::default(),
+            integration: Default::default(),
             media: backend(media),
             transcription: backend(transcription),
             search: backend(search),
@@ -663,8 +705,15 @@ mod tests {
         ));
 
         assert_eq!(description["profile"], "light");
+        assert_eq!(description["deployment"], "single_workstation");
         assert_eq!(description["services"]["media"]["backend"], "remote_rest");
         assert_eq!(description["services"]["media"]["status"], "unavailable");
+        assert_eq!(description["integration"]["gateway"]["kind"], "local_fs");
+        assert_eq!(
+            description["integration"]["gateway"]["contract"],
+            "read_through_non_invasive_media_gateway"
+        );
+        assert_eq!(description["integration"]["gateway"]["read_only"], true);
         assert_eq!(
             description["services"]["transcription"]["status"],
             "unavailable"

@@ -24,6 +24,8 @@ pub struct StoryCoverRow {
     pub source_in_frame: i64,
     pub source_out_frame: i64,
     pub source_fps: f64,
+    pub source_fps_num: i64,
+    pub source_fps_den: i64,
     pub sort_index: i64,
     pub created_at: String,
     pub updated_at: String,
@@ -50,6 +52,8 @@ pub fn ensure_cover_schema(conn: &Connection) -> rusqlite::Result<()> {
             source_in_frame INTEGER NOT NULL DEFAULT 0,
             source_out_frame INTEGER NOT NULL DEFAULT 0,
             source_fps REAL NOT NULL DEFAULT 0,
+            source_fps_num INTEGER NOT NULL DEFAULT 0,
+            source_fps_den INTEGER NOT NULL DEFAULT 1,
             sort_index INTEGER NOT NULL DEFAULT 0,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL
@@ -95,6 +99,18 @@ fn migrate_cover_frame_columns(conn: &Connection) -> rusqlite::Result<()> {
             [],
         )?;
     }
+    if !column_exists(conn, "story_covers", "source_fps_num")? {
+        conn.execute(
+            "ALTER TABLE story_covers ADD COLUMN source_fps_num INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+    }
+    if !column_exists(conn, "story_covers", "source_fps_den")? {
+        conn.execute(
+            "ALTER TABLE story_covers ADD COLUMN source_fps_den INTEGER NOT NULL DEFAULT 1",
+            [],
+        )?;
+    }
     Ok(())
 }
 
@@ -129,6 +145,7 @@ pub fn list_covers(conn: &Connection) -> rusqlite::Result<Vec<StoryCoverRow>> {
                 clip_id, virtual_shot_id, title, note,
                 in_tc, out_tc, in_seconds, out_seconds,
                 source_in_frame, source_out_frame, source_fps,
+                COALESCE(source_fps_num, 0), COALESCE(source_fps_den, 1),
                 sort_index, created_at, updated_at
          FROM story_covers
          ORDER BY timeline_start_frame ASC, sort_index ASC, cover_id ASC",
@@ -153,9 +170,11 @@ pub fn list_covers(conn: &Connection) -> rusqlite::Result<Vec<StoryCoverRow>> {
             source_in_frame: r.get(15)?,
             source_out_frame: r.get(16)?,
             source_fps: r.get(17)?,
-            sort_index: r.get(18)?,
-            created_at: r.get(19)?,
-            updated_at: r.get(20)?,
+            source_fps_num: r.get(18)?,
+            source_fps_den: r.get(19)?,
+            sort_index: r.get(20)?,
+            created_at: r.get(21)?,
+            updated_at: r.get(22)?,
         })
     })?;
     rows.collect()
@@ -188,6 +207,12 @@ pub fn cover_json(row: &StoryCoverRow) -> Value {
         "source_in_frame": row.source_in_frame,
         "source_out_frame": row.source_out_frame,
         "source_fps": row.source_fps,
+        "source_fps_num": row.source_fps_num,
+        "source_fps_den": row.source_fps_den,
+        "source_timebase": {
+            "fps_num": row.source_fps_num,
+            "fps_den": row.source_fps_den,
+        },
         "sort_index": row.sort_index,
         "created_at": row.created_at,
         "updated_at": row.updated_at,
@@ -218,12 +243,135 @@ fn normalize_selected_cover_id_value(
     }
 }
 
-fn set_selected_cover_id(conn: &Connection, cover_id: &str) -> rusqlite::Result<()> {
+pub(crate) fn set_selected_cover_id(conn: &Connection, cover_id: &str) -> rusqlite::Result<()> {
     conn.execute(
         "UPDATE story_state SET selected_cover_id = ?1 WHERE id = 1",
         params![cover_id],
     )?;
     Ok(())
+}
+
+pub(crate) fn cover_snapshot_by_id(conn: &Connection, cover_id: &str) -> Result<Value, String> {
+    let cover_id = cover_id.trim();
+    if cover_id.is_empty() {
+        return Err("cover_id required".into());
+    }
+    list_covers(conn)
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .find(|cover| cover.cover_id == cover_id)
+        .map(|cover| cover_json(&cover))
+        .ok_or_else(|| format!("cover not found: {cover_id}"))
+}
+
+fn json_string(snapshot: &Value, key: &str) -> String {
+    snapshot
+        .get(key)
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string()
+}
+
+fn json_i64(snapshot: &Value, key: &str) -> i64 {
+    snapshot.get(key).and_then(Value::as_i64).unwrap_or(0)
+}
+
+fn json_f64(snapshot: &Value, key: &str) -> f64 {
+    snapshot.get(key).and_then(Value::as_f64).unwrap_or(0.0)
+}
+
+fn json_opt_f64(snapshot: &Value, key: &str) -> Option<f64> {
+    snapshot.get(key).and_then(Value::as_f64)
+}
+
+pub(crate) fn restore_cover_from_snapshot(
+    conn: &Connection,
+    snapshot: &Value,
+) -> Result<String, String> {
+    ensure_cover_schema(conn).map_err(|e| e.to_string())?;
+    let cover_id = json_string(snapshot, "cover_id");
+    if cover_id.trim().is_empty() {
+        return Err("cover snapshot missing cover_id".into());
+    }
+    let slot_signature = json_string(snapshot, "slot_signature");
+    if !slot_signature.trim().is_empty() {
+        conn.execute(
+            "DELETE FROM story_covers WHERE slot_signature = ?1 AND cover_id != ?2",
+            params![slot_signature, cover_id],
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    let now = crate::project::db::now_str();
+    let created_at = {
+        let value = json_string(snapshot, "created_at");
+        if value.trim().is_empty() {
+            now.clone()
+        } else {
+            value
+        }
+    };
+    conn.execute(
+        "INSERT INTO story_covers
+            (cover_id, timeline_start_frame, timeline_end_frame,
+             timeline_start_sec, timeline_end_sec, slot_signature, slot_index,
+             clip_id, virtual_shot_id, title, note,
+             in_tc, out_tc, in_seconds, out_seconds,
+             source_in_frame, source_out_frame, source_fps, source_fps_num, source_fps_den,
+             sort_index, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11,
+                 ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23)
+         ON CONFLICT(cover_id) DO UPDATE SET
+             timeline_start_frame = excluded.timeline_start_frame,
+             timeline_end_frame = excluded.timeline_end_frame,
+             timeline_start_sec = excluded.timeline_start_sec,
+             timeline_end_sec = excluded.timeline_end_sec,
+             slot_signature = excluded.slot_signature,
+             slot_index = excluded.slot_index,
+             clip_id = excluded.clip_id,
+             virtual_shot_id = excluded.virtual_shot_id,
+             title = excluded.title,
+             note = excluded.note,
+             in_tc = excluded.in_tc,
+             out_tc = excluded.out_tc,
+             in_seconds = excluded.in_seconds,
+             out_seconds = excluded.out_seconds,
+             source_in_frame = excluded.source_in_frame,
+             source_out_frame = excluded.source_out_frame,
+             source_fps = excluded.source_fps,
+             source_fps_num = excluded.source_fps_num,
+             source_fps_den = excluded.source_fps_den,
+             sort_index = excluded.sort_index,
+             updated_at = excluded.updated_at",
+        params![
+            cover_id,
+            json_i64(snapshot, "timeline_start_frame"),
+            json_i64(snapshot, "timeline_end_frame"),
+            json_f64(snapshot, "timeline_start_sec"),
+            json_f64(snapshot, "timeline_end_sec"),
+            slot_signature,
+            json_i64(snapshot, "slot_index"),
+            json_string(snapshot, "clip_id"),
+            json_string(snapshot, "virtual_shot_id"),
+            json_string(snapshot, "title"),
+            json_string(snapshot, "note"),
+            json_string(snapshot, "in_tc"),
+            json_string(snapshot, "out_tc"),
+            json_opt_f64(snapshot, "in_seconds"),
+            json_opt_f64(snapshot, "out_seconds"),
+            json_i64(snapshot, "source_in_frame"),
+            json_i64(snapshot, "source_out_frame"),
+            json_f64(snapshot, "source_fps"),
+            json_i64(snapshot, "source_fps_num"),
+            json_i64(snapshot, "source_fps_den").max(1),
+            json_i64(snapshot, "sort_index"),
+            created_at,
+            now,
+        ],
+    )
+    .map_err(|e| e.to_string())?;
+    set_selected_cover_id(conn, &cover_id).map_err(|e| e.to_string())?;
+    touch_draft(conn).map_err(|e| e.to_string())?;
+    Ok(cover_id)
 }
 
 fn cover_matches_slot(
@@ -299,6 +447,8 @@ pub fn create_cover(
     source_in_frame: Option<i64>,
     source_out_frame: Option<i64>,
     source_fps: Option<f64>,
+    source_fps_num: Option<i64>,
+    source_fps_den: Option<i64>,
     title: Option<&str>,
     note: Option<&str>,
 ) -> Result<(), String> {
@@ -324,6 +474,8 @@ pub fn create_cover(
     let source_fps = source_fps
         .filter(|fps| fps.is_finite() && *fps > 0.0)
         .unwrap_or(0.0);
+    let source_fps_num = source_fps_num.unwrap_or(0).max(0);
+    let source_fps_den = source_fps_den.unwrap_or(1).max(1);
     let title = title.unwrap_or("").trim();
     let note = note.unwrap_or("").trim();
     let cover_id = new_cover_id();
@@ -341,10 +493,10 @@ pub fn create_cover(
              timeline_start_sec, timeline_end_sec, slot_signature, slot_index,
              clip_id, virtual_shot_id, title, note,
              in_tc, out_tc, in_seconds, out_seconds,
-             source_in_frame, source_out_frame, source_fps,
+             source_in_frame, source_out_frame, source_fps, source_fps_num, source_fps_den,
              sort_index, created_at, updated_at)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11,
-                 ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?20)",
+                 ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?22)",
         params![
             cover_id,
             slot.start_frame,
@@ -364,6 +516,8 @@ pub fn create_cover(
             source_in_frame,
             source_out_frame,
             source_fps,
+            source_fps_num,
+            source_fps_den,
             sort_index,
             now,
         ],

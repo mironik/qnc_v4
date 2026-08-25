@@ -10,7 +10,7 @@
 
 use eframe::egui;
 
-use crate::shortcuts::StoryBindings;
+use crate::shortcuts::{keyboard_input_is_reserved, StoryBindings};
 
 /// Frame delta for catalog actions `step_back_frame` / `step_forward_frame`.
 pub(crate) const SEEK_STEP_FRAMES: i64 = 1;
@@ -24,16 +24,22 @@ pub(crate) enum PlaybackAction {
     SelectMarkOut,
     FocusNext,
     FocusPrev,
+    ActivateFocusedItem,
     ClearFocus,
     QuickCover,
     OverwriteCover,
+    NavigatePrevObject,
+    NavigateNextObject,
     StepPrevPart,
     StepNextPart,
     StepPrevMarkerSlot,
     StepNextMarkerSlot,
+    SelectCurrentMarkerSlot,
     FocusEmptySlot,
     MarkInFitDuration,
     DeleteSelection,
+    UndoObject,
+    RedoObject,
     /// Catalog `add_marker` / `add_marker_continue`.
     AddMarker,
     /// Catalog `add_ton_segment` (Talking Head / Shift+T).
@@ -46,6 +52,25 @@ pub(crate) enum PlaybackAction {
 
 /// Resolve pressed keys → actions **only** from loaded QNC keyboard-shortcuts bindings.
 pub(crate) fn shortcut_actions(
+    ctx: &egui::Context,
+    bindings: &StoryBindings,
+) -> Vec<PlaybackAction> {
+    if keyboard_input_is_reserved(ctx) {
+        return Vec::new();
+    }
+    shortcut_actions_from_events(ctx, bindings)
+}
+
+/// Ingest has no editable text field in its active workspace body; focused
+/// buttons/cards must not steal Space from the shared transport.
+pub(crate) fn shortcut_actions_with_widget_focus(
+    ctx: &egui::Context,
+    bindings: &StoryBindings,
+) -> Vec<PlaybackAction> {
+    shortcut_actions_from_events(ctx, bindings)
+}
+
+fn shortcut_actions_from_events(
     ctx: &egui::Context,
     bindings: &StoryBindings,
 ) -> Vec<PlaybackAction> {
@@ -99,13 +124,19 @@ fn resolve_playback_action(matches: &[&str]) -> Option<PlaybackAction> {
         "mark_out",
         "focus_next",
         "focus_prev",
+        "activate_focused_item",
         "clear_focus",
+        "navigate_prev_object",
+        "navigate_next_object",
         "step_prev_part",
         "step_next_part",
         "step_prev_marker_slot",
         "step_next_marker_slot",
+        "select_current_marker_slot",
         "focus_empty_slot",
         "mark_in_fit_duration",
+        "undo_object",
+        "redo_object",
         "delete_marker",
         "delete_part",
         "play_pause",
@@ -135,13 +166,19 @@ fn playback_action_from_id(id: &str) -> Option<PlaybackAction> {
         "select_mark_out" => Some(PlaybackAction::SelectMarkOut),
         "focus_next" => Some(PlaybackAction::FocusNext),
         "focus_prev" => Some(PlaybackAction::FocusPrev),
+        "activate_focused_item" => Some(PlaybackAction::ActivateFocusedItem),
         "clear_focus" => Some(PlaybackAction::ClearFocus),
+        "navigate_prev_object" => Some(PlaybackAction::NavigatePrevObject),
+        "navigate_next_object" => Some(PlaybackAction::NavigateNextObject),
         "step_prev_part" => Some(PlaybackAction::StepPrevPart),
         "step_next_part" => Some(PlaybackAction::StepNextPart),
         "step_prev_marker_slot" => Some(PlaybackAction::StepPrevMarkerSlot),
         "step_next_marker_slot" => Some(PlaybackAction::StepNextMarkerSlot),
+        "select_current_marker_slot" => Some(PlaybackAction::SelectCurrentMarkerSlot),
         "focus_empty_slot" => Some(PlaybackAction::FocusEmptySlot),
         "mark_in_fit_duration" => Some(PlaybackAction::MarkInFitDuration),
+        "undo_object" => Some(PlaybackAction::UndoObject),
+        "redo_object" => Some(PlaybackAction::RedoObject),
         "delete_marker" | "delete_part" => Some(PlaybackAction::DeleteSelection),
         "add_marker" | "add_marker_continue" => Some(PlaybackAction::AddMarker),
         "quick_overwrite_cover" => Some(PlaybackAction::QuickCover),
@@ -173,16 +210,27 @@ mod tests {
                         "select_mark_out": [{ "code": "KeyO", "ctrl": true, "shift": false }],
                         "focus_next": [{ "key": "Tab", "shift": false }],
                         "focus_prev": [{ "key": "Tab", "shift": true }],
+                        "activate_focused_item": [{ "key": "Enter" }],
                         "clear_focus": [{ "key": "Escape" }],
                         "add_marker": [{ "key": "m" }],
                         "quick_overwrite_cover": [{ "code": "KeyB", "shift": false, "ctrl": false }],
                         "overwrite_cover": [{ "code": "KeyB", "shift": true, "ctrl": false }],
                         "step_prev_part": [{ "key": "ArrowUp" }],
                         "step_next_part": [{ "key": "ArrowDown" }],
-                        "step_prev_marker_slot": [{ "code": "BracketLeft" }],
-                        "step_next_marker_slot": [{ "code": "BracketRight" }],
+                        "navigate_prev_object": [{ "code": "ArrowLeft", "alt": true }],
+                        "navigate_next_object": [{ "code": "ArrowRight", "alt": true }],
+                        "select_current_marker_slot": [{ "code": "KeyS", "ctrl": true, "shift": false }],
                         "focus_empty_slot": [{ "code": "KeyS", "shift": true, "ctrl": false }],
                         "mark_in_fit_duration": [{ "code": "KeyI", "shift": true, "ctrl": false }],
+                        "undo_object": [
+                            { "code": "KeyU", "ctrl": true, "shift": false },
+                            { "code": "KeyZ", "ctrl": true, "shift": false }
+                        ],
+                        "redo_object": [
+                            { "code": "KeyR", "ctrl": true, "shift": false },
+                            { "code": "KeyY", "ctrl": true, "shift": false },
+                            { "code": "KeyZ", "ctrl": true, "shift": true }
+                        ],
                         "delete_part": [{ "key": "Delete" }],
                         "add_ton_segment": [{ "code": "KeyT", "shift": true, "ctrl": false }],
                         "add_off_segment": [{ "code": "KeyV", "shift": true, "ctrl": false }],
@@ -215,6 +263,28 @@ mod tests {
     }
 
     #[test]
+    fn ingest_transport_space_survives_focused_widget() {
+        let ctx = egui::Context::default();
+        ctx.memory_mut(|memory| memory.request_focus(egui::Id::new("focused_button")));
+        ctx.input_mut(|input| {
+            input.events.push(egui::Event::Key {
+                key: egui::Key::Space,
+                physical_key: Some(egui::Key::Space),
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            });
+        });
+        let bindings = storyboard_bindings();
+
+        assert!(shortcut_actions(&ctx, &bindings).is_empty());
+        assert_eq!(
+            shortcut_actions_with_widget_focus(&ctx, &bindings),
+            vec![PlaybackAction::TogglePlay]
+        );
+    }
+
+    #[test]
     fn resolves_select_mark_and_focus() {
         let bindings = storyboard_bindings();
         let mut ctrl = egui::Modifiers::NONE;
@@ -238,6 +308,12 @@ mod tests {
         assert_eq!(
             resolve_playback_action(&bindings.matching_actions(egui::Key::Tab, shift)),
             Some(PlaybackAction::FocusPrev)
+        );
+        assert_eq!(
+            resolve_playback_action(
+                &bindings.matching_actions(egui::Key::Enter, egui::Modifiers::NONE)
+            ),
+            Some(PlaybackAction::ActivateFocusedItem)
         );
         assert_eq!(
             resolve_playback_action(
@@ -275,6 +351,42 @@ mod tests {
                 &bindings.matching_actions(egui::Key::M, egui::Modifiers::NONE)
             ),
             Some(PlaybackAction::AddMarker)
+        );
+    }
+
+    #[test]
+    fn resolves_object_undo_redo_from_catalog_action() {
+        let bindings = storyboard_bindings();
+        assert_eq!(
+            resolve_playback_action(
+                &bindings.matching_actions(egui::Key::U, egui::Modifiers::CTRL)
+            ),
+            Some(PlaybackAction::UndoObject)
+        );
+        assert_eq!(
+            resolve_playback_action(
+                &bindings.matching_actions(egui::Key::Z, egui::Modifiers::CTRL)
+            ),
+            Some(PlaybackAction::UndoObject)
+        );
+        assert_eq!(
+            resolve_playback_action(
+                &bindings.matching_actions(egui::Key::R, egui::Modifiers::CTRL)
+            ),
+            Some(PlaybackAction::RedoObject)
+        );
+        assert_eq!(
+            resolve_playback_action(
+                &bindings.matching_actions(egui::Key::Y, egui::Modifiers::CTRL)
+            ),
+            Some(PlaybackAction::RedoObject)
+        );
+        let mut ctrl_shift = egui::Modifiers::NONE;
+        ctrl_shift.ctrl = true;
+        ctrl_shift.shift = true;
+        assert_eq!(
+            resolve_playback_action(&bindings.matching_actions(egui::Key::Z, ctrl_shift)),
+            Some(PlaybackAction::RedoObject)
         );
     }
 
@@ -322,6 +434,10 @@ mod tests {
             .expect("seed presets");
         let mut shift = egui::Modifiers::NONE;
         shift.shift = true;
+        let mut ctrl = egui::Modifiers::NONE;
+        ctrl.ctrl = true;
+        let mut alt = egui::Modifiers::NONE;
+        alt.alt = true;
 
         for preset_id in presets.keys() {
             let user = json!({ "active_preset": preset_id });
@@ -349,12 +465,95 @@ mod tests {
                 Some(PlaybackAction::AddOffSegment),
                 "add_off_segment missing for preset {preset_id}"
             );
+            if preset_id == "default" {
+                assert_eq!(
+                    resolve_playback_action(&bindings.matching_actions(egui::Key::ArrowLeft, alt)),
+                    Some(PlaybackAction::NavigatePrevObject),
+                    "QNC navigate_prev_object missing"
+                );
+                assert_eq!(
+                    resolve_playback_action(&bindings.matching_actions(egui::Key::ArrowRight, alt)),
+                    Some(PlaybackAction::NavigateNextObject),
+                    "QNC navigate_next_object missing"
+                );
+                assert_eq!(
+                    resolve_playback_action(&bindings.matching_actions(egui::Key::S, ctrl)),
+                    Some(PlaybackAction::SelectCurrentMarkerSlot),
+                    "QNC select_current_marker_slot missing"
+                );
+                assert_eq!(
+                    resolve_playback_action(
+                        &bindings.matching_actions(egui::Key::Enter, egui::Modifiers::NONE)
+                    ),
+                    Some(PlaybackAction::ActivateFocusedItem),
+                    "QNC activate_focused_item missing"
+                );
+                assert_eq!(
+                    resolve_playback_action(&bindings.matching_actions(egui::Key::U, ctrl)),
+                    Some(PlaybackAction::UndoObject),
+                    "QNC undo_object Ctrl+U missing"
+                );
+                assert_eq!(
+                    resolve_playback_action(&bindings.matching_actions(egui::Key::R, ctrl)),
+                    Some(PlaybackAction::RedoObject),
+                    "QNC redo_object Ctrl+R missing"
+                );
+                assert_eq!(
+                    resolve_playback_action(&bindings.matching_actions(egui::Key::Y, ctrl)),
+                    Some(PlaybackAction::RedoObject),
+                    "QNC redo_object missing"
+                );
+                assert_eq!(
+                    resolve_playback_action(
+                        &bindings.matching_actions(egui::Key::OpenBracket, egui::Modifiers::NONE)
+                    ),
+                    None,
+                    "QNC must not use bracket slot navigation"
+                );
+            } else {
+                assert_eq!(
+                    resolve_playback_action(&bindings.matching_actions(egui::Key::ArrowLeft, alt)),
+                    None,
+                    "professional preset {preset_id} must not inherit QNC Alt navigation"
+                );
+                assert_eq!(
+                    resolve_playback_action(&bindings.matching_actions(egui::Key::S, ctrl)),
+                    None,
+                    "professional preset {preset_id} must not inherit QNC Ctrl+S"
+                );
+                assert_eq!(
+                    resolve_playback_action(
+                        &bindings.matching_actions(egui::Key::OpenBracket, egui::Modifiers::NONE)
+                    ),
+                    Some(PlaybackAction::StepPrevMarkerSlot),
+                    "professional preset {preset_id} keeps its original slot navigation"
+                );
+            }
         }
+
+        let user = json!({ "active_preset": "default" });
+        let modal_bindings = StoryBindings::from_catalog(&catalog, &user, "timeline_modal");
+        assert_eq!(
+            resolve_playback_action(
+                &modal_bindings.matching_actions(egui::Key::ArrowUp, egui::Modifiers::NONE)
+            ),
+            Some(PlaybackAction::StepPrevPart),
+            "QNC timeline_modal must keep Up as active-panel previous segment"
+        );
+        assert_eq!(
+            resolve_playback_action(
+                &modal_bindings.matching_actions(egui::Key::ArrowDown, egui::Modifiers::NONE)
+            ),
+            Some(PlaybackAction::StepNextPart),
+            "QNC timeline_modal must keep Down as active-panel next segment"
+        );
     }
 
     #[test]
     fn resolves_story_playlist_input_actions_from_catalog() {
         let bindings = storyboard_bindings();
+        let mut alt = egui::Modifiers::NONE;
+        alt.alt = true;
 
         assert_eq!(
             resolve_playback_action(
@@ -369,20 +568,22 @@ mod tests {
             Some(PlaybackAction::StepNextPart)
         );
         assert_eq!(
-            resolve_playback_action(
-                &bindings.matching_actions(egui::Key::OpenBracket, egui::Modifiers::NONE)
-            ),
-            Some(PlaybackAction::StepPrevMarkerSlot)
+            resolve_playback_action(&bindings.matching_actions(egui::Key::ArrowLeft, alt)),
+            Some(PlaybackAction::NavigatePrevObject)
         );
         assert_eq!(
-            resolve_playback_action(
-                &bindings.matching_actions(egui::Key::CloseBracket, egui::Modifiers::NONE)
-            ),
-            Some(PlaybackAction::StepNextMarkerSlot)
+            resolve_playback_action(&bindings.matching_actions(egui::Key::ArrowRight, alt)),
+            Some(PlaybackAction::NavigateNextObject)
         );
 
         let mut shift = egui::Modifiers::NONE;
         shift.shift = true;
+        let mut ctrl = egui::Modifiers::NONE;
+        ctrl.ctrl = true;
+        assert_eq!(
+            resolve_playback_action(&bindings.matching_actions(egui::Key::S, ctrl)),
+            Some(PlaybackAction::SelectCurrentMarkerSlot)
+        );
         assert_eq!(
             resolve_playback_action(&bindings.matching_actions(egui::Key::S, shift)),
             Some(PlaybackAction::FocusEmptySlot)

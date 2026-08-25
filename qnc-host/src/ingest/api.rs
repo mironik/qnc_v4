@@ -19,7 +19,6 @@ use super::store::{
     save_selection, select_all_clips, set_active_source, set_browse_path,
     set_ingest_archive_original, toggle_clip_selection,
 };
-use crate::media_pool::proxy_path_for_clip;
 use crate::waveform::{peaks_for_channel, ready as waveform_ready, snapshot as waveform_snapshot};
 
 #[derive(serde::Deserialize)]
@@ -363,11 +362,9 @@ async fn api_ingest_thumbs_from_proxy(
     let pid = resolve_project_id(&app, &body.project_id)?;
     app.ingest_posters
         .enqueue_proxy_generate(&pid, &body.clip_ids);
-    Ok(Json(json!({
-        "status": "ok",
-        "phase": "from_proxy",
-        "queued_clip_ids": body.clip_ids,
-    })))
+    load_state(&app.project.paths, &pid)
+        .map(Json)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
 }
 
 #[derive(serde::Deserialize)]
@@ -401,9 +398,7 @@ async fn api_ingest_waveform_status(
         return Err((StatusCode::BAD_REQUEST, "clip_id je prazan".into()));
     }
     if !waveform_ready(&app.project.paths, &pid, clip_id) {
-        if let Some(path) = proxy_path_for_clip(&app.project.paths, &pid, clip_id) {
-            app.waveform.enqueue(&pid, clip_id, &path);
-        }
+        app.waveform.enqueue_job(&pid, clip_id);
     }
     Ok(Json(json!({
         "project_id": pid,
