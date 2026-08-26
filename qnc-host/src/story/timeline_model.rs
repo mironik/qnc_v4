@@ -12,7 +12,7 @@ use crate::timeline_model::{
 };
 
 use super::covers::{list_covers, StoryCoverRow};
-use super::db::{ensure_schema, list_parts, StoryPartRow};
+use super::db::{ensure_schema, list_active_parts, StoryPartRow};
 use super::markers::{
     list_marker_slots_rows, list_markers_rows, part_span_frames, part_span_seconds,
     timeline_duration_frames_from_parts,
@@ -56,7 +56,7 @@ fn build_wrap_timeline_model_from_conn(
     conn: &Connection,
 ) -> Result<TimelineModel, String> {
     ensure_schema(conn).map_err(|e| e.to_string())?;
-    let parts = list_parts(conn).map_err(|e| e.to_string())?;
+    let parts = list_active_parts(conn).map_err(|e| e.to_string())?;
     let timeline_fps = story_program_source_fps(&parts).unwrap_or(0.0);
     let covers = list_covers(conn).map_err(|e| e.to_string())?;
     let markers = list_markers_rows(conn).map_err(|e| e.to_string())?;

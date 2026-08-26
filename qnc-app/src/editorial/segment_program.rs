@@ -409,7 +409,7 @@ fn segment_program_covers(
         .flat_map(|segment| segment.covers.iter())
         .map(SegmentProgramCover::from_playlist_cover)
         .collect();
-    if !playlist_covers.is_empty() {
+    if playlist.is_some() {
         return playlist_covers;
     }
     story_covers
@@ -1211,7 +1211,7 @@ mod tests {
             Some(20)
         );
         assert_eq!(program.effective_marker_slot_id(""), "slot_a");
-        assert_eq!(program.covers()[0].cover_id, "cover_a");
+        assert!(program.covers().is_empty());
         assert_eq!(program.markers()[0].marker_id, "m0");
     }
 

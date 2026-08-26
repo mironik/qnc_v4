@@ -19,6 +19,7 @@ pub(crate) struct MarkerCoverInput<'a> {
     pub virtual_frame: i64,
     pub playhead_sec: f64,
     pub tc: &'a dyn Fn(f64) -> String,
+    pub show_playhead: bool,
     pub sync_cover_enabled: bool,
 }
 
@@ -46,17 +47,19 @@ pub(crate) fn show(ui: &mut egui::Ui, input: MarkerCoverInput<'_>) -> MarkerCove
             ui.label(RichText::new(label).color(MUTED).small());
             ui.label(RichText::new("-").color(MUTED).small());
         }
-        ui.label(
-            RichText::new(format!("Playhead {}", (input.tc)(input.playhead_sec)))
-                .color(TEXT)
-                .small(),
-        );
-        ui.label(
-            RichText::new(format!("frame {}", input.virtual_frame.max(0)))
-                .color(MUTED)
-                .small(),
-        );
-        ui.add_space(8.0);
+        if input.show_playhead {
+            ui.label(
+                RichText::new(format!("Playhead {}", (input.tc)(input.playhead_sec)))
+                    .color(TEXT)
+                    .small(),
+            );
+            ui.label(
+                RichText::new(format!("frame {}", input.virtual_frame.max(0)))
+                    .color(MUTED)
+                    .small(),
+            );
+            ui.add_space(8.0);
+        }
         if compact_toggle_btn(ui, "Sync", input.sync_cover_enabled).clicked() {
             action = MarkerCoverAction::ToggleSyncCover;
         }

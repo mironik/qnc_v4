@@ -94,23 +94,31 @@ impl ProgramWaveformAssets {
 pub(crate) fn source_duration_frames(
     all_clips: &[StoryShot],
     virtual_shots: &[StoryShot],
+    cover_shots: &[StoryShot],
 ) -> HashMap<String, i64> {
     let mut out = HashMap::new();
     for clip in all_clips {
         remember_source_duration(&mut out, clip);
     }
     for clip in virtual_shots {
-        let clip_id = clip.clip_id.trim();
-        if clip_id.is_empty() {
-            continue;
-        }
-        let duration = clip.duration_frames.max(clip.out_frame).max(0);
-        if duration <= 0 {
-            continue;
-        }
-        out.entry(clip_id.to_string()).or_insert(duration);
+        remember_virtual_source_duration(&mut out, clip);
+    }
+    for clip in cover_shots {
+        remember_virtual_source_duration(&mut out, clip);
     }
     out
+}
+
+fn remember_virtual_source_duration(out: &mut HashMap<String, i64>, clip: &StoryShot) {
+    let clip_id = clip.clip_id.trim();
+    if clip_id.is_empty() {
+        return;
+    }
+    let duration = clip.duration_frames.max(clip.out_frame).max(0);
+    if duration <= 0 {
+        return;
+    }
+    out.entry(clip_id.to_string()).or_insert(duration);
 }
 
 fn remember_source_duration(out: &mut HashMap<String, i64>, clip: &StoryShot) {

@@ -198,6 +198,8 @@ pub fn cover_json(row: &StoryCoverRow) -> Value {
         "slot_index": row.slot_index,
         "clip_id": row.clip_id,
         "virtual_shot_id": row.virtual_shot_id,
+        "source_class": "cover",
+        "virtual_category": "cover",
         "title": row.title,
         "note": row.note,
         "in_tc": row.in_tc,

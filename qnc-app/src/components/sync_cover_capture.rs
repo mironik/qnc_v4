@@ -163,6 +163,7 @@ pub(crate) struct SyncCoverPreviewInput<'a> {
     pub markers: &'a [StoryMarker],
     pub all_clips: &'a [StoryShot],
     pub virtual_shots: &'a [StoryShot],
+    pub cover_shots: &'a [StoryShot],
     pub playback_inputs: &'a HashMap<String, String>,
     pub source_clip_id: &'a str,
     pub source_in_frame: i64,
@@ -302,6 +303,7 @@ impl SyncCoverCaptureComponent {
             .all_clips
             .iter()
             .chain(input.virtual_shots.iter())
+            .chain(input.cover_shots.iter())
             .cloned()
             .collect::<Vec<_>>();
         let request =
@@ -577,6 +579,7 @@ mod tests {
             }],
             all_clips: &[clip("base", 300), clip("cover", 300)],
             virtual_shots: &[],
+            cover_shots: &[],
             playback_inputs: &inputs,
             source_clip_id: "cover",
             source_in_frame: 20,
@@ -634,6 +637,7 @@ mod tests {
             ],
             all_clips: &[clip("base", 300), clip("cover", 300)],
             virtual_shots: &[],
+            cover_shots: &[],
             playback_inputs: &inputs,
             source_clip_id: "cover",
             source_in_frame: 20,

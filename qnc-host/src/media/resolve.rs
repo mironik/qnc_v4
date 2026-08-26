@@ -105,7 +105,7 @@ pub fn root_shot_id(clip_id: &str) -> String {
     format!("{id}_root")
 }
 
-/// One standard: derived cut → `{clip}_shot_001` (1-based, zero-padded).
+/// One standard: short virtual cut → `{clip}_shot_001` (1-based, zero-padded).
 pub fn derived_shot_id(clip_id: &str, index: u32) -> String {
     let id = clip_id_token(clip_id);
     let n = index.max(1);
@@ -133,7 +133,7 @@ pub fn virtual_name_for_root_clip(clip_id: &str, file_extension: &str) -> String
     }
 }
 
-/// Virtual file name for a derived shot: `{clip}_shot_001.ext`.
+/// Virtual file name for a short virtual shot: `{clip}_shot_001.ext`.
 /// Built from the root virtual name so `_root` → `_shot_NNN` is visible in the name.
 pub fn virtual_name_for_derived_shot(root_virtual_name: &str, index: u32) -> String {
     let n = index.max(1);

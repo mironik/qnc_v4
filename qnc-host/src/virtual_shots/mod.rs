@@ -1,4 +1,4 @@
-//! Neutral editorial-shot domain (root + derived virtual shots).
+//! Neutral editorial-shot domain (root + short/cover virtual shots).
 //!
 //! Single owner of the `virtual_shots` model. Ingest, QStory and Media Pool all
 //! consume this module; it must not be owned by any of them.

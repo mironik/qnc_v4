@@ -7,10 +7,15 @@ pub(crate) enum LibraryTab {
     #[default]
     All,
     Virtual,
+    Cover,
     Segment,
 }
 
-#[derive(Debug, Clone, Deserialize, Default)]
+fn default_true() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, Deserialize)]
 #[allow(dead_code)]
 pub(crate) struct StoryPart {
     #[serde(default)]
@@ -46,6 +51,36 @@ pub(crate) struct StoryPart {
     pub duration_label: String,
     #[serde(default)]
     pub source_class: String,
+    #[serde(default)]
+    pub virtual_category: String,
+    #[serde(default = "default_true")]
+    pub active: bool,
+}
+
+impl Default for StoryPart {
+    fn default() -> Self {
+        Self {
+            shot_id: String::new(),
+            root_shot_id: String::new(),
+            part_id: String::new(),
+            kind: String::new(),
+            title: String::new(),
+            text: String::new(),
+            clip_id: String::new(),
+            virtual_shot_id: String::new(),
+            in_seconds: None,
+            out_seconds: None,
+            in_frame: 0,
+            out_frame: 0,
+            fps: 0.0,
+            source_timebase: EditorialSourceTimebase::default(),
+            duration_frames: 0,
+            duration_label: String::new(),
+            source_class: String::new(),
+            virtual_category: String::new(),
+            active: true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -83,6 +118,8 @@ pub(crate) struct StoryShot {
     pub interlaced: bool,
     #[serde(default)]
     pub source_class: String,
+    #[serde(default)]
+    pub virtual_category: String,
     #[serde(default)]
     pub proxy_recipe: String,
     #[serde(default)]
@@ -141,6 +178,8 @@ pub(crate) struct StoryCover {
     pub source_fps: f64,
     #[serde(default)]
     pub source_timebase: EditorialSourceTimebase,
+    #[serde(default)]
+    pub virtual_category: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]

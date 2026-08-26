@@ -97,6 +97,7 @@ pub struct StoryScreen {
     parts: Vec<StoryPart>,
     all_clips: Vec<StoryShot>,
     virtual_shots: Vec<StoryShot>,
+    cover_shots: Vec<StoryShot>,
     covers: Vec<StoryCover>,
     pending_cover_projections: Vec<StoryCover>,
     pending_cover_undo_slots: HashSet<String>,
@@ -216,6 +217,7 @@ impl StoryScreen {
             parts: Vec::new(),
             all_clips: Vec::new(),
             virtual_shots: Vec::new(),
+            cover_shots: Vec::new(),
             covers: Vec::new(),
             pending_cover_projections: Vec::new(),
             pending_cover_undo_slots: HashSet::new(),
@@ -525,6 +527,7 @@ impl StoryScreen {
         self.all_clips
             .iter()
             .chain(self.virtual_shots.iter())
+            .chain(self.cover_shots.iter())
             .find(|shot| shot.clip_id == clip_id)
             .map(|shot| {
                 (
@@ -919,7 +922,11 @@ impl StoryScreen {
             || self.sync_cover.pending_slot().is_some()
             || sync_ready_slot_id.is_some();
         let update = story_state::parse_state(state, self.timeline.as_ref());
-        let active_thumb_ids = story_thumb_ids(&update.all_clips, &update.virtual_shots);
+        let active_thumb_ids = story_thumb_ids(
+            &update.all_clips,
+            &update.virtual_shots,
+            &update.cover_shots,
+        );
         let thumbnail_queue = story_state::thumbnail_queue_delta(
             &update.all_clips,
             |clip_id| self.thumb_textures.contains_key(clip_id),
@@ -931,6 +938,7 @@ impl StoryScreen {
         self.parts = update.parts;
         self.all_clips = update.all_clips;
         self.virtual_shots = update.virtual_shots;
+        self.cover_shots = update.cover_shots;
         self.ensure_media_pool_focus();
         self.covers = update.covers;
         self.markers = update.markers;
@@ -1205,6 +1213,7 @@ impl StoryScreen {
             &self.parts,
             &self.all_clips,
             &self.virtual_shots,
+            &self.cover_shots,
             &self.covers,
             &self.markers,
         );
@@ -1377,7 +1386,8 @@ impl StoryScreen {
         self.mark_in_set = false;
         self.mark_out_set = false;
         let sync_source_end_frame = source_shot_end_frame(shot);
-        let sync_selected_from_virtual_tab = self.library_tab == LibraryTab::Virtual;
+        let sync_selected_from_virtual_tab =
+            matches!(self.library_tab, LibraryTab::Virtual | LibraryTab::Cover);
         self.focus.clear();
         self.selected_source_ref = Some(selection.source_ref);
         self.selected_source_timebase = BroadcastSourceTimebase::from_i64(
@@ -1433,7 +1443,8 @@ impl StoryScreen {
         self.selected_shot_out_frame = out_frame;
         self.mark_in_set = false;
         self.mark_out_set = false;
-        let sync_selected_from_virtual_tab = self.library_tab == LibraryTab::Virtual;
+        let sync_selected_from_virtual_tab =
+            matches!(self.library_tab, LibraryTab::Virtual | LibraryTab::Cover);
         self.focus.clear();
         self.selected_source_ref = None;
         self.selected_source_timebase = BroadcastSourceTimebase::default();
@@ -1654,11 +1665,13 @@ impl StoryScreen {
             .all_clips
             .iter()
             .chain(self.virtual_shots.iter())
+            .chain(self.cover_shots.iter())
             .find(|shot| shot.clip_id == clip_id && shot_id(shot) == self.selected_shot_id)
             .or_else(|| {
                 self.all_clips
                     .iter()
                     .chain(self.virtual_shots.iter())
+                    .chain(self.cover_shots.iter())
                     .find(|shot| shot.clip_id == clip_id)
             });
         let source_id = selected
@@ -2240,6 +2253,7 @@ impl StoryScreen {
         self.all_clips
             .iter()
             .chain(self.virtual_shots.iter())
+            .chain(self.cover_shots.iter())
             .find(|c| shot_id(c) == self.selected_shot_id || c.clip_id == self.selected_clip_id)
             .map(|c| {
                 if !c.name.is_empty() {
@@ -2261,8 +2275,11 @@ impl StoryScreen {
         match action {
             media_pool::MediaPoolAction::None => PlaybackTransportIntent::None,
             media_pool::MediaPoolAction::SwitchTab(tab) => {
-                // Honor composition: no Segment tab → clamp away.
-                let tab = if tab == LibraryTab::Segment && !self.role.head().show_segment_tab {
+                let head = self.role.head();
+                // Honor composition: no Segment/Cover tab → clamp away.
+                let tab = if (tab == LibraryTab::Segment && !head.show_segment_tab)
+                    || (tab == LibraryTab::Cover && !head.show_cover_tab)
+                {
                     LibraryTab::All
                 } else {
                     tab
@@ -2350,6 +2367,7 @@ impl StoryScreen {
                 selected_clip_id: &self.selected_clip_id,
                 all_clips: &self.all_clips,
                 virtual_shots: &self.virtual_shots,
+                cover_shots: &self.cover_shots,
                 parts: &self.parts,
                 selected_part_id: &self.selected_part_id,
                 thumb_textures: &self.thumb_textures,
@@ -2374,8 +2392,11 @@ impl StoryScreen {
             &program,
             ui.ctx(),
         );
-        let source_durations =
-            program_waveform::source_duration_frames(&self.all_clips, &self.virtual_shots);
+        let source_durations = program_waveform::source_duration_frames(
+            &self.all_clips,
+            &self.virtual_shots,
+            &self.cover_shots,
+        );
         let program_waveform = self.program_waveforms.compose(&program, &source_durations);
         let display_frame =
             playback.playlist_display_frame(self.wrap_playhead_frame, program.duration_frames());
@@ -2589,6 +2610,7 @@ impl StoryScreen {
             markers: &self.markers,
             all_clips: &self.all_clips,
             virtual_shots: &self.virtual_shots,
+            cover_shots: &self.cover_shots,
             playback_inputs: &self.playlist_playback_inputs,
         }
     }
@@ -2663,10 +2685,15 @@ impl StoryScreen {
     }
 }
 
-fn story_thumb_ids(all_clips: &[StoryShot], virtual_shots: &[StoryShot]) -> HashSet<String> {
+fn story_thumb_ids(
+    all_clips: &[StoryShot],
+    virtual_shots: &[StoryShot],
+    cover_shots: &[StoryShot],
+) -> HashSet<String> {
     all_clips
         .iter()
         .chain(virtual_shots.iter())
+        .chain(cover_shots.iter())
         .filter_map(|shot| {
             let clip_id = shot.clip_id.trim();
             (!clip_id.is_empty()).then(|| clip_id.to_string())
@@ -2848,6 +2875,7 @@ impl StoryScreen {
         match self.library_tab {
             LibraryTab::All => &self.all_clips,
             LibraryTab::Virtual => &self.virtual_shots,
+            LibraryTab::Cover => &self.cover_shots,
             LibraryTab::Segment => &[],
         }
     }
@@ -2882,6 +2910,7 @@ impl StoryScreen {
         match self.library_tab {
             LibraryTab::All => "All",
             LibraryTab::Virtual => "Virtual",
+            LibraryTab::Cover => "B-roll",
             LibraryTab::Segment => "Segment",
         }
     }
@@ -3311,7 +3340,7 @@ impl StoryScreen {
         self.enqueue_edit_command(|instance, request, project| {
             EditorialEditComponent::delete_part(instance, request, project, &part_id)
         });
-        self.status = format!("Brišem segment {}", truncate(&part_id, 24));
+        self.status = format!("Isključujem segment {}", truncate(&part_id, 24));
     }
 
     fn reorder_part(&mut self, _host: &HostClient, part_id: &str, direction: &str) {
@@ -3675,6 +3704,7 @@ impl StoryScreen {
             markers: &self.markers,
             all_clips: &self.all_clips,
             virtual_shots: &self.virtual_shots,
+            cover_shots: &self.cover_shots,
             playback_inputs: &self.playlist_playback_inputs,
             source_clip_id: &self.selected_clip_id,
             source_in_frame,

@@ -46,6 +46,7 @@ pub(crate) struct MediaPoolHeadInput {
     pub library_tab: LibraryTab,
     pub playing: bool,
     pub show_segment_tab: bool,
+    pub show_cover_tab: bool,
     pub show_export_xml: bool,
     pub show_quick_cover: bool,
 }
@@ -59,6 +60,7 @@ pub(crate) struct MediaPoolStripInput<'a> {
     pub selected_clip_id: &'a str,
     pub all_clips: &'a [StoryShot],
     pub virtual_shots: &'a [StoryShot],
+    pub cover_shots: &'a [StoryShot],
     pub parts: &'a [StoryPart],
     pub selected_part_id: &'a str,
     pub thumb_textures: &'a HashMap<String, TextureHandle>,
@@ -105,15 +107,20 @@ pub(crate) enum MediaPoolCardGridAction {
 pub(crate) fn show_head(ui: &mut egui::Ui, input: MediaPoolHeadInput) -> MediaPoolAction {
     let mut action = MediaPoolAction::None;
     qnc_theme::chrome_row(ui, true, |ui| {
-        let tabs: &[LibraryTab] = if input.show_segment_tab {
-            &[LibraryTab::All, LibraryTab::Virtual, LibraryTab::Segment]
-        } else {
-            &[LibraryTab::All, LibraryTab::Virtual]
-        };
-        for &tab in tabs {
+        let tabs: Vec<LibraryTab> = [
+            Some(LibraryTab::All),
+            Some(LibraryTab::Virtual),
+            input.show_cover_tab.then_some(LibraryTab::Cover),
+            input.show_segment_tab.then_some(LibraryTab::Segment),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        for tab in tabs {
             let label = match tab {
                 LibraryTab::All => "All",
                 LibraryTab::Virtual => "Virtual",
+                LibraryTab::Cover => "B-roll",
                 LibraryTab::Segment => "Segment",
             };
             let active = input.library_tab == tab;
@@ -329,12 +336,14 @@ fn shot_cards(ui: &mut egui::Ui, input: &MediaPoolStripInput<'_>) -> MediaPoolAc
     let shots: &[StoryShot] = match input.library_tab {
         LibraryTab::All => input.all_clips,
         LibraryTab::Virtual => input.virtual_shots,
+        LibraryTab::Cover => input.cover_shots,
         LibraryTab::Segment => &[],
     };
 
     let empty_message = match input.library_tab {
         LibraryTab::All => "Nema klipova — prvo Ingest import.",
         LibraryTab::Virtual => "Nema virtualnih — Spremi virtualni kadar.",
+        LibraryTab::Cover => "Nema B-roll kadrova — dodaj pokrivalicu.",
         LibraryTab::Segment => "",
     };
 
@@ -422,18 +431,27 @@ fn segment_cards(ui: &mut egui::Ui, input: &MediaPoolStripInput<'_>) -> MediaPoo
                 } else {
                     egui::Stroke::new(1.0, t.border)
                 };
+                let fill = if part.active {
+                    t.raised
+                } else {
+                    t.surface.linear_multiply(0.65)
+                };
+                let kind_color = if part.active { t.accent } else { t.muted };
                 let resp = egui::Frame::NONE
                     .stroke(stroke)
-                    .fill(t.raised)
+                    .fill(fill)
                     .inner_margin(8.0)
                     .show(ui, |ui| {
                         ui.set_min_width(120.0);
-                        ui.label(RichText::new(&part.kind).color(t.accent).strong());
+                        ui.label(RichText::new(&part.kind).color(kind_color).strong());
                         ui.label(RichText::new(&part.part_id).color(t.text).small());
                         if !part.duration_label.is_empty() {
                             ui.label(RichText::new(&part.duration_label).color(t.muted).small());
                         }
-                        if selected {
+                        if !part.active {
+                            ui.label(RichText::new("neaktivno").color(t.muted).small());
+                        }
+                        if selected && part.active {
                             ui.horizontal(|ui| {
                                 if ui
                                     .add(egui::Button::new(RichText::new("Up").small()))
@@ -467,7 +485,9 @@ fn segment_cards(ui: &mut egui::Ui, input: &MediaPoolStripInput<'_>) -> MediaPoo
                     })
                     .response;
                 if resp.clicked() && matches!(action, MediaPoolAction::None) {
-                    action = MediaPoolAction::SelectPart(part.part_id.clone());
+                    if part.active {
+                        action = MediaPoolAction::SelectPart(part.part_id.clone());
+                    }
                 }
             }
         });

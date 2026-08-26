@@ -76,6 +76,7 @@ pub enum RightPanelKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HeadFeatures {
     pub show_segment_tab: bool,
+    pub show_cover_tab: bool,
     pub show_export_xml: bool,
     pub show_quick_cover: bool,
 }
@@ -83,18 +84,21 @@ pub struct HeadFeatures {
 impl HeadFeatures {
     pub const STORY: Self = Self {
         show_segment_tab: true,
+        show_cover_tab: true,
         show_export_xml: true,
         show_quick_cover: true,
     };
 
     pub const MEDIA_ASSIST: Self = Self {
         show_segment_tab: false,
+        show_cover_tab: true,
         show_export_xml: false,
         show_quick_cover: false,
     };
 
     pub const INGEST: Self = Self {
         show_segment_tab: false,
+        show_cover_tab: false,
         show_export_xml: false,
         show_quick_cover: false,
     };
@@ -102,6 +106,7 @@ impl HeadFeatures {
     /// Project has no media-pool head.
     pub const NONE: Self = Self {
         show_segment_tab: false,
+        show_cover_tab: false,
         show_export_xml: false,
         show_quick_cover: false,
     };
@@ -111,6 +116,7 @@ impl HeadFeatures {
             library_tab,
             playing,
             show_segment_tab: self.show_segment_tab,
+            show_cover_tab: self.show_cover_tab,
             show_export_xml: self.show_export_xml,
             show_quick_cover: self.show_quick_cover,
         }

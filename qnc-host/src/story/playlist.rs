@@ -14,7 +14,7 @@ use crate::project::db::{open_project, ProjectPaths};
 use crate::project::ProjectDbBroker;
 
 use super::covers::{list_covers, StoryCoverRow};
-use super::db::{ensure_schema, list_parts, sync_story_part_source_fps, StoryPartRow};
+use super::db::{ensure_schema, list_active_parts, sync_story_part_source_fps, StoryPartRow};
 use super::markers::{
     part_span_frames, part_span_seconds, timeline_duration_frames_from_parts, TIMELINE_EPS,
 };
@@ -363,7 +363,7 @@ fn build_editorial_playlist_from_conn(
 ) -> Result<EditorialPlaylist, String> {
     ensure_schema(conn).map_err(|e| e.to_string())?;
     sync_story_part_source_fps(paths, project_id, conn)?;
-    let parts = list_parts(conn).map_err(|e| e.to_string())?;
+    let parts = list_active_parts(conn).map_err(|e| e.to_string())?;
     let timeline_fps = story_program_source_fps(&parts);
     let covers = list_covers(conn).map_err(|e| e.to_string())?;
     let segments = build_segments(&parts, &covers, timeline_fps);

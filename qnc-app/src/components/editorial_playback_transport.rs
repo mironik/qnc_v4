@@ -38,6 +38,7 @@ pub(crate) struct EditorialPlaylistProgramInput<'a> {
     pub markers: &'a [StoryMarker],
     pub all_clips: &'a [StoryShot],
     pub virtual_shots: &'a [StoryShot],
+    pub cover_shots: &'a [StoryShot],
     pub playback_inputs: &'a HashMap<String, String>,
 }
 
@@ -137,6 +138,7 @@ impl EditorialPlaybackTransportComponent {
             .all_clips
             .iter()
             .chain(input.virtual_shots.iter())
+            .chain(input.cover_shots.iter())
             .cloned()
             .collect::<Vec<_>>();
         EditorialProgramPlaybackComponent::build_program(EditorialProgramPlaybackInput {
@@ -189,7 +191,13 @@ impl EditorialPlaybackTransportComponent {
                     .filter(|part_id| has_part(input.parts, part_id))
             })
             .map(str::to_string)
-            .or_else(|| input.parts.first().map(|part| part.part_id.clone()))
+            .or_else(|| {
+                input
+                    .parts
+                    .iter()
+                    .find(|part| part.active)
+                    .map(|part| part.part_id.clone())
+            })
     }
 
     pub(crate) fn wrap_projection_after_program_refresh(
@@ -329,7 +337,9 @@ fn non_empty_str(value: &str) -> Option<&str> {
 }
 
 fn has_part(parts: &[StoryPart], part_id: &str) -> bool {
-    parts.iter().any(|part| part.part_id == part_id)
+    parts
+        .iter()
+        .any(|part| part.active && part.part_id == part_id)
 }
 
 fn playlist_segment_by_id<'a>(

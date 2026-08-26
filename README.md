@@ -1,4 +1,4 @@
-# QNC — native (v0.5.1)
+# QNC — native (v0.5.1.1)
 
 Aktivna radna kopija: **`qnc-app` + `qnc-host`**. Web UI nije dio `qnc_v4`
 produkta i legacy `web-arhive/` folder nije prisutan u ovom treeu.
@@ -90,6 +90,13 @@ Manualni override je dopusten za deployment/proizvodne topologije:
 | `project`, `ingest`, `story` | produkt API |
 | `media_pool` (Rust) | shared helperi za Ingest/Story |
 | design-tools HTTP | API only (nema web UI) |
+
+## v0.5.1.1 — Story segment UI / catalog checkpoint
+
+- Segment panel header now shows active segment duration, playlist playhead and total story duration in one right-aligned timing group.
+- Total duration is emphasized as `Trajanje`; playhead and segment values use their timeline colors.
+- Cover/B-roll virtual shots are separated from normal short virtual shots through `cover_shots`; source-root shots remain All-only and segments remain the Segment catalog.
+- Segment deletion is soft-deactivated for the Segment catalog while active program playback uses only active parts.
 
 ## v0.5.1 — Sync cover checkpoint
 

@@ -3,7 +3,7 @@ use serde_json::{json, Value};
 
 use crate::frame_time::{frame_to_seconds, is_valid_fps, seconds_to_frame, seconds_to_timecode};
 
-use super::db::{list_parts, read_row, touch_draft, StoryPartRow};
+use super::db::{list_active_parts, read_row, touch_draft, StoryPartRow};
 
 pub const TIMELINE_EPS: f64 = 0.001;
 
@@ -339,7 +339,7 @@ pub fn marker_slot_json(conn: &Connection, row: &StoryMarkerSlotRow) -> rusqlite
 
 pub fn markers_snapshot(conn: &Connection, timeline_fps: f64) -> rusqlite::Result<Vec<Value>> {
     backfill_marker_frames(conn, timeline_fps)?;
-    let parts = list_parts(conn)?;
+    let parts = list_active_parts(conn)?;
     Ok(list_markers(conn)?
         .iter()
         .map(|row| marker_json(row, &parts, timeline_fps))
@@ -410,7 +410,7 @@ fn set_selected_slot_id(conn: &Connection, slot_id: &str) -> rusqlite::Result<()
 /// Must never create markers at other segment starts — only here via `recompute_marker_slots`.
 fn ensure_start_marker(conn: &Connection, timeline_fps: f64) -> rusqlite::Result<()> {
     let timeline_fps = require_timeline_fps_sql(timeline_fps)?;
-    let parts = list_parts(conn)?;
+    let parts = list_active_parts(conn)?;
     let duration_frames = timeline_duration_frames_from_parts(&parts);
     if duration_frames <= 0 {
         conn.execute("DELETE FROM story_marker_slots", [])?;
@@ -578,7 +578,7 @@ pub fn recompute_marker_slots(conn: &Connection, timeline_fps: f64) -> rusqlite:
     ensure_marker_schema(conn)?;
     backfill_marker_frames(conn, timeline_fps)?;
     ensure_start_marker(conn, timeline_fps)?;
-    let parts = list_parts(conn)?;
+    let parts = list_active_parts(conn)?;
     let duration_frames = timeline_duration_frames_from_parts(&parts);
     ensure_end_marker(conn, timeline_fps, &parts, duration_frames)?;
     refresh_marker_sort_indices(conn)?;
@@ -780,8 +780,9 @@ pub fn delete_marker(conn: &Connection, marker_id: &str, timeline_fps: f64) -> R
         .iter()
         .find(|marker| marker.marker_id == marker_id)
         .ok_or_else(|| format!("marker not found: {marker_id}"))?;
-    let duration_frames =
-        timeline_duration_frames_from_parts(&list_parts(conn).map_err(|error| error.to_string())?);
+    let duration_frames = timeline_duration_frames_from_parts(
+        &list_active_parts(conn).map_err(|error| error.to_string())?,
+    );
     if marker.timeline_frame == 0 || marker.system_role == SYSTEM_MARKER_START {
         return Err("Početni M marker je zaključan.".into());
     }
@@ -833,8 +834,9 @@ pub fn update_marker_frame(
         return Err("timeline_frame must be >= 0".into());
     }
     let timeline_frame = timeline_frame.max(0);
-    let duration_frames =
-        timeline_duration_frames_from_parts(&list_parts(conn).map_err(|error| error.to_string())?);
+    let duration_frames = timeline_duration_frames_from_parts(
+        &list_active_parts(conn).map_err(|error| error.to_string())?,
+    );
     if timeline_frame > duration_frames {
         let duration = frame_to_seconds(duration_frames, timeline_fps);
         return Err(format!(
@@ -1127,7 +1129,7 @@ pub fn delete_markers_for_part(
 }
 
 pub fn ensure_materialized_slots(conn: &Connection, timeline_fps: f64) -> rusqlite::Result<()> {
-    let _ = list_parts(conn)?;
+    let _ = list_active_parts(conn)?;
     recompute_marker_slots(conn, timeline_fps)
 }
 

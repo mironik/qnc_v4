@@ -86,11 +86,31 @@ pub(crate) fn ensure(
     .map_err(|e| e.to_string())?;
     migrate_columns(conn)?;
     migrate_virtual_shots_json(paths, project_id, conn)?;
+    normalize_virtual_shot_kind_terms(conn)?;
     migrate_shot_identity_standard(conn)?;
     backfill_frame_fields(paths, project_id, conn)?;
     backfill_dual_fps(paths, project_id, conn)?;
     sync_virtual_shot_source_fps(paths, project_id, conn)?;
     sync_virtual_shot_probe_meta(conn)?;
+    Ok(())
+}
+
+fn normalize_virtual_shot_kind_terms(conn: &Connection) -> Result<(), String> {
+    conn.execute(
+        "UPDATE virtual_shots
+         SET kind = 'virtual'
+         WHERE kind = 'derived' OR TRIM(COALESCE(kind, '')) = ''",
+        [],
+    )
+    .map_err(|e| e.to_string())?;
+    conn.execute(
+        "UPDATE virtual_shots
+         SET kind = 'import_root'
+         WHERE category_key = 'import_root'
+            OR (locked != 0 AND shot_id LIKE '%_root')",
+        [],
+    )
+    .map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -857,6 +877,16 @@ pub fn list_virtual_shots(paths: &ProjectPaths, project_id: &str) -> Result<Vec<
                 source_class: row.get(34)?,
                 proxy_recipe: row.get(35)?,
             };
+            let category_key = row.get::<_, String>(12)?;
+            let kind = row.get::<_, String>(23)?;
+            let virtual_category = if kind == "import_root" || category_key == "import_root" {
+                "root"
+            } else {
+                match category_key.as_str() {
+                    "cover" | "b_roll" | "broll" | "pokrivalica" => "cover",
+                    _ => "short",
+                }
+            };
             Ok(json!({
                 "id": row.get::<_, String>(0)?,
                 "shot_id": row.get::<_, String>(0)?,
@@ -871,7 +901,8 @@ pub fn list_virtual_shots(paths: &ProjectPaths, project_id: &str) -> Result<Vec<
                 "in_tc": row.get::<_, String>(9)?,
                 "out_tc": row.get::<_, String>(10)?,
                 "description": row.get::<_, String>(11)?,
-                "category_key": row.get::<_, String>(12)?,
+                "category_key": category_key,
+                "virtual_category": virtual_category,
                 "fps": source_fps,
                 "source_fps": source_fps,
                 "timeline_fps": timeline_fps,
@@ -882,7 +913,7 @@ pub fn list_virtual_shots(paths: &ProjectPaths, project_id: &str) -> Result<Vec<
                 "duration_label": row.get::<_, String>(20)?,
                 "duration_color_key": row.get::<_, String>(21)?,
                 "created_at": row.get::<_, Option<String>>(22)?,
-                "kind": row.get::<_, String>(23)?,
+                "kind": kind,
                 "source_shot_id": row.get::<_, String>(24)?,
                 "locked": row.get::<_, i64>(25)? != 0,
                 "display_name": row.get::<_, String>(26)?,
@@ -1468,7 +1499,7 @@ pub fn virtual_shot_frames(
     Ok((clip_id, in_frame.max(0), out_frame, fps))
 }
 
-/// New editorial cut: a derived shot from an existing virtual shot.
+/// New editorial cut: a short virtual shot from an existing virtual shot.
 /// `local_*_seconds` are relative to the source shot's own IN.
 pub fn derive_virtual_shot(
     paths: &ProjectPaths,
@@ -1516,14 +1547,14 @@ pub fn derive_virtual_shot_from_frames(
         .unwrap_or_default()
         .to_string();
     conn.execute(
-        "UPDATE virtual_shots SET source_shot_id = ?1, kind = 'derived' WHERE shot_id = ?2",
+        "UPDATE virtual_shots SET source_shot_id = ?1, kind = 'virtual' WHERE shot_id = ?2",
         params![source_shot_id, new_shot_id],
     )
     .map_err(|e| e.to_string())?;
     let mut out = created;
     if let Value::Object(ref mut map) = out {
         map.insert("source_shot_id".into(), json!(source_shot_id));
-        map.insert("kind".into(), json!("derived"));
+        map.insert("kind".into(), json!("virtual"));
     }
     Ok(out)
 }

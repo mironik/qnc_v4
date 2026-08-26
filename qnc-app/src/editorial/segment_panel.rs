@@ -75,7 +75,22 @@ pub(crate) fn show(ui: &mut egui::Ui, input: SegmentPanelInput<'_>) -> SegmentPa
                     .program
                     .effective_marker_slot_id(input.selected_slot_id);
                 ui.set_min_size(content_rect.size());
-                ui.label(RichText::new("Segmenti").color(t.text).strong());
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Segmenti").color(t.text).strong());
+                    if !input.program.is_empty() {
+                        let timing = segment_panel_timing(input.program, input.virtual_frame);
+                        ui.add_space(14.0);
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            right_header_timing_group(
+                                ui,
+                                &time_from_frames(&input, timing.segment_frames),
+                                &(input.tc)(input.playhead_sec),
+                                timing.playhead_frame,
+                                &time_from_frames(&input, timing.total_frames),
+                            );
+                        });
+                    }
+                });
                 ui.add_space(8.0);
 
                 if input.program.is_empty() {
@@ -174,6 +189,7 @@ pub(crate) fn show(ui: &mut egui::Ui, input: SegmentPanelInput<'_>) -> SegmentPa
                                     virtual_frame: input.virtual_frame,
                                     playhead_sec: input.playhead_sec,
                                     tc: input.tc,
+                                    show_playhead: false,
                                     sync_cover_enabled: input.sync_cover_enabled,
                                 },
                             );
@@ -217,6 +233,71 @@ pub(crate) fn show(ui: &mut egui::Ui, input: SegmentPanelInput<'_>) -> SegmentPa
     }
 
     action
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SegmentPanelTiming {
+    segment_frames: i64,
+    playhead_frame: i64,
+    total_frames: i64,
+}
+
+fn segment_panel_timing(program: &SegmentProgramModel, playhead_frame: i64) -> SegmentPanelTiming {
+    let playhead_frame = playhead_frame.max(0);
+    let segment_frames = program
+        .active_part_at_program_frame(playhead_frame)
+        .or_else(|| {
+            program
+                .segments()
+                .last()
+                .filter(|_| playhead_frame >= program.duration_frames())
+        })
+        .map(|segment| segment.duration_frames.max(0))
+        .unwrap_or(0);
+    SegmentPanelTiming {
+        segment_frames,
+        playhead_frame,
+        total_frames: program.duration_frames(),
+    }
+}
+
+fn time_from_frames(input: &SegmentPanelInput<'_>, frames: i64) -> String {
+    input
+        .program
+        .timeline_fps()
+        .map(|fps| (input.tc)(frames.max(0) as f64 / fps))
+        .unwrap_or_else(|| "--:--:--:--".into())
+}
+
+fn right_header_timing_group(
+    ui: &mut egui::Ui,
+    segment_duration: &str,
+    playhead: &str,
+    frame: i64,
+    duration: &str,
+) {
+    let t = current(ui);
+    let segment_color = t.accent;
+    let playhead_color = t.focus;
+    header_value(ui, duration, egui::Color32::from_rgb(255, 120, 120));
+    header_label(ui, "Trajanje");
+    ui.add_space(18.0);
+    header_value(ui, &frame.max(0).to_string(), playhead_color);
+    header_label(ui, "frame");
+    header_value(ui, playhead, playhead_color);
+    header_label(ui, "Playhead");
+    ui.add_space(18.0);
+    header_value(ui, segment_duration, segment_color);
+    header_label(ui, "Segment");
+}
+
+fn header_label(ui: &mut egui::Ui, label: &str) {
+    let t = current(ui);
+    ui.label(RichText::new(label).color(t.muted).size(17.0).strong());
+}
+
+fn header_value(ui: &mut egui::Ui, value: &str, color: egui::Color32) {
+    ui.label(RichText::new(value).color(color).size(22.0).strong());
 }
 
 fn audio_expansion(ctx: &egui::Context, id: egui::Id) -> SegmentAudioExpansion {
@@ -464,6 +545,28 @@ mod tests {
         assert_eq!(program_segments.len(), 2);
         assert!(!program_segments[0].selected);
         assert!(program_segments[1].selected);
+    }
+
+    #[test]
+    fn segment_panel_timing_uses_active_segment_and_total_program() {
+        let program = program_fixture();
+
+        assert_eq!(
+            segment_panel_timing(&program, 55),
+            SegmentPanelTiming {
+                segment_frames: 40,
+                playhead_frame: 55,
+                total_frames: 90,
+            }
+        );
+        assert_eq!(
+            segment_panel_timing(&program, program.duration_frames()),
+            SegmentPanelTiming {
+                segment_frames: 40,
+                playhead_frame: 90,
+                total_frames: 90,
+            }
+        );
     }
 
     #[test]
