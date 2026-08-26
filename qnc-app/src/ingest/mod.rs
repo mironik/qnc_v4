@@ -1,9 +1,7 @@
-//! Native Ingest — composes Story `qnc_ui` shell; domain = dir browser + clip grid.
+//! Native Ingest — composes Story `qnc_ui` shell; domain = location browser + clip grid.
 //!
-//! **Components:** [`dir_list`] (left media body).
+//! **Components:** shared `qnc_location_browser` (left media body).
 //! Posters: snapshot `thumb_url` (DB) → async fetch → texture. UI never writes DB.
-
-mod dir_list;
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -20,15 +18,15 @@ use crate::media_assets::{self, AsyncImageAssetLoader, ImageAssetKey};
 use crate::playback_stack::PlaybackStack;
 use crate::player_contract::{BroadcastHostSourceRef, BroadcastSourceTimebase};
 use crate::qnc_filmstrip_background::FilmFrame;
-use crate::qnc_location_browser::clean_location_path;
+use crate::qnc_location_browser::{
+    self, clean_location_path, LocationBrowserAction, LocationBrowserInput, LocationSourceKind,
+};
 use crate::qnc_source_dock::{self, SourceDockAction, SourceDockInput};
 use crate::qnc_timeline::{ExpandedAudio, TimelineFocusPaint};
 use crate::qnc_timeline_progress::TimelineProgressModel;
 use crate::qnc_ui;
 use crate::shortcuts::{StoryBindings, STORYBOARD_SHORTCUT_SCOPE};
 use crate::story::playback_controls::{self, PlaybackAction};
-
-use dir_list::{DirBrowserKind, DirListAction, DirListInput};
 
 const POLL_INTERVAL: Duration = Duration::from_millis(1500);
 
@@ -52,7 +50,7 @@ pub struct IngestScreen {
     dir_entries: Vec<FsEntry>,
     dir_error: Option<String>,
     dir_busy: bool,
-    dir_browser: DirBrowserKind,
+    dir_browser: LocationSourceKind,
     // Broadcast player projection (PlayerRemote via app).
     pub(crate) selected_play_path: String,
     pub(crate) selected_play_input_clip_id: String,
@@ -131,7 +129,7 @@ impl Default for IngestScreen {
             dir_entries: Vec::new(),
             dir_error: None,
             dir_busy: false,
-            dir_browser: DirBrowserKind::default(),
+            dir_browser: LocationSourceKind::default(),
             selected_play_path: String::new(),
             selected_play_input_clip_id: String::new(),
             pending_play_input_clip_id: String::new(),
@@ -539,14 +537,14 @@ impl IngestScreen {
             self.path_edit.trim().to_string()
         };
         if path.is_empty() {
-            return Err("Odaberi mapu (U redu) ili upiši putanju.".into());
+            return Err("Odaberi mapu (Odaberi) ili upiši putanju.".into());
         }
         self.path_edit = path.clone();
         Ok(path)
     }
 
     pub fn cancel_dir_browser(&mut self) {
-        self.dir_browser = DirBrowserKind::Local;
+        self.dir_browser = LocationSourceKind::Local;
         self.dir_roots = true;
         self.dir_path.clear();
         self.dir_parent = None;
@@ -680,7 +678,7 @@ impl IngestScreen {
             action = IngestAction::RequestState(project_id.to_string());
         } else if !self.dir_loaded
             && !self.dir_busy
-            && matches!(self.dir_browser, DirBrowserKind::Local)
+            && matches!(self.dir_browser, LocationSourceKind::Local)
         {
             action = IngestAction::RequestDirList(self.dir_path.clone());
         }
@@ -713,8 +711,9 @@ impl IngestScreen {
                         }
                         let body = ui.available_height().max(0.0);
                         qnc_ui::content_panel(ui, body, |ui| {
-                            // Component: dir_list
-                            let input = DirListInput {
+                            // Component: shared location browser
+                            let input = LocationBrowserInput {
+                                id_salt: "ingest",
                                 kind: self.dir_browser,
                                 roots: self.dir_roots,
                                 path: &self.dir_path,
@@ -722,17 +721,19 @@ impl IngestScreen {
                                 entries: &self.dir_entries,
                                 error: self.dir_error.as_deref(),
                                 busy: self.command_busy || self.dir_busy,
+                                confirm_label: "Odaberi",
+                                max_tree_height: None,
                             };
-                            match dir_list::show(ui, input) {
-                                DirListAction::None => {}
-                                DirListAction::SelectKind(kind) => {
+                            match qnc_location_browser::show(ui, input) {
+                                LocationBrowserAction::None => {}
+                                LocationBrowserAction::SelectKind(kind) => {
                                     self.dir_browser = kind;
                                     self.dir_error = None;
                                     match kind {
-                                        DirBrowserKind::Local => {
+                                        LocationSourceKind::Local => {
                                             action = IngestAction::RequestDirList(String::new());
                                         }
-                                        DirBrowserKind::Lan | DirBrowserKind::Internet => {
+                                        LocationSourceKind::Lan | LocationSourceKind::Internet => {
                                             self.dir_roots = true;
                                             self.dir_path.clear();
                                             self.dir_parent = None;
@@ -740,11 +741,11 @@ impl IngestScreen {
                                         }
                                     }
                                 }
-                                DirListAction::OpenPath(path) => {
+                                LocationBrowserAction::OpenPath(path) => {
                                     action = IngestAction::RequestDirList(path);
                                 }
-                                DirListAction::Confirm => action = IngestAction::ConfirmDir,
-                                DirListAction::Cancel => action = IngestAction::CancelDir,
+                                LocationBrowserAction::Confirm => action = IngestAction::ConfirmDir,
+                                LocationBrowserAction::Cancel => action = IngestAction::CancelDir,
                             }
                         });
                     },

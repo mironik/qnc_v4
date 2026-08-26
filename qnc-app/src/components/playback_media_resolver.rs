@@ -3,6 +3,7 @@
 //! Forms select clips; this component resolves the concrete playback input
 //! through qnc-host media gateway.
 
+use crate::api::HostRequestTimeout;
 use crate::component_runtime::{ComponentBackendCommand, ComponentBackendEvent};
 use crate::player_contract::BroadcastSourceTimebase;
 use qnc_service_contracts::{MediaAccessKind, MediaLocator, MediaResolveResponse};
@@ -43,6 +44,7 @@ impl PlaybackMediaResolverComponent {
                 "access": MediaAccessKind::PlaybackProxy,
             }),
         )
+        .with_timeout(HostRequestTimeout::Long)
     }
 
     pub(crate) fn accepts_event(event: &ComponentBackendEvent) -> bool {
@@ -193,6 +195,7 @@ mod tests {
         assert_eq!(command.operation_id, OP_RESOLVE_PLAYBACK_PROXY);
         assert_eq!(command.path, "/api/media/resolve");
         assert_eq!(command.method, HostRequestMethod::Post);
+        assert_eq!(command.timeout, HostRequestTimeout::Long);
         let payload = command.payload.expect("payload");
         assert_eq!(
             payload.get("project_id").and_then(|v| v.as_str()),

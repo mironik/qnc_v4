@@ -8,7 +8,7 @@ use eframe::egui::{self, Pos2, Rect, RichText, Sense, Vec2};
 use crate::qnc_theme::{self, MUTED, TEXT};
 
 const COMPACT_CTRL_H: f32 = 22.0;
-const EDIT_ACTIONS_W: f32 = 260.0;
+const EDIT_ACTIONS_W: f32 = 360.0;
 const EDIT_ACTION_GAP: f32 = 6.0;
 const TRANSPORT_BTN_W: f32 = 30.0;
 const TRANSPORT_GAP: f32 = 5.0;
@@ -60,15 +60,12 @@ pub(crate) fn show(ui: &mut egui::Ui, input: MarkerCoverInput<'_>) -> MarkerCove
             );
             ui.add_space(8.0);
         }
-        if compact_toggle_btn(ui, "Sync", input.sync_cover_enabled).clicked() {
-            action = MarkerCoverAction::ToggleSyncCover;
-        }
         let (row_rect, _) = ui.allocate_exact_size(
             Vec2::new(ui.available_width(), COMPACT_CTRL_H),
             Sense::hover(),
         );
         show_transport_controls(ui, row_rect, &mut action);
-        show_edit_actions(ui, row_rect, &mut action);
+        show_edit_actions(ui, row_rect, input.sync_cover_enabled, &mut action);
     });
 
     action
@@ -116,7 +113,12 @@ fn show_transport_controls(ui: &mut egui::Ui, row_rect: Rect, action: &mut Marke
     );
 }
 
-fn show_edit_actions(ui: &mut egui::Ui, row_rect: Rect, action: &mut MarkerCoverAction) {
+fn show_edit_actions(
+    ui: &mut egui::Ui,
+    row_rect: Rect,
+    sync_cover_enabled: bool,
+    action: &mut MarkerCoverAction,
+) {
     let x = (row_rect.max.x - EDIT_ACTIONS_W).max(row_rect.min.x);
     let rect = Rect::from_min_max(Pos2::new(x, row_rect.min.y), row_rect.max);
     ui.allocate_new_ui(
@@ -134,6 +136,9 @@ fn show_edit_actions(ui: &mut egui::Ui, row_rect: Rect, action: &mut MarkerCover
             }
             if compact_action_btn(ui, "M marker").clicked() {
                 *action = MarkerCoverAction::AddMarker;
+            }
+            if compact_toggle_btn(ui, "Sync/B-roll", sync_cover_enabled).clicked() {
+                *action = MarkerCoverAction::ToggleSyncCover;
             }
         },
     );
@@ -156,11 +161,12 @@ fn compact_toggle_btn(ui: &mut egui::Ui, label: &str, active: bool) -> egui::Res
     } else {
         egui::Color32::TRANSPARENT
     };
+    let border = egui::Color32::from_gray(145);
     ui.add(
         egui::Button::new(RichText::new(label).color(t.text).size(qnc_theme::FONT_UI))
             .min_size(Vec2::new(0.0, COMPACT_CTRL_H))
             .fill(fill)
-            .stroke(egui::Stroke::new(1.0, t.border)),
+            .stroke(egui::Stroke::new(1.4, border)),
     )
     .on_hover_text("Sync pokrivalica")
 }

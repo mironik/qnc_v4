@@ -10,9 +10,9 @@ use crate::api::FsEntry;
 use crate::qnc_theme::{self, MUTED, TEXT};
 use crate::qnc_ui;
 
-const UP_COL_W: f32 = 78.0;
-const DISKS_COL_W: f32 = 76.0;
-const TREE_INDENT_W: f32 = 18.0;
+const UP_COL_W: f32 = 42.0;
+const DISKS_COL_W: f32 = 58.0;
+const NAV_GAP_W: f32 = 12.0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum LocationSourceKind {
@@ -83,13 +83,15 @@ pub fn show(ui: &mut egui::Ui, input: LocationBrowserInput<'_>) -> LocationBrows
         let can_up = matches!(input.kind, LocationSourceKind::Local)
             && !input.roots
             && input.parent.is_some();
-        if fixed_text_link(ui, "↑ Gore", can_up, UP_COL_W).clicked() {
+        if fixed_text_link(ui, "Gore", can_up, UP_COL_W).clicked() {
             action = LocationBrowserAction::OpenPath(input.parent.unwrap_or("").to_string());
         }
+        ui.add_space(NAV_GAP_W);
         let can_disks = matches!(input.kind, LocationSourceKind::Local);
         if fixed_text_link(ui, "Diskovi", can_disks, DISKS_COL_W).clicked() {
             action = LocationBrowserAction::OpenPath(String::new());
         }
+        ui.add_space(NAV_GAP_W);
         show_location_breadcrumb(ui, &input, &mut action);
     });
 
@@ -134,21 +136,25 @@ pub fn show(ui: &mut egui::Ui, input: LocationBrowserInput<'_>) -> LocationBrows
         });
 
     ui.add_space(8.0);
-    ui.horizontal(|ui| {
-        ui.spacing_mut().item_spacing.x = 8.0;
-        let can_confirm = matches!(input.kind, LocationSourceKind::Local)
-            && !input.roots
-            && !input.path.trim().is_empty()
-            && !input.busy;
-        ui.add_enabled_ui(can_confirm, |ui| {
-            if qnc_theme::primary_btn(ui, input.confirm_label).clicked() {
-                action = LocationBrowserAction::Confirm;
+    let can_confirm = matches!(input.kind, LocationSourceKind::Local)
+        && !input.roots
+        && !input.path.trim().is_empty()
+        && !input.busy;
+    ui.allocate_ui_with_layout(
+        Vec2::new(ui.available_width(), qnc_theme::CHROME_CTRL_H),
+        egui::Layout::right_to_left(egui::Align::Center),
+        |ui| {
+            ui.spacing_mut().item_spacing.x = 8.0;
+            if qnc_theme::action_btn(ui, "Odustani").clicked() {
+                action = LocationBrowserAction::Cancel;
             }
-        });
-        if qnc_theme::action_btn(ui, "Odustani").clicked() {
-            action = LocationBrowserAction::Cancel;
-        }
-    });
+            ui.add_enabled_ui(can_confirm, |ui| {
+                if qnc_theme::primary_btn(ui, input.confirm_label).clicked() {
+                    action = LocationBrowserAction::Confirm;
+                }
+            });
+        },
+    );
 
     action
 }
@@ -170,9 +176,9 @@ fn show_local_tree(
     if input.entries.is_empty() {
         ui.horizontal(|ui| {
             ui.add_space(if input.roots {
-                UP_COL_W
+                disk_tree_offset()
             } else {
-                UP_COL_W + DISKS_COL_W
+                path_tree_offset()
             });
             ui.label(
                 RichText::new(if input.roots {
@@ -189,43 +195,32 @@ fn show_local_tree(
 
     if input.roots {
         for entry in input.entries {
-            if location_tree_row(ui, UP_COL_W, "💾", &entry_display_name(entry, true)) {
+            if location_tree_row(ui, disk_tree_offset(), &entry_display_name(entry, true)) {
                 *action = LocationBrowserAction::OpenPath(clean_location_path(&entry.path));
             }
         }
         return;
     }
 
-    ui.horizontal(|ui| {
-        ui.add_space(UP_COL_W + DISKS_COL_W);
-        ui.label(
-            RichText::new("▾")
-                .monospace()
-                .size(qnc_theme::FONT_UI)
-                .color(MUTED),
-        );
-        ui.label(
-            RichText::new(path_leaf(input.path))
-                .size(qnc_theme::FONT_UI)
-                .color(TEXT),
-        );
-    });
     for entry in input.entries {
-        if location_tree_row(
-            ui,
-            UP_COL_W + DISKS_COL_W + TREE_INDENT_W,
-            "📁",
-            &entry_display_name(entry, false),
-        ) {
+        if location_tree_row(ui, path_tree_offset(), &entry_display_name(entry, false)) {
             *action = LocationBrowserAction::OpenPath(clean_location_path(&entry.path));
         }
     }
 }
 
-fn location_tree_row(ui: &mut egui::Ui, offset: f32, icon: &str, label: &str) -> bool {
+fn disk_tree_offset() -> f32 {
+    UP_COL_W + NAV_GAP_W
+}
+
+fn path_tree_offset() -> f32 {
+    UP_COL_W + NAV_GAP_W + DISKS_COL_W + NAV_GAP_W
+}
+
+fn location_tree_row(ui: &mut egui::Ui, offset: f32, label: &str) -> bool {
     ui.horizontal(|ui| {
         ui.add_space(offset);
-        qnc_theme::text_link(ui, &format!("{icon}  {label}"), true).clicked()
+        qnc_theme::text_link(ui, label, true).clicked()
     })
     .inner
 }
@@ -413,4 +408,66 @@ fn short_path(path: &str) -> String {
         .rev()
         .collect();
     format!("…{tail}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clean_location_path_removes_windows_extended_prefix() {
+        assert_eq!(
+            clean_location_path(r"\\?\C:\Users\miron\Media"),
+            r"C:\Users\miron\Media"
+        );
+        assert_eq!(
+            clean_location_path(r"\\?\UNC\server\share\Media"),
+            r"\\server\share\Media"
+        );
+    }
+
+    #[test]
+    fn breadcrumb_parts_keep_clickable_windows_drive_chain() {
+        let parts = breadcrumb_parts(r"C:\News\Today");
+        assert_eq!(
+            parts,
+            vec![
+                ("C:".to_string(), r"C:\".to_string()),
+                ("News".to_string(), r"C:\News".to_string()),
+                ("Today".to_string(), r"C:\News\Today".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn root_disk_rows_align_under_disk_column_not_gore_column() {
+        assert!(disk_tree_offset() > UP_COL_W);
+        assert!(disk_tree_offset() < path_tree_offset());
+    }
+
+    #[test]
+    fn opened_folder_rows_share_breadcrumb_column() {
+        assert_eq!(
+            path_tree_offset(),
+            UP_COL_W + NAV_GAP_W + DISKS_COL_W + NAV_GAP_W
+        );
+    }
+
+    #[test]
+    fn root_location_label_stays_readable() {
+        let entries: [FsEntry; 0] = [];
+        let input = LocationBrowserInput {
+            id_salt: "test",
+            kind: LocationSourceKind::Local,
+            roots: true,
+            path: "",
+            parent: None,
+            entries: &entries,
+            error: None,
+            busy: false,
+            confirm_label: "Odaberi",
+            max_tree_height: None,
+        };
+        assert_eq!(location_label(&input), "Računalo");
+    }
 }
