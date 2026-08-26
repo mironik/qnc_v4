@@ -16,6 +16,7 @@ mod source_import_command;
 mod source_import_selection;
 mod source_import_state;
 mod source_import_status;
+mod sync_cover_capture;
 mod theme_picker;
 
 pub(crate) use editorial_broadcast_program::{
@@ -41,4 +42,7 @@ pub(crate) use source_import_command::{SourceImportCommandComponent, SourceImpor
 pub(crate) use source_import_selection::SourceImportSelectionComponent;
 pub(crate) use source_import_state::{SourceImportStateComponent, SourceImportStateKind};
 pub(crate) use source_import_status::SourceImportStatusComponent;
+pub(crate) use sync_cover_capture::{
+    SyncCoverCaptureComponent, SyncCoverCaptureState, SyncCoverPreviewInput, SyncCoverSpaceContext,
+};
 pub(crate) use theme_picker::ThemePickerComponent;

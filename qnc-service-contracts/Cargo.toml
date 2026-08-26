@@ -1,6 +1,6 @@
 [package]
 name = "qnc-service-contracts"
-version = "0.5.0"
+version = "0.5.1"
 edition = "2021"
 description = "Neutral QNC service contracts for media, AI, search, and remote adapters"
 

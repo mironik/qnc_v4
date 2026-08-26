@@ -31,6 +31,7 @@ pub(crate) struct SegmentPanelInput<'a> {
     pub a2_peaks: &'a [f32],
     pub selected_slot_id: &'a str,
     pub selected_cover_id: &'a str,
+    pub sync_cover_enabled: bool,
     pub tc: &'a dyn Fn(f64) -> String,
 }
 
@@ -173,6 +174,7 @@ pub(crate) fn show(ui: &mut egui::Ui, input: SegmentPanelInput<'_>) -> SegmentPa
                                     virtual_frame: input.virtual_frame,
                                     playhead_sec: input.playhead_sec,
                                     tc: input.tc,
+                                    sync_cover_enabled: input.sync_cover_enabled,
                                 },
                             );
                             if !matches!(marker_action, marker_cover_panel::MarkerCoverAction::None)

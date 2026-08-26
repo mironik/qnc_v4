@@ -22,22 +22,22 @@ pub(super) fn quick_cover_target(
     marker_slots: &[MarkerSlot],
 ) -> Result<CoverTarget, String> {
     let selected_slot_id = selected_slot_id.trim();
-    let selected_empty_slot = marker_slots.iter().find(|slot| {
-        slot.slot_id == selected_slot_id && !slot.has_cover && !slot.slot_id.trim().is_empty()
-    });
-    let slot_id = if let Some(slot) = selected_empty_slot {
-        slot.slot_id.clone()
-    } else {
-        first_empty_marker_slot(marker_slots)
-            .map(|slot| slot.slot_id.clone())
-            .unwrap_or_default()
+    if selected_slot_id.is_empty() {
+        return Err("Odaberi marker slot za pokrivalicu".into());
+    }
+    let Some(slot) = marker_slots
+        .iter()
+        .find(|slot| slot.slot_id == selected_slot_id && !slot.slot_id.trim().is_empty())
+    else {
+        return Err("Odabrani marker slot nije dostupan".into());
     };
-
-    if slot_id.trim().is_empty() {
-        return Err("Nema marker slota za pokrivalicu".into());
+    if slot.has_cover {
+        return Err("Odabrani marker slot već ima pokrivalicu".into());
     }
 
-    Ok(CoverTarget { slot_id })
+    Ok(CoverTarget {
+        slot_id: slot.slot_id.clone(),
+    })
 }
 
 pub(super) fn overwrite_cover_target(
@@ -51,13 +51,14 @@ pub(super) fn overwrite_cover_target(
     } else if let Some(slot_id) = selected_cover_slot_id(selected_cover_id, covers) {
         slot_id.to_string()
     } else {
-        first_empty_marker_slot(marker_slots)
-            .map(|slot| slot.slot_id.clone())
-            .unwrap_or_default()
+        String::new()
     };
 
     if slot_id.trim().is_empty() {
         return Err("Odaberi marker slot za pokrivalicu".into());
+    }
+    if !marker_slots.is_empty() && marker_slots.iter().all(|slot| slot.slot_id != slot_id) {
+        return Err("Odabrani marker slot nije dostupan".into());
     }
 
     Ok(CoverTarget { slot_id })
@@ -93,12 +94,6 @@ pub(super) fn cover_source_range(
         fps,
         source_timebase,
     })
-}
-
-fn first_empty_marker_slot(marker_slots: &[MarkerSlot]) -> Option<&MarkerSlot> {
-    marker_slots
-        .iter()
-        .find(|slot| !slot.has_cover && !slot.slot_id.trim().is_empty())
 }
 
 fn selected_cover_slot_id<'a>(
@@ -141,7 +136,7 @@ mod tests {
     }
 
     #[test]
-    fn quick_cover_skips_selected_filled_slot() {
+    fn quick_cover_rejects_selected_filled_slot() {
         let slots = vec![
             MarkerSlot {
                 slot_id: "slot_a".into(),
@@ -155,13 +150,13 @@ mod tests {
             },
         ];
 
-        let target = quick_cover_target("slot_a", &slots).unwrap();
+        let err = quick_cover_target("slot_a", &slots).unwrap_err();
 
-        assert_eq!(target.slot_id, "slot_b");
+        assert!(err.contains("već ima pokrivalicu"));
     }
 
     #[test]
-    fn quick_cover_uses_first_empty_slot_when_none_selected() {
+    fn quick_cover_requires_selected_slot_when_empty_slot_exists() {
         let slots = vec![
             MarkerSlot {
                 slot_id: "slot_a".into(),
@@ -179,9 +174,9 @@ mod tests {
             },
         ];
 
-        let target = quick_cover_target("", &slots).unwrap();
+        let err = quick_cover_target("", &slots).unwrap_err();
 
-        assert_eq!(target.slot_id, "slot_b");
+        assert!(err.contains("Odaberi marker slot"));
     }
 
     #[test]
@@ -196,7 +191,7 @@ mod tests {
 
         let err = quick_cover_target("", &slots).unwrap_err();
 
-        assert!(err.contains("marker slota"));
+        assert!(err.contains("Odaberi marker slot"));
     }
 
     #[test]

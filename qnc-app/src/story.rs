@@ -30,7 +30,8 @@ use crate::components::{
     EditorialPlaybackTransportComponent, EditorialPlaybackView, EditorialPlaylistProgramInput,
     EditorialTogglePlayInput, EditorialTogglePlayOutcome, EditorialWrapRefreshInput,
     EditorialWrapRefreshOutcome, EditorialWrapSessionInput, EditorialWrapSessionOutcome,
-    PlaybackMediaResolution, PlaybackMediaResolverComponent,
+    PlaybackMediaResolution, PlaybackMediaResolverComponent, SyncCoverCaptureComponent,
+    SyncCoverCaptureState, SyncCoverPreviewInput, SyncCoverSpaceContext,
 };
 use crate::composition::EditorialRole;
 use crate::editorial::common::{shot_id, truncate};
@@ -134,6 +135,7 @@ pub struct StoryScreen {
     /// only this map, never snapshot play_path.
     playlist_playback_inputs: HashMap<String, String>,
     pending_playlist_playback_input_clip_ids: HashSet<String>,
+    sync_cover: SyncCoverCaptureState,
     story_summary: String,
     draft_status: String,
     pending_wrap_scrub_part_id: Option<String>,
@@ -247,6 +249,7 @@ impl StoryScreen {
             pending_play_input_clip_id: String::new(),
             playlist_playback_inputs: HashMap::new(),
             pending_playlist_playback_input_clip_ids: HashSet::new(),
+            sync_cover: SyncCoverCaptureState::default(),
             story_summary: String::new(),
             draft_status: "draft".into(),
             pending_wrap_scrub_part_id: None,
@@ -908,6 +911,13 @@ impl StoryScreen {
     }
 
     fn apply_story_state(&mut self, state: &Value) {
+        let sync_ready_slot_id = self
+            .sync_cover
+            .ready_cover()
+            .map(|ready| ready.slot_id.clone());
+        let sync_holds_slot_selection = self.sync_cover.active().is_some()
+            || self.sync_cover.pending_slot().is_some()
+            || sync_ready_slot_id.is_some();
         let update = story_state::parse_state(state, self.timeline.as_ref());
         let active_thumb_ids = story_thumb_ids(&update.all_clips, &update.virtual_shots);
         let thumbnail_queue = story_state::thumbnail_queue_delta(
@@ -925,8 +935,21 @@ impl StoryScreen {
         self.covers = update.covers;
         self.markers = update.markers;
         self.marker_slots = update.marker_slots;
-        self.selected_cover_id = update.selected_cover_id;
-        self.selected_slot_id = update.selected_slot_id;
+        if sync_holds_slot_selection {
+            self.selected_cover_id.clear();
+            self.selected_slot_id.clear();
+            self.selected_marker_id.clear();
+            if let Some(slot_id) = sync_ready_slot_id.filter(|slot_id| {
+                self.marker_slots
+                    .iter()
+                    .any(|slot| slot.slot_id == *slot_id && !slot.has_cover)
+            }) {
+                self.selected_slot_id = slot_id;
+            }
+        } else {
+            self.selected_cover_id = update.selected_cover_id;
+            self.selected_slot_id = update.selected_slot_id;
+        }
         self.draft_status = update.draft_status;
         self.story_summary = update.story_summary;
         self.thumb_textures
@@ -1245,6 +1268,11 @@ impl StoryScreen {
                 PlaybackTransportIntent::None
             }
             EditorialEditKind::CreateMarker => {
+                if self.sync_cover.pending_slot().is_some() {
+                    return self
+                        .try_select_pending_sync_slot()
+                        .unwrap_or(PlaybackTransportIntent::None);
+                }
                 self.status = format!("Marker @ {}", self.tc(self.virtual_sec()));
                 PlaybackTransportIntent::None
             }
@@ -1348,6 +1376,8 @@ impl StoryScreen {
         self.selected_shot_out_frame = selection.shot_out_frame;
         self.mark_in_set = false;
         self.mark_out_set = false;
+        let sync_source_end_frame = source_shot_end_frame(shot);
+        let sync_selected_from_virtual_tab = self.library_tab == LibraryTab::Virtual;
         self.focus.clear();
         self.selected_source_ref = Some(selection.source_ref);
         self.selected_source_timebase = BroadcastSourceTimebase::from_i64(
@@ -1360,6 +1390,13 @@ impl StoryScreen {
         self.selected_source_audio_channels = shot.audio_channels;
         self.source_timebase_ready = self.selected_source_timebase.is_valid();
         self.set_source_playhead_frame(selection.shot_in_frame);
+        SyncCoverCaptureComponent::auto_arm_source_selection(
+            &mut self.sync_cover,
+            &selection.clip_id,
+            selection.shot_in_frame,
+            sync_source_end_frame,
+            sync_selected_from_virtual_tab,
+        );
         if self.waveform_clip_id != selection.clip_id {
             self.a1_peaks.clear();
             self.a2_peaks.clear();
@@ -1396,6 +1433,7 @@ impl StoryScreen {
         self.selected_shot_out_frame = out_frame;
         self.mark_in_set = false;
         self.mark_out_set = false;
+        let sync_selected_from_virtual_tab = self.library_tab == LibraryTab::Virtual;
         self.focus.clear();
         self.selected_source_ref = None;
         self.selected_source_timebase = BroadcastSourceTimebase::default();
@@ -1404,6 +1442,13 @@ impl StoryScreen {
         self.selected_source_audio_channels = shot.audio_channels;
         self.source_timebase_ready = false;
         self.set_source_playhead_frame(in_frame);
+        SyncCoverCaptureComponent::auto_arm_source_selection(
+            &mut self.sync_cover,
+            clip_id,
+            in_frame,
+            out_frame,
+            sync_selected_from_virtual_tab,
+        );
         if self.waveform_clip_id != clip_id {
             self.a1_peaks.clear();
             self.a2_peaks.clear();
@@ -1973,6 +2018,10 @@ impl StoryScreen {
         playlist_input_active: bool,
         playlist_input_playing: bool,
     ) -> PlaybackTransportIntent {
+        if self.sync_cover.active().is_some() || self.sync_cover_should_start_on_space() {
+            return self
+                .sync_cover_toggle_play_intent(playlist_input_active, playlist_input_playing);
+        }
         self.toggle_play_intent_for_input(playlist_input_active, playlist_input_playing)
     }
 
@@ -2006,6 +2055,11 @@ impl StoryScreen {
             ViewMode::Wrap => {
                 if let Some(segment) = self.playlist_segment_at_frame(frame) {
                     self.selected_part_id = segment.part_id.clone();
+                }
+                if let Some(session) = self.sync_cover.active() {
+                    let source_frame =
+                        SyncCoverCaptureComponent::source_frame_at_program_frame(session, frame);
+                    self.set_source_playhead_frame(source_frame);
                 }
                 self.set_wrap_playhead_frame(frame);
             }
@@ -2340,6 +2394,7 @@ impl StoryScreen {
                 a2_peaks: &program_waveform.a2_peaks,
                 selected_slot_id: &self.selected_slot_id,
                 selected_cover_id: &self.selected_cover_id,
+                sync_cover_enabled: self.sync_cover.enabled(),
                 tc: &tc,
             },
         );
@@ -2378,6 +2433,9 @@ impl StoryScreen {
             }
             marker_cover_panel::MarkerCoverAction::CreateCover => self.quick_cover(host),
             marker_cover_panel::MarkerCoverAction::OverwriteCover => self.overwrite_cover(host),
+            marker_cover_panel::MarkerCoverAction::ToggleSyncCover => {
+                self.toggle_sync_cover_capture()
+            }
         }
     }
 
@@ -2481,6 +2539,9 @@ impl StoryScreen {
     }
 
     pub(crate) fn playlist_input_preload_intent(&mut self) -> PlaybackTransportIntent {
+        if self.sync_cover.active().is_some() || self.sync_cover.pending_slot().is_some() {
+            return PlaybackTransportIntent::None;
+        }
         if !self.playlist_input_available() {
             return PlaybackTransportIntent::None;
         }
@@ -2682,13 +2743,13 @@ impl StoryScreen {
         match action {
             playback_controls::PlaybackAction::TogglePlay => PlaybackTransportIntent::TogglePlay,
             playback_controls::PlaybackAction::MarkIn => self.mark_in_action(host),
-            playback_controls::PlaybackAction::MarkOut => self.mark_out_action(host),
+            playback_controls::PlaybackAction::MarkOut => self.mark_out_or_sync_end(host),
             playback_controls::PlaybackAction::SelectMarkIn => self.select_mark_in(host),
             playback_controls::PlaybackAction::SelectMarkOut => self.select_mark_out(host),
             playback_controls::PlaybackAction::FocusNext => self.focus_adjacent_panel(host, 1),
             playback_controls::PlaybackAction::FocusPrev => self.focus_adjacent_panel(host, -1),
             playback_controls::PlaybackAction::ActivateFocusedItem => {
-                self.activate_focused_panel_item(host)
+                self.sync_cover_enter_or_activate_focused_item(host)
             }
             playback_controls::PlaybackAction::ClearFocus => {
                 if !self.focus.is_playhead() {
@@ -2918,6 +2979,25 @@ impl StoryScreen {
         }
     }
 
+    fn sync_cover_enter_or_activate_focused_item(
+        &mut self,
+        host: &HostClient,
+    ) -> PlaybackTransportIntent {
+        if self.sync_cover.active().is_some() {
+            self.status = "Sync play je aktivan · OUT završava slot".into();
+            return PlaybackTransportIntent::None;
+        }
+        if self.sync_cover.pending_slot().is_some() {
+            if self.try_select_pending_sync_slot().is_none() {
+                return PlaybackTransportIntent::None;
+            }
+        }
+        if self.sync_cover.ready_cover().is_some() {
+            return self.commit_sync_cover_with_enter(host);
+        }
+        self.activate_focused_panel_item(host)
+    }
+
     #[allow(dead_code)]
     fn edit_focus_chain(&self) -> Vec<FocusTarget> {
         let mut chain = vec![FocusTarget::Playhead];
@@ -3058,6 +3138,10 @@ impl StoryScreen {
                     self.source_out_frame = clip_end.max(self.source_in_frame + 1);
                 }
                 self.mark_in_set = true;
+                if self.sync_cover.enabled() {
+                    self.sync_cover
+                        .arm_source_in(&self.selected_clip_id, self.source_in_frame);
+                }
                 // Stay on playhead — select_mark_in later for frame edit focus.
                 self.focus.clear();
                 self.status = format!(
@@ -3094,6 +3178,13 @@ impl StoryScreen {
                 }
             }
         }
+    }
+
+    fn mark_out_or_sync_end(&mut self, host: &HostClient) -> PlaybackTransportIntent {
+        if self.sync_cover.active().is_some() {
+            return self.finish_sync_cover_with_out(host);
+        }
+        self.mark_out_action(host)
     }
 
     fn mark_out_action(&mut self, _host: &HostClient) -> PlaybackTransportIntent {
@@ -3515,6 +3606,257 @@ impl StoryScreen {
         self.status = format!("Spremam marker @ {}", self.tc(self.virtual_sec()));
     }
 
+    fn toggle_sync_cover_capture(&mut self) -> PlaybackTransportIntent {
+        let enabled = !self.sync_cover.enabled();
+        let was_active = self.sync_cover.set_enabled(enabled);
+        if enabled {
+            self.status = "Sync uključen · Source IN armira Sync play".into();
+            return PlaybackTransportIntent::None;
+        }
+        if was_active {
+            self.playing = false;
+            self.status = "Sync prekinut".into();
+            return PlaybackTransportIntent::Pause;
+        }
+        self.status = "Sync isključen".into();
+        PlaybackTransportIntent::None
+    }
+
+    fn sync_cover_should_start_on_space(&self) -> bool {
+        SyncCoverCaptureComponent::should_start_on_space(
+            &self.sync_cover,
+            SyncCoverSpaceContext {
+                view_is_source: self.view_mode == ViewMode::Source,
+                source_dock_keyboard_focus: self.source_dock_keyboard_focus,
+                source_clip_id: &self.selected_clip_id,
+            },
+        )
+    }
+
+    fn sync_cover_toggle_play_intent(
+        &mut self,
+        playlist_input_active: bool,
+        playlist_input_playing: bool,
+    ) -> PlaybackTransportIntent {
+        if self.sync_cover.active().is_some() && (playlist_input_playing || self.playing) {
+            self.playing = false;
+            self.status = "Sync pauza".into();
+            return PlaybackTransportIntent::Pause;
+        }
+        if self.sync_cover.active().is_some() && playlist_input_active {
+            self.playing = true;
+            self.status = "Sync play".into();
+            return PlaybackTransportIntent::PlayLoadedInput;
+        }
+        let Some(source_in_frame) = self
+            .sync_cover
+            .armed_source_in_frame(&self.selected_clip_id)
+        else {
+            return self
+                .toggle_play_intent_for_input(playlist_input_active, playlist_input_playing);
+        };
+        if !self.sync_cover_should_start_on_space() {
+            return self
+                .toggle_play_intent_for_input(playlist_input_active, playlist_input_playing);
+        }
+        self.selected_slot_id.clear();
+        self.selected_cover_id.clear();
+        self.selected_marker_id.clear();
+        if !self.request_sync_cover_playback_inputs() {
+            return PlaybackTransportIntent::None;
+        }
+        let input = SyncCoverPreviewInput {
+            project_id: &self.project_id,
+            program_id: self.edit_instance_id(),
+            start_program_frame: self.wrap_playhead_frame,
+            playlist: self.playlist.as_ref(),
+            marker_slots: &self.marker_slots,
+            covers: &self.covers,
+            markers: &self.markers,
+            all_clips: &self.all_clips,
+            virtual_shots: &self.virtual_shots,
+            playback_inputs: &self.playlist_playback_inputs,
+            source_clip_id: &self.selected_clip_id,
+            source_in_frame,
+            source_duration_frames: self.selected_clip_duration_frames(),
+            source_timebase: self.selected_source_timebase,
+        };
+        let outcome = match SyncCoverCaptureComponent::build_preview(input) {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                self.status = error;
+                return PlaybackTransportIntent::None;
+            }
+        };
+        let anchor_program_frame = outcome.session.anchor_program_frame;
+        let source_in_frame = outcome.session.source_in_frame;
+        if let Some(part_id) = self
+            .segment_program_model()
+            .active_part_at_program_frame(anchor_program_frame)
+            .map(|segment| segment.part_id.clone())
+        {
+            self.selected_part_id = part_id;
+        }
+        self.view_mode = ViewMode::Wrap;
+        self.source_dock_keyboard_focus = false;
+        self.panel_focus = PanelFocus::SegmentPanel;
+        self.set_wrap_playhead_frame(anchor_program_frame);
+        self.set_source_playhead_frame(source_in_frame);
+        self.playing = true;
+        self.sync_cover.set_active(outcome.session);
+        self.status = "Sync play · OUT završava slot".into();
+        PlaybackTransportIntent::PlayProgram(outcome.request)
+    }
+
+    fn request_sync_cover_playback_inputs(&mut self) -> bool {
+        let playlist_ready = self.request_playlist_playback_inputs();
+        let clip_id = self.selected_clip_id.trim().to_string();
+        if clip_id.is_empty() {
+            self.status = "Odaberi source klip za Sync".into();
+            return false;
+        }
+        if self
+            .playlist_playback_inputs
+            .get(&clip_id)
+            .is_some_and(|input| !input.trim().is_empty())
+        {
+            return playlist_ready;
+        }
+        if self.selected_play_input_clip_id == clip_id && !self.selected_play_path.trim().is_empty()
+        {
+            self.playlist_playback_inputs
+                .insert(clip_id, self.selected_play_path.trim().to_string());
+            return playlist_ready;
+        }
+        self.request_playback_input_for_selected_clip();
+        self.status = "Sync · čekam source media resolve".into();
+        false
+    }
+
+    fn finish_sync_cover_with_out(&mut self, host: &HostClient) -> PlaybackTransportIntent {
+        let Some(session) = self.sync_cover.active().cloned() else {
+            return self.mark_out_action(host);
+        };
+        let duration_frames = self
+            .playlist
+            .as_ref()
+            .map(|playlist| playlist.duration_frames)
+            .unwrap_or_else(|| self.segment_program_model().duration_frames())
+            .max(session.anchor_program_frame + 1);
+        let pending = match SyncCoverCaptureComponent::pending_slot(
+            &session,
+            self.wrap_playhead_frame,
+            duration_frames,
+        ) {
+            Ok(pending) => pending,
+            Err(error) => {
+                self.status = error;
+                return PlaybackTransportIntent::None;
+            }
+        };
+        self.set_wrap_playhead_frame(pending.timeline_end_frame);
+        self.source_in_frame = pending.source_in_frame;
+        self.source_out_frame = pending.source_out_frame;
+        self.set_source_playhead_frame(pending.source_out_frame);
+        self.mark_in_set = true;
+        self.mark_out_set = true;
+        self.focus.clear();
+        self.sync_cover.set_pending_slot(pending.clone());
+        self.playing = false;
+        if self.try_select_pending_sync_slot().is_some() {
+            self.status = "Sync slot odabran · Enter dodaje pokrivalicu".into();
+            return PlaybackTransportIntent::Pause;
+        }
+        if !self
+            .markers
+            .iter()
+            .any(|marker| marker.timeline_frame == pending.timeline_end_frame)
+        {
+            self.marker_at_head(host);
+        }
+        self.status = "Sync OUT spremljen · čekam novi M-M slot".into();
+        PlaybackTransportIntent::Pause
+    }
+
+    fn try_select_pending_sync_slot(&mut self) -> Option<PlaybackTransportIntent> {
+        let pending = self.sync_cover.take_pending_slot()?;
+        let plan = match SyncCoverCaptureComponent::slot_plan(&pending, &self.marker_slots) {
+            Ok(plan) => plan,
+            Err(error) => {
+                self.sync_cover.restore_pending_slot(pending);
+                self.status = error;
+                return None;
+            }
+        };
+        let ready = SyncCoverCaptureComponent::ready_cover(&pending, &plan);
+        self.selected_slot_id = plan.slot_id;
+        self.selected_cover_id.clear();
+        self.source_in_frame = pending.source_in_frame;
+        self.source_out_frame = pending.source_out_frame;
+        self.set_source_playhead_frame(pending.source_out_frame);
+        self.mark_in_set = true;
+        self.mark_out_set = true;
+        self.sync_cover.set_ready_cover(ready);
+        self.status = "Sync slot odabran · Enter dodaje pokrivalicu".into();
+        Some(self.playlist_input_preload_intent())
+    }
+
+    fn commit_sync_cover_with_enter(&mut self, _host: &HostClient) -> PlaybackTransportIntent {
+        let Some(ready) = self.sync_cover.take_ready_cover() else {
+            return PlaybackTransportIntent::None;
+        };
+        let Some(slot) = self
+            .marker_slots
+            .iter()
+            .find(|slot| slot.slot_id == ready.slot_id && !slot.slot_id.trim().is_empty())
+        else {
+            self.sync_cover.set_ready_cover(ready);
+            self.status = "Sync slot još nije dostupan".into();
+            return PlaybackTransportIntent::None;
+        };
+        if slot.has_cover {
+            self.status = "Sync slot već ima pokrivalicu".into();
+            return PlaybackTransportIntent::None;
+        }
+        let Some(source_fps) = ready.source_timebase.fps() else {
+            self.sync_cover.set_ready_cover(ready);
+            self.status = "Source FPS još nije potvrđen".into();
+            return PlaybackTransportIntent::None;
+        };
+        let slot_id = ready.slot_id.clone();
+        let clip_id = ready.source_clip_id.clone();
+        let source = story_edit::CoverSourceRange {
+            clip_id: clip_id.clone(),
+            in_frame: ready.source_in_frame,
+            out_frame: ready.source_out_frame,
+            fps: source_fps,
+            source_timebase: ready.source_timebase,
+        };
+        self.selected_slot_id = slot_id.clone();
+        self.selected_cover_id.clear();
+        self.selected_marker_id.clear();
+        self.selected_clip_id = clip_id.clone();
+        self.source_in_frame = ready.source_in_frame;
+        self.source_out_frame = ready.source_out_frame;
+        self.set_source_playhead_frame(ready.source_out_frame);
+        self.mark_in_set = true;
+        self.mark_out_set = true;
+        self.enqueue_edit_command(|instance, request, project| {
+            EditorialEditComponent::create_cover_from_source(
+                instance,
+                request,
+                project,
+                &slot_id,
+                &clip_id,
+                source.in_frame,
+                source.out_frame,
+            )
+        });
+        let intent = self.add_pending_cover_projection(&slot_id, &source);
+        self.status = "Sync pokrivalica dodana u slot · spremam...".into();
+        intent
+    }
+
     fn delete_marker(&mut self, _host: &HostClient, marker_id: &str) {
         if marker_id.trim().is_empty() {
             return;
@@ -3699,6 +4041,14 @@ impl StoryScreen {
     fn quick_cover(&mut self, _host: &HostClient) -> PlaybackTransportIntent {
         if self.project_id.trim().is_empty() {
             self.status = "Nema otvorenog projekta".into();
+            return PlaybackTransportIntent::None;
+        }
+        if self.sync_cover.ready_cover().is_some() {
+            self.status = "Sync slot čeka Enter".into();
+            return PlaybackTransportIntent::None;
+        }
+        if self.sync_cover.pending_slot().is_some() && self.try_select_pending_sync_slot().is_none()
+        {
             return PlaybackTransportIntent::None;
         }
         let target =
@@ -4082,7 +4432,7 @@ impl crate::player_bridge::PlayerClient for StoryScreen {
 mod tests {
     use super::*;
     use crate::api::{EditorialSourceTimebase, TimelineSegment};
-    use crate::player_remote::{PlayerEvent, PROGRAM_AUDIO_OUTPUT_CH1};
+    use crate::player_remote::{PlayerEvent, PROGRAM_AUDIO_OUTPUT_CH1, PROGRAM_AUDIO_OUTPUT_CH2};
     use qnc_player_core::FieldMode;
     use serde_json::json;
 
@@ -4308,6 +4658,185 @@ mod tests {
             has_audio: Some(true),
             audio_channels: Some(2),
         }
+    }
+
+    fn sync_story_screen() -> StoryScreen {
+        let mut screen = StoryScreen::story();
+        screen.project_id = "p".into();
+        screen.loaded_project_id = "p".into();
+        screen.state_loaded = true;
+        screen.initial_selection_done = true;
+        screen.view_mode = ViewMode::Source;
+        screen.source_dock_keyboard_focus = true;
+        screen.panel_focus = PanelFocus::SourceTimeline;
+        screen.timeline = Some(two_part_timeline());
+        screen.playlist = Some(two_part_playlist());
+        screen.parts = vec![
+            StoryPart {
+                part_id: "part_a".into(),
+                clip_id: "clip_a".into(),
+                in_frame: 100,
+                out_frame: 150,
+                fps: 50.0,
+                duration_frames: 50,
+                ..StoryPart::default()
+            },
+            StoryPart {
+                part_id: "part_b".into(),
+                clip_id: "clip_a".into(),
+                in_frame: 200,
+                out_frame: 250,
+                fps: 50.0,
+                duration_frames: 50,
+                ..StoryPart::default()
+            },
+        ];
+        screen.marker_slots = vec![
+            MarkerSlot {
+                slot_id: "slot_a".into(),
+                start_frame: 0,
+                end_frame: 50,
+                has_cover: false,
+                ..MarkerSlot::default()
+            },
+            MarkerSlot {
+                slot_id: "slot_b".into(),
+                start_frame: 50,
+                end_frame: 100,
+                has_cover: false,
+                ..MarkerSlot::default()
+            },
+        ];
+        screen.markers = vec![
+            StoryMarker {
+                marker_id: "m0".into(),
+                timeline_frame: 0,
+                part_id: "part_a".into(),
+                ..StoryMarker::default()
+            },
+            StoryMarker {
+                marker_id: "m50".into(),
+                timeline_frame: 50,
+                part_id: "part_b".into(),
+                ..StoryMarker::default()
+            },
+        ];
+        screen.all_clips = vec![
+            StoryShot {
+                shot_id: "clip_a".into(),
+                root_shot_id: "clip_a".into(),
+                clip_id: "clip_a".into(),
+                fps: 50.0,
+                source_timebase: tb50(),
+                in_frame: 0,
+                out_frame: 300,
+                duration_frames: 300,
+                play_path: "C:/qnc/proxy/clip_a.mp4".into(),
+                has_audio: true,
+                audio_channels: 2,
+                ..StoryShot::default()
+            },
+            StoryShot {
+                shot_id: "cover_a".into(),
+                root_shot_id: "cover_a".into(),
+                clip_id: "cover_a".into(),
+                fps: 50.0,
+                source_timebase: tb50(),
+                in_frame: 0,
+                out_frame: 300,
+                duration_frames: 300,
+                play_path: "C:/qnc/proxy/cover_a.mp4".into(),
+                has_audio: true,
+                audio_channels: 2,
+                ..StoryShot::default()
+            },
+        ];
+        screen.selected_clip_id = "cover_a".into();
+        screen.selected_shot_id = "cover_a".into();
+        screen.selected_source_fps = 50.0;
+        screen.selected_source_timebase = source_tb50();
+        screen.source_timebase_ready = true;
+        screen.selected_source_has_audio = true;
+        screen.selected_source_audio_channels = 2;
+        screen.source_in_frame = 0;
+        screen.source_out_frame = 300;
+        screen.source_playhead_frame = 24;
+        screen.wrap_playhead_frame = 30;
+        screen.selected_source_ref = BroadcastHostSourceRef::from_frame_fields(
+            "p",
+            "cover_a",
+            "",
+            "cover_a",
+            Some(FrameNumber(0)),
+            Some(FrameNumber(300)),
+            FrameNumber(300),
+        )
+        .ok();
+        screen.selected_play_path = "C:/qnc/proxy/cover_a.mp4".into();
+        seed_playlist_playback_inputs(&mut screen, &["clip_a", "cover_a"]);
+        screen
+    }
+
+    fn sync_marker_state_with_slot(end_frame: i64) -> Value {
+        json!({
+            "selected_part_id": "part_a",
+            "selected_slot_id": "",
+            "parts": [{
+                "part_id": "part_a",
+                "kind": "tonovi",
+                "clip_id": "clip_a",
+                "in_frame": 100,
+                "out_frame": 150,
+                "fps": 50.0,
+                "duration_frames": 50
+            }, {
+                "part_id": "part_b",
+                "kind": "tonovi",
+                "clip_id": "clip_a",
+                "in_frame": 200,
+                "out_frame": 250,
+                "fps": 50.0,
+                "duration_frames": 50
+            }],
+            "all_clips": [{
+                "shot_id": "clip_a",
+                "root_shot_id": "clip_a",
+                "clip_id": "clip_a",
+                "fps": 50.0,
+                "source_timebase": { "fps_num": 50, "fps_den": 1 },
+                "duration_frames": 300,
+                "play_path": "C:/qnc/proxy/clip_a.mp4",
+                "has_audio": true,
+                "audio_channels": 2
+            }, {
+                "shot_id": "cover_a",
+                "root_shot_id": "cover_a",
+                "clip_id": "cover_a",
+                "fps": 50.0,
+                "source_timebase": { "fps_num": 50, "fps_den": 1 },
+                "duration_frames": 300,
+                "play_path": "C:/qnc/proxy/cover_a.mp4",
+                "has_audio": true,
+                "audio_channels": 2
+            }],
+            "virtual_shots": [],
+            "covers": [],
+            "markers": [{
+                "marker_id": "m0",
+                "timeline_frame": 0,
+                "part_id": "part_a"
+            }, {
+                "marker_id": "m_end",
+                "timeline_frame": end_frame,
+                "part_id": "part_a"
+            }],
+            "marker_slots": [{
+                "slot_id": format!("slot_0_{end_frame}"),
+                "start_frame": 0,
+                "end_frame": end_frame,
+                "has_cover": false
+            }]
+        })
     }
 
     #[test]
@@ -4783,6 +5312,333 @@ mod tests {
         assert!(audio.has_audio);
         assert_eq!(audio.audio_channels, 2);
         assert_eq!(audio.audio_output_channel, Some(PROGRAM_AUDIO_OUTPUT_CH1));
+    }
+
+    #[test]
+    fn sync_enabled_without_source_in_keeps_source_space_normal() {
+        let mut screen = sync_story_screen();
+        screen.toggle_sync_cover_capture();
+
+        let intent = screen.playback_transport_toggle_intent(false, false);
+
+        assert_eq!(intent, PlaybackTransportIntent::TogglePlay);
+        assert_eq!(screen.view_mode, ViewMode::Source);
+        assert_eq!(screen.source_playhead_frame, 24);
+        assert!(screen.sync_cover.active().is_none());
+    }
+
+    #[test]
+    fn source_mark_in_arms_sync_and_space_builds_single_program_overlay() {
+        let mut screen = sync_story_screen();
+        screen.toggle_sync_cover_capture();
+        screen.source_playhead_frame = 24;
+
+        let mark_in_intent = screen.dispatch_playback_action(
+            &HostClient::new("http://127.0.0.1:1"),
+            playback_controls::PlaybackAction::MarkIn,
+        );
+        assert!(matches!(
+            mark_in_intent,
+            PlaybackTransportIntent::None | PlaybackTransportIntent::CueFrame(24)
+        ));
+        assert_eq!(screen.sync_cover.armed_source_in_frame("cover_a"), Some(24));
+
+        let intent = screen.playback_transport_toggle_intent(false, false);
+        let request = match intent {
+            PlaybackTransportIntent::PlayProgram(request) => request,
+            other => panic!("expected PlayProgram, got {other:?}"),
+        };
+
+        assert_eq!(screen.view_mode, ViewMode::Wrap);
+        assert_eq!(screen.wrap_playhead_frame, 0);
+        assert_eq!(screen.source_playhead_frame, 24);
+        assert!(screen.playing);
+        assert_eq!(request.start_program_frame, FrameNumber(0));
+        assert_eq!(request.items.len(), 2);
+        let preview_item = request
+            .items
+            .iter()
+            .find(|item| item.record_in_frame == FrameNumber(0))
+            .expect("preview item");
+        assert!(preview_item.sources.iter().any(|source| {
+            source.source_ref.clip_id == "clip_a"
+                && !source.has_video
+                && source.has_audio
+                && source.audio_output_channel == Some(PROGRAM_AUDIO_OUTPUT_CH1)
+        }));
+        let cover_video = preview_item
+            .sources
+            .iter()
+            .find(|source| {
+                source.source_ref.clip_id == "cover_a"
+                    && source.has_video
+                    && source.has_audio
+                    && source.audio_output_channel == Some(PROGRAM_AUDIO_OUTPUT_CH2)
+            })
+            .expect("cover video");
+        assert_eq!(cover_video.source_ref.in_frame, Some(FrameNumber(24)));
+        assert_eq!(cover_video.source_ref.out_frame, Some(FrameNumber(74)));
+    }
+
+    #[test]
+    fn sync_space_clears_stale_selected_slot_before_choosing_anchor_marker() {
+        let mut screen = sync_story_screen();
+        screen.marker_slots = vec![MarkerSlot {
+            slot_id: "old_slot_0_35".into(),
+            start_frame: 0,
+            end_frame: 35,
+            has_cover: false,
+            ..MarkerSlot::default()
+        }];
+        screen.markers = vec![
+            StoryMarker {
+                marker_id: "m0".into(),
+                timeline_frame: 0,
+                part_id: "part_a".into(),
+                ..StoryMarker::default()
+            },
+            StoryMarker {
+                marker_id: "m35".into(),
+                timeline_frame: 35,
+                part_id: "part_a".into(),
+                ..StoryMarker::default()
+            },
+        ];
+        screen.selected_slot_id = "old_slot_0_35".into();
+        screen.selected_cover_id = "old_cover".into();
+        screen.selected_marker_id = "old_marker".into();
+        screen.wrap_playhead_frame = 35;
+        screen.toggle_sync_cover_capture();
+        screen.source_playhead_frame = 24;
+        let _ = screen.dispatch_playback_action(
+            &HostClient::new("http://127.0.0.1:1"),
+            playback_controls::PlaybackAction::MarkIn,
+        );
+
+        let intent = screen.playback_transport_toggle_intent(false, false);
+        let request = match intent {
+            PlaybackTransportIntent::PlayProgram(request) => request,
+            other => panic!("expected PlayProgram, got {other:?}"),
+        };
+
+        assert_eq!(screen.selected_slot_id, "");
+        assert_eq!(screen.selected_cover_id, "");
+        assert_eq!(screen.selected_marker_id, "");
+        assert_eq!(screen.wrap_playhead_frame, 35);
+        assert_eq!(request.start_program_frame, FrameNumber(35));
+        assert_eq!(
+            screen
+                .sync_cover
+                .active()
+                .map(|session| session.anchor_program_frame),
+            Some(35)
+        );
+
+        screen.apply_story_state(&json!({
+            "selected_part_id": "part_a",
+            "selected_slot_id": "old_slot_0_35",
+            "selected_cover_id": "old_cover",
+            "parts": [],
+            "all_clips": [],
+            "virtual_shots": [],
+            "covers": [],
+            "markers": [{
+                "marker_id": "m0",
+                "timeline_frame": 0,
+                "part_id": "part_a"
+            }, {
+                "marker_id": "m35",
+                "timeline_frame": 35,
+                "part_id": "part_a"
+            }],
+            "marker_slots": [{
+                "slot_id": "old_slot_0_35",
+                "start_frame": 0,
+                "end_frame": 35,
+                "has_cover": false
+            }]
+        }));
+        assert_eq!(screen.selected_slot_id, "");
+        assert_eq!(screen.selected_cover_id, "");
+    }
+
+    #[test]
+    fn sync_play_blocks_normal_playlist_preload_from_replacing_pending_open() {
+        let mut screen = sync_story_screen();
+        screen.toggle_sync_cover_capture();
+        screen.source_playhead_frame = 24;
+        let _ = screen.dispatch_playback_action(
+            &HostClient::new("http://127.0.0.1:1"),
+            playback_controls::PlaybackAction::MarkIn,
+        );
+        let intent = screen.playback_transport_toggle_intent(false, false);
+        assert!(matches!(intent, PlaybackTransportIntent::PlayProgram(_)));
+
+        assert_eq!(
+            screen.playlist_input_preload_intent(),
+            PlaybackTransportIntent::None
+        );
+    }
+
+    #[test]
+    fn sync_pending_slot_blocks_quick_cover_fallback_until_materialized() {
+        let host = HostClient::new("http://127.0.0.1:1");
+        let mut screen = sync_story_screen();
+        screen.toggle_sync_cover_capture();
+        screen.source_playhead_frame = 24;
+        let _ = screen.dispatch_playback_action(&host, playback_controls::PlaybackAction::MarkIn);
+        let _ = screen.playback_transport_toggle_intent(false, false);
+        screen.sync_playhead_from_player_frame(FrameNumber(35));
+        let _ = screen.dispatch_playback_action(&host, playback_controls::PlaybackAction::MarkOut);
+        let _ = screen.drain_backend_commands();
+
+        let cover_intent =
+            screen.dispatch_playback_action(&host, playback_controls::PlaybackAction::QuickCover);
+
+        assert_eq!(cover_intent, PlaybackTransportIntent::None);
+        assert!(screen.drain_backend_commands().is_empty());
+        assert_eq!(screen.selected_slot_id, "");
+        assert_eq!(screen.status, "Sync slot još nije materijaliziran");
+    }
+
+    #[test]
+    fn sync_out_creates_marker_only_then_enter_fills_new_slot() {
+        let host = HostClient::new("http://127.0.0.1:1");
+        let mut screen = sync_story_screen();
+        screen.toggle_sync_cover_capture();
+        screen.source_playhead_frame = 24;
+        let _ = screen.dispatch_playback_action(&host, playback_controls::PlaybackAction::MarkIn);
+        let _ = screen.playback_transport_toggle_intent(false, false);
+        screen.sync_playhead_from_player_frame(FrameNumber(35));
+
+        let out_intent =
+            screen.dispatch_playback_action(&host, playback_controls::PlaybackAction::MarkOut);
+
+        assert_eq!(out_intent, PlaybackTransportIntent::Pause);
+        assert_eq!(screen.source_in_frame, 24);
+        assert_eq!(screen.source_out_frame, 59);
+        let commands = screen.drain_backend_commands();
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0].path, "/api/story/marker/create");
+        let marker_payload = commands[0].payload.as_ref().expect("marker payload");
+        assert_eq!(
+            marker_payload.get("timeline_frame").and_then(Value::as_i64),
+            Some(35)
+        );
+
+        let preload = screen.apply_editorial_edit_data(EditorialEditData {
+            instance_id: "story".into(),
+            project_id: "p".into(),
+            kind: EditorialEditKind::CreateMarker,
+            detail: "part_a".into(),
+            state: sync_marker_state_with_slot(35),
+        });
+        assert!(matches!(
+            preload,
+            PlaybackTransportIntent::PreloadProgram(_)
+        ));
+        assert_eq!(screen.selected_slot_id, "slot_0_35");
+        assert_eq!(screen.source_in_frame, 24);
+        assert_eq!(screen.source_out_frame, 59);
+
+        let shift_b_intent =
+            screen.dispatch_playback_action(&host, playback_controls::PlaybackAction::QuickCover);
+        assert_eq!(shift_b_intent, PlaybackTransportIntent::None);
+        assert!(screen.drain_backend_commands().is_empty());
+        assert_eq!(screen.status, "Sync slot čeka Enter");
+
+        let cover_intent = screen.dispatch_playback_action(
+            &host,
+            playback_controls::PlaybackAction::ActivateFocusedItem,
+        );
+
+        assert!(matches!(
+            cover_intent,
+            PlaybackTransportIntent::PreloadProgram(_)
+        ));
+        let commands = screen.drain_backend_commands();
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0].path, "/api/story/cover/create");
+        let cover_payload = commands[0].payload.as_ref().expect("cover payload");
+        assert_eq!(
+            cover_payload.get("slot_id").and_then(Value::as_str),
+            Some("slot_0_35")
+        );
+        assert_eq!(
+            cover_payload.get("clip_id").and_then(Value::as_str),
+            Some("cover_a")
+        );
+        assert_eq!(
+            cover_payload.get("in_frame").and_then(Value::as_i64),
+            Some(24)
+        );
+        assert_eq!(
+            cover_payload.get("out_frame").and_then(Value::as_i64),
+            Some(59)
+        );
+    }
+
+    #[test]
+    fn sync_auto_arms_virtual_tab_selection_but_not_all_tab_root_selection() {
+        let mut screen = StoryScreen::story();
+        screen.project_id = "p".into();
+        screen.loaded_project_id = "p".into();
+        screen.toggle_sync_cover_capture();
+        let root_shot = StoryShot {
+            shot_id: "root_a".into(),
+            root_shot_id: "root_a".into(),
+            clip_id: "clip_a".into(),
+            kind: "virtual".into(),
+            fps: 50.0,
+            source_timebase: tb50(),
+            in_frame: 0,
+            out_frame: 300,
+            duration_frames: 300,
+            play_path: "C:/qnc/proxy/clip_a.mp4".into(),
+            has_audio: true,
+            audio_channels: 2,
+            ..StoryShot::default()
+        };
+        let short_shot = StoryShot {
+            shot_id: "short_a".into(),
+            root_shot_id: "clip_a".into(),
+            clip_id: "clip_a".into(),
+            kind: "virtual".into(),
+            fps: 50.0,
+            source_timebase: tb50(),
+            in_frame: 80,
+            out_frame: 130,
+            duration_frames: 50,
+            play_path: "C:/qnc/proxy/clip_a.mp4".into(),
+            has_audio: true,
+            audio_channels: 2,
+            ..StoryShot::default()
+        };
+        screen.all_clips = vec![root_shot.clone()];
+        screen.virtual_shots = vec![short_shot.clone()];
+
+        screen.library_tab = LibraryTab::All;
+        screen.select_shot_from_snapshot(&root_shot);
+        assert_eq!(
+            screen.sync_cover.armed_source_in_frame("clip_a"),
+            None,
+            "All/source-root selection must not arm sync just because it is internally virtual"
+        );
+
+        screen.library_tab = LibraryTab::Virtual;
+        screen.select_shot_from_snapshot(&short_shot);
+        assert_eq!(screen.sync_cover.armed_source_in_frame("clip_a"), Some(80));
+
+        screen.source_playhead_frame = 92;
+        let intent = screen.dispatch_playback_action(
+            &HostClient::new("http://127.0.0.1:1"),
+            playback_controls::PlaybackAction::MarkIn,
+        );
+        assert!(matches!(
+            intent,
+            PlaybackTransportIntent::None | PlaybackTransportIntent::CueFrame(92)
+        ));
+        assert_eq!(screen.sync_cover.armed_source_in_frame("clip_a"), Some(92));
     }
 
     #[test]
@@ -5296,7 +6152,7 @@ mod tests {
     }
 
     #[test]
-    fn quick_cover_adds_to_empty_slot_when_another_slot_is_filled() {
+    fn quick_cover_does_not_fallback_to_empty_slot_when_selected_slot_is_filled() {
         let mut screen = StoryScreen::story();
         screen.project_id = "p".into();
         screen.loaded_project_id = "p".into();
@@ -5330,34 +6186,10 @@ mod tests {
         );
 
         assert_eq!(intent, PlaybackTransportIntent::None);
-        let commands = screen.drain_backend_commands();
-        assert_eq!(commands.len(), 1);
-        let payload = commands[0].payload.as_ref().expect("cover payload");
-        assert_eq!(
-            payload.get("slot_id").and_then(Value::as_str),
-            Some("slot_b")
-        );
-        assert_eq!(
-            payload.get("clip_id").and_then(Value::as_str),
-            Some("clip_a")
-        );
-        assert_eq!(payload.get("in_frame").and_then(Value::as_i64), Some(100));
-        assert_eq!(payload.get("out_frame").and_then(Value::as_i64), Some(150));
-        assert_eq!(screen.selected_slot_id, "slot_b");
-        assert_eq!(screen.covers.len(), 1);
-        assert_eq!(screen.covers[0].slot_id, "slot_b");
-        assert_eq!(screen.covers[0].clip_id, "clip_a");
-        assert_eq!(screen.covers[0].timeline_start_frame, 10);
-        assert_eq!(screen.covers[0].timeline_end_frame, 40);
-        assert_eq!(screen.covers[0].source_in_frame, 100);
-        assert_eq!(screen.covers[0].source_out_frame, 150);
-        assert!(screen
-            .marker_slots
-            .iter()
-            .any(|slot| slot.slot_id == "slot_b" && slot.has_cover));
-        assert!(screen
-            .selected_cover_id
-            .starts_with("pending-cover:slot_b:clip_a"));
+        assert!(screen.drain_backend_commands().is_empty());
+        assert_eq!(screen.selected_slot_id, "slot_a");
+        assert!(screen.covers.is_empty());
+        assert_eq!(screen.status, "Odabrani marker slot već ima pokrivalicu");
     }
 
     #[test]

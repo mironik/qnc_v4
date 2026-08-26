@@ -1,4 +1,4 @@
-# QNC — native (v0.5.0.1)
+# QNC — native (v0.5.1)
 
 Aktivna radna kopija: **`qnc-app` + `qnc-host`**. Web UI nije dio `qnc_v4`
 produkta i legacy `web-arhive/` folder nije prisutan u ovom treeu.
@@ -90,6 +90,14 @@ Manualni override je dopusten za deployment/proizvodne topologije:
 | `project`, `ingest`, `story` | produkt API |
 | `media_pool` (Rust) | shared helperi za Ingest/Story |
 | design-tools HTTP | API only (nema web UI) |
+
+## v0.5.1 — Sync cover checkpoint
+
+- Story Sync cover flow adds a standalone Sync button in the segment panel.
+- Sync play starts only after Source IN, uses one broadcast playlist input, and keeps frame-only source/program mapping.
+- Sync OUT creates only the marker; Enter commits the captured cover into the Sync-created slot.
+- Shift+B remains the normal cover command and no longer falls back to the first empty slot when no valid slot is selected.
+- Source-root shots in All do not auto-arm Sync; short virtual shots in Virtual can arm from their existing IN.
 
 ## v0.5.0.1 — Stability backup
 

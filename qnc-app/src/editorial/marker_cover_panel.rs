@@ -19,6 +19,7 @@ pub(crate) struct MarkerCoverInput<'a> {
     pub virtual_frame: i64,
     pub playhead_sec: f64,
     pub tc: &'a dyn Fn(f64) -> String,
+    pub sync_cover_enabled: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -34,6 +35,7 @@ pub(crate) enum MarkerCoverAction {
     AddMarker,
     CreateCover,
     OverwriteCover,
+    ToggleSyncCover,
 }
 
 pub(crate) fn show(ui: &mut egui::Ui, input: MarkerCoverInput<'_>) -> MarkerCoverAction {
@@ -54,6 +56,10 @@ pub(crate) fn show(ui: &mut egui::Ui, input: MarkerCoverInput<'_>) -> MarkerCove
                 .color(MUTED)
                 .small(),
         );
+        ui.add_space(8.0);
+        if compact_toggle_btn(ui, "Sync", input.sync_cover_enabled).clicked() {
+            action = MarkerCoverAction::ToggleSyncCover;
+        }
         let (row_rect, _) = ui.allocate_exact_size(
             Vec2::new(ui.available_width(), COMPACT_CTRL_H),
             Sense::hover(),
@@ -138,6 +144,22 @@ fn compact_action_btn(ui: &mut egui::Ui, label: &str) -> egui::Response {
             .fill(egui::Color32::TRANSPARENT)
             .stroke(egui::Stroke::new(1.0, t.border)),
     )
+}
+
+fn compact_toggle_btn(ui: &mut egui::Ui, label: &str, active: bool) -> egui::Response {
+    let t = qnc_theme::current(ui);
+    let fill = if active {
+        qnc_theme::ACCENT.gamma_multiply(0.55)
+    } else {
+        egui::Color32::TRANSPARENT
+    };
+    ui.add(
+        egui::Button::new(RichText::new(label).color(t.text).size(qnc_theme::FONT_UI))
+            .min_size(Vec2::new(0.0, COMPACT_CTRL_H))
+            .fill(fill)
+            .stroke(egui::Stroke::new(1.0, t.border)),
+    )
+    .on_hover_text("Sync pokrivalica")
 }
 
 fn compact_icon_btn(ui: &mut egui::Ui, icon: &str, tooltip: &str) -> egui::Response {
