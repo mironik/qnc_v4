@@ -11,8 +11,8 @@ use crate::editorial::types::{StoryCover, StoryShot};
 use crate::frame_time::normalize_fps;
 use crate::player_contract::{BroadcastHostSourceRef, BroadcastSourceTimebase, FrameNumber};
 use crate::player_remote::{
-    BroadcastProgramItem, BroadcastProgramOpenRequest, BroadcastProgramSource,
-    PROGRAM_AUDIO_OUTPUT_CH1, PROGRAM_AUDIO_OUTPUT_CH2,
+    BroadcastProgramItem, BroadcastProgramOpenRequest, BroadcastProgramPreviewVideoResolution,
+    BroadcastProgramSource, PROGRAM_AUDIO_OUTPUT_CH1, PROGRAM_AUDIO_OUTPUT_CH2,
 };
 use std::collections::HashMap;
 
@@ -73,6 +73,7 @@ impl EditorialProgramPlaybackComponent {
                     .max(0)
                     .min(duration_frames.saturating_sub(1)),
             ),
+            preview_video_resolution: BroadcastProgramPreviewVideoResolution::FastPreview,
             items,
         })
     }

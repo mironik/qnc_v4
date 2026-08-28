@@ -7,7 +7,8 @@ use crate::playback_routing::PlaybackTransportIntent;
 use crate::playback_stack::PlaybackStack;
 use crate::player_contract::{BroadcastHostSourceRef, BroadcastSourceTimebase, FrameNumber};
 use crate::player_remote::{
-    BroadcastProgramItem, BroadcastProgramOpenRequest, BroadcastProgramSource,
+    BroadcastProgramItem, BroadcastProgramOpenRequest, BroadcastProgramPreviewVideoResolution,
+    BroadcastProgramSource,
 };
 use crate::qnc_theme;
 
@@ -23,7 +24,6 @@ pub(crate) struct HiResPreviewOpen {
 pub(crate) struct HiResPreviewPlayerState {
     active: bool,
     input_ready: bool,
-    title: String,
     message: String,
 }
 
@@ -68,6 +68,7 @@ impl HiResPreviewPlayerComponent {
                 timeline_fps,
                 duration_frames: input.duration_frames.max(1),
                 start_program_frame: FrameNumber(0),
+                preview_video_resolution: BroadcastProgramPreviewVideoResolution::SourceRaster,
                 items,
             },
         })
@@ -80,11 +81,10 @@ impl HiResPreviewPlayerComponent {
     pub(crate) fn open(
         state: &mut HiResPreviewPlayerState,
         ctx: &egui::Context,
-        open: &HiResPreviewOpen,
+        _open: &HiResPreviewOpen,
     ) {
         state.active = true;
         state.input_ready = true;
-        state.title = format!("HI-res Preview · {}", open.preview_id);
         state.message = HIRES_PREVIEW_PLAY_HINT.into();
         ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(true));
         ctx.request_repaint();
@@ -93,7 +93,6 @@ impl HiResPreviewPlayerComponent {
     pub(crate) fn close(state: &mut HiResPreviewPlayerState, ctx: &egui::Context) {
         state.active = false;
         state.input_ready = false;
-        state.title.clear();
         state.message.clear();
         ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
         ctx.request_repaint();
@@ -112,7 +111,6 @@ impl HiResPreviewPlayerComponent {
         }
 
         let screen_rect = ctx.screen_rect();
-        let mut action = HiResPreviewPlayerAction::None;
         egui::Area::new(egui::Id::new("hires_preview_player.fullscreen"))
             .order(egui::Order::Foreground)
             .fixed_pos(screen_rect.min)
@@ -120,50 +118,32 @@ impl HiResPreviewPlayerComponent {
                 ui.set_min_size(screen_rect.size());
                 egui::Frame::NONE
                     .fill(Color32::BLACK)
-                    .inner_margin(egui::Margin::same(12))
+                    .inner_margin(egui::Margin::same(0))
                     .show(ui, |ui| {
-                        ui.vertical(|ui| {
-                            ui.horizontal(|ui| {
-                                ui.label(
-                                    RichText::new(&state.title)
-                                        .color(qnc_theme::TEXT)
-                                        .size(qnc_theme::FONT_UI + 2.0),
-                                );
-                                ui.with_layout(
-                                    egui::Layout::right_to_left(egui::Align::Center),
-                                    |ui| {
-                                        if ui.button("Close").clicked() {
-                                            action = HiResPreviewPlayerAction::Close;
-                                        }
-                                    },
-                                );
-                            });
-                            ui.add_space(8.0);
-                            let monitor_h = (ui.available_height() - 8.0).max(120.0);
-                            let empty_label = if state.message.trim().is_empty() {
-                                "Preview HI-res"
-                            } else {
-                                state.message.as_str()
-                            };
-                            if state.input_ready {
-                                playback.show_monitor(ui, monitor_h, empty_label);
-                            } else {
-                                ui.allocate_ui_with_layout(
-                                    egui::vec2(ui.available_width(), monitor_h),
-                                    egui::Layout::centered_and_justified(egui::Direction::TopDown),
-                                    |ui| {
-                                        ui.label(
-                                            RichText::new(empty_label)
-                                                .color(qnc_theme::MUTED)
-                                                .size(qnc_theme::FONT_UI + 2.0),
-                                        );
-                                    },
-                                );
-                            }
-                        });
+                        let monitor_h = ui.available_height().max(120.0);
+                        let empty_label = if state.message.trim().is_empty() {
+                            "Space to play"
+                        } else {
+                            state.message.as_str()
+                        };
+                        if state.input_ready {
+                            playback.show_monitor(ui, monitor_h, empty_label);
+                        } else {
+                            ui.allocate_ui_with_layout(
+                                egui::vec2(ui.available_width(), monitor_h),
+                                egui::Layout::centered_and_justified(egui::Direction::TopDown),
+                                |ui| {
+                                    ui.label(
+                                        RichText::new(empty_label)
+                                            .color(qnc_theme::MUTED)
+                                            .size(qnc_theme::FONT_UI + 2.0),
+                                    );
+                                },
+                            );
+                        }
                     });
             });
-        action
+        HiResPreviewPlayerAction::None
     }
 }
 
@@ -321,6 +301,10 @@ mod tests {
         assert_eq!(open.request.program_id, "hires-preview:preview_a");
         assert_eq!(open.request.timeline_fps, 50.0);
         assert_eq!(open.request.duration_frames, 100);
+        assert_eq!(
+            open.request.preview_video_resolution,
+            BroadcastProgramPreviewVideoResolution::SourceRaster
+        );
         assert_eq!(open.request.items.len(), 1);
         assert_eq!(open.request.items[0].sources.len(), 2);
         assert_eq!(

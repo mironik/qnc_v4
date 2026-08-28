@@ -196,6 +196,7 @@ pub struct QncBroadcastPlayer {
     event_fanout: EventFanout,
     remote: PlayerRemote,
     texture: Option<TextureHandle>,
+    last_logged_texture_size: Option<[usize; 2]>,
     snapshot: Arc<Mutex<PlayerSnapshot>>,
     transport_tick_gate: TransportTickGate,
 }
@@ -233,6 +234,7 @@ impl QncBroadcastPlayer {
             event_fanout: Arc::new(Mutex::new(Vec::new())),
             remote: PlayerRemote::new(),
             texture: None,
+            last_logged_texture_size: None,
             snapshot: Arc::new(Mutex::new(PlayerSnapshot::default())),
             transport_tick_gate: TransportTickGate::default(),
         }
@@ -292,6 +294,7 @@ impl QncBroadcastPlayer {
                 PlayerEvent::Stopped => {
                     crate::player_log::log_info("player", "Stopped");
                     self.texture = None;
+                    self.last_logged_texture_size = None;
                 }
                 PlayerEvent::Error(err) => {
                     crate::player_log::log_error("player", err);
@@ -345,6 +348,7 @@ impl QncBroadcastPlayer {
         let _ = self.tx.stop();
         self.remote.stop();
         self.texture = None;
+        self.last_logged_texture_size = None;
         self.fanout_event(PlayerEvent::Stopped);
         if let Ok(mut slot) = self.snapshot.lock() {
             *slot = PlayerSnapshot::default();
@@ -352,6 +356,11 @@ impl QncBroadcastPlayer {
     }
 
     fn upload_frame(&mut self, ctx: &egui::Context, image: ColorImage) {
+        let size = image.size;
+        if self.last_logged_texture_size != Some(size) {
+            crate::player_log::log_monitor("monitor", format!("texture={}x{}", size[0], size[1]));
+            self.last_logged_texture_size = Some(size);
+        }
         if let Some(texture) = self.texture.as_mut() {
             texture.set(image, TextureOptions::LINEAR);
         } else {

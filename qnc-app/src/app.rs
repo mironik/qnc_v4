@@ -25,6 +25,7 @@ use crate::media_assist::MediaAssistScreen;
 use crate::playback_routing::PlaybackTransportIntent;
 use crate::playback_stack::PlaybackStack;
 use crate::player_bridge;
+use crate::player_remote::PlayerEvent;
 use crate::project::{ProjectAction, ProjectScreen};
 use crate::qnc_broadcast_player::BroadcastPlayerRx;
 use crate::qnc_theme;
@@ -2432,6 +2433,7 @@ impl QncApp {
         self.playback.player_mut().pump(ctx);
         let events = self.playback_rx.try_recv_all();
         self.playback.ingest_events(&events);
+        self.apply_hires_preview_player_events(&events, ctx);
         if self.phase == Phase::Workspace {
             match self.screen {
                 Screen::Ingest => player_bridge::apply_player_events(
@@ -2464,6 +2466,7 @@ impl QncApp {
             return;
         }
         self.playback.ingest_events(&follow_up);
+        self.apply_hires_preview_player_events(&follow_up, ctx);
         if self.phase != Phase::Workspace {
             return;
         }
@@ -2484,6 +2487,19 @@ impl QncApp {
                 self.playback.player(),
             ),
             _ => {}
+        }
+    }
+
+    fn apply_hires_preview_player_events(&mut self, events: &[PlayerEvent], ctx: &egui::Context) {
+        if !self.hires_preview_player.active() {
+            return;
+        }
+        if events
+            .iter()
+            .any(|event| matches!(event, PlayerEvent::BoundaryReached { .. }))
+        {
+            HiResPreviewPlayerComponent::close(&mut self.hires_preview_player, ctx);
+            self.status = "Preview HI-res završen".into();
         }
     }
 

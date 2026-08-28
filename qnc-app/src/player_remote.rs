@@ -96,9 +96,16 @@ pub struct BroadcastProgramOpenRequest {
     pub timeline_fps: f64,
     pub duration_frames: i64,
     pub start_program_frame: FrameNumber,
+    pub preview_video_resolution: BroadcastProgramPreviewVideoResolution,
     /// Streaming playlist input. This is one playable program input; do not
     /// rebuild this as a top-level list of independently played takes.
     pub items: Vec<BroadcastProgramItem>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BroadcastProgramPreviewVideoResolution {
+    FastPreview,
+    SourceRaster,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1957,6 +1964,16 @@ fn build_program_runtime_session(
         .video_format
         .clone()
         .unwrap_or(default_video_format()?);
+    crate::player_log::log_monitor(
+        "program-format",
+        format!(
+            "program_id={} mode={:?} output={}x{}",
+            request.program_id,
+            request.preview_video_resolution,
+            playlist_video_format.width,
+            playlist_video_format.height
+        ),
+    );
     let playlist_audio_format = playlist_input
         .audio_format
         .clone()
@@ -2120,7 +2137,7 @@ fn playlist_input_source(
         program.duration_frames,
         program.timebase,
     )?;
-    if let Some(video_format) = playlist_video_format(program) {
+    if let Some(video_format) = playlist_video_format(request, program) {
         source = source.with_video_format(video_format);
     }
     if let Some(audio_format) = playlist_audio_format(program)? {
@@ -2132,22 +2149,43 @@ fn playlist_input_source(
     Ok(source)
 }
 
-fn playlist_video_format(program: &PlayerProgramState) -> Option<VideoFormat> {
-    program
+fn playlist_video_format(
+    request: &BroadcastProgramOpenRequest,
+    program: &PlayerProgramState,
+) -> Option<VideoFormat> {
+    let source_format = program
         .media_sources_matching(PlayerProgramSource::has_video)
         .iter()
         .find_map(|take| {
             take.source
                 .video_format
                 .as_ref()
-                .map(playlist_preview_video_format)
-        })
+                .map(|format| format.clone())
+        })?;
+    Some(match request.preview_video_resolution {
+        BroadcastProgramPreviewVideoResolution::FastPreview => {
+            playlist_preview_video_format(&source_format)
+        }
+        BroadcastProgramPreviewVideoResolution::SourceRaster => {
+            playlist_source_raster_video_format(&source_format)
+        }
+    })
 }
 
 fn playlist_preview_video_format(source_format: &VideoFormat) -> VideoFormat {
     VideoFormat::new(
         PLAYLIST_PREVIEW_WIDTH,
         PLAYLIST_PREVIEW_HEIGHT,
+        FieldMode::Progressive,
+        source_format.color_space.clone(),
+    )
+    .unwrap_or_else(|_| source_format.clone())
+}
+
+fn playlist_source_raster_video_format(source_format: &VideoFormat) -> VideoFormat {
+    VideoFormat::new(
+        source_format.width,
+        source_format.height,
         FieldMode::Progressive,
         source_format.color_space.clone(),
     )
@@ -2543,6 +2581,7 @@ fn same_program_request(
 ) -> bool {
     left.program_id == right.program_id
         && left.project_id == right.project_id
+        && left.preview_video_resolution == right.preview_video_resolution
         && left.duration_frames == right.duration_frames
         && left.items == right.items
 }
@@ -3085,6 +3124,7 @@ mod tests {
             timeline_fps: 50.0,
             duration_frames: 100,
             start_program_frame: FrameNumber(0),
+            preview_video_resolution: BroadcastProgramPreviewVideoResolution::FastPreview,
             items: Vec::new(),
         }
     }
@@ -3692,8 +3732,17 @@ mod tests {
                 ),
             ],
         };
+        let request = BroadcastProgramOpenRequest {
+            program_id: "playlist".into(),
+            project_id: "project".into(),
+            timeline_fps: 50.0,
+            duration_frames: 50,
+            start_program_frame: FrameNumber(0),
+            preview_video_resolution: BroadcastProgramPreviewVideoResolution::FastPreview,
+            items: Vec::new(),
+        };
         assert_eq!(
-            playlist_video_format(&program).map(|format| (format.width, format.height)),
+            playlist_video_format(&request, &program).map(|format| (format.width, format.height)),
             Some((PLAYLIST_PREVIEW_WIDTH, PLAYLIST_PREVIEW_HEIGHT))
         );
 
@@ -3860,6 +3909,7 @@ mod tests {
             timeline_fps: 50.0,
             duration_frames: 100,
             start_program_frame: FrameNumber(0),
+            preview_video_resolution: BroadcastProgramPreviewVideoResolution::FastPreview,
             items: Vec::new(),
         };
         let make_source = |shot_id: &str,
@@ -4056,6 +4106,7 @@ mod tests {
             timeline_fps: 50.0,
             duration_frames: 100,
             start_program_frame: FrameNumber(0),
+            preview_video_resolution: BroadcastProgramPreviewVideoResolution::FastPreview,
             items: Vec::new(),
         };
         let program = two_take_program_state();
@@ -4067,6 +4118,30 @@ mod tests {
         assert_eq!(source.timebase, CoreTimebase::new(50, 1).unwrap());
         assert!(source.video_format.is_some());
         assert_eq!(source.audio_format.as_ref().unwrap().channel_count, 2);
+    }
+
+    #[test]
+    fn playlist_input_source_can_use_source_raster_for_hires_preview() {
+        let request = BroadcastProgramOpenRequest {
+            program_id: "hires-preview:story_a".into(),
+            project_id: "project".into(),
+            timeline_fps: 50.0,
+            duration_frames: 100,
+            start_program_frame: FrameNumber(0),
+            preview_video_resolution: BroadcastProgramPreviewVideoResolution::SourceRaster,
+            items: Vec::new(),
+        };
+        let program = two_take_program_state();
+
+        let source = playlist_input_source(&request, &program).unwrap();
+
+        assert_eq!(
+            source
+                .video_format
+                .as_ref()
+                .map(|format| (format.width, format.height)),
+            Some((1920, 1080))
+        );
     }
 
     #[test]

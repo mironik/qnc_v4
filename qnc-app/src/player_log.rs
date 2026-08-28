@@ -20,10 +20,28 @@ pub fn log_state(scope: &str, status: &str, playing: bool, frame: i64, sec: f64)
     }
 }
 
+pub fn log_monitor(scope: &str, message: impl AsRef<str>) {
+    if monitor_trace_enabled() {
+        println!("[qnc-player:{scope}] {}", message.as_ref());
+    }
+}
+
 fn trace_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
         std::env::var("QNC_PLAYER_TRACE")
+            .map(|value| {
+                let value = value.trim().to_ascii_lowercase();
+                matches!(value.as_str(), "1" | "true" | "yes" | "on")
+            })
+            .unwrap_or(false)
+    })
+}
+
+fn monitor_trace_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("QNC_PLAYER_MONITOR_TRACE")
             .map(|value| {
                 let value = value.trim().to_ascii_lowercase();
                 matches!(value.as_str(), "1" | "true" | "yes" | "on")

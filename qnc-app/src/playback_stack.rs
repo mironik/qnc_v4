@@ -528,6 +528,7 @@ fn same_playlist_program(
 ) -> bool {
     left.program_id == right.program_id
         && left.project_id == right.project_id
+        && left.preview_video_resolution == right.preview_video_resolution
         && (left.timeline_fps - right.timeline_fps).abs() < 0.01
         && left.duration_frames == right.duration_frames
         && left.items == right.items
@@ -539,7 +540,8 @@ mod tests {
     use crate::player_contract::{BroadcastHostSourceRef, BroadcastSourceTimebase, FrameNumber};
     use crate::player_remote::{
         BroadcastPlayerOpenRequest, BroadcastProgramItem, BroadcastProgramOpenRequest,
-        BroadcastProgramSource, PlayerEvent, PROGRAM_AUDIO_OUTPUT_CH1,
+        BroadcastProgramPreviewVideoResolution, BroadcastProgramSource, PlayerEvent,
+        PROGRAM_AUDIO_OUTPUT_CH1,
     };
 
     fn open_request() -> BroadcastPlayerOpenRequest {
@@ -586,6 +588,7 @@ mod tests {
             timeline_fps: 50.0,
             duration_frames: 100,
             start_program_frame: FrameNumber(start_frame),
+            preview_video_resolution: BroadcastProgramPreviewVideoResolution::FastPreview,
             items: vec![BroadcastProgramItem {
                 item_id: "item:0-100".into(),
                 record_in_frame: FrameNumber(0),
