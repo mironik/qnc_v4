@@ -173,32 +173,19 @@ fn show_local_tree(
     input: &LocationBrowserInput<'_>,
     action: &mut LocationBrowserAction,
 ) {
-    if input.entries.is_empty() {
-        ui.horizontal(|ui| {
-            ui.add_space(if input.roots {
-                disk_tree_offset()
-            } else {
-                path_tree_offset()
-            });
-            ui.label(
-                RichText::new(if input.roots {
-                    "Nema diskova."
-                } else {
-                    "Nema podmapa."
-                })
-                .size(qnc_theme::FONT_UI)
-                .color(MUTED),
-            );
-        });
+    if input.roots {
         return;
     }
 
-    if input.roots {
-        for entry in input.entries {
-            if location_tree_row(ui, disk_tree_offset(), &entry_display_name(entry, true)) {
-                *action = LocationBrowserAction::OpenPath(clean_location_path(&entry.path));
-            }
-        }
+    if input.entries.is_empty() {
+        ui.horizontal(|ui| {
+            ui.add_space(path_tree_offset());
+            ui.label(
+                RichText::new("Nema podmapa.")
+                    .size(qnc_theme::FONT_UI)
+                    .color(MUTED),
+            );
+        });
         return;
     }
 
@@ -207,10 +194,6 @@ fn show_local_tree(
             *action = LocationBrowserAction::OpenPath(clean_location_path(&entry.path));
         }
     }
-}
-
-fn disk_tree_offset() -> f32 {
-    UP_COL_W + NAV_GAP_W
 }
 
 fn path_tree_offset() -> f32 {
@@ -264,7 +247,7 @@ pub fn clean_location_path(path: &str) -> String {
 
 fn location_label(input: &LocationBrowserInput<'_>) -> String {
     match input.kind {
-        LocationSourceKind::Local if input.roots => "Računalo".into(),
+        LocationSourceKind::Local if input.roots => "Diskovi".into(),
         LocationSourceKind::Local if !input.path.trim().is_empty() => short_path(input.path),
         LocationSourceKind::Lan => "LAN".into(),
         LocationSourceKind::Internet => "Internet".into(),
@@ -277,7 +260,12 @@ fn show_location_breadcrumb(
     input: &LocationBrowserInput<'_>,
     action: &mut LocationBrowserAction,
 ) {
-    if !matches!(input.kind, LocationSourceKind::Local) || input.roots {
+    if matches!(input.kind, LocationSourceKind::Local) && input.roots {
+        show_root_disks_inline(ui, input, action);
+        return;
+    }
+
+    if !matches!(input.kind, LocationSourceKind::Local) {
         ui.label(
             RichText::new(location_label(input))
                 .monospace()
@@ -314,6 +302,46 @@ fn show_location_breadcrumb(
             }
         }
     });
+}
+
+fn show_root_disks_inline(
+    ui: &mut egui::Ui,
+    input: &LocationBrowserInput<'_>,
+    action: &mut LocationBrowserAction,
+) {
+    if input.entries.is_empty() {
+        ui.label(
+            RichText::new("Nema diskova.")
+                .size(qnc_theme::FONT_UI)
+                .color(MUTED),
+        );
+        return;
+    }
+
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing.x = 12.0;
+        for entry in input.entries {
+            let label = root_disk_label(entry);
+            if qnc_theme::text_link(ui, &label, true).clicked() {
+                *action = LocationBrowserAction::OpenPath(clean_location_path(&entry.path));
+            }
+        }
+    });
+}
+
+fn root_disk_label(entry: &FsEntry) -> String {
+    let path = clean_location_path(&entry.path);
+    let name = clean_location_path(&entry.name);
+    if path.is_empty() {
+        return name;
+    }
+    if name.is_empty() || name.eq_ignore_ascii_case(&path) {
+        return path;
+    }
+    if name.contains(&path) || path.contains(&name) {
+        return name;
+    }
+    format!("{path} {name}")
 }
 
 fn breadcrumb_parts(path: &str) -> Vec<(String, String)> {
@@ -440,12 +468,6 @@ mod tests {
     }
 
     #[test]
-    fn root_disk_rows_align_under_disk_column_not_gore_column() {
-        assert!(disk_tree_offset() > UP_COL_W);
-        assert!(disk_tree_offset() < path_tree_offset());
-    }
-
-    #[test]
     fn opened_folder_rows_share_breadcrumb_column() {
         assert_eq!(
             path_tree_offset(),
@@ -454,7 +476,7 @@ mod tests {
     }
 
     #[test]
-    fn root_location_label_stays_readable() {
+    fn root_location_label_no_longer_duplicates_selected_source() {
         let entries: [FsEntry; 0] = [];
         let input = LocationBrowserInput {
             id_salt: "test",
@@ -468,6 +490,24 @@ mod tests {
             confirm_label: "Odaberi",
             max_tree_height: None,
         };
-        assert_eq!(location_label(&input), "Računalo");
+        assert_eq!(location_label(&input), "Diskovi");
+    }
+
+    #[test]
+    fn root_disk_label_does_not_duplicate_drive_letter() {
+        let entry = FsEntry {
+            name: r"C:\".to_string(),
+            path: r"C:\".to_string(),
+        };
+        assert_eq!(root_disk_label(&entry), r"C:\");
+    }
+
+    #[test]
+    fn root_disk_label_includes_available_disk_name() {
+        let entry = FsEntry {
+            name: "Media".to_string(),
+            path: r"G:\".to_string(),
+        };
+        assert_eq!(root_disk_label(&entry), r"G:\ Media");
     }
 }

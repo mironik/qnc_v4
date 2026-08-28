@@ -22,6 +22,7 @@ use crate::api::{self, HostClient, HostRequestMethod, HostRequestTimeout};
 const DOWNLOAD_CONNECT_TIMEOUT: Duration = Duration::from_secs(8);
 const DOWNLOAD_READ_TIMEOUT: Duration = Duration::from_secs(12);
 pub(crate) const IMAGE_ASSET_MAX_IN_FLIGHT: usize = 64;
+pub(crate) const SOURCE_FILMSTRIP_FRAME_COUNT: usize = 13;
 const IMAGE_ASSET_WORKERS: usize = 4;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -185,6 +186,8 @@ pub(crate) struct SourceMediaAsset {
     pub waveform_loaded: bool,
     pub film_frames: Vec<SourceFilmFrameAsset>,
     pub filmstrip_ready: bool,
+    pub filmstrip_status: String,
+    pub filmstrip_error: String,
 }
 
 pub(crate) struct SourceMediaAssetResult {
@@ -429,7 +432,7 @@ fn load_source_media(
         Some(json!({
             "project_id": project_id,
             "clip_id": clip_id,
-            "frames": 13
+            "frames": SOURCE_FILMSTRIP_FRAME_COUNT
         })),
         HostRequestTimeout::Default,
     );
@@ -449,6 +452,8 @@ fn load_source_media(
         waveform_loaded: include_waveform,
         film_frames: filmstrip.frames,
         filmstrip_ready: filmstrip.ready,
+        filmstrip_status: filmstrip.status,
+        filmstrip_error: filmstrip.error,
     })
 }
 
@@ -495,6 +500,8 @@ fn waveform_peaks(
 #[derive(Default)]
 struct SourceFilmstripAsset {
     ready: bool,
+    status: String,
+    error: String,
     frames: Vec<SourceFilmFrameAsset>,
 }
 
@@ -513,11 +520,19 @@ fn filmstrip_frames(
         None,
         HostRequestTimeout::Default,
     )?;
-    let ready = value
+    let status = value
         .get("filmstrip")
         .and_then(|f| f.get("status"))
         .and_then(|s| s.as_str())
-        == Some("ready");
+        .unwrap_or("")
+        .to_string();
+    let error = value
+        .get("filmstrip")
+        .and_then(|f| f.get("error"))
+        .and_then(|s| s.as_str())
+        .unwrap_or("")
+        .to_string();
+    let ready = status == "ready";
     let frames = value
         .get("frames")
         .and_then(|f| f.as_array())
@@ -525,6 +540,8 @@ fn filmstrip_frames(
         .unwrap_or_default();
     Ok(SourceFilmstripAsset {
         ready,
+        status,
+        error,
         frames: frames
             .into_iter()
             .filter_map(|frame| {

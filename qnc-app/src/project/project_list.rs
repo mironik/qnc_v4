@@ -24,6 +24,12 @@ const ROW_H: f32 = 60.0;
 const ROW_GAP: f32 = 10.0;
 const DEL_COL_W: f32 = 28.0;
 const COL_GAP: f32 = 8.0;
+const CONFIRM_BTN_W: f32 = 28.0;
+const CONFIRM_BTN_H: f32 = 22.0;
+const CONFIRM_GAP: f32 = 8.0;
+const CONFIRM_MARGIN_X: f32 = 8.0;
+const CONFIRM_MARGIN_Y: f32 = 6.0;
+const CONFIRM_OVERLAY_GAP: f32 = 2.0;
 
 pub struct ProjectListInput<'a> {
     pub width: f32,
@@ -125,55 +131,68 @@ pub fn show(ui: &mut egui::Ui, input: ProjectListInput<'_>) -> ProjectListAction
 
                             for (i, p) in input.projects.iter().enumerate() {
                                 let selected = input.selected_index == Some(i);
-                                // Row body: paint only — no full-row Sense::click
-                                // (that steals hits and covers the name).
                                 let (row_rect, _) = ui
                                     .allocate_exact_size(Vec2::new(table_w, ROW_H), Sense::hover());
-                                if selected {
-                                    ui.painter().rect_filled(row_rect, 0.0, t.surface);
-                                }
-
                                 let del_rect = egui::Rect::from_min_size(
                                     egui::pos2(row_rect.right() - DEL_COL_W, row_rect.top()),
                                     Vec2::new(DEL_COL_W, ROW_H),
                                 );
-                                let name_rect = egui::Rect::from_min_max(
-                                    egui::pos2(row_rect.left() + TEXT_PAD_L, row_rect.top()),
+                                let del_button_rect = egui::Rect::from_center_size(
+                                    del_rect.center(),
+                                    Vec2::new(DEL_COL_W, CONFIRM_BTN_H),
+                                );
+                                let select_rect = egui::Rect::from_min_max(
+                                    row_rect.min,
                                     egui::pos2(del_rect.left() - COL_GAP, row_rect.bottom()),
                                 );
+                                let name_rect = egui::Rect::from_min_max(
+                                    egui::pos2(row_rect.left() + TEXT_PAD_L, row_rect.top()),
+                                    select_rect.right_bottom(),
+                                );
+                                let select = ui.interact(
+                                    select_rect,
+                                    ui.id().with(("project_list_row_select", i)),
+                                    Sense::click(),
+                                );
+                                if selected || select.hovered() {
+                                    let fill = if selected {
+                                        t.surface
+                                    } else {
+                                        t.surface.linear_multiply(0.55)
+                                    };
+                                    ui.painter().rect_filled(row_rect, 0.0, fill);
+                                }
 
-                                let name = ui
-                                    .allocate_new_ui(
-                                        egui::UiBuilder::new().max_rect(name_rect).layout(
-                                            egui::Layout::left_to_right(egui::Align::Center),
-                                        ),
-                                        |ui| {
-                                            ui.set_clip_rect(name_rect);
-                                            ui.set_max_width(name_rect.width().max(0.0));
-                                            let mut label =
-                                                RichText::new(&p.name).size(FONT_UI).color(TEXT);
-                                            if p.project_id == input.active_project_id {
-                                                label = label.strong();
-                                            }
-                                            ui.add(
-                                                egui::Label::new(label)
-                                                    .truncate()
-                                                    .sense(Sense::click())
-                                                    .selectable(false),
-                                            )
-                                        },
-                                    )
-                                    .inner;
+                                ui.allocate_new_ui(
+                                    egui::UiBuilder::new()
+                                        .max_rect(name_rect)
+                                        .layout(egui::Layout::left_to_right(egui::Align::Center)),
+                                    |ui| {
+                                        ui.set_clip_rect(name_rect);
+                                        ui.set_max_width(name_rect.width().max(0.0));
+                                        let mut label =
+                                            RichText::new(&p.name).size(FONT_UI).color(TEXT);
+                                        if p.project_id == input.active_project_id {
+                                            label = label.strong();
+                                        }
+                                        ui.add(
+                                            egui::Label::new(label)
+                                                .truncate()
+                                                .sense(Sense::hover())
+                                                .selectable(false),
+                                        );
+                                    },
+                                );
 
                                 let del = ui
                                     .allocate_new_ui(
-                                        egui::UiBuilder::new().max_rect(del_rect).layout(
+                                        egui::UiBuilder::new().max_rect(del_button_rect).layout(
                                             egui::Layout::centered_and_justified(
                                                 egui::Direction::LeftToRight,
                                             ),
                                         ),
                                         |ui| {
-                                            ui.set_clip_rect(del_rect);
+                                            ui.set_clip_rect(del_button_rect);
                                             ui.add(
                                                 egui::Label::new(
                                                     RichText::new("×").size(FONT_UI).color(MUTED),
@@ -186,12 +205,12 @@ pub fn show(ui: &mut egui::Ui, input: ProjectListInput<'_>) -> ProjectListAction
                                     .inner;
 
                                 if selected && input.confirm_delete {
-                                    confirm_anchor = Some(del_rect);
+                                    confirm_anchor = Some(del_button_rect);
                                 }
 
                                 if del.clicked() {
                                     action = ProjectListAction::RequestDelete(i);
-                                } else if name.clicked() {
+                                } else if select.clicked() {
                                     action = ProjectListAction::Open(i);
                                 }
 
@@ -216,15 +235,19 @@ pub fn show(ui: &mut egui::Ui, input: ProjectListInput<'_>) -> ProjectListAction
             if let Some(anchor) = confirm_anchor {
                 egui::Area::new(egui::Id::new("project_list_del_confirm"))
                     .order(egui::Order::Foreground)
-                    .fixed_pos(egui::pos2(anchor.right() - 88.0, anchor.top() - 40.0))
+                    .fixed_pos(confirm_popup_pos(anchor))
                     .show(ui.ctx(), |ui| {
                         egui::Frame::popup(ui.style())
-                            .inner_margin(egui::Margin::symmetric(8, 6))
+                            .inner_margin(egui::Margin::symmetric(
+                                CONFIRM_MARGIN_X as i8,
+                                CONFIRM_MARGIN_Y as i8,
+                            ))
                             .show(ui, |ui| {
                                 ui.horizontal(|ui| {
-                                    ui.spacing_mut().item_spacing.x = 8.0;
+                                    ui.spacing_mut().item_spacing.x = CONFIRM_GAP;
                                     if ui
-                                        .add(
+                                        .add_sized(
+                                            Vec2::new(CONFIRM_BTN_W, CONFIRM_BTN_H),
                                             egui::Label::new(
                                                 RichText::new("Da").size(FONT_UI).color(TEXT),
                                             )
@@ -236,7 +259,8 @@ pub fn show(ui: &mut egui::Ui, input: ProjectListInput<'_>) -> ProjectListAction
                                         action = ProjectListAction::ConfirmDelete;
                                     }
                                     if ui
-                                        .add(
+                                        .add_sized(
+                                            Vec2::new(CONFIRM_BTN_W, CONFIRM_BTN_H),
                                             egui::Label::new(
                                                 RichText::new("Ne").size(FONT_UI).color(MUTED),
                                             )
@@ -255,4 +279,13 @@ pub fn show(ui: &mut egui::Ui, input: ProjectListInput<'_>) -> ProjectListAction
     );
 
     action
+}
+
+fn confirm_popup_pos(anchor: egui::Rect) -> egui::Pos2 {
+    let popup_h = CONFIRM_BTN_H + (CONFIRM_MARGIN_Y * 2.0);
+    let ne_center_x = CONFIRM_MARGIN_X + CONFIRM_BTN_W + CONFIRM_GAP + (CONFIRM_BTN_W * 0.5);
+    egui::pos2(
+        anchor.center().x - ne_center_x,
+        anchor.top() - popup_h - CONFIRM_OVERLAY_GAP,
+    )
 }

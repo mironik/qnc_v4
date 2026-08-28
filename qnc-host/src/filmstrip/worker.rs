@@ -6,7 +6,9 @@ use std::time::{Duration, Instant};
 use tracing::{info, warn};
 
 use crate::background_work::BackgroundWorkGate;
-use crate::ingest::db::{open_ingest, queue_ingest_artifact_job_once};
+use crate::ingest::db::{
+    open_ingest, queue_ingest_artifact_job_once, requeue_terminal_ingest_artifact_job,
+};
 use crate::ingest::thumb::timeline_seek_seconds;
 use crate::media::imported_clip_ids;
 use crate::project::db::ProjectPaths;
@@ -89,6 +91,33 @@ impl FilmstripWorker {
             return;
         }
         self.queue_filmstrip_job(pid, cid);
+    }
+
+    pub fn retry_terminal_error(&self, project_id: &str, clip_id: &str) -> bool {
+        let pid = project_id.trim();
+        let cid = clip_id.trim();
+        if pid.is_empty() || cid.is_empty() || self.is_blocked(pid) {
+            return false;
+        }
+        match self.project_db.serialize_project_write(pid, || {
+            let conn = open_ingest(&self.paths, pid).map_err(|e| e.to_string())?;
+            requeue_terminal_ingest_artifact_job(
+                &conn,
+                JOB_TYPE_FILMSTRIP,
+                JOB_SOURCE_FILMSTRIP,
+                cid,
+            )
+            .map_err(|e| e.to_string())
+        }) {
+            Ok(queued) => queued,
+            Err(error) => {
+                warn!(
+                    "filmstrip retry: project={} clip={} err={}",
+                    project_id, clip_id, error
+                );
+                false
+            }
+        }
     }
 
     pub fn enqueue_recoverable_projects(&self) -> Result<usize, String> {

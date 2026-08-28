@@ -1897,16 +1897,10 @@ impl StoryScreen {
         self.source_media_retry_attempts = self.source_media_retry_attempts.saturating_add(1);
         if self.source_media_retry_attempts >= SOURCE_MEDIA_MAX_RETRIES {
             self.source_media_retry_at = None;
-            self.status = format!(
-                "{status} · pokušaji {}/{}",
-                self.source_media_retry_attempts, SOURCE_MEDIA_MAX_RETRIES
-            );
+            self.status = source_media_retry_status(&status, true);
         } else {
             self.source_media_retry_at = Some(Instant::now() + SOURCE_MEDIA_RETRY_DELAY);
-            self.status = format!(
-                "{status} · pokušaj {}/{}",
-                self.source_media_retry_attempts, SOURCE_MEDIA_MAX_RETRIES
-            );
+            self.status = source_media_retry_status(&status, false);
         }
     }
 
@@ -1975,6 +1969,17 @@ impl StoryScreen {
                         self.a2_peaks = media.a2_peaks;
                     }
                     self.filmstrip_manifest_ready = media.filmstrip_ready;
+                    let filmstrip_status = media.filmstrip_status.trim().to_string();
+                    let filmstrip_error = media.filmstrip_error.trim().to_string();
+                    let filmstrip_ready_count = media
+                        .film_frames
+                        .iter()
+                        .filter(|frame| filmstrip_frame_url_ready(&frame.url))
+                        .count();
+                    let filmstrip_total = media
+                        .film_frames
+                        .len()
+                        .max(media_assets::SOURCE_FILMSTRIP_FRAME_COUNT);
                     let media_clip_id = self.waveform_clip_id.clone();
                     let frames = media.film_frames.into_iter().map(|frame| FilmFrame {
                         index: frame.index,
@@ -1984,10 +1989,33 @@ impl StoryScreen {
                         load_attempts: 0,
                     });
                     crate::qnc_filmstrip_background::merge_frames(&mut self.film_frames, frames);
-                    if !self.source_filmstrip_ready() {
+                    if matches!(filmstrip_status.as_str(), "error" | "failed")
+                        && !self.source_filmstrip_ready()
+                    {
+                        self.source_media_retry_at = None;
+                        self.source_media_retry_clip_id = media_clip_id.clone();
+                        self.source_media_retry_attempts = SOURCE_MEDIA_MAX_RETRIES;
+                        self.status = if filmstrip_error.is_empty() {
+                            format!(
+                                "Filmstrip nije spreman · {} · {}/{} sličica",
+                                self.selected_clip_id, filmstrip_ready_count, filmstrip_total
+                            )
+                        } else {
+                            format!(
+                                "Filmstrip nije spreman · {} · {}/{} sličica · {}",
+                                self.selected_clip_id,
+                                filmstrip_ready_count,
+                                filmstrip_total,
+                                filmstrip_error
+                            )
+                        };
+                    } else if !self.source_filmstrip_ready() {
                         self.schedule_source_media_retry(
                             &media_clip_id,
-                            format!("Filmstrip se gradi · {}", self.selected_clip_id),
+                            format!(
+                                "Filmstrip se priprema · {} · {}/{} sličica",
+                                self.selected_clip_id, filmstrip_ready_count, filmstrip_total
+                            ),
                         );
                     } else if self.selected_source_has_audio
                         && self.a1_peaks.is_empty()
@@ -1995,7 +2023,7 @@ impl StoryScreen {
                     {
                         self.schedule_source_media_retry(
                             &media_clip_id,
-                            format!("Waveform se gradi · {}", self.selected_clip_id),
+                            format!("Waveform se priprema · {}", self.selected_clip_id),
                         );
                     } else {
                         self.clear_source_media_retry();
@@ -2804,6 +2832,30 @@ fn story_thumb_ids(
             (!clip_id.is_empty()).then(|| clip_id.to_string())
         })
         .collect()
+}
+
+fn source_media_retry_status(status: &str, terminal: bool) -> String {
+    if let Some(clip_id) = status
+        .strip_prefix("Filmstrip se priprema · ")
+        .or_else(|| status.strip_prefix("Filmstrip se gradi · "))
+    {
+        return if terminal {
+            format!("Filmstrip još nije spreman · {clip_id}")
+        } else {
+            format!("Filmstrip se priprema · {clip_id}")
+        };
+    }
+    if let Some(clip_id) = status
+        .strip_prefix("Waveform se priprema · ")
+        .or_else(|| status.strip_prefix("Waveform se gradi · "))
+    {
+        return if terminal {
+            format!("Waveform još nije spreman · {clip_id}")
+        } else {
+            format!("Waveform se priprema · {clip_id}")
+        };
+    }
+    status.to_string()
 }
 
 fn filmstrip_frame_url_ready(url: &str) -> bool {
@@ -6102,6 +6154,30 @@ mod tests {
         }];
 
         assert!(!screen.source_media_request_blocked("clip_a"));
+    }
+
+    #[test]
+    fn source_media_retry_status_reports_filmstrip_progress_without_attempts() {
+        let status =
+            source_media_retry_status("Filmstrip se priprema · mironik_1506 · 5/13 sličica", false);
+
+        assert_eq!(
+            status,
+            "Filmstrip se priprema · mironik_1506 · 5/13 sličica"
+        );
+        assert!(!status.contains("pokušaj"));
+    }
+
+    #[test]
+    fn source_media_retry_status_reports_terminal_filmstrip_without_attempts() {
+        let status =
+            source_media_retry_status("Filmstrip se priprema · mironik_1506 · 5/13 sličica", true);
+
+        assert_eq!(
+            status,
+            "Filmstrip još nije spreman · mironik_1506 · 5/13 sličica"
+        );
+        assert!(!status.contains("pokušaj"));
     }
 
     #[test]

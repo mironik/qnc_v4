@@ -165,6 +165,49 @@ pub fn queue_ingest_artifact_job_once(
     Ok(true)
 }
 
+pub fn requeue_terminal_ingest_artifact_job(
+    conn: &Connection,
+    job_type: &str,
+    source_id: &str,
+    clip_id: &str,
+) -> rusqlite::Result<bool> {
+    let now = now_str();
+    let job_id = ingest_job_id(job_type, source_id, clip_id);
+    let changed = conn.execute(
+        "UPDATE ingest_jobs
+         SET status = 'queued',
+             error = '',
+             attempts = 0,
+             queued_at = ?2,
+             started_at = NULL,
+             finished_at = NULL,
+             updated_at = ?2,
+             worker_id = '',
+             lease_id = '',
+             lease_until_ms = 0,
+             heartbeat_ms = 0,
+             result_json = '{}'
+         WHERE job_id = ?1
+           AND status IN ('error', 'failed')",
+        params![job_id, now],
+    )?;
+    if changed == 1 {
+        return Ok(true);
+    }
+    let status: Option<String> = conn
+        .query_row(
+            "SELECT status FROM ingest_jobs WHERE job_id = ?1",
+            params![job_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if status.is_none() {
+        queue_ingest_job(conn, job_type, source_id, clip_id)?;
+        return Ok(true);
+    }
+    Ok(false)
+}
+
 pub fn queue_ingest_job_payload(
     conn: &Connection,
     job_type: &str,
@@ -1079,6 +1122,101 @@ mod tests {
                 )
             );
         }
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn terminal_artifact_job_can_be_explicitly_requeued() {
+        let base = std::env::temp_dir().join(format!(
+            "qnc_artifact_retry_test_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+        let paths = test_paths(&base);
+        let conn = open_ingest(&paths, "artifact_retry_proj").unwrap();
+
+        queue_ingest_artifact_job_once(&conn, "filmstrip", "filmstrip", "clip_a").unwrap();
+        conn.execute(
+            "UPDATE ingest_jobs
+             SET status = 'error',
+                 attempts = 3,
+                 error = 'filmstrip duration missing',
+                 worker_id = 'worker-a',
+                 lease_id = 'lease-a'
+             WHERE job_id = ?1",
+            params![ingest_job_id("filmstrip", "filmstrip", "clip_a")],
+        )
+        .unwrap();
+
+        assert!(
+            requeue_terminal_ingest_artifact_job(&conn, "filmstrip", "filmstrip", "clip_a")
+                .unwrap()
+        );
+        let row: (String, String, i64, String, String) = conn
+            .query_row(
+                "SELECT status, error, attempts, worker_id, lease_id
+                 FROM ingest_jobs WHERE job_id = ?1",
+                params![ingest_job_id("filmstrip", "filmstrip", "clip_a")],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(row, ("queued".into(), "".into(), 0, "".into(), "".into()));
+
+        conn.execute(
+            "UPDATE ingest_jobs
+             SET status = 'processing',
+                 error = 'keep-me',
+                 attempts = 4,
+                 worker_id = 'worker-b',
+                 lease_id = 'lease-b'
+             WHERE job_id = ?1",
+            params![ingest_job_id("filmstrip", "filmstrip", "clip_a")],
+        )
+        .unwrap();
+        assert!(
+            !requeue_terminal_ingest_artifact_job(&conn, "filmstrip", "filmstrip", "clip_a")
+                .unwrap()
+        );
+        let processing: (String, String, i64, String, String) = conn
+            .query_row(
+                "SELECT status, error, attempts, worker_id, lease_id
+                 FROM ingest_jobs WHERE job_id = ?1",
+                params![ingest_job_id("filmstrip", "filmstrip", "clip_a")],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            processing,
+            (
+                "processing".into(),
+                "keep-me".into(),
+                4,
+                "worker-b".into(),
+                "lease-b".into()
+            )
+        );
 
         let _ = fs::remove_dir_all(&base);
     }

@@ -466,14 +466,41 @@ async fn api_timeline_build(
                 "waveform": waveform_snapshot(&app.project.paths, &pid, clip_id),
             })));
         }
-        if matches!(
-            status,
-            "building" | "queued" | "processing" | "error" | "failed" | "done"
-        ) {
+        if matches!(status, "building" | "queued" | "processing" | "done") {
             return Ok(Json(json!({
                 "status": status,
                 "clip_id": clip_id,
                 "filmstrip": existing,
+                "waveform": waveform_snapshot(&app.project.paths, &pid, clip_id),
+            })));
+        }
+        if matches!(status, "error" | "failed") {
+            let error = existing.get("error").and_then(Value::as_str).unwrap_or("");
+            if !filmstrip_error_allows_explicit_retry(error) {
+                return Ok(Json(json!({
+                    "status": status,
+                    "clip_id": clip_id,
+                    "filmstrip": existing,
+                    "waveform": waveform_snapshot(&app.project.paths, &pid, clip_id),
+                })));
+            }
+            let media =
+                requested_media_path(&app, &pid, clip_id, &body.media_path).ok_or_else(|| {
+                    (
+                        StatusCode::NOT_FOUND,
+                        format!("Nema medijskog zapisa za '{clip_id}'."),
+                    )
+                })?;
+            mark_filmstrip_building(&app.project.paths, &pid, clip_id).map_err(internal)?;
+            if app.filmstrip.retry_terminal_error(&pid, clip_id) {
+                return Ok(Json(json!({ "status": "queued", "clip_id": clip_id })));
+            }
+            app.filmstrip
+                .enqueue_priority(&pid, clip_id, &media, frames);
+            return Ok(Json(json!({
+                "status": "building",
+                "clip_id": clip_id,
+                "filmstrip": get_filmstrip(&app.project.paths, &pid, clip_id).unwrap_or(existing),
                 "waveform": waveform_snapshot(&app.project.paths, &pid, clip_id),
             })));
         }
@@ -488,6 +515,10 @@ async fn api_timeline_build(
     app.filmstrip
         .enqueue_priority(&pid, clip_id, &media, frames);
     Ok(Json(json!({ "status": "queued", "clip_id": clip_id })))
+}
+
+fn filmstrip_error_allows_explicit_retry(error: &str) -> bool {
+    matches!(error.trim(), "filmstrip duration missing")
 }
 
 async fn api_virtual_shot(
@@ -1056,7 +1087,7 @@ fn parse_range_header(range: Option<&header::HeaderValue>, size: u64) -> Option<
 
 #[cfg(test)]
 mod tests {
-    use super::{bounded_media_range, media_chunk_bytes};
+    use super::{bounded_media_range, filmstrip_error_allows_explicit_retry, media_chunk_bytes};
 
     #[test]
     fn qstory_media_response_is_limited_to_ten_seconds() {
@@ -1078,5 +1109,15 @@ mod tests {
             bounded_media_range(None, size, Some(bytes)),
             Some((0, bytes - 1))
         );
+    }
+
+    #[test]
+    fn filmstrip_explicit_retry_is_limited_to_transient_duration_error() {
+        assert!(filmstrip_error_allows_explicit_retry(
+            "filmstrip duration missing"
+        ));
+        assert!(!filmstrip_error_allows_explicit_retry(
+            "ffmpeg filmstrip failed"
+        ));
     }
 }
