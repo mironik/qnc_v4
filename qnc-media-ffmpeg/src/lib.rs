@@ -6,6 +6,7 @@ pub mod waveform;
 
 use std::collections::BTreeMap;
 use std::env;
+use std::ffi::{OsStr, OsString};
 use std::io::{ErrorKind, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdout, Command, Stdio};
@@ -144,31 +145,101 @@ fn validate_tool_path(path: &Path, label: &str) -> Result<(), String> {
     Ok(())
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FfmpegMediaInput {
+    raw: OsString,
+}
+
+impl FfmpegMediaInput {
+    pub fn from_path(path: impl AsRef<Path>) -> Self {
+        Self {
+            raw: path.as_ref().as_os_str().to_os_string(),
+        }
+    }
+
+    pub fn from_uri(uri: impl AsRef<str>) -> Self {
+        Self {
+            raw: OsString::from(uri.as_ref().trim()),
+        }
+    }
+
+    fn as_os_str(&self) -> &OsStr {
+        self.raw.as_os_str()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.raw.to_string_lossy().trim().is_empty()
+    }
+
+    pub fn label(&self) -> String {
+        self.raw.to_string_lossy().to_string()
+    }
+}
+
+impl From<PathBuf> for FfmpegMediaInput {
+    fn from(path: PathBuf) -> Self {
+        Self::from_path(path)
+    }
+}
+
+impl From<&Path> for FfmpegMediaInput {
+    fn from(path: &Path) -> Self {
+        Self::from_path(path)
+    }
+}
+
+impl From<String> for FfmpegMediaInput {
+    fn from(input: String) -> Self {
+        Self {
+            raw: OsString::from(input),
+        }
+    }
+}
+
+impl From<&str> for FfmpegMediaInput {
+    fn from(input: &str) -> Self {
+        Self::from_uri(input)
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct FfmpegSourceRegistry {
-    source_paths: BTreeMap<String, PathBuf>,
+    source_inputs: BTreeMap<String, FfmpegMediaInput>,
 }
 
 impl FfmpegSourceRegistry {
     pub fn new(source_paths: BTreeMap<String, PathBuf>) -> Self {
-        Self { source_paths }
+        Self::from_media_inputs(
+            source_paths
+                .into_iter()
+                .map(|(source_id, path)| (source_id, FfmpegMediaInput::from(path)))
+                .collect(),
+        )
+    }
+
+    pub fn from_media_inputs(source_inputs: BTreeMap<String, FfmpegMediaInput>) -> Self {
+        Self { source_inputs }
     }
 
     pub fn single(source_id: impl Into<String>, path: impl Into<PathBuf>) -> Self {
         Self::new(BTreeMap::from([(source_id.into(), path.into())]))
     }
 
-    fn source_path(&self, source_id: &str) -> Result<&Path, BroadcastEngineError> {
-        self.source_paths
-            .get(source_id)
-            .map(PathBuf::as_path)
-            .ok_or_else(|| {
-                BroadcastEngineError::new(
-                    BroadcastEngineErrorKind::SourceOpen,
-                    format!("source path not registered: {source_id}"),
-                )
-                .with_source_id(source_id.to_string())
-            })
+    pub fn single_media_input(
+        source_id: impl Into<String>,
+        input: impl Into<FfmpegMediaInput>,
+    ) -> Self {
+        Self::from_media_inputs(BTreeMap::from([(source_id.into(), input.into())]))
+    }
+
+    fn source_input(&self, source_id: &str) -> Result<&FfmpegMediaInput, BroadcastEngineError> {
+        self.source_inputs.get(source_id).ok_or_else(|| {
+            BroadcastEngineError::new(
+                BroadcastEngineErrorKind::SourceOpen,
+                format!("source media input not registered: {source_id}"),
+            )
+            .with_source_id(source_id.to_string())
+        })
     }
 }
 
@@ -197,9 +268,28 @@ pub fn probe_source_runtime_with_toolchain(
     source_id: impl Into<String>,
     toolchain: &FfmpegToolchain,
 ) -> Result<FfmpegProbeReport, BroadcastEngineError> {
+    probe_media_input_runtime_with_toolchain(
+        &FfmpegMediaInput::from_path(path),
+        source_id,
+        toolchain,
+    )
+}
+
+pub fn probe_media_input_runtime_with_toolchain(
+    input: &FfmpegMediaInput,
+    source_id: impl Into<String>,
+    toolchain: &FfmpegToolchain,
+) -> Result<FfmpegProbeReport, BroadcastEngineError> {
     let source_id = source_id.into();
-    let video_probe = probe_video_runtime(path, &source_id, toolchain)?;
-    let audio_probe = probe_audio_runtime(path, &source_id, toolchain)?;
+    if input.is_empty() {
+        return Err(BroadcastEngineError::new(
+            BroadcastEngineErrorKind::SourceOpen,
+            "media input is empty",
+        )
+        .with_source_id(source_id));
+    }
+    let video_probe = probe_video_runtime(input, &source_id, toolchain)?;
+    let audio_probe = probe_audio_runtime(input, &source_id, toolchain)?;
     if video_probe.is_none() && audio_probe.is_none() {
         return Err(BroadcastEngineError::new(
             BroadcastEngineErrorKind::SourceOpen,
@@ -262,7 +352,7 @@ impl SourceOpenAdapter for FfmpegSourceOpen {
         source: &SourceRuntime,
         source_revision: Option<u64>,
     ) -> Result<EngineSourceHandle, BroadcastEngineError> {
-        self.registry.source_path(&source.source_id)?;
+        self.registry.source_input(&source.source_id)?;
 
         if source.video_format.is_none() && source.audio_format.is_none() {
             return Err(BroadcastEngineError::new(
@@ -479,9 +569,10 @@ pub struct FfmpegVideoDecodeProfile {
 }
 
 impl FfmpegVideoDecodeProfile {
-    fn from_path(path: &Path) -> Self {
+    fn from_input(input: &FfmpegMediaInput) -> Self {
+        let label = input.label();
         Self {
-            container: path
+            container: Path::new(&label)
                 .extension()
                 .and_then(|value| value.to_str())
                 .map(normalized_label),
@@ -489,8 +580,8 @@ impl FfmpegVideoDecodeProfile {
         }
     }
 
-    fn from_probe_values(path: &Path, values: &BTreeMap<String, String>) -> Self {
-        let mut profile = Self::from_path(path);
+    fn from_probe_values(input: &FfmpegMediaInput, values: &BTreeMap<String, String>) -> Self {
+        let mut profile = Self::from_input(input);
         if let Some(container) = values
             .get("format_name")
             .map(|value| normalized_label(value))
@@ -624,13 +715,13 @@ impl FfmpegVideoSession {
 
     fn cache_streamed_frames(
         &mut self,
-        path: &Path,
+        input: &FfmpegMediaInput,
         start_frame: u64,
         end_frame: u64,
         request: FfmpegVideoCacheRequest<'_>,
     ) -> Result<(), BroadcastEngineError> {
         let frame_byte_len = self.frame_byte_len()?;
-        self.ensure_stream_at(path, start_frame, end_frame, frame_byte_len, request)?;
+        self.ensure_stream_at(input, start_frame, end_frame, frame_byte_len, request)?;
         let stream = self.stream.as_mut().ok_or_else(|| {
             BroadcastEngineError::new(
                 BroadcastEngineErrorKind::VideoDecode,
@@ -666,7 +757,7 @@ impl FfmpegVideoSession {
     /// - matching next: reuse
     fn ensure_stream_at(
         &mut self,
-        path: &Path,
+        input: &FfmpegMediaInput,
         start_frame: u64,
         end_frame: u64,
         frame_byte_len: usize,
@@ -711,7 +802,11 @@ impl FfmpegVideoSession {
             read_ahead_frames,
             read_timeout: request.cache_config.read_timeout,
         };
-        self.stream = Some(FfmpegVideoStream::spawn(path, start_frame, stream_request)?);
+        self.stream = Some(FfmpegVideoStream::spawn(
+            input,
+            start_frame,
+            stream_request,
+        )?);
         Ok(())
     }
 
@@ -791,7 +886,7 @@ struct FfmpegVideoStream {
 
 impl FfmpegVideoStream {
     fn spawn(
-        path: &Path,
+        input: &FfmpegMediaInput,
         start_frame: u64,
         request: FfmpegVideoStreamRequest<'_>,
     ) -> Result<Self, BroadcastEngineError> {
@@ -815,7 +910,7 @@ impl FfmpegVideoStream {
         }
         let mut child = command
             .arg("-i")
-            .arg(path)
+            .arg(input.as_os_str())
             .args([
                 "-map", "0:v:0", "-an", "-vf", &filter, "-vsync", "0", "-f", "rawvideo",
                 "-pix_fmt", "rgb24", "pipe:1",
@@ -1247,7 +1342,7 @@ impl FfmpegVideoDecode {
         {
             return Ok(());
         }
-        let path = self.registry.source_path(&request.source_id)?.to_path_buf();
+        let input = self.registry.source_input(&request.source_id)?.clone();
         let (start_frame, read_ahead_frames, field_mode, output_filter_format, frame_byte_len) = {
             let session = self.video_session(&request.source_id)?;
             let start_frame = session.decode_frame_for_request(request.frame);
@@ -1293,7 +1388,7 @@ impl FfmpegVideoDecode {
                     read_ahead_frames,
                     read_timeout,
                 };
-                let result = FfmpegVideoStream::spawn(&path, start_frame, stream_request);
+                let result = FfmpegVideoStream::spawn(&input, start_frame, stream_request);
                 let _ = tx.send(result);
             })
             .map_err(|err| engine_error(BroadcastEngineErrorKind::VideoDecode, err))?;
@@ -1356,7 +1451,7 @@ impl FfmpegVideoDecode {
         request: &EngineFrameRequest,
         start_frame: u64,
         end_frame: u64,
-        path: &Path,
+        input: &FfmpegMediaInput,
     ) -> Result<(), BroadcastEngineError> {
         let max_cache_frames = self.options.video_cache_frames;
         let max_cache_bytes = self.options.video_cache_bytes;
@@ -1374,7 +1469,7 @@ impl FfmpegVideoDecode {
             cache_config,
         };
         self.video_session_mut(&request.source_id)?
-            .cache_streamed_frames(path, start_frame, end_frame, stream_request)
+            .cache_streamed_frames(input, start_frame, end_frame, stream_request)
             .map_err(|error| error.with_source_id(request.source_id.clone()))
     }
 
@@ -1431,9 +1526,9 @@ impl VideoDecodeAdapter for FfmpegVideoDecode {
         if source.video_format.is_none() {
             return Ok(Vec::new());
         }
-        let path = self.registry.source_path(&source.source_id)?.to_path_buf();
+        let input = self.registry.source_input(&source.source_id)?.clone();
         let decode_profile =
-            probe_video_decode_profile(&path, &source.source_id, &self.options.toolchain);
+            probe_video_decode_profile(&input, &source.source_id, &self.options.toolchain);
         self.sessions.insert(
             source.source_id.clone(),
             FfmpegVideoSession::new(
@@ -1455,9 +1550,9 @@ impl VideoDecodeAdapter for FfmpegVideoDecode {
             return Ok(decoded_video_frame(request, payload));
         }
 
-        let path = self.registry.source_path(&request.source_id)?.to_path_buf();
+        let input = self.registry.source_input(&request.source_id)?.clone();
         let (decode_start_frame, prefetch_end_frame) = self.decode_span(&request)?;
-        self.cache_streamed_payload(&request, decode_start_frame, prefetch_end_frame, &path)?;
+        self.cache_streamed_payload(&request, decode_start_frame, prefetch_end_frame, &input)?;
         let payload = self
             .cached_payload(&request.source_id, request.frame)
             .ok_or_else(|| {
@@ -1513,7 +1608,7 @@ impl FfmpegAudioOutput {
         {
             return Ok(());
         }
-        let path = self.registry.source_path(&request.source_id)?.to_path_buf();
+        let input = self.registry.source_input(&request.source_id)?.clone();
         let (start_frame, read_ahead_packets, audio_format) = {
             let session = self.audio_session(&request.source_id)?;
             let Some(start_frame) = session.decode_frame_for_request(request.frame) else {
@@ -1547,7 +1642,7 @@ impl FfmpegAudioOutput {
             .name(format!("qnc-ffmpeg-audio-warmup-{source_id}"))
             .spawn(move || {
                 let result = FfmpegAudioStream::spawn(
-                    &path,
+                    &input,
                     &toolchain,
                     &audio_format,
                     timebase,
@@ -1616,7 +1711,7 @@ impl FfmpegAudioOutput {
         request: &EngineFrameRequest,
         start_frame: u64,
         end_frame: u64,
-        path: &Path,
+        input: &FfmpegMediaInput,
     ) -> Result<(), BroadcastEngineError> {
         let max_cache_frames = self.options.audio_cache_frames;
         let max_cache_bytes = self.options.audio_cache_bytes;
@@ -1628,7 +1723,7 @@ impl FfmpegAudioOutput {
         let toolchain = self.options.toolchain.clone();
         self.audio_session_mut(&request.source_id)?
             .cache_streamed_packets(
-                path,
+                input,
                 &toolchain,
                 request.timebase,
                 start_frame,
@@ -1790,7 +1885,7 @@ impl FfmpegAudioSession {
 
     fn cache_streamed_packets(
         &mut self,
-        path: &Path,
+        input: &FfmpegMediaInput,
         toolchain: &FfmpegToolchain,
         timebase: Timebase,
         start_frame: u64,
@@ -1798,7 +1893,7 @@ impl FfmpegAudioSession {
         cache_config: FfmpegStreamCacheConfig,
     ) -> Result<(), BroadcastEngineError> {
         self.ensure_stream_at(
-            path,
+            input,
             toolchain,
             timebase,
             start_frame,
@@ -1837,7 +1932,7 @@ impl FfmpegAudioSession {
 
     fn ensure_stream_at(
         &mut self,
-        path: &Path,
+        input: &FfmpegMediaInput,
         toolchain: &FfmpegToolchain,
         timebase: Timebase,
         start_frame: u64,
@@ -1878,7 +1973,7 @@ impl FfmpegAudioSession {
         self.stream = None;
         let read_ahead_packets = audio_frame_span_len(start_frame, end_frame)?;
         self.stream = Some(FfmpegAudioStream::spawn(
-            path,
+            input,
             toolchain,
             &self.audio_format,
             timebase,
@@ -2069,7 +2164,7 @@ struct FfmpegAudioStream {
 
 impl FfmpegAudioStream {
     fn spawn(
-        path: &Path,
+        input: &FfmpegMediaInput,
         toolchain: &FfmpegToolchain,
         audio_format: &AudioFormat,
         timebase: Timebase,
@@ -2091,7 +2186,7 @@ impl FfmpegAudioStream {
         }
         let mut child = command
             .arg("-i")
-            .arg(path)
+            .arg(input.as_os_str())
             .args([
                 "-map",
                 "0:a:0",
@@ -2468,10 +2563,10 @@ impl AudioOutputAdapter for FfmpegAudioOutput {
         if source.audio_format.is_none() {
             return Ok(Vec::new());
         }
-        let path = self.registry.source_path(&source.source_id)?.to_path_buf();
+        let input = self.registry.source_input(&source.source_id)?.clone();
         let decode_frame_offset = if source.video_format.is_some() {
             probe_av_stream_start_offset_frames(
-                &path,
+                &input,
                 &source.source_id,
                 &self.options.toolchain,
                 source.timebase,
@@ -2505,12 +2600,12 @@ impl AudioOutputAdapter for FfmpegAudioOutput {
             return silent_audio_packet(request, audio_format);
         }
 
-        let path = self.registry.source_path(&request.source_id)?.to_path_buf();
+        let input = self.registry.source_input(&request.source_id)?.clone();
         let Some((decode_start_frame, prefetch_end_frame)) = self.decode_span(&request)? else {
             let audio_format = self.audio_session(&request.source_id)?.audio_format.clone();
             return silent_audio_packet(request, audio_format);
         };
-        self.cache_streamed_packet(&request, decode_start_frame, prefetch_end_frame, &path)?;
+        self.cache_streamed_packet(&request, decode_start_frame, prefetch_end_frame, &input)?;
         let payload = self
             .cached_packet(&request.source_id, request.frame)
             .ok_or_else(|| {
@@ -2603,30 +2698,30 @@ struct FfmpegAudioProbe {
 }
 
 fn probe_video_decode_profile(
-    path: &Path,
+    input: &FfmpegMediaInput,
     source_id: &str,
     toolchain: &FfmpegToolchain,
 ) -> FfmpegVideoDecodeProfile {
     match probe_key_values(
-        path,
+        input,
         toolchain,
         "v:0",
         "stream=codec_name,pix_fmt,profile:format=format_name",
         BroadcastEngineErrorKind::VideoDecode,
         source_id,
     ) {
-        Ok(Some(values)) => FfmpegVideoDecodeProfile::from_probe_values(path, &values),
-        Ok(None) | Err(_) => FfmpegVideoDecodeProfile::from_path(path),
+        Ok(Some(values)) => FfmpegVideoDecodeProfile::from_probe_values(input, &values),
+        Ok(None) | Err(_) => FfmpegVideoDecodeProfile::from_input(input),
     }
 }
 
 fn probe_video_runtime(
-    path: &Path,
+    input: &FfmpegMediaInput,
     source_id: &str,
     toolchain: &FfmpegToolchain,
 ) -> Result<Option<FfmpegVideoProbe>, BroadcastEngineError> {
     let Some(values) = probe_key_values(
-        path,
+        input,
         toolchain,
         "v:0",
         "stream=width,height,field_order,color_space,r_frame_rate,avg_frame_rate,nb_frames,duration_ts,time_base",
@@ -2657,12 +2752,12 @@ fn probe_video_runtime(
 }
 
 fn probe_audio_runtime(
-    path: &Path,
+    input: &FfmpegMediaInput,
     source_id: &str,
     toolchain: &FfmpegToolchain,
 ) -> Result<Option<FfmpegAudioProbe>, BroadcastEngineError> {
     let Some(values) = probe_key_values(
-        path,
+        input,
         toolchain,
         "a:0",
         "stream=sample_rate,channels,duration_ts,time_base",
@@ -2685,18 +2780,18 @@ fn probe_audio_runtime(
 }
 
 fn probe_av_stream_start_offset_frames(
-    path: &Path,
+    input: &FfmpegMediaInput,
     source_id: &str,
     toolchain: &FfmpegToolchain,
     timebase: Timebase,
 ) -> i64 {
     let Some(video_start_seconds) =
-        probe_stream_start_time_seconds(path, source_id, toolchain, "v:0")
+        probe_stream_start_time_seconds(input, source_id, toolchain, "v:0")
     else {
         return 0;
     };
     let Some(audio_start_seconds) =
-        probe_stream_start_time_seconds(path, source_id, toolchain, "a:0")
+        probe_stream_start_time_seconds(input, source_id, toolchain, "a:0")
     else {
         return 0;
     };
@@ -2704,13 +2799,13 @@ fn probe_av_stream_start_offset_frames(
 }
 
 fn probe_stream_start_time_seconds(
-    path: &Path,
+    input: &FfmpegMediaInput,
     source_id: &str,
     toolchain: &FfmpegToolchain,
     stream_selector: &str,
 ) -> Option<f64> {
     probe_key_values(
-        path,
+        input,
         toolchain,
         stream_selector,
         "stream=start_time",
@@ -2739,7 +2834,7 @@ fn stream_start_offset_frames(
 }
 
 fn probe_key_values(
-    path: &Path,
+    input: &FfmpegMediaInput,
     toolchain: &FfmpegToolchain,
     stream_selector: &str,
     entries: &str,
@@ -2757,7 +2852,7 @@ fn probe_key_values(
         "-of",
         "default=noprint_wrappers=1:nokey=0",
     ]);
-    command.arg(path);
+    command.arg(input.as_os_str());
     let output = run_probe_command(command, kind, source_id)?;
     if !output.status.success() {
         return Err(stderr_error(kind, &output.stderr).with_source_id(source_id.to_string()));
@@ -3316,13 +3411,25 @@ mod tests {
     }
 
     #[test]
+    fn media_input_registry_preserves_http_hls_uri() {
+        let uri = "http://127.0.0.1:8001/api/preview/hires/stream/manifest?project_id=p&job_id=j";
+        let registry = FfmpegSourceRegistry::single_media_input("preview", uri);
+        let input = registry.source_input("preview").unwrap();
+
+        assert_eq!(input.label(), uri);
+    }
+
+    #[test]
     fn decode_policy_applies_matching_prefetch_rule() {
         let mut values = BTreeMap::new();
         values.insert("format_name".to_string(), "container_a".to_string());
         values.insert("codec_name".to_string(), "codec_a".to_string());
         values.insert("pix_fmt".to_string(), "pixel_format_a".to_string());
         values.insert("profile".to_string(), "profile_a".to_string());
-        let profile = FfmpegVideoDecodeProfile::from_probe_values(Path::new("clip.ext"), &values);
+        let profile = FfmpegVideoDecodeProfile::from_probe_values(
+            &FfmpegMediaInput::from_path("clip.ext"),
+            &values,
+        );
         let policy = FfmpegDecodePolicy::fixed().with_video_prefetch_rule(
             FfmpegVideoPrefetchRule::new(8)
                 .when_container_contains("container_a")
@@ -3374,7 +3481,8 @@ mod tests {
 
     #[test]
     fn decode_profile_falls_back_to_path_container() {
-        let profile = FfmpegVideoDecodeProfile::from_path(Path::new("clip.EXT"));
+        let profile =
+            FfmpegVideoDecodeProfile::from_input(&FfmpegMediaInput::from_path("clip.EXT"));
 
         assert_eq!(profile.container.as_deref(), Some("ext"));
         assert_eq!(profile.codec, None);

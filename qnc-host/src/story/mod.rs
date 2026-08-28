@@ -1,9 +1,8 @@
 mod api;
-mod covers;
-mod db;
-mod markers;
+pub(crate) mod covers;
+pub(crate) mod db;
+pub(crate) mod markers;
 mod object_history;
-mod playlist;
 mod timeline_model;
 
 pub use api::router;

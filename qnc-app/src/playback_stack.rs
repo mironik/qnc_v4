@@ -177,9 +177,13 @@ impl PlaybackStack {
         self.player.snapshot().playing || self.carrier.playing()
     }
 
-    /// True while background workers should yield to playback setup or playback itself.
+    /// True while background workers should yield to actual playback.
+    ///
+    /// Opening/cueing an input is UI focus work. It must not stop artifact
+    /// workers, otherwise changing the selected clip can starve filmstrip and
+    /// waveform jobs.
     pub fn blocks_background_work(&self) -> bool {
-        self.playing() || self.input_opening || self.playlist_program_preparing
+        self.playing()
     }
 
     /// Live playlist/program frame for passive Program/Segment UI projections.
@@ -368,13 +372,26 @@ impl PlaybackStack {
             self.cue_frame(request.start_program_frame.0);
             return self.play_loaded_input();
         }
-        crate::player_log::log_info("bridge", "OpenProgram + Play");
-        self.open_program(request)?;
-        self.player.tx().play()
+        crate::player_log::log_info("bridge", "PlayProgram auto-start");
+        self.open_program_state(request.clone())?;
+        if let Err(error) = self.player.tx().play_program(request) {
+            self.input_opening = false;
+            return Err(error);
+        }
+        Ok(())
     }
 
     /// Open one playlist input without starting transport.
     pub fn open_program(&mut self, request: BroadcastProgramOpenRequest) -> Result<(), String> {
+        self.open_program_state(request.clone())?;
+        if let Err(error) = self.player.tx().open_program(request) {
+            self.input_opening = false;
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn open_program_state(&mut self, request: BroadcastProgramOpenRequest) -> Result<(), String> {
         if self.playlist_program_matches(&request) {
             self.playlist_input_active = true;
             self.cue_frame(request.start_program_frame.0);
@@ -389,10 +406,6 @@ impl PlaybackStack {
         self.playlist_program_ready = false;
         self.pending_seek = None;
         self.input_opening = true;
-        if let Err(error) = self.player.tx().open_program(request) {
-            self.input_opening = false;
-            return Err(error);
-        }
         self.playlist_input_active = true;
         self.playlist_program_request = Some(loaded_request);
         Ok(())
@@ -690,12 +703,12 @@ mod tests {
     }
 
     #[test]
-    fn source_open_blocks_background_until_ready() {
+    fn source_open_does_not_block_background_work() {
         let mut stack = PlaybackStack::new();
 
         stack.ensure_open(open_request()).unwrap();
 
-        assert!(stack.blocks_background_work());
+        assert!(!stack.blocks_background_work());
 
         stack.ingest_events(&[PlayerEvent::SourceReady {
             fps: 50.0,
@@ -706,6 +719,19 @@ mod tests {
         }]);
 
         assert!(!stack.blocks_background_work());
+    }
+
+    #[test]
+    fn actual_playback_blocks_background_work() {
+        let mut stack = PlaybackStack::new();
+        stack.ingest_events(&[PlayerEvent::State {
+            source_frame: FrameNumber(12),
+            source_sec: 0.24,
+            playing: true,
+            status: "Playing".into(),
+        }]);
+
+        assert!(stack.blocks_background_work());
     }
 
     #[test]
@@ -745,7 +771,7 @@ mod tests {
         assert!(stack.playlist_program_request_matches(&program_request(60)));
         assert!(stack.playlist_program_preparing);
         assert!(!stack.playlist_program_ready);
-        assert!(stack.blocks_background_work());
+        assert!(!stack.blocks_background_work());
     }
 
     #[test]
@@ -782,7 +808,7 @@ mod tests {
         assert!(stack.playlist_input_active());
         assert!(!stack.playlist_input_playing());
         assert!(stack.playlist_program_matches(&program_request(60)));
-        assert!(stack.blocks_background_work());
+        assert!(!stack.blocks_background_work());
     }
 
     #[test]

@@ -3187,7 +3187,7 @@ checksum = "d55d956fa96f5ec02be2e13af0e20391a5aa83d6a074e3ad368959d0fab299ea"
 
 [[package]]
 name = "qnc-app"
-version = "0.5.1"
+version = "0.6.0"
 dependencies = [
  "clap",
  "eframe",
@@ -3208,7 +3208,7 @@ dependencies = [
 
 [[package]]
 name = "qnc-broadcast-player"
-version = "0.5.1"
+version = "0.6.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -3216,7 +3216,7 @@ dependencies = [
 
 [[package]]
 name = "qnc-host"
-version = "0.5.1"
+version = "0.6.0"
 dependencies = [
  "async-trait",
  "axum",
@@ -3239,7 +3239,7 @@ dependencies = [
 
 [[package]]
 name = "qnc-media-ffmpeg"
-version = "0.5.1"
+version = "0.6.0"
 dependencies = [
  "qnc-broadcast-player",
  "qnc-service-contracts",
@@ -3248,14 +3248,14 @@ dependencies = [
 
 [[package]]
 name = "qnc-player-monitor"
-version = "0.5.1"
+version = "0.6.0"
 dependencies = [
  "qnc-broadcast-player",
 ]
 
 [[package]]
 name = "qnc-player-monitor-bridge"
-version = "0.5.1"
+version = "0.6.0"
 dependencies = [
  "qnc-broadcast-player",
  "qnc-player-monitor",
@@ -3263,7 +3263,7 @@ dependencies = [
 
 [[package]]
 name = "qnc-player-output"
-version = "0.5.1"
+version = "0.6.0"
 dependencies = [
  "qnc-broadcast-player",
  "qnc-media-ffmpeg",
@@ -3272,7 +3272,7 @@ dependencies = [
 
 [[package]]
 name = "qnc-player-runner"
-version = "0.5.1"
+version = "0.6.0"
 dependencies = [
  "qnc-broadcast-player",
  "qnc-media-ffmpeg",
@@ -3284,14 +3284,14 @@ dependencies = [
 
 [[package]]
 name = "qnc-player-runtime"
-version = "0.5.1"
+version = "0.6.0"
 dependencies = [
  "qnc-broadcast-player",
 ]
 
 [[package]]
 name = "qnc-service-contracts"
-version = "0.5.1"
+version = "0.6.0"
 dependencies = [
  "async-trait",
  "serde",
@@ -3300,7 +3300,7 @@ dependencies = [
 
 [[package]]
 name = "qnc-worker"
-version = "0.5.1"
+version = "0.6.0"
 dependencies = [
  "clap",
  "qnc-media-ffmpeg",

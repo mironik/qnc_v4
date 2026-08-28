@@ -1,7 +1,8 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use rusqlite::{params, Connection};
+use qnc_service_contracts::{JOB_SOURCE_FILMSTRIP, JOB_TYPE_FILMSTRIP};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::{json, Value};
 
 use crate::project::db::{now_str, open_project_strict, ProjectPaths};
@@ -334,13 +335,61 @@ pub fn clip_filmstrip_snapshot_for_api(
 
 pub fn get_filmstrip(paths: &ProjectPaths, project_id: &str, clip_id: &str) -> Option<Value> {
     let conn = open_db(paths, project_id).ok()?;
-    conn.query_row(
-        "SELECT clip_id, status, duration_sec, frame_count, error, built_at, updated_at
+    let row: Option<Value> = conn
+        .query_row(
+            "SELECT clip_id, status, duration_sec, frame_count, error, built_at, updated_at
          FROM filmstrips WHERE clip_id = ?1",
-        params![clip_id],
-        filmstrip_row,
+            params![clip_id],
+            filmstrip_row,
+        )
+        .ok();
+    if let Some(mut filmstrip) = row {
+        if filmstrip.get("status").and_then(Value::as_str) != Some("ready") {
+            if let Some((job_status, job_error)) = filmstrip_job_status(paths, project_id, clip_id)
+            {
+                if matches!(
+                    job_status.as_str(),
+                    "queued" | "processing" | "error" | "failed"
+                ) {
+                    filmstrip["status"] = json!(job_status);
+                    if !job_error.trim().is_empty() {
+                        filmstrip["error"] = json!(job_error);
+                    }
+                }
+            }
+        }
+        return Some(filmstrip);
+    }
+    filmstrip_job_status(paths, project_id, clip_id).map(|(status, error)| {
+        json!({
+            "clip_id": clip_id,
+            "status": status,
+            "duration_sec": 0.0,
+            "frame_count": 0,
+            "error": error,
+            "built_at": Value::Null,
+            "updated_at": Value::Null,
+        })
+    })
+}
+
+fn filmstrip_job_status(
+    paths: &ProjectPaths,
+    project_id: &str,
+    clip_id: &str,
+) -> Option<(String, String)> {
+    let conn = crate::ingest::db::open_ingest(paths, project_id).ok()?;
+    let job_id =
+        crate::ingest::db::ingest_job_id(JOB_TYPE_FILMSTRIP, JOB_SOURCE_FILMSTRIP, clip_id);
+    conn.query_row(
+        "SELECT status, error FROM ingest_jobs
+         WHERE job_id = ?1",
+        params![job_id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
     )
+    .optional()
     .ok()
+    .flatten()
 }
 
 pub fn list_frames_for_clip(
@@ -664,6 +713,119 @@ mod tests {
         );
         let fs = get_filmstrip(&paths, project_id, clip_id).unwrap();
         assert_eq!(fs.get("status").and_then(|v| v.as_str()), Some("ready"));
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn get_filmstrip_reports_active_job_status_without_frames() {
+        let base = std::env::temp_dir().join(format!(
+            "qnc_filmstrip_active_status_test_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+        let paths = test_paths(&base);
+        let project_id = "test_proj";
+        let clip_id = "clip_a";
+        register_project(&paths, project_id);
+        let conn = crate::ingest::db::open_ingest(&paths, project_id).unwrap();
+
+        crate::ingest::db::queue_ingest_job(
+            &conn,
+            JOB_TYPE_FILMSTRIP,
+            JOB_SOURCE_FILMSTRIP,
+            clip_id,
+        )
+        .unwrap();
+        let queued = get_filmstrip(&paths, project_id, clip_id).unwrap();
+        assert_eq!(
+            queued.get("status").and_then(|v| v.as_str()),
+            Some("queued")
+        );
+
+        crate::ingest::db::mark_ingest_job_processing(
+            &conn,
+            JOB_TYPE_FILMSTRIP,
+            JOB_SOURCE_FILMSTRIP,
+            clip_id,
+        )
+        .unwrap();
+        let processing = get_filmstrip(&paths, project_id, clip_id).unwrap();
+        assert_eq!(
+            processing.get("status").and_then(|v| v.as_str()),
+            Some("processing")
+        );
+
+        let snapshot = clip_filmstrip_snapshot(&paths, project_id, clip_id);
+        assert_eq!(
+            snapshot.get("filmstrip_status").and_then(|v| v.as_str()),
+            Some("processing")
+        );
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn get_filmstrip_reports_terminal_job_error_over_stale_building_status() {
+        let base = std::env::temp_dir().join(format!(
+            "qnc_filmstrip_terminal_status_test_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+        let paths = test_paths(&base);
+        let project_id = "test_proj";
+        let clip_id = "clip_a";
+        register_project(&paths, project_id);
+        let conn = crate::ingest::db::open_ingest(&paths, project_id).unwrap();
+
+        mark_filmstrip(&paths, project_id, clip_id, "building", "").unwrap();
+        crate::ingest::db::queue_ingest_job(
+            &conn,
+            JOB_TYPE_FILMSTRIP,
+            JOB_SOURCE_FILMSTRIP,
+            clip_id,
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE ingest_jobs
+             SET status = 'error',
+                 error = 'decode failed',
+                 finished_at = 'done',
+                 updated_at = 'done'
+             WHERE job_id = ?1",
+            params![crate::ingest::db::ingest_job_id(
+                JOB_TYPE_FILMSTRIP,
+                JOB_SOURCE_FILMSTRIP,
+                clip_id
+            )],
+        )
+        .unwrap();
+
+        let filmstrip = get_filmstrip(&paths, project_id, clip_id).unwrap();
+        assert_eq!(
+            filmstrip.get("status").and_then(|v| v.as_str()),
+            Some("error")
+        );
+        assert_eq!(
+            filmstrip.get("error").and_then(|v| v.as_str()),
+            Some("decode failed")
+        );
+
+        let snapshot = clip_filmstrip_snapshot(&paths, project_id, clip_id);
+        assert_eq!(
+            snapshot.get("filmstrip_status").and_then(|v| v.as_str()),
+            Some("error")
+        );
+
         let _ = fs::remove_dir_all(&base);
     }
 }

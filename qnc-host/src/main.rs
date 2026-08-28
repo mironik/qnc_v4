@@ -19,6 +19,9 @@ mod db_first;
 mod design;
 mod design_db;
 mod editor_assets;
+mod editorial_playlist;
+mod export_hires;
+mod export_playlist;
 mod filmstrip;
 mod frame_time;
 mod hardware_profile;
@@ -36,6 +39,7 @@ mod media_pool;
 mod modules;
 mod platform;
 mod project;
+mod render_api;
 mod routes;
 mod services;
 mod shell_dialog;
@@ -231,6 +235,7 @@ async fn main() {
         .merge(project::router())
         .merge(ingest::router())
         .merge(media::router())
+        .merge(render_api::router())
         .merge(story::router())
         .merge(jobs::router())
         .merge(routes::design_tools::router())

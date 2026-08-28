@@ -12,7 +12,7 @@ Native egui client against `qnc-host` (**no WebView / WASM / browser UI**).
 .\run_app.ps1
 ```
 
-Ako vidiš **AI / Virtual / Segment / Export XML** i `127.0.0.1` u browser footeru — to je **web**.  
+Ako vidiš **AI / Virtual / Segment / Export HI-res** i `127.0.0.1` u browser footeru — to je **web**.  
 Native prozor: naslov **„QNC App”**, Host URL red, Project lista s create/templates.
 
 ## Done (workflow parity)

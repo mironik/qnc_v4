@@ -51,6 +51,7 @@ data/_proxy_bench/
 
 # Alternate cargo target dir (local check builds)
 **/target-check/
+**/target-*/
 
 # Local DB dumps / scratch
 _dbdump/

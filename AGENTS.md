@@ -147,13 +147,20 @@ projektu za projektnu istinu, te runtime cache samo za brze, ne-trajne statuse.
 - Import se osvjezava po klipu, ne po batchu: cim pojedini klip dobije proxy,
   thumb, filmstrip frame ili waveform status, host zapisuje status za taj klip,
   a UI smije prikazati taj napredak bez cekanja zavrsetka cijele kartice.
+- Workeri su UI-agnostic background procesi. Nijedan worker ne smije znati koji
+  je tab, panel, forma, clip-card ili timeline trenutno fokusiran/selektiran u
+  UI-u. UI smije citati status i slati eksplicitne korisnicke workflow komande
+  poput import/export/odobri poster. UI smije poslati i idempotentni priority
+  hint za prikazni artefakt, ali prikaz, selekcija, hover, scrub ili otvaranje
+  timelinea ne smiju resetirati, otkazati, prekidati, requeueati ili mijenjati
+  lease postojeceg worker joba.
 - Import pipeline je step-by-step za QNC/breaking-news montazu: za jedan klip
   najprije se koristi/kopira proxy s kartice/NAS-a ili se generira proxy ako
   proxy ne postoji; zatim se za taj klip odmah pokrece filmstrip i klip postaje
-  montazno/playback upotrebljiv bez cekanja pomocnih UI artefakata. Ne gasiti
+  montazno/playback upotrebljiv bez cekanja pomocnih prikaznih artefakata. Ne gasiti
   pozadinske procese apsolutno: dijeliti ih u QoS trake. Proxy/generate je
-  teska traka i ne smije masovno zauzeti GPU/disk; filmstrip je prioritetni UI
-  artefakt; waveform je sekundarni UI artefakt i smije raditi u pozadini dok ne
+  teska traka i ne smije masovno zauzeti GPU/disk; filmstrip je prioritetni
+  prikazni artefakt; waveform je sekundarni prikazni artefakt i smije raditi u pozadini dok ne
   postoji playback/proxy pressure. Partial fajl ne smije biti playback/decode
   istina i ne smije predstavljati cijeli filmstrip.
 - Buduci vanjski workeri ne smiju uvoditi paralelni queue niti direktan SQLite
@@ -176,8 +183,8 @@ projektu za projektnu istinu, te runtime cache samo za brze, ne-trajne statuse.
 - Playback ima najviši prioritet, ali pozadinski poslovi se ne gase
   apsolutno. Worker scheduler mora koristiti QoS/resursne laneove: disk/GPU/CPU
   poslovi koji bi ugrozili broadcast player ne smiju startati u istom resursnom
-  laneu, dok lagani status/copy/UI artefakti mogu nastaviti kad policy kaže da
-  ne diraju play resurse.
+  laneu, dok lagani status/copy/prikazni artefakti mogu nastaviti kad policy
+  kaže da ne diraju play resurse.
 - `Import/Uvezi` ostaje zakljucani DB-first ugovor dok se izricito ne napravi
   zaseban migracijski korak. Worker split pocinje oko samostalnih artefakt
   poslova, ne izmjenama Ingest forme.

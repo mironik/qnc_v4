@@ -13,9 +13,11 @@ use crate::frame_time::{frame_to_seconds, is_valid_fps, seconds_to_frame};
 use crate::project::db::{open_project, ProjectPaths};
 use crate::project::ProjectDbBroker;
 
-use super::covers::{list_covers, StoryCoverRow};
-use super::db::{ensure_schema, list_active_parts, sync_story_part_source_fps, StoryPartRow};
-use super::markers::{
+use crate::story::covers::{list_covers, StoryCoverRow};
+use crate::story::db::{
+    ensure_schema, list_active_parts, sync_story_part_source_fps, StoryPartRow,
+};
+use crate::story::markers::{
     part_span_frames, part_span_seconds, timeline_duration_frames_from_parts, TIMELINE_EPS,
 };
 
@@ -123,19 +125,18 @@ struct CoverPlaybackTrim {
     source_fps: f64,
 }
 
-fn cover_playback_trim(cover: &StoryCoverRow, fallback_fps: f64) -> CoverPlaybackTrim {
-    let source_fps = if is_valid_fps(cover.source_fps) {
-        cover.source_fps
-    } else {
-        fallback_fps
-    };
+fn cover_playback_trim(cover: &StoryCoverRow) -> Result<CoverPlaybackTrim, String> {
+    if !is_valid_fps(cover.source_fps) {
+        return Err("missing source probe FPS".into());
+    }
+    let source_fps = cover.source_fps;
     let (source_in_frame, source_out_frame) = if cover.source_out_frame > cover.source_in_frame {
         let source_in_frame = cover.source_in_frame.max(0);
         (
             source_in_frame,
             cover.source_out_frame.max(source_in_frame + 1),
         )
-    } else if is_valid_fps(source_fps) {
+    } else {
         let in_sec = cover.in_seconds.unwrap_or(0.0).max(0.0);
         let out_sec = cover.out_seconds.unwrap_or(in_sec).max(in_sec);
         let in_frame = seconds_to_frame(in_sec, source_fps).max(0);
@@ -143,14 +144,12 @@ fn cover_playback_trim(cover: &StoryCoverRow, fallback_fps: f64) -> CoverPlaybac
             in_frame,
             seconds_to_frame(out_sec, source_fps).max(in_frame + 1),
         )
-    } else {
-        (0, 1)
     };
-    CoverPlaybackTrim {
+    Ok(CoverPlaybackTrim {
         source_in_frame,
         source_out_frame,
         source_fps,
-    }
+    })
 }
 
 fn cover_is_streamable(cover: &StoryCoverRow) -> bool {
@@ -188,19 +187,32 @@ fn map_covers_for_segment(
         if local_end_frame <= local_start_frame {
             continue;
         }
-        let trim = cover_playback_trim(cover, timeline_fps);
+        let trim = cover_playback_trim(cover);
+        let trim_error = trim.as_ref().err().cloned().unwrap_or_default();
+        let trim = trim.unwrap_or(CoverPlaybackTrim {
+            source_in_frame: 0,
+            source_out_frame: 1,
+            source_fps: 0.0,
+        });
         let source_in_frame = trim.source_in_frame;
         let source_out_frame = trim.source_out_frame.max(source_in_frame + 1);
         let slot_duration_frames = (local_end_frame - local_start_frame).max(0);
         let source_offset_frames = (part_start_frame - c_start_frame).max(0);
-        let streamable = cover_is_streamable(cover);
-        let stream_error = if streamable {
-            String::new()
-        } else if cover.virtual_shot_id.trim().is_empty() {
+        let source_timebase =
+            SourceTimebase::from_parts(cover.source_fps_num, cover.source_fps_den);
+        let stream_identity_ok = cover_is_streamable(cover);
+        let stream_error = if cover.virtual_shot_id.trim().is_empty() {
             "missing virtual_shot_id".into()
-        } else {
+        } else if cover.cover_id.trim().is_empty() {
             "missing cover_id".into()
+        } else if !trim_error.is_empty() {
+            trim_error
+        } else if !source_timebase.is_valid() {
+            "missing source probe timebase".into()
+        } else {
+            String::new()
         };
+        let streamable = stream_identity_ok && stream_error.is_empty();
         out.push(EditorialCover {
             cover_id: cover.cover_id.clone(),
             clip_id: cover.clip_id.clone(),
@@ -222,7 +234,7 @@ fn map_covers_for_segment(
             source_in_frame,
             source_out_frame,
             source_fps: trim.source_fps,
-            source_timebase: SourceTimebase::from_parts(cover.source_fps_num, cover.source_fps_den),
+            source_timebase,
             source_in_sec: if is_valid_fps(trim.source_fps) {
                 round3(frame_to_seconds(source_in_frame, trim.source_fps))
             } else {
@@ -356,7 +368,7 @@ pub fn build_editorial_playlist(
     build_editorial_playlist_from_conn(paths, pid, &conn)
 }
 
-fn build_editorial_playlist_from_conn(
+pub(crate) fn build_editorial_playlist_from_conn(
     paths: &ProjectPaths,
     project_id: &str,
     conn: &Connection,
@@ -784,6 +796,51 @@ mod tests {
         let cover = &plan.segments[0].covers[0];
         assert!(!cover.streamable);
         assert!(cover.stream_error.contains("virtual_shot_id"));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn build_editorial_playlist_cover_without_probe_fps_is_not_streamable() {
+        let base = std::env::temp_dir().join(format!(
+            "qnc_playlist_cover_no_probe_fps_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let paths = test_paths(&base);
+        let project_id = "playlist_cover_no_probe_fps";
+        let conn = open_project(&paths, project_id).unwrap();
+        ensure_schema(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO story_parts
+                (part_id, kind, sort_index, title, text, clip_id, virtual_shot_id,
+                 in_tc, out_tc, in_seconds, out_seconds, fps, source_fps_num, source_fps_den,
+                 in_frame, out_frame, duration_frames,
+                 duration_label, duration_color_key, created_at, updated_at)
+             VALUES ('part_manual', 'tonovi', 0, '', '', 'clip_a', '',
+                     '', '', 0, 2, 50, 50, 1, 0, 100, 100, '2:00', 'under_3', 't', 't')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO story_covers
+                (cover_id, timeline_start_sec, timeline_end_sec, slot_signature, slot_index,
+                 clip_id, virtual_shot_id, title, note, in_tc, out_tc, in_seconds, out_seconds,
+                 source_in_frame, source_out_frame, source_fps, source_fps_num, source_fps_den,
+                 sort_index, created_at, updated_at)
+             VALUES ('cover_no_fps', 0.5, 1.5, '', 0, 'clip_b', 'cover_b', 'No FPS', '',
+                     '', '', 0, 1, 0, 50, 0, 0, 1, 0, 't', 't')",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        let plan = build_editorial_playlist(&paths, project_id).unwrap();
+        let cover = &plan.segments[0].covers[0];
+
+        assert!(!cover.streamable);
+        assert_eq!(cover.source_fps, 0.0);
+        assert!(cover.stream_error.contains("source probe FPS"));
         let _ = std::fs::remove_dir_all(&base);
     }
 }

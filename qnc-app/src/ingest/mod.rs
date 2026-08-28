@@ -780,7 +780,7 @@ impl IngestScreen {
                     | MediaPoolAction::MarkIn
                     | MediaPoolAction::MarkOut
                     | MediaPoolAction::QuickCover
-                    | MediaPoolAction::ExportCommit => {}
+                    | MediaPoolAction::ExportHiRes => {}
                 }
             }
         });
@@ -805,7 +805,7 @@ impl IngestScreen {
             MediaPoolAction::MarkIn if enabled => self.nudge_frames(-1),
             MediaPoolAction::MarkOut if enabled => self.nudge_frames(1),
             MediaPoolAction::QuickCover
-            | MediaPoolAction::ExportCommit
+            | MediaPoolAction::ExportHiRes
             | MediaPoolAction::TogglePlay
             | MediaPoolAction::MarkIn
             | MediaPoolAction::MarkOut

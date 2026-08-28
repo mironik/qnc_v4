@@ -4,8 +4,8 @@ use std::thread;
 use clap::{Parser, ValueEnum};
 use qnc_service_contracts::WorkerPlacement;
 use qnc_worker::{
-    detect_worker_placement, HandlerRegistry, HttpJobClient, Worker, WorkerConfig,
-    DEFAULT_HOST_URL, DEFAULT_LEASE_MS, DEFAULT_POLL_MS,
+    HandlerRegistry, HttpJobClient, Worker, WorkerConfig, DEFAULT_HOST_URL, DEFAULT_LEASE_MS,
+    DEFAULT_POLL_MS,
 };
 
 #[derive(Debug, Parser)]
@@ -62,15 +62,14 @@ impl From<PlacementArg> for WorkerPlacement {
 fn main() -> ExitCode {
     let args = Args::parse();
     let worker_id = args.worker_id.unwrap_or_else(default_worker_id);
-    let auto_placement = detect_worker_placement(&args.host_url);
     let placement = args
         .placement
         .map(WorkerPlacement::from)
-        .unwrap_or(auto_placement);
+        .unwrap_or(WorkerPlacement::LocalWorkstation);
     let placement_source = if args.placement.is_some() {
-        "manual"
+        "config"
     } else {
-        "auto"
+        "default"
     };
     let registry = HandlerRegistry::with_builtin_handlers();
     let config = WorkerConfig::new(

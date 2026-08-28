@@ -38,7 +38,7 @@ pub(crate) enum MediaPoolAction {
     MarkIn,
     MarkOut,
     QuickCover,
-    ExportCommit,
+    ExportHiRes,
 }
 
 /// Built via `composition::HeadFeatures::to_pool_head` — do not hardcode flags in screens.
@@ -47,7 +47,8 @@ pub(crate) struct MediaPoolHeadInput {
     pub playing: bool,
     pub show_segment_tab: bool,
     pub show_cover_tab: bool,
-    pub show_export_xml: bool,
+    pub show_export_hires: bool,
+    pub export_hires_pending: bool,
     pub show_quick_cover: bool,
 }
 
@@ -131,8 +132,16 @@ pub(crate) fn show_head(ui: &mut egui::Ui, input: MediaPoolHeadInput) -> MediaPo
         }
 
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if input.show_export_xml && qnc_theme::transport_btn(ui, "Export XML").clicked() {
-                action = MediaPoolAction::ExportCommit;
+            let export_label = if input.export_hires_pending {
+                "Export..."
+            } else {
+                "Export HI-res"
+            };
+            if input.show_export_hires
+                && qnc_theme::transport_btn_state(ui, export_label, input.export_hires_pending)
+                    .clicked()
+            {
+                action = MediaPoolAction::ExportHiRes;
             }
             if input.show_quick_cover
                 && qnc_theme::transport_btn(ui, "B")

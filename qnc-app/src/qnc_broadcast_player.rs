@@ -113,6 +113,10 @@ impl BroadcastPlayerTx {
         self.send(PlayerCommand::OpenProgram(request))
     }
 
+    pub fn play_program(&self, request: BroadcastProgramOpenRequest) -> Result<(), String> {
+        self.send(PlayerCommand::PlayProgram(request))
+    }
+
     #[allow(dead_code)]
     pub fn play(&self) -> Result<(), String> {
         self.send(PlayerCommand::Play)

@@ -12,7 +12,6 @@ pub(crate) enum EditorialEditKind {
     MarkPartOut,
     SaveVirtualShot,
     CreatePartFromMarks,
-    Commit,
     DeletePart,
     ReorderPart,
     CreateMarker,
@@ -33,7 +32,6 @@ impl EditorialEditKind {
             Self::MarkPartOut => "part.mark_out",
             Self::SaveVirtualShot => "virtual_shot.create",
             Self::CreatePartFromMarks => "part.create_from_marks",
-            Self::Commit => "story.commit",
             Self::DeletePart => "part.delete",
             Self::ReorderPart => "part.reorder",
             Self::CreateMarker => "marker.create",
@@ -54,7 +52,6 @@ impl EditorialEditKind {
             "part.mark_out" => Self::MarkPartOut,
             "virtual_shot.create" => Self::SaveVirtualShot,
             "part.create_from_marks" => Self::CreatePartFromMarks,
-            "story.commit" => Self::Commit,
             "part.delete" => Self::DeletePart,
             "part.reorder" => Self::ReorderPart,
             "marker.create" => Self::CreateMarker,
@@ -174,18 +171,6 @@ impl EditorialEditComponent {
                 "in_frame": in_frame.max(0),
                 "out_frame": out_frame.max(in_frame + 1),
             }),
-        )
-    }
-
-    pub fn commit(instance_id: &str, request_id: u64, project_id: &str) -> ComponentBackendCommand {
-        Self::post(
-            instance_id,
-            request_id,
-            project_id,
-            EditorialEditKind::Commit,
-            "",
-            "/api/story/commit",
-            json!({ "project_id": project_id }),
         )
     }
 

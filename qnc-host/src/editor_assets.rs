@@ -29,7 +29,7 @@ use crate::virtual_shots::{
     derive_virtual_shot_from_frames, list_virtual_shots, update_virtual_shot,
     update_virtual_shot_from_frames, virtual_shot_frames,
 };
-use crate::waveform::{ready as waveform_ready, snapshot as waveform_snapshot};
+use crate::waveform::snapshot as waveform_snapshot;
 use qnc_service_contracts::{MediaAccessKind, MediaLocator, MediaResolveRequest};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -161,12 +161,12 @@ fn default_frame_index() -> i64 {
     -1
 }
 
-fn default_frames() -> u32 {
-    crate::filmstrip::DEFAULT_FILMSTRIP_FRAMES
-}
-
 fn default_media_chunk_sec() -> f64 {
     10.0
+}
+
+fn default_frames() -> u32 {
+    crate::filmstrip::DEFAULT_FILMSTRIP_FRAMES
 }
 
 fn timeline_build_frames(raw: u32) -> u32 {
@@ -459,9 +459,6 @@ async fn api_timeline_build(
     if let Some(existing) = get_filmstrip(&app.project.paths, &pid, clip_id) {
         let status = existing.get("status").and_then(Value::as_str).unwrap_or("");
         if status == "ready" {
-            if !waveform_ready(&app.project.paths, &pid, clip_id) {
-                enqueue_editor_waveform(&app, &pid, clip_id, None);
-            }
             return Ok(Json(json!({
                 "status": "ready",
                 "clip_id": clip_id,
@@ -469,11 +466,16 @@ async fn api_timeline_build(
                 "waveform": waveform_snapshot(&app.project.paths, &pid, clip_id),
             })));
         }
-        if status == "building" {
-            if let Some(path) = requested_media_path(&app, &pid, clip_id, &body.media_path) {
-                app.filmstrip.enqueue_priority(&pid, clip_id, &path, frames);
-            }
-            return Ok(Json(json!({ "status": "building", "clip_id": clip_id })));
+        if matches!(
+            status,
+            "building" | "queued" | "processing" | "error" | "failed" | "done"
+        ) {
+            return Ok(Json(json!({
+                "status": status,
+                "clip_id": clip_id,
+                "filmstrip": existing,
+                "waveform": waveform_snapshot(&app.project.paths, &pid, clip_id),
+            })));
         }
     }
     let media = requested_media_path(&app, &pid, clip_id, &body.media_path).ok_or_else(|| {
@@ -485,7 +487,6 @@ async fn api_timeline_build(
     mark_filmstrip_building(&app.project.paths, &pid, clip_id).map_err(internal)?;
     app.filmstrip
         .enqueue_priority(&pid, clip_id, &media, frames);
-    enqueue_editor_waveform(&app, &pid, clip_id, Some(&media));
     Ok(Json(json!({ "status": "queued", "clip_id": clip_id })))
 }
 
@@ -643,16 +644,6 @@ fn resolve_editor_proxy_or_original_path(
                 .map_err(|_| proxy_err)
         }
     }
-}
-
-fn enqueue_editor_waveform(
-    app: &AppState,
-    project_id: &str,
-    clip_id: &str,
-    fallback: Option<&PathBuf>,
-) {
-    let _ = fallback;
-    app.waveform.enqueue_job(project_id, clip_id);
 }
 
 fn resolve_editor_media_path(

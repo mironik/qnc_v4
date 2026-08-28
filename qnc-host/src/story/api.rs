@@ -10,6 +10,7 @@ use qnc_service_contracts::{
 use serde_json::{json, Value};
 
 use crate::app_state::AppState;
+use crate::editorial_playlist::{build_editorial_playlist_with_broker, EditorialPlaylist};
 use crate::frame_time::frame_to_seconds;
 use crate::project::db::{export_dir_from_settings, project_settings_snapshot_from_conn};
 
@@ -21,7 +22,6 @@ use super::db::{
     set_part_mark_out, set_part_mark_out_frame, undo_object, update_cover, update_marker,
     update_marker_frame, update_part, SegmentRangeInput,
 };
-use super::playlist::{build_editorial_playlist_with_broker, EditorialPlaylist};
 use super::timeline_model::{build_source_timeline_model, build_wrap_timeline_model_with_broker};
 
 #[derive(serde::Deserialize)]
@@ -285,6 +285,10 @@ pub fn router() -> Router<AppState> {
         .route("/api/story/object/redo", post(api_object_redo))
         .route("/api/story/commit", post(api_commit))
         .route("/api/story/export/submit", post(api_export_submit))
+        .route(
+            "/api/story/export/hires/submit",
+            post(crate::render_api::api_render_hires_submit),
+        )
         .route("/api/story/export/status", get(api_export_status))
         .route("/api/story/export/cancel", post(api_export_cancel))
         .route("/api/story/play-media", get(api_play_media))

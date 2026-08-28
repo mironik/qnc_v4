@@ -19,7 +19,7 @@ use super::store::{
     save_selection, select_all_clips, set_active_source, set_browse_path,
     set_ingest_archive_original, toggle_clip_selection,
 };
-use crate::waveform::{peaks_for_channel, ready as waveform_ready, snapshot as waveform_snapshot};
+use crate::waveform::{peaks_for_channel, snapshot as waveform_snapshot};
 
 #[derive(serde::Deserialize)]
 struct ProjectQuery {
@@ -396,9 +396,6 @@ async fn api_ingest_waveform_status(
     let clip_id = q.clip_id.trim();
     if clip_id.is_empty() {
         return Err((StatusCode::BAD_REQUEST, "clip_id je prazan".into()));
-    }
-    if !waveform_ready(&app.project.paths, &pid, clip_id) {
-        app.waveform.enqueue_job(&pid, clip_id);
     }
     Ok(Json(json!({
         "project_id": pid,

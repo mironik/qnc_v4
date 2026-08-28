@@ -30,6 +30,7 @@ use crate::components::{
     EditorialPlaybackTransportComponent, EditorialPlaybackView, EditorialPlaylistProgramInput,
     EditorialTogglePlayInput, EditorialTogglePlayOutcome, EditorialWrapRefreshInput,
     EditorialWrapRefreshOutcome, EditorialWrapSessionInput, EditorialWrapSessionOutcome,
+    ExportHiResStatus, HiResRenderProceduresComponent, HiResRenderProceduresState,
     PlaybackMediaResolution, PlaybackMediaResolverComponent, SyncCoverCaptureComponent,
     SyncCoverCaptureState, SyncCoverPreviewInput, SyncCoverSpaceContext,
 };
@@ -56,7 +57,6 @@ use self::focus::{
 const SOURCE_MEDIA_RETRY_DELAY: Duration = Duration::from_secs(1);
 const SOURCE_MEDIA_MAX_RETRIES: u8 = 30;
 const FILM_FRAME_MAX_LOAD_ATTEMPTS: u8 = 3;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ViewMode {
     Wrap,
@@ -145,6 +145,7 @@ pub struct StoryScreen {
     playhead_frame: i64,
     playing: bool,
     status: String,
+    hires_render_procedures: HiResRenderProceduresState,
     /// True while broadcast PlayerRemote owns the monitor.
     broadcast_preview_active: bool,
     thumb_textures: HashMap<String, TextureHandle>,
@@ -259,6 +260,7 @@ impl StoryScreen {
             playhead_frame: 0,
             playing: false,
             status: role.idle_status().into(),
+            hires_render_procedures: HiResRenderProceduresState::default(),
             broadcast_preview_active: false,
             thumb_textures: HashMap::new(),
             thumbs_queued: Vec::new(),
@@ -691,11 +693,106 @@ impl StoryScreen {
         self.status = format!("editorial snapshot: {}", error.into());
     }
 
+    pub fn apply_export_hires_submit(
+        &mut self,
+        project_id: &str,
+        response: qnc_service_contracts::ExportHiResSubmitResponse,
+    ) {
+        if let Some(status) = HiResRenderProceduresComponent::apply_export_submit(
+            &mut self.hires_render_procedures,
+            &self.loaded_project_id,
+            project_id,
+            response,
+        ) {
+            self.status = status;
+        }
+    }
+
+    pub fn set_export_hires_error(&mut self, project_id: &str, error: impl Into<String>) {
+        if let Some(status) = HiResRenderProceduresComponent::set_export_error(
+            &mut self.hires_render_procedures,
+            &self.loaded_project_id,
+            project_id,
+            error,
+            Instant::now(),
+        ) {
+            self.status = status;
+        }
+    }
+
+    pub fn apply_export_hires_status(&mut self, project_id: &str, job_status: ExportHiResStatus) {
+        if let Some(status) = HiResRenderProceduresComponent::apply_export_status(
+            &mut self.hires_render_procedures,
+            &self.loaded_project_id,
+            project_id,
+            job_status,
+            Instant::now(),
+        ) {
+            self.status = status;
+        }
+    }
+
+    pub fn set_export_hires_status_error(&mut self, project_id: &str, error: impl Into<String>) {
+        if let Some(status) = HiResRenderProceduresComponent::set_export_status_error(
+            &mut self.hires_render_procedures,
+            &self.loaded_project_id,
+            project_id,
+            error,
+        ) {
+            self.status = status;
+        }
+    }
+
+    pub fn apply_preview_hires_submit(
+        &mut self,
+        project_id: &str,
+        response: qnc_service_contracts::PreviewHiResInputResponse,
+    ) {
+        if let Some(status) = HiResRenderProceduresComponent::apply_preview_submit(
+            &mut self.hires_render_procedures,
+            &self.loaded_project_id,
+            project_id,
+            response,
+        ) {
+            self.status = status;
+        }
+    }
+
+    pub fn set_preview_hires_error(&mut self, project_id: &str, error: impl Into<String>) {
+        if let Some(status) = HiResRenderProceduresComponent::set_preview_error(
+            &mut self.hires_render_procedures,
+            &self.loaded_project_id,
+            project_id,
+            error,
+            Instant::now(),
+        ) {
+            self.status = status;
+        }
+    }
+
     pub fn meta_ready(&self) -> bool {
         !self.project_id.is_empty()
             && self.state_loaded
             && self.timeline_loaded
             && self.playlist_loaded
+    }
+
+    pub fn status_text(&self) -> &str {
+        &self.status
+    }
+
+    fn export_hires_button_active(&mut self) -> bool {
+        HiResRenderProceduresComponent::export_button_active(
+            &mut self.hires_render_procedures,
+            Instant::now(),
+        )
+    }
+
+    fn preview_hires_button_active(&mut self) -> bool {
+        HiResRenderProceduresComponent::preview_button_active(
+            &mut self.hires_render_procedures,
+            Instant::now(),
+        )
     }
 
     fn finish_meta_result(&mut self) {
@@ -1247,10 +1344,6 @@ impl StoryScreen {
             EditorialEditKind::CreatePartFromMarks => {
                 self.status = format!("Dodan {}", data.detail);
                 self.defer_wrap_scrub_after_timeline(None);
-                PlaybackTransportIntent::None
-            }
-            EditorialEditKind::Commit => {
-                self.status = "Commit OK — Export XML datoteka čeka host API (isto kao web)".into();
                 PlaybackTransportIntent::None
             }
             EditorialEditKind::DeletePart => {
@@ -1965,6 +2058,7 @@ impl StoryScreen {
         if self.project_id.is_empty() {
             return;
         }
+        self.poll_export_hires_status_if_needed();
         self.pump_film_frames(ctx);
         self.pump_thumbs(host, ctx);
         let _ = host;
@@ -1978,6 +2072,9 @@ impl StoryScreen {
         }
         if self.playing {
             ctx.request_repaint();
+        }
+        if self.hires_render_procedures.export_has_watch() {
+            ctx.request_repaint_after(HiResRenderProceduresComponent::export_poll_interval());
         }
     }
 
@@ -2063,16 +2160,21 @@ impl StoryScreen {
     /// Timelines do not talk to each other; they only mirror the player.
     fn sync_playhead_from_player_frame(&mut self, source_frame: FrameNumber) {
         let frame = source_frame.0.max(0);
+        if let Some(session) = self.sync_cover.active() {
+            if let Some(segment) = self.playlist_segment_at_frame(frame) {
+                self.selected_part_id = segment.part_id.clone();
+            }
+            let source_frame =
+                SyncCoverCaptureComponent::source_frame_at_program_frame(session, frame);
+            self.set_source_playhead_frame(source_frame);
+            self.set_wrap_playhead_frame(frame);
+            return;
+        }
         match self.view_mode {
             ViewMode::Source => self.set_source_playhead_frame(frame),
             ViewMode::Wrap => {
                 if let Some(segment) = self.playlist_segment_at_frame(frame) {
                     self.selected_part_id = segment.part_id.clone();
-                }
-                if let Some(session) = self.sync_cover.active() {
-                    let source_frame =
-                        SyncCoverCaptureComponent::source_frame_at_program_frame(session, frame);
-                    self.set_source_playhead_frame(source_frame);
                 }
                 self.set_wrap_playhead_frame(frame);
             }
@@ -2318,8 +2420,8 @@ impl StoryScreen {
             media_pool::MediaPoolAction::QuickCover => {
                 self.dispatch_playback_action(host, playback_controls::PlaybackAction::QuickCover)
             }
-            media_pool::MediaPoolAction::ExportCommit => {
-                self.export_commit(host);
+            media_pool::MediaPoolAction::ExportHiRes => {
+                self.export_hires(host);
                 PlaybackTransportIntent::None
             }
             media_pool::MediaPoolAction::SelectClipId(_)
@@ -2328,12 +2430,12 @@ impl StoryScreen {
     }
 
     fn ui_pool_head(&mut self, ui: &mut egui::Ui, host: &HostClient) -> PlaybackTransportIntent {
-        let action = media_pool::show_head(
-            ui,
-            self.role
-                .head()
-                .to_pool_head(self.library_tab, self.playing),
-        );
+        let mut input = self
+            .role
+            .head()
+            .to_pool_head(self.library_tab, self.playing);
+        input.export_hires_pending = self.export_hires_button_active();
+        let action = media_pool::show_head(ui, input);
         self.dispatch_media_pool(host, action)
     }
 
@@ -2400,6 +2502,7 @@ impl StoryScreen {
         let program_waveform = self.program_waveforms.compose(&program, &source_durations);
         let display_frame =
             playback.playlist_display_frame(self.wrap_playhead_frame, program.duration_frames());
+        let preview_hires_pending = self.preview_hires_button_active();
         let tc = |sec| self.tc(sec);
         let playhead_sec = self.timeline_sec_from_frame(display_frame).unwrap_or(0.0);
         let action = segment_panel::show(
@@ -2415,6 +2518,7 @@ impl StoryScreen {
                 a2_peaks: &program_waveform.a2_peaks,
                 selected_slot_id: &self.selected_slot_id,
                 selected_cover_id: &self.selected_cover_id,
+                preview_hires_pending,
                 sync_cover_enabled: self.sync_cover.enabled(),
                 tc: &tc,
             },
@@ -2454,6 +2558,7 @@ impl StoryScreen {
             }
             marker_cover_panel::MarkerCoverAction::CreateCover => self.quick_cover(host),
             marker_cover_panel::MarkerCoverAction::OverwriteCover => self.overwrite_cover(host),
+            marker_cover_panel::MarkerCoverAction::PreviewHiRes => self.preview_hires(host),
             marker_cover_panel::MarkerCoverAction::ToggleSyncCover => {
                 self.toggle_sync_cover_capture()
             }
@@ -3327,9 +3432,72 @@ impl StoryScreen {
         Ok((clip_id.to_string(), in_frame, out_frame))
     }
 
-    fn export_commit(&mut self, _host: &HostClient) {
-        self.enqueue_edit_command(EditorialEditComponent::commit);
-        self.status = "Commit u tijeku...".into();
+    fn export_hires(&mut self, _host: &HostClient) {
+        let instance_id = self.edit_instance_id();
+        let request_id = self.next_backend_request_id();
+        let project_id = self.project_id.clone();
+        match HiResRenderProceduresComponent::start_export(
+            &mut self.hires_render_procedures,
+            instance_id,
+            request_id,
+            &project_id,
+            Instant::now(),
+        ) {
+            Ok((command, status)) => {
+                self.enqueue_backend_command(command);
+                self.status = status;
+            }
+            Err(status) => {
+                self.status = status;
+            }
+        }
+    }
+
+    fn poll_export_hires_status_if_needed(&mut self) {
+        let project_id = self.project_id.clone();
+        if project_id.trim().is_empty() {
+            return;
+        }
+        let Some(job_id) = HiResRenderProceduresComponent::claim_export_status_poll(
+            &mut self.hires_render_procedures,
+            Instant::now(),
+        ) else {
+            return;
+        };
+        let instance_id = self.edit_instance_id();
+        let request_id = self.next_backend_request_id();
+        self.enqueue_backend_command(HiResRenderProceduresComponent::export_status_command(
+            instance_id,
+            request_id,
+            &project_id,
+            &job_id,
+        ));
+    }
+
+    fn preview_hires(&mut self, host: &HostClient) -> PlaybackTransportIntent {
+        let instance_id = self.edit_instance_id();
+        let request_id = self.next_backend_request_id();
+        let project_id = self.project_id.clone();
+        match HiResRenderProceduresComponent::start_preview(
+            &mut self.hires_render_procedures,
+            instance_id,
+            request_id,
+            &project_id,
+            Instant::now(),
+        ) {
+            Ok((command, status)) => {
+                self.enqueue_backend_command(command);
+                let preview_status = status;
+                self.status = preview_status.clone();
+                let home_intent = self.jump_playlist_start(host);
+                self.status = preview_status;
+                home_intent
+            }
+            Err(status) => {
+                self.status = status;
+                PlaybackTransportIntent::None
+            }
+        }
     }
 
     fn delete_part(&mut self, _host: &HostClient, part_id: &str) {
@@ -3727,9 +3895,6 @@ impl StoryScreen {
         {
             self.selected_part_id = part_id;
         }
-        self.view_mode = ViewMode::Wrap;
-        self.source_dock_keyboard_focus = false;
-        self.panel_focus = PanelFocus::SegmentPanel;
         self.set_wrap_playhead_frame(anchor_program_frame);
         self.set_source_playhead_frame(source_in_frame);
         self.playing = true;
@@ -5151,6 +5316,94 @@ mod tests {
     }
 
     #[test]
+    fn preview_hires_button_builds_preview_flat_playlist() {
+        let mut screen = StoryScreen::story();
+        screen.project_id = "p".into();
+        screen.loaded_project_id = "p".into();
+
+        let intent = screen.preview_hires(&HostClient::new("http://127.0.0.1:1"));
+
+        assert_eq!(intent, PlaybackTransportIntent::None);
+        assert!(screen.hires_render_procedures.preview_pending());
+        let commands = screen.drain_backend_commands();
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0].component_id, "hires.render_transport");
+        assert_eq!(commands[0].operation_id, "preview_hires_input.build");
+        assert_eq!(commands[0].path, "/api/preview/hires/input/build");
+        assert_eq!(
+            commands[0]
+                .payload
+                .as_ref()
+                .and_then(|payload| payload.get("project_id"))
+                .and_then(Value::as_str),
+            Some("p")
+        );
+        assert!(screen.status.contains("flat playlist"));
+    }
+
+    #[test]
+    fn preview_hires_sends_playlist_home_before_backend_build() {
+        let mut screen = StoryScreen::story();
+        screen.project_id = "p".into();
+        screen.loaded_project_id = "p".into();
+        screen.playlist = Some(two_part_playlist());
+        screen.wrap_playhead_frame = 50;
+        screen.selected_part_id = "part_b".into();
+        screen.all_clips = vec![StoryShot {
+            clip_id: "clip_a".into(),
+            fps: 50.0,
+            duration_frames: 300,
+            play_path: "C:/qnc/proxy/clip_a.mp4".into(),
+            has_audio: true,
+            audio_channels: 2,
+            ..StoryShot::default()
+        }];
+        seed_playlist_playback_inputs(&mut screen, &["clip_a"]);
+
+        let intent = screen.preview_hires(&HostClient::new("http://127.0.0.1:1"));
+
+        let request = match intent {
+            PlaybackTransportIntent::OpenProgram(request) => request,
+            other => {
+                panic!("expected playlist Home OpenProgram before preview build, got {other:?}")
+            }
+        };
+        assert_eq!(screen.view_mode, ViewMode::Wrap);
+        assert_eq!(screen.wrap_playhead_frame, 0);
+        assert_eq!(screen.selected_part_id, "part_a");
+        assert_eq!(request.start_program_frame, FrameNumber(0));
+        assert!(screen.status.contains("flat playlist"));
+        let commands = screen.drain_backend_commands();
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0].operation_id, "preview_hires_input.build");
+    }
+
+    #[test]
+    fn export_hires_button_uses_existing_render_transport() {
+        let mut screen = StoryScreen::story();
+        screen.project_id = "p".into();
+        screen.loaded_project_id = "p".into();
+
+        screen.export_hires(&HostClient::new("http://127.0.0.1:1"));
+
+        assert!(screen.hires_render_procedures.export_pending());
+        let commands = screen.drain_backend_commands();
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0].component_id, "hires.render_transport");
+        assert_eq!(commands[0].operation_id, "export_hires.submit");
+        assert_eq!(commands[0].path, "/api/render/hires/submit");
+        assert_eq!(
+            commands[0]
+                .payload
+                .as_ref()
+                .and_then(|payload| payload.get("project_id"))
+                .and_then(Value::as_str),
+            Some("p")
+        );
+        assert!(screen.status.contains("worker job"));
+    }
+
+    #[test]
     fn suspend_playback_session_keeps_loaded_story_components() {
         let mut screen = StoryScreen::story();
         screen.begin_meta_load("p", 3);
@@ -5379,7 +5632,8 @@ mod tests {
             other => panic!("expected PlayProgram, got {other:?}"),
         };
 
-        assert_eq!(screen.view_mode, ViewMode::Wrap);
+        assert_eq!(screen.view_mode, ViewMode::Source);
+        assert!(screen.source_dock_keyboard_focus);
         assert_eq!(screen.wrap_playhead_frame, 0);
         assert_eq!(screen.source_playhead_frame, 24);
         assert!(screen.playing);
@@ -5408,6 +5662,28 @@ mod tests {
             .expect("cover video");
         assert_eq!(cover_video.source_ref.in_frame, Some(FrameNumber(24)));
         assert_eq!(cover_video.source_ref.out_frame, Some(FrameNumber(74)));
+    }
+
+    #[test]
+    fn sync_player_frame_maps_program_clock_while_source_dock_stays_active() {
+        let mut screen = sync_story_screen();
+        screen.toggle_sync_cover_capture();
+        screen.source_playhead_frame = 24;
+        let _ = screen.dispatch_playback_action(
+            &HostClient::new("http://127.0.0.1:1"),
+            playback_controls::PlaybackAction::MarkIn,
+        );
+        let intent = screen.playback_transport_toggle_intent(false, false);
+        assert!(matches!(intent, PlaybackTransportIntent::PlayProgram(_)));
+        assert_eq!(screen.view_mode, ViewMode::Source);
+        assert!(screen.source_dock_keyboard_focus);
+
+        screen.sync_playhead_from_player_frame(FrameNumber(35));
+
+        assert_eq!(screen.wrap_playhead_frame, 35);
+        assert_eq!(screen.source_playhead_frame, 59);
+        assert_eq!(screen.view_mode, ViewMode::Source);
+        assert!(screen.source_dock_keyboard_focus);
     }
 
     #[test]

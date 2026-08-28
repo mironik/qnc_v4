@@ -10,13 +10,14 @@ use crate::component_errors::{ComponentErrorBoundary, ComponentErrorKey};
 use crate::component_runtime::{ComponentBackendCommand, ComponentBackendRuntime};
 use crate::components::{
     EditorialEditComponent, EditorialEditData, EditorialEditKind, EditorialStateComponent,
-    EditorialStateData, FilesystemListComponent, PlaybackMediaResolution,
-    PlaybackMediaResolverComponent, ProjectCatalogComponent, ProjectCommandComponent,
-    ProjectCommandData, ProjectCommandKind, ProjectExportProfileComponent,
-    ProjectRegistryComponent, ShellStateComponent, ShellStateData, ShortcutBindingsComponent,
-    ShortcutBindingsData, SourceImportCommandComponent, SourceImportCommandKind,
-    SourceImportSelectionComponent, SourceImportStateComponent, SourceImportStateKind,
-    SourceImportStatusComponent, ThemePickerComponent,
+    EditorialStateData, ExportHiResStatus, FilesystemListComponent, HiResPreviewOpen,
+    HiResPreviewPlayerAction, HiResPreviewPlayerComponent, HiResPreviewPlayerState,
+    HiResRenderTransportComponent, PlaybackMediaResolution, PlaybackMediaResolverComponent,
+    ProjectCatalogComponent, ProjectCommandComponent, ProjectCommandData, ProjectCommandKind,
+    ProjectExportProfileComponent, ProjectRegistryComponent, ShellStateComponent, ShellStateData,
+    ShortcutBindingsComponent, ShortcutBindingsData, SourceImportCommandComponent,
+    SourceImportCommandKind, SourceImportSelectionComponent, SourceImportStateComponent,
+    SourceImportStateKind, SourceImportStatusComponent, ThemePickerComponent,
 };
 use crate::composition::{ScreenComposition, WorkflowScreen};
 use crate::ingest::IngestScreen;
@@ -95,6 +96,7 @@ pub struct QncApp {
     /// Sole broadcast player (+ carrier / monitor). Screens only host the UI slots.
     pub(crate) playback: PlaybackStack,
     playback_rx: BroadcastPlayerRx,
+    hires_preview_player: HiResPreviewPlayerState,
     component_backend: ComponentBackendRuntime,
     component_errors: ComponentErrorBoundary,
     source_import_status: SourceImportStatusComponent,
@@ -147,6 +149,7 @@ impl QncApp {
             story: StoryScreen::story(),
             playback,
             playback_rx,
+            hires_preview_player: HiResPreviewPlayerState::default(),
             component_backend: ComponentBackendRuntime::new(),
             component_errors: ComponentErrorBoundary::default(),
             source_import_status: SourceImportStatusComponent::default(),
@@ -814,7 +817,11 @@ impl QncApp {
         };
         for command in commands {
             if let Err(e) = self.submit_component_backend_command(command, ctx.clone()) {
-                self.set_editorial_edit_error(instance_id, "", EditorialEditKind::Commit, e);
+                match instance_id {
+                    EDITORIAL_INSTANCE_STORY => self.story.apply_player_error(e),
+                    EDITORIAL_INSTANCE_MEDIA_ASSIST => self.media_assist.apply_player_error(e),
+                    _ => self.error = Some(e),
+                }
             }
         }
     }
@@ -857,6 +864,159 @@ impl QncApp {
                 .media_assist
                 .set_editorial_edit_error(project_id, kind, error),
             _ => self.error = Some(error.into()),
+        }
+    }
+
+    fn apply_export_hires_submit(
+        &mut self,
+        instance_id: &str,
+        project_id: &str,
+        response: qnc_service_contracts::ExportHiResSubmitResponse,
+    ) {
+        match instance_id {
+            EDITORIAL_INSTANCE_STORY => {
+                self.story.apply_export_hires_submit(project_id, response);
+                self.status = self.story.status_text().to_owned();
+            }
+            EDITORIAL_INSTANCE_MEDIA_ASSIST => {
+                self.media_assist
+                    .apply_export_hires_submit(project_id, response);
+                self.status = self.media_assist.status_text().to_owned();
+            }
+            _ => {}
+        }
+    }
+
+    fn set_export_hires_error(
+        &mut self,
+        instance_id: &str,
+        project_id: &str,
+        error: impl Into<String>,
+    ) {
+        let error = error.into();
+        match instance_id {
+            EDITORIAL_INSTANCE_STORY => {
+                self.story.set_export_hires_error(project_id, error);
+                self.status = self.story.status_text().to_owned();
+            }
+            EDITORIAL_INSTANCE_MEDIA_ASSIST => {
+                self.media_assist.set_export_hires_error(project_id, error);
+                self.status = self.media_assist.status_text().to_owned();
+            }
+            _ => self.error = Some(error),
+        }
+    }
+
+    fn apply_export_hires_status(
+        &mut self,
+        instance_id: &str,
+        project_id: &str,
+        status: ExportHiResStatus,
+    ) {
+        match instance_id {
+            EDITORIAL_INSTANCE_STORY => {
+                self.story.apply_export_hires_status(project_id, status);
+                self.status = self.story.status_text().to_owned();
+            }
+            EDITORIAL_INSTANCE_MEDIA_ASSIST => {
+                self.media_assist
+                    .apply_export_hires_status(project_id, status);
+                self.status = self.media_assist.status_text().to_owned();
+            }
+            _ => {}
+        }
+    }
+
+    fn set_export_hires_status_error(
+        &mut self,
+        instance_id: &str,
+        project_id: &str,
+        error: impl Into<String>,
+    ) {
+        let error = error.into();
+        match instance_id {
+            EDITORIAL_INSTANCE_STORY => {
+                self.story.set_export_hires_status_error(project_id, error);
+                self.status = self.story.status_text().to_owned();
+            }
+            EDITORIAL_INSTANCE_MEDIA_ASSIST => {
+                self.media_assist
+                    .set_export_hires_status_error(project_id, error);
+                self.status = self.media_assist.status_text().to_owned();
+            }
+            _ => self.error = Some(error),
+        }
+    }
+
+    fn apply_preview_hires_submit(
+        &mut self,
+        instance_id: &str,
+        project_id: &str,
+        response: qnc_service_contracts::PreviewHiResInputResponse,
+        ctx: Option<egui::Context>,
+    ) {
+        match instance_id {
+            EDITORIAL_INSTANCE_STORY => {
+                self.story
+                    .apply_preview_hires_submit(project_id, response.clone());
+                self.status = self.story.status_text().to_owned();
+            }
+            EDITORIAL_INSTANCE_MEDIA_ASSIST => {
+                self.media_assist
+                    .apply_preview_hires_submit(project_id, response.clone());
+                self.status = self.media_assist.status_text().to_owned();
+            }
+            _ => {
+                self.error = Some("Preview HI-res: nepoznata editorial instanca".into());
+                return;
+            }
+        }
+        let open = match HiResPreviewPlayerComponent::build_open(&response) {
+            Ok(open) => open,
+            Err(error) => {
+                self.set_preview_hires_error(instance_id, project_id, error);
+                return;
+            }
+        };
+        if ctx.is_some() {
+            self.playback.stop();
+        }
+        self.open_hires_preview(instance_id, project_id, open, ctx);
+    }
+
+    fn open_hires_preview(
+        &mut self,
+        instance_id: &str,
+        project_id: &str,
+        open: HiResPreviewOpen,
+        ctx: Option<egui::Context>,
+    ) {
+        let intent = HiResPreviewPlayerComponent::build_play_intent(&open);
+        if let Some(ctx) = ctx.as_ref() {
+            HiResPreviewPlayerComponent::open(&mut self.hires_preview_player, ctx, &open);
+        }
+        self.playback_transport_intent(intent);
+        self.status = format!("Preview HI-res play · {}", open.preview_id);
+        let _ = (instance_id, project_id);
+    }
+
+    fn set_preview_hires_error(
+        &mut self,
+        instance_id: &str,
+        project_id: &str,
+        error: impl Into<String>,
+    ) {
+        let error = error.into();
+        match instance_id {
+            EDITORIAL_INSTANCE_STORY => {
+                self.story.set_preview_hires_error(project_id, error);
+                self.status = self.story.status_text().to_owned();
+            }
+            EDITORIAL_INSTANCE_MEDIA_ASSIST => {
+                self.media_assist.set_preview_hires_error(project_id, error);
+                self.status = self.media_assist.status_text().to_owned();
+            }
+            _ => self.error = Some(error),
         }
     }
 
@@ -1773,6 +1933,59 @@ impl QncApp {
                         self.set_editorial_edit_error(&instance_id, &project_id, kind, e);
                     }
                 }
+            } else if HiResRenderTransportComponent::accepts_event(&event) {
+                let Some((instance_id, project_id, result)) =
+                    HiResRenderTransportComponent::into_submit(event)
+                else {
+                    continue;
+                };
+                match result {
+                    Ok(response) => {
+                        self.clear_component_error(&error_key);
+                        self.apply_export_hires_submit(&instance_id, &project_id, response);
+                    }
+                    Err(e) => {
+                        let e = self.record_component_error(error_key, e);
+                        self.set_export_hires_error(&instance_id, &project_id, e);
+                    }
+                }
+            } else if HiResRenderTransportComponent::accepts_status_event(&event) {
+                let Some((instance_id, project_id, result)) =
+                    HiResRenderTransportComponent::into_status(event)
+                else {
+                    continue;
+                };
+                match result {
+                    Ok(status) => {
+                        self.clear_component_error(&error_key);
+                        self.apply_export_hires_status(&instance_id, &project_id, status);
+                    }
+                    Err(e) => {
+                        let e = self.record_component_error(error_key, e);
+                        self.set_export_hires_status_error(&instance_id, &project_id, e);
+                    }
+                }
+            } else if HiResRenderTransportComponent::accepts_preview_event(&event) {
+                let Some((instance_id, project_id, result)) =
+                    HiResRenderTransportComponent::into_preview_submit(event)
+                else {
+                    continue;
+                };
+                match result {
+                    Ok(response) => {
+                        self.clear_component_error(&error_key);
+                        self.apply_preview_hires_submit(
+                            &instance_id,
+                            &project_id,
+                            response,
+                            ctx.clone(),
+                        );
+                    }
+                    Err(e) => {
+                        let e = self.record_component_error(error_key, e);
+                        self.set_preview_hires_error(&instance_id, &project_id, e);
+                    }
+                }
             } else if EditorialStateComponent::accepts_event(&event) {
                 let Some((instance_id, project_id, result)) =
                     EditorialStateComponent::into_data(event)
@@ -2438,6 +2651,8 @@ impl eframe::App for QncApp {
             });
         }
 
+        let panel_bg = qnc_theme::current_ctx(ctx).bg;
+
         // Footer first = outer bottom edge (web workflow tabs)
         if self.phase == Phase::Workspace {
             egui::TopBottomPanel::bottom("footer")
@@ -2563,8 +2778,31 @@ impl eframe::App for QncApp {
                 });
         }
 
+        if self.phase == Phase::Workspace {
+            egui::TopBottomPanel::bottom("workspace_status")
+                .exact_height(22.0)
+                .frame(egui::Frame::NONE.fill(panel_bg).inner_margin(egui::Margin {
+                    left: 8,
+                    right: 8,
+                    top: 2,
+                    bottom: 2,
+                }))
+                .show(ctx, |ui| {
+                    let t = qnc_theme::current_ctx(ctx);
+                    ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                        ui.set_min_height(ui.available_height());
+                        let status = self.status.trim();
+                        let status = if status.is_empty() { "Ready" } else { status };
+                        ui.label(
+                            RichText::new(status)
+                                .size(qnc_theme::FONT_UI)
+                                .color(t.muted),
+                        );
+                    });
+                });
+        }
+
         // Source editor dock — composition.dock decides which screens get it.
-        let panel_bg = qnc_theme::current_ctx(ctx).bg;
         if comp.dock.show && story_active {
             let h = self.story.source_dock_height();
             egui::TopBottomPanel::bottom("story_source_dock")
@@ -2656,6 +2894,7 @@ impl eframe::App for QncApp {
                                     EDITORIAL_INSTANCE_MEDIA_ASSIST,
                                     Some(ctx.clone()),
                                 );
+                                self.status = self.media_assist.status_text().to_owned();
                             }
                             Screen::Story => {
                                 let intents = self.story.ui_main(ui, &self.host, ctx, &self.playback);
@@ -2664,6 +2903,7 @@ impl eframe::App for QncApp {
                                     EDITORIAL_INSTANCE_STORY,
                                     Some(ctx.clone()),
                                 );
+                                self.status = self.story.status_text().to_owned();
                             }
                             Screen::Unsupported(tab) => {
                                 ui.vertical_centered(|ui| {
@@ -2690,5 +2930,18 @@ impl eframe::App for QncApp {
 
         // Post-UI: process app-routed transport commands emitted during paint.
         self.tick_active_player(ctx);
+        if self.hires_preview_player.active() {
+            match HiResPreviewPlayerComponent::show(
+                ctx,
+                &self.playback,
+                &mut self.hires_preview_player,
+            ) {
+                HiResPreviewPlayerAction::None => {}
+                HiResPreviewPlayerAction::Close => {
+                    self.playback.stop();
+                    HiResPreviewPlayerComponent::close(&mut self.hires_preview_player, ctx);
+                }
+            }
+        }
     }
 }

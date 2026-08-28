@@ -8,8 +8,10 @@ use eframe::egui::{self, Pos2, Rect, RichText, Sense, Vec2};
 use crate::qnc_theme::{self, MUTED, TEXT};
 
 const COMPACT_CTRL_H: f32 = 22.0;
-const EDIT_ACTIONS_W: f32 = 360.0;
+const EDIT_ACTIONS_W: f32 = 250.0;
+const RIGHT_ACTIONS_W: f32 = 190.0;
 const EDIT_ACTION_GAP: f32 = 6.0;
+const CONTROL_GROUP_GAP: f32 = 10.0;
 const TRANSPORT_BTN_W: f32 = 30.0;
 const TRANSPORT_GAP: f32 = 5.0;
 const TRANSPORT_CONTROLS_W: f32 = TRANSPORT_BTN_W * 7.0 + TRANSPORT_GAP * 6.0;
@@ -20,6 +22,7 @@ pub(crate) struct MarkerCoverInput<'a> {
     pub playhead_sec: f64,
     pub tc: &'a dyn Fn(f64) -> String,
     pub show_playhead: bool,
+    pub preview_hires_pending: bool,
     pub sync_cover_enabled: bool,
 }
 
@@ -36,6 +39,7 @@ pub(crate) enum MarkerCoverAction {
     AddMarker,
     CreateCover,
     OverwriteCover,
+    PreviewHiRes,
     ToggleSyncCover,
 }
 
@@ -64,20 +68,31 @@ pub(crate) fn show(ui: &mut egui::Ui, input: MarkerCoverInput<'_>) -> MarkerCove
             Vec2::new(ui.available_width(), COMPACT_CTRL_H),
             Sense::hover(),
         );
-        show_transport_controls(ui, row_rect, &mut action);
-        show_edit_actions(ui, row_rect, input.sync_cover_enabled, &mut action);
+        if let Some(transport_rect) = show_transport_controls(ui, row_rect, &mut action) {
+            show_edit_actions(ui, row_rect, transport_rect, &mut action);
+            show_right_actions(
+                ui,
+                row_rect,
+                transport_rect,
+                input.preview_hires_pending,
+                input.sync_cover_enabled,
+                &mut action,
+            );
+        }
     });
 
     action
 }
 
-fn show_transport_controls(ui: &mut egui::Ui, row_rect: Rect, action: &mut MarkerCoverAction) {
-    let free_right = (row_rect.max.x - EDIT_ACTIONS_W - 12.0).max(row_rect.min.x);
-    let free_w = free_right - row_rect.min.x;
-    if free_w < TRANSPORT_CONTROLS_W {
-        return;
+fn show_transport_controls(
+    ui: &mut egui::Ui,
+    row_rect: Rect,
+    action: &mut MarkerCoverAction,
+) -> Option<Rect> {
+    if row_rect.width() < TRANSPORT_CONTROLS_W {
+        return None;
     }
-    let x = row_rect.min.x + (free_w - TRANSPORT_CONTROLS_W) * 0.5;
+    let x = row_rect.center().x - TRANSPORT_CONTROLS_W * 0.5;
     let rect = Rect::from_min_size(
         Pos2::new(x, row_rect.min.y),
         Vec2::new(TRANSPORT_CONTROLS_W, COMPACT_CTRL_H),
@@ -111,16 +126,63 @@ fn show_transport_controls(ui: &mut egui::Ui, row_rect: Rect, action: &mut Marke
             }
         },
     );
+    Some(rect)
 }
 
 fn show_edit_actions(
     ui: &mut egui::Ui,
     row_rect: Rect,
+    transport_rect: Rect,
+    action: &mut MarkerCoverAction,
+) {
+    let max_x = transport_rect.min.x - CONTROL_GROUP_GAP;
+    let available_w = max_x - row_rect.min.x;
+    if available_w < 120.0 {
+        return;
+    }
+    let width = available_w.min(EDIT_ACTIONS_W);
+    let rect = Rect::from_min_max(
+        Pos2::new(row_rect.min.x, row_rect.min.y),
+        Pos2::new(row_rect.min.x + width, row_rect.max.y),
+    );
+    ui.allocate_new_ui(
+        egui::UiBuilder::new()
+            .max_rect(rect)
+            .layout(egui::Layout::left_to_right(egui::Align::Center)),
+        |ui| {
+            ui.spacing_mut().item_spacing.x = EDIT_ACTION_GAP;
+            ui.spacing_mut().button_padding = Vec2::new(6.0, 1.0);
+            if compact_action_btn(ui, "M marker").clicked() {
+                *action = MarkerCoverAction::AddMarker;
+            }
+            if compact_action_btn(ui, "Cover slot").clicked() {
+                *action = MarkerCoverAction::CreateCover;
+            }
+            if compact_action_btn(ui, "Overwrite").clicked() {
+                *action = MarkerCoverAction::OverwriteCover;
+            }
+        },
+    );
+}
+
+fn show_right_actions(
+    ui: &mut egui::Ui,
+    row_rect: Rect,
+    transport_rect: Rect,
+    preview_hires_pending: bool,
     sync_cover_enabled: bool,
     action: &mut MarkerCoverAction,
 ) {
-    let x = (row_rect.max.x - EDIT_ACTIONS_W).max(row_rect.min.x);
-    let rect = Rect::from_min_max(Pos2::new(x, row_rect.min.y), row_rect.max);
+    let min_x = transport_rect.max.x + CONTROL_GROUP_GAP;
+    let available_w = row_rect.max.x - min_x;
+    if available_w < 110.0 {
+        return;
+    }
+    let width = available_w.min(RIGHT_ACTIONS_W);
+    let rect = Rect::from_min_max(
+        Pos2::new(row_rect.max.x - width, row_rect.min.y),
+        Pos2::new(row_rect.max.x, row_rect.max.y),
+    );
     ui.allocate_new_ui(
         egui::UiBuilder::new()
             .max_rect(rect)
@@ -128,14 +190,16 @@ fn show_edit_actions(
         |ui| {
             ui.spacing_mut().item_spacing.x = EDIT_ACTION_GAP;
             ui.spacing_mut().button_padding = Vec2::new(6.0, 1.0);
-            if compact_action_btn(ui, "Overwrite").clicked() {
-                *action = MarkerCoverAction::OverwriteCover;
-            }
-            if compact_action_btn(ui, "Cover slot").clicked() {
-                *action = MarkerCoverAction::CreateCover;
-            }
-            if compact_action_btn(ui, "M marker").clicked() {
-                *action = MarkerCoverAction::AddMarker;
+            let preview_label = if preview_hires_pending {
+                "Preview..."
+            } else {
+                "Preview"
+            };
+            if compact_action_btn_state(ui, preview_label, preview_hires_pending)
+                .on_hover_text("Render + fullscreen HI-res preview")
+                .clicked()
+            {
+                *action = MarkerCoverAction::PreviewHiRes;
             }
             if compact_toggle_btn(ui, "Sync/B-roll", sync_cover_enabled).clicked() {
                 *action = MarkerCoverAction::ToggleSyncCover;
@@ -145,11 +209,20 @@ fn show_edit_actions(
 }
 
 fn compact_action_btn(ui: &mut egui::Ui, label: &str) -> egui::Response {
+    compact_action_btn_state(ui, label, false)
+}
+
+fn compact_action_btn_state(ui: &mut egui::Ui, label: &str, active: bool) -> egui::Response {
     let t = qnc_theme::current(ui);
+    let fill = if active {
+        qnc_theme::ACCENT.gamma_multiply(0.45)
+    } else {
+        egui::Color32::TRANSPARENT
+    };
     ui.add(
         egui::Button::new(RichText::new(label).color(t.text).size(qnc_theme::FONT_UI))
             .min_size(Vec2::new(0.0, COMPACT_CTRL_H))
-            .fill(egui::Color32::TRANSPARENT)
+            .fill(fill)
             .stroke(egui::Stroke::new(1.0, t.border)),
     )
 }

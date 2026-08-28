@@ -7,17 +7,16 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
-use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use eframe::egui::{self, ColorImage};
 use qnc_media_ffmpeg::{
-    probe_source_runtime_with_toolchain, FfmpegAudioDecodeOptions, FfmpegAudioOutput,
+    probe_media_input_runtime_with_toolchain, FfmpegAudioDecodeOptions, FfmpegAudioOutput,
     FfmpegDecodeOptions, FfmpegDecodePolicy as AdapterDecodePolicy, FfmpegHardwareDecode,
-    FfmpegSourceOpen, FfmpegSourceRegistry, FfmpegToolchain, FfmpegVideoDecode, FfmpegVideoPayload,
-    FfmpegVideoPrefetchRule,
+    FfmpegMediaInput, FfmpegSourceOpen, FfmpegSourceRegistry, FfmpegToolchain, FfmpegVideoDecode,
+    FfmpegVideoPayload, FfmpegVideoPrefetchRule,
 };
 use qnc_player_core::{
     AudioFormat, AudioFramePacket, AudioOutputAdapter, BroadcastEngineError,
@@ -79,7 +78,7 @@ const PLAYLIST_PREVIEW_HEIGHT: u32 = 360;
 const QNC_PLAYER_HWACCEL_ENV: &str = "QNC_PLAYER_HWACCEL";
 
 /// UI open payload - media identity for the modular player runtime.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct BroadcastPlayerOpenRequest {
     pub source_ref: BroadcastHostSourceRef,
     pub media_input: String,
@@ -131,6 +130,7 @@ pub enum PlayerCommand {
     Open(BroadcastPlayerOpenRequest),
     PrepareProgram(BroadcastProgramOpenRequest),
     OpenProgram(BroadcastProgramOpenRequest),
+    PlayProgram(BroadcastProgramOpenRequest),
     Play,
     Pause,
     TogglePlay,
@@ -929,6 +929,7 @@ impl PlayerRemote {
             PlayerCommand::Open(request) => self.open(request, ctx),
             PlayerCommand::PrepareProgram(request) => self.prepare_program(request, ctx),
             PlayerCommand::OpenProgram(request) => self.open_program(request, ctx),
+            PlayerCommand::PlayProgram(request) => self.play_program(request, ctx),
             PlayerCommand::Play => self.play(ctx),
             PlayerCommand::Pause => self.pause(),
             PlayerCommand::TogglePlay => {
@@ -1156,6 +1157,46 @@ impl PlayerRemote {
             }
         }
         self.start_program_build(request, PendingProgramMode::Open, ctx);
+    }
+
+    fn play_program(&mut self, request: BroadcastProgramOpenRequest, ctx: &egui::Context) {
+        if self.program_matches(&request) && self.runtime.is_some() {
+            self.active = true;
+            self.status = "Ready".into();
+            self.play(ctx);
+            return;
+        }
+        if self.prepared_program_matches(&request) {
+            let Some(prepared) = self.prepared_program.take() else {
+                return;
+            };
+            crate::player_log::log_info("program-open", "play from prepared program");
+            if self
+                .finish_program_open(request, prepared.build, ctx)
+                .is_ok()
+            {
+                self.play(ctx);
+            }
+            return;
+        }
+        if let Some(pending) = self.pending_program_open.as_mut() {
+            if same_program_request(&pending.request, &request) {
+                pending.mode = PendingProgramMode::Open;
+                pending.request = request;
+                self.pending_program_play = true;
+                self.status = "Opening program".into();
+                crate::player_log::log_info("program-open", "autoplay waits for pending program");
+                ctx.request_repaint_after(Duration::from_millis(16));
+                return;
+            }
+        }
+        let request_for_match = request.clone();
+        self.start_program_build(request, PendingProgramMode::Open, ctx);
+        if self.pending_program_matches(&request_for_match) {
+            self.pending_program_play = true;
+            self.status = "Opening program".into();
+            ctx.request_repaint_after(Duration::from_millis(16));
+        }
     }
 
     fn start_program_build(
@@ -1749,19 +1790,15 @@ fn build_runtime_session(
     request: &BroadcastPlayerOpenRequest,
     decode_policy: &PlayerDecodePolicy,
 ) -> Result<PlayerRuntimeSession, String> {
-    let media_path = PathBuf::from(request.media_input.trim());
-    if media_path.as_os_str().is_empty() {
-        return Err("media path is empty".into());
-    }
+    let media_input = ffmpeg_media_input(&request.media_input, "media path")?;
 
     let source_id = source_id_from_request(request);
     let toolchain = FfmpegToolchain::default();
     let mut source =
-        probe_source_runtime_with_toolchain(&media_path, source_id.clone(), &toolchain)
+        probe_media_input_runtime_with_toolchain(&media_input, source_id.clone(), &toolchain)
             .map_err(|error| error.to_string())?
             .source;
     source.timebase = core_timebase_from_source_timebase(request.source_timebase)?;
-
     let field_label = source
         .video_format
         .as_ref()
@@ -1780,7 +1817,7 @@ fn build_runtime_session(
         "probe",
         &format!(
             "file={} {}x{} timebase={}/{} field={} audio={}",
-            media_path.display(),
+            request.media_input.trim(),
             w,
             h,
             source.timebase.frame_rate_num,
@@ -1800,7 +1837,8 @@ fn build_runtime_session(
     }
 
     let range = range_from_request(request, &source)?;
-    let registry = FfmpegSourceRegistry::new(BTreeMap::from([(source_id, media_path)]));
+    let registry =
+        FfmpegSourceRegistry::from_media_inputs(BTreeMap::from([(source_id, media_input)]));
     let (hardware_decode, hardware_warning) = hardware_decode_from_policy(decode_policy);
     let video_decode = FfmpegVideoDecode::with_options(
         registry.clone(),
@@ -1862,7 +1900,7 @@ fn build_program_runtime_session(
     }
 
     let toolchain = FfmpegToolchain::default();
-    let mut registry_paths = BTreeMap::new();
+    let mut registry_inputs = BTreeMap::new();
     let mut probe_cache = BTreeMap::new();
     let mut items = Vec::new();
     let mut startup_warnings = Vec::new();
@@ -1877,7 +1915,7 @@ fn build_program_runtime_session(
                 source,
                 source_id,
                 &toolchain,
-                &mut registry_paths,
+                &mut registry_inputs,
                 &mut probe_cache,
             )?);
         }
@@ -1906,7 +1944,7 @@ fn build_program_runtime_session(
     let playlist_input = playlist_input_source(request, &program)?;
     let range = CoreFrameRange::new(0, playlist_input.duration_frames)
         .map_err(|error| error.to_string())?;
-    let registry = FfmpegSourceRegistry::new(registry_paths);
+    let registry = FfmpegSourceRegistry::from_media_inputs(registry_inputs);
     let (hardware_decode, hardware_warning) = hardware_decode_from_policy(decode_policy);
     let audio_sink_result = build_audio_sink();
     startup_warnings.extend(
@@ -2016,15 +2054,12 @@ fn build_program_source_runtime(
     source_spec: &BroadcastProgramSource,
     source_id: String,
     toolchain: &FfmpegToolchain,
-    registry_paths: &mut BTreeMap<String, PathBuf>,
+    registry_inputs: &mut BTreeMap<String, FfmpegMediaInput>,
     probe_cache: &mut BTreeMap<String, qnc_media_ffmpeg::FfmpegProbeReport>,
 ) -> Result<PlayerProgramSource, String> {
-    let media_path = PathBuf::from(source_spec.media_input.trim());
-    if media_path.as_os_str().is_empty() {
-        return Err(format!("Program media nema path · {}", item.item_id));
-    }
+    let media_input = ffmpeg_media_input(&source_spec.media_input, "Program media")?;
     let mut source =
-        probe_program_source_runtime(source_id.clone(), &media_path, toolchain, probe_cache)?
+        probe_program_source_runtime(source_id.clone(), &media_input, toolchain, probe_cache)?
             .source;
     source.timebase = core_timebase_from_source_timebase(source_spec.source_timebase)?;
     if !source_spec.has_video {
@@ -2048,7 +2083,7 @@ fn build_program_source_runtime(
     let range = range_from_source_ref(&source_spec.source_ref, &source)?;
     let record_in_frame = old_to_core_frame(item.record_in_frame);
     let record_out_frame = old_to_core_frame(item.record_out_frame).max(record_in_frame + 1);
-    registry_paths.insert(source_id, media_path);
+    registry_inputs.insert(source_id, media_input);
     Ok(PlayerProgramSource {
         spec: source_spec.clone(),
         record_in_frame,
@@ -2066,6 +2101,14 @@ fn core_timebase_from_source_timebase(
     }
     CoreTimebase::new(source_timebase.fps_num, source_timebase.fps_den)
         .map_err(|err| err.to_string())
+}
+
+fn ffmpeg_media_input(value: &str, label: &str) -> Result<FfmpegMediaInput, String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(format!("{label} nema media input"));
+    }
+    Ok(FfmpegMediaInput::from_uri(value))
 }
 
 fn playlist_input_source(
@@ -2359,18 +2402,19 @@ fn video_prefetch_rule_from_json(value: &Value) -> Option<FfmpegVideoPrefetchRul
 
 fn probe_program_source_runtime(
     source_id: String,
-    media_path: &std::path::Path,
+    media_input: &FfmpegMediaInput,
     toolchain: &FfmpegToolchain,
     probe_cache: &mut BTreeMap<String, qnc_media_ffmpeg::FfmpegProbeReport>,
 ) -> Result<qnc_media_ffmpeg::FfmpegProbeReport, String> {
-    let cache_key = media_input_identity(media_path.to_string_lossy().as_ref());
+    let cache_key = media_input_identity(media_input.label().as_str());
     if let Some(cached) = probe_cache.get(&cache_key) {
         let mut report = cached.clone();
         report.source.source_id = source_id;
         return Ok(report);
     }
-    let report = probe_source_runtime_with_toolchain(media_path, source_id.clone(), toolchain)
-        .map_err(|error| error.to_string())?;
+    let report =
+        probe_media_input_runtime_with_toolchain(media_input, source_id.clone(), toolchain)
+            .map_err(|error| error.to_string())?;
     probe_cache.insert(cache_key, report.clone());
     Ok(report)
 }
@@ -3066,7 +3110,7 @@ mod tests {
 
         let report = probe_program_source_runtime(
             "playlist-source".into(),
-            std::path::Path::new(path),
+            &FfmpegMediaInput::from_uri(path),
             &toolchain,
             &mut cache,
         )
@@ -3177,6 +3221,36 @@ mod tests {
         remote.play(&egui::Context::default());
 
         assert!(remote.pending_program_play);
+        assert!(!remote.playing);
+        assert!(remote.pending_error.is_none());
+        assert_eq!(remote.status, "Opening program");
+    }
+
+    #[test]
+    fn play_program_command_autostarts_after_pending_program_open() {
+        let mut remote = PlayerRemote::new();
+        let (_tx, rx) = std::sync::mpsc::channel();
+        remote.pending_program_open = Some(PendingProgramOpen {
+            sequence: 7,
+            mode: PendingProgramMode::Prepare,
+            request: program_open_request(),
+            rx,
+            started_at: Instant::now(),
+        });
+
+        remote.dispatch(
+            PlayerCommand::PlayProgram(program_open_request()),
+            &egui::Context::default(),
+        );
+
+        assert!(remote.pending_program_play);
+        assert_eq!(
+            remote
+                .pending_program_open
+                .as_ref()
+                .map(|pending| pending.mode),
+            Some(PendingProgramMode::Open)
+        );
         assert!(!remote.playing);
         assert!(remote.pending_error.is_none());
         assert_eq!(remote.status, "Opening program");

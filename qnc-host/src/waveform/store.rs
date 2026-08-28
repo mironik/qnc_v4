@@ -3,13 +3,13 @@ use std::fs;
 use std::path::Path;
 use std::sync::Mutex;
 
-use qnc_service_contracts::WaveformJobResult;
-use rusqlite::params;
+use qnc_service_contracts::{WaveformJobResult, JOB_SOURCE_WAVEFORM, JOB_TYPE_WAVEFORM};
+use rusqlite::{params, OptionalExtension};
 use serde_json::{json, Value};
 
 use tracing::info;
 
-use crate::ingest::db::open_ingest;
+use crate::ingest::db::{ingest_job_id, open_ingest};
 use crate::project::db::{now_str, ProjectPaths};
 use crate::project::{list_project_ids, ProjectDbBroker};
 
@@ -209,6 +209,18 @@ pub fn snapshot(paths: &ProjectPaths, project_id: &str, clip_id: &str) -> Value 
     let Ok(conn) = open_ingest(paths, project_id) else {
         return fallback();
     };
+    let active_status = active_waveform_job_status(&conn, clip_id).unwrap_or(None);
+    let fallback_with_status = |status: &str| {
+        json!({
+            "status": status,
+            "a1_ready": false,
+            "a2_ready": false,
+            "peak_count": 0,
+            "a1_peaks_url": peaks_url(1),
+            "a2_peaks_url": peaks_url(2),
+            "error": "",
+        })
+    };
     let row: Option<(String, String, String, String, i64, i64)> = conn
         .query_row(
             "SELECT status, a1_peaks, a2_peaks, error, peak_count, render_version
@@ -227,18 +239,43 @@ pub fn snapshot(paths: &ProjectPaths, project_id: &str, clip_id: &str) -> Value 
         )
         .ok();
     let Some((status, a1_peaks, a2_peaks, error, peak_count, version)) = row else {
-        return fallback();
+        return fallback_with_status(active_status.as_deref().unwrap_or("missing"));
     };
     let current = version == WAVEFORM_RENDER_VERSION;
+    let ready_status = current && status == "ready";
+    let display_status = if ready_status {
+        status
+    } else if let Some(active_status) = active_status {
+        active_status
+    } else if current {
+        status
+    } else {
+        "stale".into()
+    };
     json!({
-        "status": if current { status } else { "stale".into() },
-        "a1_ready": current && peaks_non_empty(&a1_peaks),
-        "a2_ready": current && peaks_non_empty(&a2_peaks),
-        "peak_count": if current { peak_count } else { 0 },
+        "status": display_status,
+        "a1_ready": ready_status && peaks_non_empty(&a1_peaks),
+        "a2_ready": ready_status && peaks_non_empty(&a2_peaks),
+        "peak_count": if ready_status { peak_count } else { 0 },
         "a1_peaks_url": peaks_url(1),
         "a2_peaks_url": peaks_url(2),
         "error": error,
     })
+}
+
+fn active_waveform_job_status(
+    conn: &rusqlite::Connection,
+    clip_id: &str,
+) -> Result<Option<String>, String> {
+    let job_id = ingest_job_id(JOB_TYPE_WAVEFORM, JOB_SOURCE_WAVEFORM, clip_id);
+    conn.query_row(
+        "SELECT status FROM ingest_jobs
+         WHERE job_id = ?1 AND status IN ('queued', 'processing')",
+        params![job_id],
+        |row| row.get(0),
+    )
+    .optional()
+    .map_err(|error| error.to_string())
 }
 
 fn mark(
@@ -379,11 +416,82 @@ fn url_encode(raw: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::project::db::{
+        ensure_project_dirs_at, open_global, open_project, project_dir_in_root,
+    };
+    use std::fs;
+    use std::path::Path;
+
+    fn test_paths(base: &Path) -> ProjectPaths {
+        ProjectPaths {
+            data_dir: base.join("data"),
+            projects_root: base.join("projects"),
+            seed_path: base.join("seed.json"),
+        }
+    }
+
+    fn register_project(paths: &ProjectPaths, project_id: &str) {
+        let global = open_global(paths).unwrap();
+        let project_dir = project_dir_in_root(&paths.projects_root, project_id);
+        global
+            .execute(
+                "INSERT INTO projects (project_id, name, project_dir)
+                 VALUES (?1, ?2, ?3)",
+                params![
+                    project_id,
+                    project_id,
+                    project_dir.to_string_lossy().to_string()
+                ],
+            )
+            .unwrap();
+        ensure_project_dirs_at(&project_dir).unwrap();
+        let _ = open_project(paths, project_id).unwrap();
+    }
 
     #[test]
     fn parse_peaks_json_roundtrip() {
         let raw = peaks_to_json(&[0.1, 0.5, 1.0]);
         let parsed = parse_peaks_json(&raw).expect("parse peaks");
         assert_eq!(parsed.len(), 3);
+    }
+
+    #[test]
+    fn snapshot_reports_active_waveform_job_status() {
+        let base = std::env::temp_dir().join(format!(
+            "qnc_waveform_snapshot_job_test_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+        let paths = test_paths(&base);
+        let project_id = "project_a";
+        register_project(&paths, project_id);
+        let conn = open_ingest(&paths, project_id).unwrap();
+
+        crate::ingest::db::queue_ingest_job(
+            &conn,
+            JOB_TYPE_WAVEFORM,
+            JOB_SOURCE_WAVEFORM,
+            "clip_a",
+        )
+        .unwrap();
+        let queued = snapshot(&paths, project_id, "clip_a");
+        assert_eq!(queued["status"].as_str(), Some("queued"));
+
+        crate::ingest::db::mark_ingest_job_processing(
+            &conn,
+            JOB_TYPE_WAVEFORM,
+            JOB_SOURCE_WAVEFORM,
+            "clip_a",
+        )
+        .unwrap();
+        let processing = snapshot(&paths, project_id, "clip_a");
+        assert_eq!(processing["status"].as_str(), Some("processing"));
+
+        let _ = fs::remove_dir_all(&base);
     }
 }

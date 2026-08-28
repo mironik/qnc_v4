@@ -9,13 +9,14 @@ use axum::{
     Json, Router,
 };
 use qnc_service_contracts::{
-    AudioWrapJobItem, AudioWrapJobPayload, AudioWrapJobResult, FilmstripJobFrame,
-    FilmstripJobPayload, FilmstripJobResult, JobAck, JobClaimRequest, JobClaimResponse,
-    JobCompleteRequest, JobFailRequest, JobHeartbeatRequest, JobHeartbeatResponse, JobLease,
-    MediaAccessKind, MediaLocator, MediaProbeJobPayload, MediaProbeJobResult, MediaResolveRequest,
-    PosterJobPayload, PosterJobResult, ProxyGenerateJobPayload, ProxyGenerateJobResult,
-    WaveformJobPayload, WaveformJobResult, JOB_SOURCE_FILMSTRIP, JOB_SOURCE_WAVEFORM,
-    JOB_TYPE_AUDIO_WRAP, JOB_TYPE_FILMSTRIP, JOB_TYPE_MEDIA_PROBE, JOB_TYPE_THUMB_PROXY,
+    AudioWrapJobItem, AudioWrapJobPayload, AudioWrapJobResult, ExportHiResJobPayload,
+    ExportHiResJobResult, FilmstripJobFrame, FilmstripJobPayload, FilmstripJobResult, JobAck,
+    JobClaimRequest, JobClaimResponse, JobCompleteRequest, JobFailRequest, JobHeartbeatRequest,
+    JobHeartbeatResponse, JobLease, MediaAccessKind, MediaLocator, MediaProbeJobPayload,
+    MediaProbeJobResult, MediaResolveRequest, PosterJobPayload, PosterJobResult,
+    ProxyGenerateJobPayload, ProxyGenerateJobResult, WaveformJobPayload, WaveformJobResult,
+    JOB_SOURCE_EXPORT_HIRES, JOB_SOURCE_FILMSTRIP, JOB_SOURCE_WAVEFORM, JOB_TYPE_AUDIO_WRAP,
+    JOB_TYPE_EXPORT_HIRES, JOB_TYPE_FILMSTRIP, JOB_TYPE_MEDIA_PROBE, JOB_TYPE_THUMB_PROXY,
     JOB_TYPE_WAVEFORM,
 };
 use rusqlite::{params, Connection, OptionalExtension};
@@ -27,8 +28,8 @@ use crate::ingest::asset_row::IngestAssetRow;
 use crate::ingest::db::{
     get_meta, ingest_asset_meta, mark_ingest_job_done, mark_ingest_job_error,
     migrate_ingest_job_lease_columns, open_ingest, poster_exists,
-    poster_proxy_generation_approved_for_asset, queue_ingest_job, set_thumb_ready_path,
-    set_thumb_status, thumbnail_path,
+    poster_proxy_generation_approved_for_asset, queue_ingest_artifact_job_once,
+    set_thumb_ready_path, set_thumb_status, thumbnail_path,
 };
 use crate::ingest::import_finish::complete_imported_clip;
 use crate::ingest::proxy_generate::proxy_dest_for_source;
@@ -55,6 +56,8 @@ const WAVEFORM_SOURCE_ID: &str = JOB_SOURCE_WAVEFORM;
 const THUMB_PROXY_JOB_TYPE: &str = JOB_TYPE_THUMB_PROXY;
 const AUDIO_WRAP_JOB_TYPE: &str = JOB_TYPE_AUDIO_WRAP;
 const MEDIA_PROBE_JOB_TYPE: &str = JOB_TYPE_MEDIA_PROBE;
+const EXPORT_HIRES_JOB_TYPE: &str = JOB_TYPE_EXPORT_HIRES;
+const EXPORT_HIRES_SOURCE_ID: &str = JOB_SOURCE_EXPORT_HIRES;
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/api/jobs/status", get(api_jobs_status))
@@ -84,14 +87,19 @@ async fn api_jobs_claim(
     State(state): State<AppState>,
     Json(body): Json<JobClaimRequest>,
 ) -> Result<Json<JobClaimResponse>, (StatusCode, String)> {
-    let claim = NormalizedClaim::from_request(body)?;
+    let mut claim = NormalizedClaim::from_request(body)?;
     let playback_active = state.background_work.playback_active();
     if playback_active {
-        return Ok(Json(JobClaimResponse {
-            jobs: Vec::new(),
-            playback_active: true,
-            message: Some("playback_active".into()),
-        }));
+        claim
+            .capabilities
+            .retain(|job_type| is_claimable_during_playback(job_type));
+        if claim.capabilities.is_empty() {
+            return Ok(Json(JobClaimResponse {
+                jobs: Vec::new(),
+                playback_active: true,
+                message: Some("playback_active".into()),
+            }));
+        }
     }
     if claim.capabilities.is_empty() {
         return Ok(Json(JobClaimResponse {
@@ -198,6 +206,7 @@ struct ArtifactWorkerSnapshot {
     thumb_proxy: ArtifactJobTypeCounts,
     audio_wrap: ArtifactJobTypeCounts,
     media_probe: ArtifactJobTypeCounts,
+    export_hires: ArtifactJobTypeCounts,
 }
 
 impl ArtifactWorkerSnapshot {
@@ -208,6 +217,7 @@ impl ArtifactWorkerSnapshot {
             + self.thumb_proxy.queued
             + self.audio_wrap.queued
             + self.media_probe.queued
+            + self.export_hires.queued
     }
 
     fn processing(&self) -> i64 {
@@ -217,6 +227,7 @@ impl ArtifactWorkerSnapshot {
             + self.thumb_proxy.processing
             + self.audio_wrap.processing
             + self.media_probe.processing
+            + self.export_hires.processing
     }
 
     fn active_leases(&self) -> i64 {
@@ -226,6 +237,7 @@ impl ArtifactWorkerSnapshot {
             + self.thumb_proxy.active_leases
             + self.audio_wrap.active_leases
             + self.media_probe.active_leases
+            + self.export_hires.active_leases
     }
 
     fn expired_leases(&self) -> i64 {
@@ -235,6 +247,7 @@ impl ArtifactWorkerSnapshot {
             + self.thumb_proxy.expired_leases
             + self.audio_wrap.expired_leases
             + self.media_probe.expired_leases
+            + self.export_hires.expired_leases
     }
 
     fn missing_external_worker(&self) -> bool {
@@ -274,6 +287,7 @@ impl ArtifactWorkerSnapshot {
                     THUMB_PROXY_JOB_TYPE: self.thumb_proxy.to_json(),
                     AUDIO_WRAP_JOB_TYPE: self.audio_wrap.to_json(),
                     MEDIA_PROBE_JOB_TYPE: self.media_probe.to_json(),
+                    EXPORT_HIRES_JOB_TYPE: self.export_hires.to_json(),
                 },
             },
         })
@@ -307,12 +321,14 @@ fn artifact_worker_status(
             let thumb_proxy = artifact_counts_for_type(&conn, THUMB_PROXY_JOB_TYPE, now_ms)?;
             let audio_wrap = artifact_counts_for_type(&conn, AUDIO_WRAP_JOB_TYPE, now_ms)?;
             let media_probe = artifact_counts_for_type(&conn, MEDIA_PROBE_JOB_TYPE, now_ms)?;
+            let export_hires = artifact_counts_for_type(&conn, EXPORT_HIRES_JOB_TYPE, now_ms)?;
             snapshot.proxy_generate.add(&proxy);
             snapshot.filmstrip.add(&filmstrip);
             snapshot.waveform.add(&waveform);
             snapshot.thumb_proxy.add(&thumb_proxy);
             snapshot.audio_wrap.add(&audio_wrap);
             snapshot.media_probe.add(&media_probe);
+            snapshot.export_hires.add(&export_hires);
             snapshot.projects_scanned += 1;
             Ok(())
         })?;
@@ -552,8 +568,61 @@ fn payload_for_job_claim(
         }
         AUDIO_WRAP_JOB_TYPE => payload_for_audio_wrap_claim(paths, project_id, conn, row),
         MEDIA_PROBE_JOB_TYPE => payload_for_media_probe_claim(project_id, conn, row),
+        EXPORT_HIRES_JOB_TYPE => payload_for_hires_render_claim(
+            conn,
+            row,
+            EXPORT_HIRES_JOB_TYPE,
+            EXPORT_HIRES_SOURCE_ID,
+            "export_hires",
+        ),
         _ => Ok(None),
     }
+}
+
+fn payload_for_hires_render_claim(
+    conn: &Connection,
+    row: &QueuedJobRow,
+    expected_job_type: &str,
+    expected_source_id: &str,
+    label: &str,
+) -> Result<Option<Value>, String> {
+    let source_id = row.source_id.trim();
+    if source_id != expected_source_id {
+        let _ = mark_ingest_job_error(
+            conn,
+            expected_job_type,
+            source_id,
+            &row.clip_id,
+            &format!("{label} job source nije {expected_source_id}"),
+        );
+        return Ok(None);
+    }
+    let payload: ExportHiResJobPayload = match serde_json::from_str(&row.payload_json) {
+        Ok(payload) => payload,
+        Err(error) => {
+            let _ = mark_ingest_job_error(
+                conn,
+                expected_job_type,
+                source_id,
+                &row.clip_id,
+                &format!("invalid {label} payload: {error}"),
+            );
+            return Ok(None);
+        }
+    };
+    if payload.items.is_empty() {
+        let _ = mark_ingest_job_error(
+            conn,
+            expected_job_type,
+            source_id,
+            &row.clip_id,
+            &format!("{label} payload nema snapshot flat playlist iteme"),
+        );
+        return Ok(None);
+    }
+    serde_json::to_value(payload)
+        .map(Some)
+        .map_err(|error| error.to_string())
 }
 
 fn payload_for_thumb_proxy_claim(
@@ -1178,11 +1247,11 @@ fn apply_proxy_generate_result(
         let conn = open_ingest(paths, &pid).map_err(|e| e.to_string())?;
         mark_ingest_job_done(&conn, "proxy_generate", &sid, &cid).map_err(|e| e.to_string())?;
         if !crate::filmstrip::filmstrip_ready(paths, &pid, &cid) {
-            queue_ingest_job(&conn, FILMSTRIP_JOB_TYPE, JOB_SOURCE_FILMSTRIP, &cid)
+            queue_ingest_artifact_job_once(&conn, FILMSTRIP_JOB_TYPE, JOB_SOURCE_FILMSTRIP, &cid)
                 .map_err(|e| e.to_string())?;
         }
         if !crate::waveform::ready(paths, &pid, &cid) {
-            queue_ingest_job(&conn, WAVEFORM_JOB_TYPE, JOB_SOURCE_WAVEFORM, &cid)
+            queue_ingest_artifact_job_once(&conn, WAVEFORM_JOB_TYPE, JOB_SOURCE_WAVEFORM, &cid)
                 .map_err(|e| e.to_string())?;
         }
         Ok(())
@@ -1509,6 +1578,18 @@ fn complete_job(
                 result.probe,
             )?;
         }
+        EXPORT_HIRES_JOB_TYPE => {
+            let result: ExportHiResJobResult =
+                serde_json::from_value(request.result).map_err(|error| {
+                    format!("invalid export_hires result for job_id={job_id}: {error}")
+                })?;
+            if !result.output_path.is_file() {
+                return Err(format!(
+                    "export_hires output missing for job_id={job_id}: {}",
+                    result.output_path.display()
+                ));
+            }
+        }
         _ => {
             return Ok(JobAck {
                 accepted: false,
@@ -1760,6 +1841,7 @@ struct QueuedJobRow {
     clip_id: String,
     attempts: i64,
     queued_at: Option<String>,
+    payload_json: String,
 }
 
 fn queued_jobs_for_type(
@@ -1768,15 +1850,14 @@ fn queued_jobs_for_type(
     limit: usize,
 ) -> Result<Vec<QueuedJobRow>, String> {
     let limit = limit.max(1) as i64;
-    let mut stmt = conn
-        .prepare(
-            "SELECT job_id, job_type, source_id, clip_id, attempts, queued_at
-             FROM ingest_jobs
-             WHERE job_type = ?1 AND status = 'queued'
-             ORDER BY queued_at ASC, updated_at ASC, job_id ASC
-             LIMIT ?2",
-        )
-        .map_err(|e| e.to_string())?;
+    let sql = format!(
+        "SELECT job_id, job_type, source_id, clip_id, attempts, queued_at, COALESCE(payload_json, '{{}}')
+         FROM ingest_jobs
+         WHERE job_type = ?1 AND status = 'queued'
+         ORDER BY queued_at ASC, updated_at ASC, job_id ASC
+         LIMIT ?2"
+    );
+    let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
     let rows = stmt
         .query_map(params![job_type, limit], |row| {
             Ok(QueuedJobRow {
@@ -1786,6 +1867,7 @@ fn queued_jobs_for_type(
                 clip_id: row.get(3)?,
                 attempts: row.get(4)?,
                 queued_at: row.get(5)?,
+                payload_json: row.get(6)?,
             })
         })
         .map_err(|e| e.to_string())?;
@@ -1834,7 +1916,12 @@ fn is_claimable_job_type(job_type: &str) -> bool {
                 | THUMB_PROXY_JOB_TYPE
                 | AUDIO_WRAP_JOB_TYPE
                 | MEDIA_PROBE_JOB_TYPE
+                | EXPORT_HIRES_JOB_TYPE
         )
+}
+
+fn is_claimable_during_playback(job_type: &str) -> bool {
+    matches!(job_type, EXPORT_HIRES_JOB_TYPE)
 }
 
 fn is_lease_managed_job_type(job_type: &str) -> bool {
@@ -1847,6 +1934,7 @@ fn is_lease_managed_job_type(job_type: &str) -> bool {
             | THUMB_PROXY_JOB_TYPE
             | AUDIO_WRAP_JOB_TYPE
             | MEDIA_PROBE_JOB_TYPE
+            | EXPORT_HIRES_JOB_TYPE
     )
 }
 
@@ -1907,7 +1995,9 @@ fn request_error(error: String) -> (StatusCode, String) {
 mod tests {
     use super::*;
     use crate::ingest::db::queue_ingest_job;
-    use qnc_service_contracts::{FrameTimebase, MediaProbe, ScanMode};
+    use qnc_service_contracts::{
+        ExportHiResPlaylistItem, ExportHiResPlaylistSource, FrameTimebase, MediaProbe, ScanMode,
+    };
     use std::fs;
 
     fn test_paths(label: &str) -> ProjectPaths {
@@ -2058,6 +2148,17 @@ mod tests {
         )
         .unwrap();
         queue_ingest_job(&conn, "proxy_generate", "card", "clip0002").unwrap();
+        queue_ingest_job(&conn, WAVEFORM_JOB_TYPE, WAVEFORM_SOURCE_ID, "clip0002").unwrap();
+        conn.execute(
+            "UPDATE ingest_jobs
+             SET status = 'processing',
+                 queued_at = 'waveform-original-queued',
+                 started_at = 'waveform-original-started',
+                 worker_id = 'waveform-worker'
+             WHERE job_type = ?1 AND source_id = ?2 AND clip_id = 'clip0002'",
+            params![WAVEFORM_JOB_TYPE, WAVEFORM_SOURCE_ID],
+        )
+        .unwrap();
         drop(conn);
 
         apply_proxy_generate_result(
@@ -2098,6 +2199,23 @@ mod tests {
         assert_eq!(row.1, proxy.to_string_lossy());
         assert_eq!(row.2, 50.0);
         assert_eq!(proxy_status, "done");
+        let waveform_job: (String, String, String) = conn
+            .query_row(
+                "SELECT status, queued_at, worker_id
+                 FROM ingest_jobs
+                 WHERE job_type = ?1 AND source_id = ?2 AND clip_id = 'clip0002'",
+                params![WAVEFORM_JOB_TYPE, WAVEFORM_SOURCE_ID],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            waveform_job,
+            (
+                "processing".into(),
+                "waveform-original-queued".into(),
+                "waveform-worker".into()
+            )
+        );
     }
 
     #[test]
@@ -2218,6 +2336,140 @@ mod tests {
     }
 
     #[test]
+    fn playback_gate_allows_user_initiated_hires_render_only() {
+        assert!(is_claimable_during_playback(EXPORT_HIRES_JOB_TYPE));
+        assert!(!is_claimable_during_playback(FILMSTRIP_JOB_TYPE));
+        assert!(!is_claimable_during_playback(WAVEFORM_JOB_TYPE));
+        assert!(!is_claimable_during_playback(PROXY_GENERATE_JOB_TYPE));
+    }
+
+    #[test]
+    fn export_hires_claim_uses_stored_flat_payload() {
+        let paths = test_paths("export_hires_claim");
+        let broker = ProjectDbBroker::new(paths.clone());
+        register_project(&paths, "project_a");
+        let conn = open_ingest(&paths, "project_a").unwrap();
+        let payload = ExportHiResJobPayload {
+            project_id: "project_a".into(),
+            export_id: "hires_a".into(),
+            output_path: paths
+                .project_dir("project_a")
+                .join("exports")
+                .join("master.mov"),
+            timeline_timebase: FrameTimebase {
+                fps_num: 50,
+                fps_den: 1,
+            },
+            duration_frames: 50,
+            items: vec![ExportHiResPlaylistItem {
+                item_id: "item:0-50".into(),
+                record_in_frame: 0,
+                record_out_frame: 50,
+                sources: vec![ExportHiResPlaylistSource {
+                    source_id: "part:p1:base_video".into(),
+                    source_kind: "base_video".into(),
+                    clip_id: "clip_a".into(),
+                    virtual_shot_id: "shot_a".into(),
+                    original_path: paths.project_dir("project_a").join("original.mxf"),
+                    source_in_frame: 10,
+                    source_out_frame: 60,
+                    source_timebase: FrameTimebase {
+                        fps_num: 50,
+                        fps_den: 1,
+                    },
+                    has_video: true,
+                    has_audio: false,
+                    audio_output_channel: None,
+                }],
+            }],
+        };
+        crate::ingest::db::queue_ingest_job_payload(
+            &conn,
+            EXPORT_HIRES_JOB_TYPE,
+            EXPORT_HIRES_SOURCE_ID,
+            "hires_a",
+            &serde_json::to_value(&payload).unwrap(),
+        )
+        .unwrap();
+        drop(conn);
+
+        let claim = NormalizedClaim::from_request(JobClaimRequest {
+            worker_id: "worker_a".into(),
+            placement: None,
+            project_id: Some("project_a".into()),
+            capabilities: vec![EXPORT_HIRES_JOB_TYPE.into()],
+            max_jobs: Some(1),
+            lease_ms: Some(10_000),
+        })
+        .unwrap();
+        let gateway = test_media_gateway(&paths);
+        let jobs = claim_jobs(paths, broker, gateway, claim).unwrap();
+
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].job_type, EXPORT_HIRES_JOB_TYPE);
+        let claimed: ExportHiResJobPayload =
+            serde_json::from_value(jobs[0].payload.clone()).unwrap();
+        assert_eq!(claimed.export_id, "hires_a");
+        assert_eq!(claimed.items[0].sources[0].source_in_frame, 10);
+    }
+
+    #[test]
+    fn export_hires_claim_rejects_payload_without_flat_snapshot() {
+        let paths = test_paths("export_hires_claim_missing_snapshot");
+        let broker = ProjectDbBroker::new(paths.clone());
+        register_project(&paths, "project_a");
+        let conn = open_ingest(&paths, "project_a").unwrap();
+        let payload = ExportHiResJobPayload {
+            project_id: "project_a".into(),
+            export_id: "hires_empty".into(),
+            output_path: paths
+                .project_dir("project_a")
+                .join("exports")
+                .join("master.mxf"),
+            timeline_timebase: FrameTimebase {
+                fps_num: 50,
+                fps_den: 1,
+            },
+            duration_frames: 50,
+            items: Vec::new(),
+        };
+        crate::ingest::db::queue_ingest_job_payload(
+            &conn,
+            EXPORT_HIRES_JOB_TYPE,
+            EXPORT_HIRES_SOURCE_ID,
+            "hires_empty",
+            &serde_json::to_value(&payload).unwrap(),
+        )
+        .unwrap();
+        drop(conn);
+
+        let claim = NormalizedClaim::from_request(JobClaimRequest {
+            worker_id: "worker_a".into(),
+            placement: None,
+            project_id: Some("project_a".into()),
+            capabilities: vec![EXPORT_HIRES_JOB_TYPE.into()],
+            max_jobs: Some(1),
+            lease_ms: Some(10_000),
+        })
+        .unwrap();
+        let gateway = test_media_gateway(&paths);
+        let jobs = claim_jobs(paths.clone(), broker, gateway, claim).unwrap();
+
+        assert!(jobs.is_empty());
+        let conn = open_ingest(&paths, "project_a").unwrap();
+        let (status, error): (String, String) = conn
+            .query_row(
+                "SELECT status, error FROM ingest_jobs
+                 WHERE job_type = ?1 AND source_id = ?2 AND clip_id = ?3",
+                params![EXPORT_HIRES_JOB_TYPE, EXPORT_HIRES_SOURCE_ID, "hires_empty"],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(status, "error");
+        assert!(error.contains("snapshot flat playlist"));
+    }
+
+    #[test]
     fn artifact_worker_status_warns_when_external_jobs_wait_without_worker() {
         let paths = test_paths("artifact_status_missing_worker");
         let broker = ProjectDbBroker::new(paths.clone());
@@ -2247,6 +2499,36 @@ mod tests {
                 .and_then(|v| v.get("active_leases"))
                 .and_then(Value::as_i64),
             Some(0)
+        );
+    }
+
+    #[test]
+    fn non_preview_claim_keeps_fifo_order() {
+        let paths = test_paths("non_preview_claim_fifo");
+        register_project(&paths, "project_a");
+        let conn = open_ingest(&paths, "project_a").unwrap();
+        queue_ingest_job(&conn, FILMSTRIP_JOB_TYPE, FILMSTRIP_SOURCE_ID, "old").unwrap();
+        queue_ingest_job(&conn, FILMSTRIP_JOB_TYPE, FILMSTRIP_SOURCE_ID, "new").unwrap();
+        conn.execute(
+            "UPDATE ingest_jobs SET queued_at = '2026-08-27T10:00:00Z', updated_at = '2026-08-27T10:00:00Z'
+             WHERE clip_id = 'old'",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE ingest_jobs SET queued_at = '2026-08-27T10:01:00Z', updated_at = '2026-08-27T10:01:00Z'
+             WHERE clip_id = 'new'",
+            [],
+        )
+        .unwrap();
+
+        let rows = queued_jobs_for_type(&conn, FILMSTRIP_JOB_TYPE, 2).unwrap();
+
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.clip_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["old", "new"]
         );
     }
 
@@ -2986,6 +3268,7 @@ mod tests {
                 THUMB_PROXY_JOB_TYPE.into(),
                 AUDIO_WRAP_JOB_TYPE.into(),
                 MEDIA_PROBE_JOB_TYPE.into(),
+                EXPORT_HIRES_JOB_TYPE.into(),
                 SMOKE_JOB_TYPE.into(),
             ],
             max_jobs: Some(1),
@@ -3001,6 +3284,7 @@ mod tests {
                 THUMB_PROXY_JOB_TYPE.to_string(),
                 AUDIO_WRAP_JOB_TYPE.to_string(),
                 MEDIA_PROBE_JOB_TYPE.to_string(),
+                EXPORT_HIRES_JOB_TYPE.to_string(),
                 SMOKE_JOB_TYPE.to_string(),
             ]
         );
@@ -3145,6 +3429,7 @@ mod tests {
             THUMB_PROXY_JOB_TYPE,
             AUDIO_WRAP_JOB_TYPE,
             MEDIA_PROBE_JOB_TYPE,
+            EXPORT_HIRES_JOB_TYPE,
         ];
         let mut job_ids = Vec::new();
         for (index, job_type) in job_types.iter().enumerate() {

@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use qnc_service_contracts::{ArtifactRef, FilmstripFrameArtifact, FilmstripJobFrame};
 
@@ -44,29 +45,12 @@ pub fn build_filmstrip_frame_artifacts_at_paths_with_options(
         return Err(format!("izvor ne postoji: {}", source.display()));
     }
 
-    let missing: Vec<FilmstripJobFrame> = frames
+    let missing = frames
         .iter()
-        .filter(|frame| !frame_file_ready(&frame.output_path))
-        .cloned()
-        .collect();
+        .any(|frame| !frame_file_ready(&frame.output_path));
 
-    if !missing.is_empty() {
-        let results = extract_filmstrip_frames_at_seeks_with_options(source, &missing, options);
-        for (frame, result) in missing.iter().zip(results.into_iter()) {
-            let _ok = match result {
-                Ok(()) if frame_file_ready(&frame.output_path) => true,
-                _ => {
-                    extract_poster_jpeg_at_seek_with_options(
-                        source,
-                        &frame.output_path,
-                        frame.seek_sec,
-                        options,
-                    )
-                    .is_ok()
-                        && frame_file_ready(&frame.output_path)
-                }
-            };
-        }
+    if missing {
+        let _ = extract_filmstrip_frames_at_seeks_with_options(source, frames, options);
     }
 
     let artifacts: Vec<FilmstripFrameArtifact> = frames
@@ -99,142 +83,91 @@ fn extract_filmstrip_frames_at_seeks_with_options(
         return vec![Err(format!("izvor ne postoji: {}", source.display()))];
     }
 
-    if !frames.iter().all(|frame| {
-        frame
-            .output_path
-            .parent()
-            .map(|parent| std::fs::create_dir_all(parent).is_ok())
-            .unwrap_or(true)
-    }) {
+    for frame in frames {
+        if let Some(parent) = frame.output_path.parent() {
+            if let Err(error) = std::fs::create_dir_all(parent) {
+                return frames
+                    .iter()
+                    .map(|_| Err(format!("filmstrip output dir: {error}")))
+                    .collect();
+            }
+        }
+    }
+
+    let Some(parent) = frames[0].output_path.parent() else {
         return frames
             .iter()
-            .map(|frame| {
-                extract_poster_jpeg_at_seek_with_options(
-                    source,
-                    &frame.output_path,
-                    frame.seek_sec,
-                    options,
-                )
-            })
+            .map(|_| Err("filmstrip output path has no parent".into()))
+            .collect();
+    };
+    let Some(interval_sec) = filmstrip_interval_seconds(frames) else {
+        return frames
+            .iter()
+            .map(|_| Err("filmstrip interval is invalid".into()))
+            .collect();
+    };
+    let temp_dir = parent.join(format!(
+        ".qnc_filmstrip_tmp_{}_{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    if let Err(error) = std::fs::create_dir_all(&temp_dir) {
+        return frames
+            .iter()
+            .map(|_| Err(format!("filmstrip temp dir: {error}")))
             .collect();
     }
 
     let scale = filmstrip_scale_filter();
+    let fps_rate = format_decimal(1.0 / interval_sec, 9);
+    let filter = format!("fps={fps_rate},{scale}");
+    let frame_count = frames.len().to_string();
+    let pattern = temp_dir.join("%03d.jpg");
     let mut cmd = Command::new(options.toolchain.ffmpeg());
     cmd.args(["-hide_banner", "-loglevel", "error", "-y"]);
-    for frame in frames {
-        cmd.arg("-ss")
-            .arg(format_decimal(frame.seek_sec.max(0.0), 2))
-            .arg("-i")
-            .arg(source);
-    }
-    for (input_index, frame) in frames.iter().enumerate() {
-        cmd.arg("-map")
-            .arg(format!("{input_index}:v:0"))
-            .arg("-vf")
-            .arg(&scale)
-            .args([
-                "-frames:v",
-                "1",
-                "-q:v",
-                "2",
-                "-pix_fmt",
-                "yuvj420p",
-                "-strict",
-                "unofficial",
-            ])
-            .arg(&frame.output_path);
-    }
-
-    match cmd.output() {
-        Ok(output) if output.status.success() => {}
-        Ok(output) => {
-            let err = stderr_or_default(&output, "filmstrip multi-seek failed");
-            return frames
-                .iter()
-                .map(|frame| {
-                    extract_poster_jpeg_at_seek_with_options(
-                        source,
-                        &frame.output_path,
-                        frame.seek_sec,
-                        options,
-                    )
-                    .map_err(|fallback| format!("filmstrip multi-seek: {err}; {fallback}"))
-                })
-                .collect();
-        }
-        Err(error) => {
-            return frames
-                .iter()
-                .map(|frame| {
-                    extract_poster_jpeg_at_seek_with_options(
-                        source,
-                        &frame.output_path,
-                        frame.seek_sec,
-                        options,
-                    )
-                    .map_err(|fallback| format!("filmstrip multi-seek start: {error}; {fallback}"))
-                })
-                .collect();
-        }
-    }
-
-    frames
-        .iter()
-        .map(|frame| {
-            if frame_file_ready(&frame.output_path) {
-                Ok(())
-            } else {
-                extract_poster_jpeg_at_seek_with_options(
-                    source,
-                    &frame.output_path,
-                    frame.seek_sec,
-                    options,
-                )
-                .map_err(|fallback| format!("filmstrip frame missing; {fallback}"))
-            }
-        })
-        .collect()
-}
-
-fn extract_poster_jpeg_at_seek_with_options(
-    source: &Path,
-    dest: &Path,
-    seek_sec: f64,
-    options: &FfmpegFilmstripOptions,
-) -> Result<(), String> {
-    if !source.is_file() {
-        return Err(format!("izvor ne postoji: {}", source.display()));
-    }
-    if let Some(parent) = dest.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-    }
-    let seek = format_decimal(seek_sec.max(0.0), 2);
-    let mut cmd = Command::new(options.toolchain.ffmpeg());
-    cmd.args(["-hide_banner", "-loglevel", "error", "-y"]);
-    cmd.args(["-ss"]).arg(&seek).arg("-i").arg(source);
-    cmd.args(["-vf"]).arg(filmstrip_scale_filter());
+    cmd.arg("-i").arg(source);
+    cmd.args(["-an", "-sn", "-dn"]);
+    cmd.arg("-vf").arg(filter);
     cmd.args([
         "-frames:v",
-        "1",
+        &frame_count,
         "-q:v",
         "2",
         "-pix_fmt",
         "yuvj420p",
         "-strict",
         "unofficial",
+        "-start_number",
+        "0",
     ]);
-    cmd.arg(dest);
-    let output = cmd
-        .output()
-        .map_err(|e| format!("ffmpeg pokretanje: {e}"))?;
-    if !output.status.success() {
-        return Err(stderr_or_default(&output, "ffmpeg neuspjesan"));
+    cmd.arg(&pattern);
+
+    let command_result = match cmd.output() {
+        Ok(output) if output.status.success() => Ok(()),
+        Ok(output) => Err(stderr_or_default(&output, "filmstrip single-pass failed")),
+        Err(error) => Err(format!("filmstrip single-pass start: {error}")),
+    };
+    if let Err(error) = command_result {
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        return frames.iter().map(|_| Err(error.clone())).collect();
     }
-    if !dest.is_file() {
-        return Err("ffmpeg nije kreirao poster".into());
-    }
-    Ok(())
+
+    let results: Vec<Result<(), String>> = frames
+        .iter()
+        .enumerate()
+        .map(|(index, frame)| {
+            let temp = temp_dir.join(format!("{index:03}.jpg"));
+            if !frame_file_ready(&temp) {
+                return Err("filmstrip single-pass frame missing".into());
+            }
+            move_or_copy(&temp, &frame.output_path)
+        })
+        .collect();
+    let _ = std::fs::remove_dir_all(&temp_dir);
+    results
 }
 
 fn artifact(path: PathBuf) -> ArtifactRef {
@@ -243,6 +176,29 @@ fn artifact(path: PathBuf) -> ArtifactRef {
         media_type: "image/jpeg".into(),
         render_version: None,
     }
+}
+
+fn move_or_copy(from: &Path, to: &Path) -> Result<(), String> {
+    if let Some(parent) = to.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    match std::fs::rename(from, to) {
+        Ok(()) => Ok(()),
+        Err(_) => {
+            std::fs::copy(from, to).map_err(|e| e.to_string())?;
+            Ok(())
+        }
+    }
+}
+
+fn filmstrip_interval_seconds(frames: &[FilmstripJobFrame]) -> Option<f64> {
+    frames
+        .windows(2)
+        .filter_map(|pair| {
+            let delta = pair[1].seek_sec - pair[0].seek_sec;
+            (delta.is_finite() && delta > 0.0).then_some(delta)
+        })
+        .min_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
 }
 
 fn frame_file_ready(path: &Path) -> bool {
@@ -321,6 +277,51 @@ mod tests {
         assert_eq!(artifacts.len(), 2);
         assert_eq!(artifacts[0].artifact.path, one);
         assert_eq!(artifacts[1].artifact.path, two);
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn filmstrip_output_dir_error_does_not_fall_back_to_per_frame_extracts() {
+        let base = std::env::temp_dir().join(format!(
+            "qnc_media_filmstrip_no_per_frame_fallback_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let source = base.join("source.mp4");
+        std::fs::write(&source, b"media").unwrap();
+        let blocked_parent = base.join("blocked");
+        std::fs::write(&blocked_parent, b"not a dir").unwrap();
+
+        let frames = vec![
+            FilmstripJobFrame {
+                index: 0,
+                seek_sec: 0.0,
+                output_path: blocked_parent.join("000_0_00.jpg"),
+            },
+            FilmstripJobFrame {
+                index: 1,
+                seek_sec: 1.0,
+                output_path: blocked_parent.join("001_1_00.jpg"),
+            },
+        ];
+        let options = FfmpegFilmstripOptions {
+            toolchain: FfmpegToolchain::new("missing_ffmpeg", "missing_ffprobe").unwrap(),
+        };
+
+        let results = extract_filmstrip_frames_at_seeks_with_options(&source, &frames, &options);
+
+        assert_eq!(results.len(), 2);
+        assert!(results.iter().all(|result| {
+            result
+                .as_ref()
+                .err()
+                .is_some_and(|error| error.contains("filmstrip output dir"))
+        }));
         let _ = std::fs::remove_dir_all(base);
     }
 }

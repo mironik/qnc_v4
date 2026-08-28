@@ -1,7 +1,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::Value;
 
 use crate::project::db::{now_str, open_project, ProjectPaths};
@@ -84,6 +84,7 @@ fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
             status TEXT NOT NULL DEFAULT 'queued',
             error TEXT NOT NULL DEFAULT '',
             attempts INTEGER NOT NULL DEFAULT 0,
+            payload_json TEXT NOT NULL DEFAULT '{}',
             queued_at TEXT,
             started_at TEXT,
             finished_at TEXT,
@@ -132,24 +133,81 @@ pub fn queue_ingest_job(
     source_id: &str,
     clip_id: &str,
 ) -> rusqlite::Result<()> {
+    queue_ingest_job_payload(conn, job_type, source_id, clip_id, &serde_json::json!({}))
+}
+
+/// Queue a background artifact job without resetting an existing job row.
+///
+/// Artifact schedulers are recovery/priority hints. They must not clear an
+/// active lease, a completed row, or a terminal error just because UI asked for
+/// a passive asset again.
+pub fn queue_ingest_artifact_job_once(
+    conn: &Connection,
+    job_type: &str,
+    source_id: &str,
+    clip_id: &str,
+) -> rusqlite::Result<bool> {
+    let job_id = ingest_job_id(job_type, source_id, clip_id);
+    let status: Option<String> = conn
+        .query_row(
+            "SELECT status FROM ingest_jobs WHERE job_id = ?1",
+            params![job_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if matches!(
+        status.as_deref().map(str::trim),
+        Some("queued" | "processing" | "done" | "error" | "failed")
+    ) {
+        return Ok(false);
+    }
+    queue_ingest_job(conn, job_type, source_id, clip_id)?;
+    Ok(true)
+}
+
+pub fn queue_ingest_job_payload(
+    conn: &Connection,
+    job_type: &str,
+    source_id: &str,
+    clip_id: &str,
+    payload: &Value,
+) -> rusqlite::Result<()> {
     let now = now_str();
     let job_id = ingest_job_id(job_type, source_id, clip_id);
+    let existing_status: Option<String> = conn
+        .query_row(
+            "SELECT status FROM ingest_jobs WHERE job_id = ?1",
+            params![job_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if existing_status.as_deref().map(str::trim) == Some("processing") {
+        return Ok(());
+    }
+    let payload_json = serde_json::to_string(payload).unwrap_or_else(|_| "{}".to_string());
     conn.execute(
         "INSERT INTO ingest_jobs
-            (job_id, job_type, source_id, clip_id, status, error, attempts, queued_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, 'queued', '', 0, ?5, ?5)
+            (job_id, job_type, source_id, clip_id, status, error, attempts, payload_json, queued_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, 'queued', '', 0, ?5, ?6, ?6)
          ON CONFLICT(job_id) DO UPDATE SET
             status = 'queued',
             error = '',
+            payload_json = excluded.payload_json,
             queued_at = excluded.queued_at,
             started_at = NULL,
             finished_at = NULL,
-            updated_at = excluded.updated_at",
+            updated_at = excluded.updated_at,
+            worker_id = '',
+            lease_id = '',
+            lease_until_ms = 0,
+            heartbeat_ms = 0,
+            result_json = '{}'",
         params![
             job_id,
             job_type.trim(),
             source_id.trim(),
             clip_id.trim(),
+            payload_json,
             now
         ],
     )?;
@@ -311,6 +369,12 @@ pub fn migrate_ingest_job_lease_columns(conn: &Connection) -> rusqlite::Result<(
     if !column_exists(conn, "ingest_jobs", "result_json") {
         conn.execute(
             "ALTER TABLE ingest_jobs ADD COLUMN result_json TEXT NOT NULL DEFAULT '{}'",
+            [],
+        )?;
+    }
+    if !column_exists(conn, "ingest_jobs", "payload_json") {
+        conn.execute(
+            "ALTER TABLE ingest_jobs ADD COLUMN payload_json TEXT NOT NULL DEFAULT '{}'",
             [],
         )?;
     }
@@ -901,6 +965,217 @@ mod tests {
             )
             .unwrap();
         assert_eq!(status, "queued");
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn artifact_job_enqueue_once_does_not_reset_existing_rows() {
+        let base = std::env::temp_dir().join(format!(
+            "qnc_artifact_jobs_once_test_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+        let paths = test_paths(&base);
+        let conn = open_ingest(&paths, "artifact_once_proj").unwrap();
+
+        assert!(queue_ingest_artifact_job_once(&conn, "waveform", "waveform", "clip_a").unwrap());
+        let status: String = conn
+            .query_row(
+                "SELECT status FROM ingest_jobs WHERE job_id = ?1",
+                params![ingest_job_id("waveform", "waveform", "clip_a")],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "queued");
+
+        conn.execute(
+            "UPDATE ingest_jobs
+             SET status = 'processing',
+                 queued_at = 'original-queued',
+                 started_at = 'original-started',
+                 worker_id = 'worker-a',
+                 lease_id = 'lease-a',
+                 error = 'keep-me'
+             WHERE job_id = ?1",
+            params![ingest_job_id("waveform", "waveform", "clip_a")],
+        )
+        .unwrap();
+        assert!(!queue_ingest_artifact_job_once(&conn, "waveform", "waveform", "clip_a").unwrap());
+        let processing: (String, String, String, String, String) = conn
+            .query_row(
+                "SELECT status, queued_at, started_at, worker_id, error
+                 FROM ingest_jobs WHERE job_id = ?1",
+                params![ingest_job_id("waveform", "waveform", "clip_a")],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            processing,
+            (
+                "processing".into(),
+                "original-queued".into(),
+                "original-started".into(),
+                "worker-a".into(),
+                "keep-me".into()
+            )
+        );
+
+        for terminal_status in ["error", "done"] {
+            conn.execute(
+                "UPDATE ingest_jobs
+                 SET status = ?2,
+                     queued_at = 'terminal-queued',
+                     started_at = 'terminal-started',
+                     worker_id = 'terminal-worker',
+                     error = 'terminal-error'
+                 WHERE job_id = ?1",
+                params![
+                    ingest_job_id("waveform", "waveform", "clip_a"),
+                    terminal_status
+                ],
+            )
+            .unwrap();
+            assert!(
+                !queue_ingest_artifact_job_once(&conn, "waveform", "waveform", "clip_a").unwrap()
+            );
+            let row: (String, String, String, String, String) = conn
+                .query_row(
+                    "SELECT status, queued_at, started_at, worker_id, error
+                     FROM ingest_jobs WHERE job_id = ?1",
+                    params![ingest_job_id("waveform", "waveform", "clip_a")],
+                    |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                        ))
+                    },
+                )
+                .unwrap();
+            assert_eq!(
+                row,
+                (
+                    terminal_status.into(),
+                    "terminal-queued".into(),
+                    "terminal-started".into(),
+                    "terminal-worker".into(),
+                    "terminal-error".into()
+                )
+            );
+        }
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn queue_ingest_job_payload_does_not_reset_processing_job() {
+        let base = std::env::temp_dir().join(format!(
+            "qnc_job_payload_processing_test_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+        let paths = test_paths(&base);
+        let conn = open_ingest(&paths, "job_payload_processing_proj").unwrap();
+
+        queue_ingest_job_payload(
+            &conn,
+            "export_hires",
+            "render",
+            "clip_a",
+            &serde_json::json!({"version": 1}),
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE ingest_jobs
+             SET status = 'processing',
+                 attempts = 3,
+                 payload_json = '{\"version\":1}',
+                 queued_at = 'original-queued',
+                 started_at = 'original-started',
+                 worker_id = 'worker-a',
+                 lease_id = 'lease-a',
+                 lease_until_ms = 123456,
+                 heartbeat_ms = 123000,
+                 error = 'keep-me'
+             WHERE job_id = ?1",
+            params![ingest_job_id("export_hires", "render", "clip_a")],
+        )
+        .unwrap();
+
+        queue_ingest_job_payload(
+            &conn,
+            "export_hires",
+            "render",
+            "clip_a",
+            &serde_json::json!({"version": 2}),
+        )
+        .unwrap();
+        let row: (
+            String,
+            i64,
+            String,
+            String,
+            String,
+            String,
+            String,
+            i64,
+            i64,
+        ) = conn
+            .query_row(
+                "SELECT status, attempts, payload_json, queued_at, started_at,
+                        worker_id, lease_id, lease_until_ms, heartbeat_ms
+                 FROM ingest_jobs WHERE job_id = ?1",
+                params![ingest_job_id("export_hires", "render", "clip_a")],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                        row.get(7)?,
+                        row.get(8)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            row,
+            (
+                "processing".into(),
+                3,
+                "{\"version\":1}".into(),
+                "original-queued".into(),
+                "original-started".into(),
+                "worker-a".into(),
+                "lease-a".into(),
+                123456,
+                123000,
+            )
+        );
 
         let _ = fs::remove_dir_all(&base);
     }

@@ -17,6 +17,8 @@ pub const JOB_SOURCE_WAVEFORM: &str = "waveform";
 pub const JOB_TYPE_THUMB_PROXY: &str = "thumb_proxy";
 pub const JOB_TYPE_AUDIO_WRAP: &str = "audio_wrap";
 pub const JOB_TYPE_MEDIA_PROBE: &str = "media_probe";
+pub const JOB_TYPE_EXPORT_HIRES: &str = "export_hires";
+pub const JOB_SOURCE_EXPORT_HIRES: &str = "story_export";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -525,6 +527,70 @@ pub struct ProxyGenerateJobResult {
     pub output_path: PathBuf,
     #[serde(default)]
     pub probe: Option<MediaProbe>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExportHiResSubmitResponse {
+    pub project_id: String,
+    pub job_id: String,
+    pub export_id: String,
+    pub state: ExportJobState,
+    pub output_path: PathBuf,
+    pub timeline_timebase: FrameTimebase,
+    pub duration_frames: i64,
+    pub message: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExportHiResJobPayload {
+    pub project_id: String,
+    pub export_id: String,
+    pub output_path: PathBuf,
+    pub timeline_timebase: FrameTimebase,
+    pub duration_frames: i64,
+    pub items: Vec<ExportHiResPlaylistItem>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PreviewHiResInputResponse {
+    pub project_id: String,
+    pub preview_id: String,
+    pub timeline_timebase: FrameTimebase,
+    pub duration_frames: i64,
+    pub items: Vec<ExportHiResPlaylistItem>,
+    pub message: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExportHiResPlaylistItem {
+    pub item_id: String,
+    pub record_in_frame: i64,
+    pub record_out_frame: i64,
+    pub sources: Vec<ExportHiResPlaylistSource>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExportHiResPlaylistSource {
+    pub source_id: String,
+    pub source_kind: String,
+    pub clip_id: String,
+    pub virtual_shot_id: String,
+    pub original_path: PathBuf,
+    pub source_in_frame: i64,
+    pub source_out_frame: i64,
+    pub source_timebase: FrameTimebase,
+    pub has_video: bool,
+    pub has_audio: bool,
+    pub audio_output_channel: Option<u8>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExportHiResJobResult {
+    pub output_path: PathBuf,
+    pub manifest_path: Option<PathBuf>,
+    pub item_count: usize,
+    pub source_count: usize,
+    pub mode: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

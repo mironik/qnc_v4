@@ -326,15 +326,34 @@ fn chrome_row_fill(
     out.response
 }
 
-/// Ghost chrome button — Media Assist / Story dock (`>`, `[`, Export XML, Pokrivalice…).
+/// Ghost chrome button — Media Assist / Story dock (`>`, `[`, Export HI-res, Pokrivalice…).
 pub fn transport_btn(ui: &mut egui::Ui, label: &str) -> egui::Response {
+    transport_btn_state(ui, label, false)
+}
+
+pub fn transport_btn_state(ui: &mut egui::Ui, label: &str, active: bool) -> egui::Response {
     let t = current(ui);
-    let width = if label == "Export XML" { 100.0 } else { 40.0 };
+    let width = if label.starts_with("Export") {
+        120.0
+    } else {
+        40.0
+    };
+    let text = if active { t.accent } else { t.text };
+    let fill = if active {
+        t.accent.gamma_multiply(0.16)
+    } else {
+        Color32::TRANSPARENT
+    };
+    let stroke = if active {
+        egui::Stroke::new(1.0, t.accent)
+    } else {
+        egui::Stroke::new(1.0, t.border)
+    };
     ui.add(
-        egui::Button::new(RichText::new(label).color(t.text).monospace().size(FONT_UI))
+        egui::Button::new(RichText::new(label).color(text).monospace().size(FONT_UI))
             .min_size(Vec2::new(width, CHROME_CTRL_H))
-            .fill(Color32::TRANSPARENT)
-            .stroke(egui::Stroke::new(1.0, t.border)),
+            .fill(fill)
+            .stroke(stroke),
     )
 }
 
