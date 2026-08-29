@@ -1,18 +1,17 @@
 use std::time::{Duration, Instant};
 
-use qnc_service_contracts::{ExportHiResSubmitResponse, PreviewHiResInputResponse};
+use qnc_service_contracts::ExportHiResSubmitResponse;
 
 use crate::component_runtime::ComponentBackendCommand;
 
 use super::{
     ExportHiResStatus, HiResExportProcedureComponent, HiResExportProcedureState,
-    HiResPreviewProcedureComponent, HiResPreviewProcedureState, HIRES_EXPORT_POLL_INTERVAL,
+    HIRES_EXPORT_POLL_INTERVAL,
 };
 
 #[derive(Debug, Default)]
 pub(crate) struct HiResRenderProceduresState {
     export: HiResExportProcedureState,
-    preview: HiResPreviewProcedureState,
 }
 
 pub(crate) struct HiResRenderProceduresComponent;
@@ -21,11 +20,6 @@ impl HiResRenderProceduresState {
     #[cfg(test)]
     pub(crate) fn export_pending(&self) -> bool {
         self.export.pending()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn preview_pending(&self) -> bool {
-        self.preview.pending()
     }
 
     pub(crate) fn export_has_watch(&self) -> bool {
@@ -43,13 +37,6 @@ impl HiResRenderProceduresComponent {
         now: Instant,
     ) -> bool {
         HiResExportProcedureComponent::button_active(&mut state.export, now)
-    }
-
-    pub(crate) fn preview_button_active(
-        state: &mut HiResRenderProceduresState,
-        now: Instant,
-    ) -> bool {
-        HiResPreviewProcedureComponent::button_active(&mut state.preview, now)
     }
 
     pub(crate) fn start_export(
@@ -143,52 +130,5 @@ impl HiResRenderProceduresComponent {
         job_id: &str,
     ) -> ComponentBackendCommand {
         HiResExportProcedureComponent::status_command(instance_id, request_id, project_id, job_id)
-    }
-
-    pub(crate) fn start_preview(
-        state: &mut HiResRenderProceduresState,
-        instance_id: &str,
-        request_id: u64,
-        project_id: &str,
-        now: Instant,
-    ) -> Result<(ComponentBackendCommand, String), String> {
-        HiResPreviewProcedureComponent::start(
-            &mut state.preview,
-            instance_id,
-            request_id,
-            project_id,
-            now,
-        )
-        .map(|start| (start.command, start.status))
-    }
-
-    pub(crate) fn apply_preview_submit(
-        state: &mut HiResRenderProceduresState,
-        active_project_id: &str,
-        project_id: &str,
-        response: PreviewHiResInputResponse,
-    ) -> Option<String> {
-        HiResPreviewProcedureComponent::apply_submit(
-            &mut state.preview,
-            active_project_id,
-            project_id,
-            response,
-        )
-    }
-
-    pub(crate) fn set_preview_error(
-        state: &mut HiResRenderProceduresState,
-        active_project_id: &str,
-        project_id: &str,
-        error: impl Into<String>,
-        now: Instant,
-    ) -> Option<String> {
-        HiResPreviewProcedureComponent::set_error(
-            &mut state.preview,
-            active_project_id,
-            project_id,
-            error,
-            now,
-        )
     }
 }

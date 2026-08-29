@@ -552,16 +552,6 @@ pub struct ExportHiResJobPayload {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PreviewHiResInputResponse {
-    pub project_id: String,
-    pub preview_id: String,
-    pub timeline_timebase: FrameTimebase,
-    pub duration_frames: i64,
-    pub items: Vec<ExportHiResPlaylistItem>,
-    pub message: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExportHiResPlaylistItem {
     pub item_id: String,
     pub record_in_frame: i64,

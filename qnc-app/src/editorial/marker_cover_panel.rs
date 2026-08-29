@@ -9,7 +9,7 @@ use crate::qnc_theme::{self, MUTED, TEXT};
 
 const COMPACT_CTRL_H: f32 = 22.0;
 const EDIT_ACTIONS_W: f32 = 250.0;
-const RIGHT_ACTIONS_W: f32 = 190.0;
+const RIGHT_ACTIONS_W: f32 = 110.0;
 const EDIT_ACTION_GAP: f32 = 6.0;
 const CONTROL_GROUP_GAP: f32 = 10.0;
 const TRANSPORT_BTN_W: f32 = 30.0;
@@ -22,7 +22,6 @@ pub(crate) struct MarkerCoverInput<'a> {
     pub playhead_sec: f64,
     pub tc: &'a dyn Fn(f64) -> String,
     pub show_playhead: bool,
-    pub preview_hires_pending: bool,
     pub sync_cover_enabled: bool,
 }
 
@@ -39,7 +38,6 @@ pub(crate) enum MarkerCoverAction {
     AddMarker,
     CreateCover,
     OverwriteCover,
-    PreviewHiRes,
     ToggleSyncCover,
 }
 
@@ -74,7 +72,6 @@ pub(crate) fn show(ui: &mut egui::Ui, input: MarkerCoverInput<'_>) -> MarkerCove
                 ui,
                 row_rect,
                 transport_rect,
-                input.preview_hires_pending,
                 input.sync_cover_enabled,
                 &mut action,
             );
@@ -169,7 +166,6 @@ fn show_right_actions(
     ui: &mut egui::Ui,
     row_rect: Rect,
     transport_rect: Rect,
-    preview_hires_pending: bool,
     sync_cover_enabled: bool,
     action: &mut MarkerCoverAction,
 ) {
@@ -190,17 +186,6 @@ fn show_right_actions(
         |ui| {
             ui.spacing_mut().item_spacing.x = EDIT_ACTION_GAP;
             ui.spacing_mut().button_padding = Vec2::new(6.0, 1.0);
-            let preview_label = if preview_hires_pending {
-                "Preview..."
-            } else {
-                "Preview"
-            };
-            if compact_action_btn_state(ui, preview_label, preview_hires_pending)
-                .on_hover_text("Render + fullscreen HI-res preview")
-                .clicked()
-            {
-                *action = MarkerCoverAction::PreviewHiRes;
-            }
             if compact_toggle_btn(ui, "Sync/B-roll", sync_cover_enabled).clicked() {
                 *action = MarkerCoverAction::ToggleSyncCover;
             }

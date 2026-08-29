@@ -3411,8 +3411,8 @@ mod tests {
     }
 
     #[test]
-    fn media_input_registry_preserves_http_hls_uri() {
-        let uri = "http://127.0.0.1:8001/api/preview/hires/stream/manifest?project_id=p&job_id=j";
+    fn media_input_registry_preserves_http_media_uri() {
+        let uri = "http://127.0.0.1:8001/api/media/stream/source?project_id=p&clip_id=c";
         let registry = FfmpegSourceRegistry::single_media_input("preview", uri);
         let input = registry.source_input("preview").unwrap();
 

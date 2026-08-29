@@ -1,4 +1,4 @@
-use qnc_service_contracts::{ExportHiResSubmitResponse, PreviewHiResInputResponse};
+use qnc_service_contracts::ExportHiResSubmitResponse;
 use serde::Deserialize;
 use serde_json::json;
 
@@ -10,7 +10,6 @@ const PORT_SUBMIT: &str = "submit";
 const PORT_STATUS: &str = "status";
 const OP_SUBMIT: &str = "export_hires.submit";
 const OP_STATUS: &str = "export_hires.status";
-const OP_PREVIEW_SUBMIT: &str = "preview_hires_input.build";
 const REQUEST_SEP: char = '\u{1f}';
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -55,22 +54,6 @@ impl HiResRenderTransportComponent {
         .with_timeout(HostRequestTimeout::Default)
     }
 
-    pub fn submit_preview(
-        instance_id: &str,
-        request_id: u64,
-        project_id: &str,
-    ) -> ComponentBackendCommand {
-        ComponentBackendCommand::post(
-            COMPONENT_ID,
-            PORT_SUBMIT,
-            OP_PREVIEW_SUBMIT,
-            request_key(instance_id, project_id, request_id),
-            "/api/preview/hires/input/build",
-            json!({ "project_id": project_id }),
-        )
-        .with_timeout(HostRequestTimeout::Long)
-    }
-
     pub fn accepts_event(event: &ComponentBackendEvent) -> bool {
         event.component_id == COMPONENT_ID
             && event.port_id == PORT_SUBMIT
@@ -83,30 +66,10 @@ impl HiResRenderTransportComponent {
             && event.operation_id == OP_STATUS
     }
 
-    pub fn accepts_preview_event(event: &ComponentBackendEvent) -> bool {
-        event.component_id == COMPONENT_ID
-            && event.port_id == PORT_SUBMIT
-            && event.operation_id == OP_PREVIEW_SUBMIT
-    }
-
     pub fn into_submit(
         event: ComponentBackendEvent,
     ) -> Option<(String, String, Result<ExportHiResSubmitResponse, String>)> {
         if !Self::accepts_event(&event) {
-            return None;
-        }
-        let (instance_id, project_id, _request_id) = split_request_key(&event.request_key)
-            .unwrap_or_else(|| (String::new(), event.request_key.clone(), 0));
-        let result = event
-            .result
-            .and_then(|value| serde_json::from_value(value).map_err(|error| error.to_string()));
-        Some((instance_id, project_id, result))
-    }
-
-    pub fn into_preview_submit(
-        event: ComponentBackendEvent,
-    ) -> Option<(String, String, Result<PreviewHiResInputResponse, String>)> {
-        if !Self::accepts_preview_event(&event) {
             return None;
         }
         let (instance_id, project_id, _request_id) = split_request_key(&event.request_key)
@@ -217,17 +180,6 @@ mod tests {
         assert_eq!(command.port_id, PORT_SUBMIT);
         assert_eq!(command.method, HostRequestMethod::Post);
         assert_eq!(command.path, "/api/render/hires/submit");
-        assert_eq!(command.timeout, HostRequestTimeout::Long);
-    }
-
-    #[test]
-    fn submit_preview_uses_hires_preview_endpoint() {
-        let command = HiResRenderTransportComponent::submit_preview("story", 7, "p1");
-        assert_eq!(command.component_id, COMPONENT_ID);
-        assert_eq!(command.port_id, PORT_SUBMIT);
-        assert_eq!(command.operation_id, OP_PREVIEW_SUBMIT);
-        assert_eq!(command.method, HostRequestMethod::Post);
-        assert_eq!(command.path, "/api/preview/hires/input/build");
         assert_eq!(command.timeout, HostRequestTimeout::Long);
     }
 

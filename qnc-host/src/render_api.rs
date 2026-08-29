@@ -7,9 +7,7 @@ use axum::{
 use serde_json::{json, Value};
 
 use crate::app_state::AppState;
-use crate::export_hires::{
-    build_hires_preview_input, hires_export_status, submit_hires_export_job,
-};
+use crate::export_hires::{hires_export_status, submit_hires_export_job};
 use crate::project::db::project_settings_snapshot_from_conn;
 
 #[derive(serde::Deserialize)]
@@ -30,10 +28,6 @@ pub fn router() -> Router<AppState> {
     Router::new()
         .route("/api/render/hires/submit", post(api_render_hires_submit))
         .route("/api/render/hires/status", get(api_render_hires_status))
-        .route(
-            "/api/preview/hires/input/build",
-            post(api_preview_hires_input_build),
-        )
 }
 
 pub(crate) async fn api_render_hires_status(
@@ -68,23 +62,6 @@ pub(crate) async fn api_render_hires_submit(
         &app.media_gateway,
         &pid,
         &project_settings,
-    )
-    .map_err(map_bad_request)?;
-    serde_json::to_value(response)
-        .map(Json)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
-}
-
-pub(crate) async fn api_preview_hires_input_build(
-    State(app): State<AppState>,
-    Json(body): Json<RenderSubmitBody>,
-) -> Result<Json<Value>, (StatusCode, String)> {
-    let pid = resolve_project_id(&app, &body.project_id)?;
-    let response = build_hires_preview_input(
-        &app.project.paths,
-        &app.project_db,
-        &app.media_gateway,
-        &pid,
     )
     .map_err(map_bad_request)?;
     serde_json::to_value(response)

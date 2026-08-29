@@ -423,8 +423,9 @@ fn shot_cards(ui: &mut egui::Ui, input: &MediaPoolStripInput<'_>) -> MediaPoolAc
 fn segment_cards(ui: &mut egui::Ui, input: &MediaPoolStripInput<'_>) -> MediaPoolAction {
     let mut action = MediaPoolAction::None;
     let t = current(ui);
-    egui::ScrollArea::horizontal().show(ui, |ui| {
-        ui.horizontal(|ui| {
+    egui::ScrollArea::vertical()
+        .max_height(input.height)
+        .show(ui, |ui| {
             if input.parts.is_empty() {
                 ui.colored_label(
                     t.muted,
@@ -434,6 +435,7 @@ fn segment_cards(ui: &mut egui::Ui, input: &MediaPoolStripInput<'_>) -> MediaPoo
             }
 
             for part in input.parts {
+                let row_width = ui.available_width().max(180.0);
                 let selected = part.part_id == input.selected_part_id;
                 let stroke = if selected {
                     egui::Stroke::new(2.0, t.select_red)
@@ -449,48 +451,56 @@ fn segment_cards(ui: &mut egui::Ui, input: &MediaPoolStripInput<'_>) -> MediaPoo
                 let resp = egui::Frame::NONE
                     .stroke(stroke)
                     .fill(fill)
-                    .inner_margin(8.0)
+                    .inner_margin(egui::Margin::symmetric(10, 7))
                     .show(ui, |ui| {
-                        ui.set_min_width(120.0);
-                        ui.label(RichText::new(&part.kind).color(kind_color).strong());
-                        ui.label(RichText::new(&part.part_id).color(t.text).small());
-                        if !part.duration_label.is_empty() {
-                            ui.label(RichText::new(&part.duration_label).color(t.muted).small());
-                        }
-                        if !part.active {
-                            ui.label(RichText::new("neaktivno").color(t.muted).small());
-                        }
-                        if selected && part.active {
-                            ui.horizontal(|ui| {
-                                if ui
-                                    .add(egui::Button::new(RichText::new("Up").small()))
-                                    .on_hover_text("Pomakni segment ranije")
-                                    .clicked()
-                                {
-                                    action = MediaPoolAction::ReorderPart {
-                                        part_id: part.part_id.clone(),
-                                        direction: "up".into(),
-                                    };
-                                }
-                                if ui
-                                    .add(egui::Button::new(RichText::new("Down").small()))
-                                    .on_hover_text("Pomakni segment kasnije")
-                                    .clicked()
-                                {
-                                    action = MediaPoolAction::ReorderPart {
-                                        part_id: part.part_id.clone(),
-                                        direction: "down".into(),
-                                    };
-                                }
-                                if ui
-                                    .add(egui::Button::new(RichText::new("Del").small()))
-                                    .on_hover_text("Obriši segment")
-                                    .clicked()
-                                {
-                                    action = MediaPoolAction::DeletePart(part.part_id.clone());
-                                }
-                            });
-                        }
+                        ui.set_min_width(row_width);
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new(&part.kind).color(kind_color).strong());
+                            ui.label(RichText::new(&part.part_id).color(t.text).small());
+                            if !part.duration_label.is_empty() {
+                                ui.label(
+                                    RichText::new(&part.duration_label).color(t.muted).small(),
+                                );
+                            }
+                            if !part.active {
+                                ui.label(RichText::new("neaktivno").color(t.muted).small());
+                            }
+                            if selected && part.active {
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        if ui
+                                            .add(egui::Button::new(RichText::new("Del").small()))
+                                            .on_hover_text("Obriši segment")
+                                            .clicked()
+                                        {
+                                            action =
+                                                MediaPoolAction::DeletePart(part.part_id.clone());
+                                        }
+                                        if ui
+                                            .add(egui::Button::new(RichText::new("Down").small()))
+                                            .on_hover_text("Pomakni segment kasnije")
+                                            .clicked()
+                                        {
+                                            action = MediaPoolAction::ReorderPart {
+                                                part_id: part.part_id.clone(),
+                                                direction: "down".into(),
+                                            };
+                                        }
+                                        if ui
+                                            .add(egui::Button::new(RichText::new("Up").small()))
+                                            .on_hover_text("Pomakni segment ranije")
+                                            .clicked()
+                                        {
+                                            action = MediaPoolAction::ReorderPart {
+                                                part_id: part.part_id.clone(),
+                                                direction: "up".into(),
+                                            };
+                                        }
+                                    },
+                                );
+                            }
+                        });
                     })
                     .response;
                 if resp.clicked() && matches!(action, MediaPoolAction::None) {
@@ -498,8 +508,8 @@ fn segment_cards(ui: &mut egui::Ui, input: &MediaPoolStripInput<'_>) -> MediaPoo
                         action = MediaPoolAction::SelectPart(part.part_id.clone());
                     }
                 }
+                ui.add_space(6.0);
             }
         });
-    });
     action
 }

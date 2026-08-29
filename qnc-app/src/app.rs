@@ -10,14 +10,13 @@ use crate::component_errors::{ComponentErrorBoundary, ComponentErrorKey};
 use crate::component_runtime::{ComponentBackendCommand, ComponentBackendRuntime};
 use crate::components::{
     EditorialEditComponent, EditorialEditData, EditorialEditKind, EditorialStateComponent,
-    EditorialStateData, ExportHiResStatus, FilesystemListComponent, HiResPreviewOpen,
-    HiResPreviewPlayerAction, HiResPreviewPlayerComponent, HiResPreviewPlayerState,
-    HiResRenderTransportComponent, PlaybackMediaResolution, PlaybackMediaResolverComponent,
-    ProjectCatalogComponent, ProjectCommandComponent, ProjectCommandData, ProjectCommandKind,
-    ProjectExportProfileComponent, ProjectRegistryComponent, ShellStateComponent, ShellStateData,
-    ShortcutBindingsComponent, ShortcutBindingsData, SourceImportCommandComponent,
-    SourceImportCommandKind, SourceImportSelectionComponent, SourceImportStateComponent,
-    SourceImportStateKind, SourceImportStatusComponent, ThemePickerComponent,
+    EditorialStateData, ExportHiResStatus, FilesystemListComponent, HiResRenderTransportComponent,
+    PlaybackMediaResolution, PlaybackMediaResolverComponent, ProjectCatalogComponent,
+    ProjectCommandComponent, ProjectCommandData, ProjectCommandKind, ProjectExportProfileComponent,
+    ProjectRegistryComponent, ShellStateComponent, ShellStateData, ShortcutBindingsComponent,
+    ShortcutBindingsData, SourceImportCommandComponent, SourceImportCommandKind,
+    SourceImportSelectionComponent, SourceImportStateComponent, SourceImportStateKind,
+    SourceImportStatusComponent, ThemePickerComponent,
 };
 use crate::composition::{ScreenComposition, WorkflowScreen};
 use crate::ingest::IngestScreen;
@@ -25,7 +24,6 @@ use crate::media_assist::MediaAssistScreen;
 use crate::playback_routing::PlaybackTransportIntent;
 use crate::playback_stack::PlaybackStack;
 use crate::player_bridge;
-use crate::player_remote::PlayerEvent;
 use crate::project::{ProjectAction, ProjectScreen};
 use crate::qnc_broadcast_player::BroadcastPlayerRx;
 use crate::qnc_theme;
@@ -97,7 +95,6 @@ pub struct QncApp {
     /// Sole broadcast player (+ carrier / monitor). Screens only host the UI slots.
     pub(crate) playback: PlaybackStack,
     playback_rx: BroadcastPlayerRx,
-    hires_preview_player: HiResPreviewPlayerState,
     component_backend: ComponentBackendRuntime,
     component_errors: ComponentErrorBoundary,
     source_import_status: SourceImportStatusComponent,
@@ -150,7 +147,6 @@ impl QncApp {
             story: StoryScreen::story(),
             playback,
             playback_rx,
-            hires_preview_player: HiResPreviewPlayerState::default(),
             component_backend: ComponentBackendRuntime::new(),
             component_errors: ComponentErrorBoundary::default(),
             source_import_status: SourceImportStatusComponent::default(),
@@ -943,78 +939,6 @@ impl QncApp {
             EDITORIAL_INSTANCE_MEDIA_ASSIST => {
                 self.media_assist
                     .set_export_hires_status_error(project_id, error);
-                self.status = self.media_assist.status_text().to_owned();
-            }
-            _ => self.error = Some(error),
-        }
-    }
-
-    fn apply_preview_hires_submit(
-        &mut self,
-        instance_id: &str,
-        project_id: &str,
-        response: qnc_service_contracts::PreviewHiResInputResponse,
-        ctx: Option<egui::Context>,
-    ) {
-        match instance_id {
-            EDITORIAL_INSTANCE_STORY => {
-                self.story
-                    .apply_preview_hires_submit(project_id, response.clone());
-                self.status = self.story.status_text().to_owned();
-            }
-            EDITORIAL_INSTANCE_MEDIA_ASSIST => {
-                self.media_assist
-                    .apply_preview_hires_submit(project_id, response.clone());
-                self.status = self.media_assist.status_text().to_owned();
-            }
-            _ => {
-                self.error = Some("Preview HI-res: nepoznata editorial instanca".into());
-                return;
-            }
-        }
-        let open = match HiResPreviewPlayerComponent::build_open(&response) {
-            Ok(open) => open,
-            Err(error) => {
-                self.set_preview_hires_error(instance_id, project_id, error);
-                return;
-            }
-        };
-        if ctx.is_some() {
-            self.playback.stop();
-        }
-        self.open_hires_preview(instance_id, project_id, open, ctx);
-    }
-
-    fn open_hires_preview(
-        &mut self,
-        instance_id: &str,
-        project_id: &str,
-        open: HiResPreviewOpen,
-        ctx: Option<egui::Context>,
-    ) {
-        let intent = HiResPreviewPlayerComponent::build_play_intent(&open);
-        if let Some(ctx) = ctx.as_ref() {
-            HiResPreviewPlayerComponent::open(&mut self.hires_preview_player, ctx, &open);
-        }
-        self.playback_transport_intent(intent);
-        self.status = format!("Preview HI-res play · {}", open.preview_id);
-        let _ = (instance_id, project_id);
-    }
-
-    fn set_preview_hires_error(
-        &mut self,
-        instance_id: &str,
-        project_id: &str,
-        error: impl Into<String>,
-    ) {
-        let error = error.into();
-        match instance_id {
-            EDITORIAL_INSTANCE_STORY => {
-                self.story.set_preview_hires_error(project_id, error);
-                self.status = self.story.status_text().to_owned();
-            }
-            EDITORIAL_INSTANCE_MEDIA_ASSIST => {
-                self.media_assist.set_preview_hires_error(project_id, error);
                 self.status = self.media_assist.status_text().to_owned();
             }
             _ => self.error = Some(error),
@@ -1966,27 +1890,6 @@ impl QncApp {
                         self.set_export_hires_status_error(&instance_id, &project_id, e);
                     }
                 }
-            } else if HiResRenderTransportComponent::accepts_preview_event(&event) {
-                let Some((instance_id, project_id, result)) =
-                    HiResRenderTransportComponent::into_preview_submit(event)
-                else {
-                    continue;
-                };
-                match result {
-                    Ok(response) => {
-                        self.clear_component_error(&error_key);
-                        self.apply_preview_hires_submit(
-                            &instance_id,
-                            &project_id,
-                            response,
-                            ctx.clone(),
-                        );
-                    }
-                    Err(e) => {
-                        let e = self.record_component_error(error_key, e);
-                        self.set_preview_hires_error(&instance_id, &project_id, e);
-                    }
-                }
             } else if EditorialStateComponent::accepts_event(&event) {
                 let Some((instance_id, project_id, result)) =
                     EditorialStateComponent::into_data(event)
@@ -2433,7 +2336,6 @@ impl QncApp {
         self.playback.player_mut().pump(ctx);
         let events = self.playback_rx.try_recv_all();
         self.playback.ingest_events(&events);
-        self.apply_hires_preview_player_events(&events, ctx);
         if self.phase == Phase::Workspace {
             match self.screen {
                 Screen::Ingest => player_bridge::apply_player_events(
@@ -2466,7 +2368,6 @@ impl QncApp {
             return;
         }
         self.playback.ingest_events(&follow_up);
-        self.apply_hires_preview_player_events(&follow_up, ctx);
         if self.phase != Phase::Workspace {
             return;
         }
@@ -2487,19 +2388,6 @@ impl QncApp {
                 self.playback.player(),
             ),
             _ => {}
-        }
-    }
-
-    fn apply_hires_preview_player_events(&mut self, events: &[PlayerEvent], ctx: &egui::Context) {
-        if !self.hires_preview_player.active() {
-            return;
-        }
-        if events
-            .iter()
-            .any(|event| matches!(event, PlayerEvent::BoundaryReached { .. }))
-        {
-            HiResPreviewPlayerComponent::close(&mut self.hires_preview_player, ctx);
-            self.status = "Preview HI-res završen".into();
         }
     }
 
@@ -2946,18 +2834,5 @@ impl eframe::App for QncApp {
 
         // Post-UI: process app-routed transport commands emitted during paint.
         self.tick_active_player(ctx);
-        if self.hires_preview_player.active() {
-            match HiResPreviewPlayerComponent::show(
-                ctx,
-                &self.playback,
-                &mut self.hires_preview_player,
-            ) {
-                HiResPreviewPlayerAction::None => {}
-                HiResPreviewPlayerAction::Close => {
-                    self.playback.stop();
-                    HiResPreviewPlayerComponent::close(&mut self.hires_preview_player, ctx);
-                }
-            }
-        }
     }
 }

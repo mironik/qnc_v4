@@ -496,7 +496,7 @@ mod tests {
     }
 
     #[test]
-    fn output_path_keeps_existing_transport_extension() {
+    fn output_path_keeps_existing_export_extension() {
         let playlist = ExportFlatPlaylist {
             timeline_timebase: FrameTimebase {
                 fps_num: 50,
@@ -511,11 +511,10 @@ mod tests {
             }],
         };
 
-        let output =
-            output_path_for_flat_playlist(PathBuf::from("C:/stream/stream.m3u8"), &playlist)
-                .expect("stream path");
+        let output = output_path_for_flat_playlist(PathBuf::from("C:/out/custom.mov"), &playlist)
+            .expect("export path");
 
-        assert_eq!(output, PathBuf::from("C:/stream/stream.m3u8"));
+        assert_eq!(output, PathBuf::from("C:/out/custom.mov"));
     }
 
     #[test]

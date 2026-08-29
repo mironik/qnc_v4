@@ -743,33 +743,6 @@ impl StoryScreen {
         }
     }
 
-    pub fn apply_preview_hires_submit(
-        &mut self,
-        project_id: &str,
-        response: qnc_service_contracts::PreviewHiResInputResponse,
-    ) {
-        if let Some(status) = HiResRenderProceduresComponent::apply_preview_submit(
-            &mut self.hires_render_procedures,
-            &self.loaded_project_id,
-            project_id,
-            response,
-        ) {
-            self.status = status;
-        }
-    }
-
-    pub fn set_preview_hires_error(&mut self, project_id: &str, error: impl Into<String>) {
-        if let Some(status) = HiResRenderProceduresComponent::set_preview_error(
-            &mut self.hires_render_procedures,
-            &self.loaded_project_id,
-            project_id,
-            error,
-            Instant::now(),
-        ) {
-            self.status = status;
-        }
-    }
-
     pub fn meta_ready(&self) -> bool {
         !self.project_id.is_empty()
             && self.state_loaded
@@ -783,13 +756,6 @@ impl StoryScreen {
 
     fn export_hires_button_active(&mut self) -> bool {
         HiResRenderProceduresComponent::export_button_active(
-            &mut self.hires_render_procedures,
-            Instant::now(),
-        )
-    }
-
-    fn preview_hires_button_active(&mut self) -> bool {
-        HiResRenderProceduresComponent::preview_button_active(
             &mut self.hires_render_procedures,
             Instant::now(),
         )
@@ -964,7 +930,7 @@ impl StoryScreen {
         self.status = "Playlist input · timeline".into();
     }
 
-    /// Enter Wrap UI — editorial only. Preview stays on broadcast PlayerRemote.
+    /// Enter Wrap UI — editorial only. Playback stays on broadcast PlayerRemote.
     fn start_wrap_session_for_part(
         &mut self,
         host: &HostClient,
@@ -2530,7 +2496,6 @@ impl StoryScreen {
         let program_waveform = self.program_waveforms.compose(&program, &source_durations);
         let display_frame =
             playback.playlist_display_frame(self.wrap_playhead_frame, program.duration_frames());
-        let preview_hires_pending = self.preview_hires_button_active();
         let tc = |sec| self.tc(sec);
         let playhead_sec = self.timeline_sec_from_frame(display_frame).unwrap_or(0.0);
         let action = segment_panel::show(
@@ -2546,7 +2511,6 @@ impl StoryScreen {
                 a2_peaks: &program_waveform.a2_peaks,
                 selected_slot_id: &self.selected_slot_id,
                 selected_cover_id: &self.selected_cover_id,
-                preview_hires_pending,
                 sync_cover_enabled: self.sync_cover.enabled(),
                 tc: &tc,
             },
@@ -2586,7 +2550,6 @@ impl StoryScreen {
             }
             marker_cover_panel::MarkerCoverAction::CreateCover => self.quick_cover(host),
             marker_cover_panel::MarkerCoverAction::OverwriteCover => self.overwrite_cover(host),
-            marker_cover_panel::MarkerCoverAction::PreviewHiRes => self.preview_hires(host),
             marker_cover_panel::MarkerCoverAction::ToggleSyncCover => {
                 self.toggle_sync_cover_capture()
             }
@@ -3524,32 +3487,6 @@ impl StoryScreen {
             &project_id,
             &job_id,
         ));
-    }
-
-    fn preview_hires(&mut self, host: &HostClient) -> PlaybackTransportIntent {
-        let instance_id = self.edit_instance_id();
-        let request_id = self.next_backend_request_id();
-        let project_id = self.project_id.clone();
-        match HiResRenderProceduresComponent::start_preview(
-            &mut self.hires_render_procedures,
-            instance_id,
-            request_id,
-            &project_id,
-            Instant::now(),
-        ) {
-            Ok((command, status)) => {
-                self.enqueue_backend_command(command);
-                let preview_status = status;
-                self.status = preview_status.clone();
-                let home_intent = self.jump_playlist_start(host);
-                self.status = preview_status;
-                home_intent
-            }
-            Err(status) => {
-                self.status = status;
-                PlaybackTransportIntent::None
-            }
-        }
     }
 
     fn delete_part(&mut self, _host: &HostClient, part_id: &str) {
@@ -5365,69 +5302,6 @@ mod tests {
         assert_eq!(updated.fps, 50.0);
         assert_eq!(updated.duration_frames, 100);
         assert_eq!(updated.duration_sec, 2.0);
-    }
-
-    #[test]
-    fn preview_hires_button_builds_preview_flat_playlist() {
-        let mut screen = StoryScreen::story();
-        screen.project_id = "p".into();
-        screen.loaded_project_id = "p".into();
-
-        let intent = screen.preview_hires(&HostClient::new("http://127.0.0.1:1"));
-
-        assert_eq!(intent, PlaybackTransportIntent::None);
-        assert!(screen.hires_render_procedures.preview_pending());
-        let commands = screen.drain_backend_commands();
-        assert_eq!(commands.len(), 1);
-        assert_eq!(commands[0].component_id, "hires.render_transport");
-        assert_eq!(commands[0].operation_id, "preview_hires_input.build");
-        assert_eq!(commands[0].path, "/api/preview/hires/input/build");
-        assert_eq!(
-            commands[0]
-                .payload
-                .as_ref()
-                .and_then(|payload| payload.get("project_id"))
-                .and_then(Value::as_str),
-            Some("p")
-        );
-        assert!(screen.status.contains("flat playlist"));
-    }
-
-    #[test]
-    fn preview_hires_sends_playlist_home_before_backend_build() {
-        let mut screen = StoryScreen::story();
-        screen.project_id = "p".into();
-        screen.loaded_project_id = "p".into();
-        screen.playlist = Some(two_part_playlist());
-        screen.wrap_playhead_frame = 50;
-        screen.selected_part_id = "part_b".into();
-        screen.all_clips = vec![StoryShot {
-            clip_id: "clip_a".into(),
-            fps: 50.0,
-            duration_frames: 300,
-            play_path: "C:/qnc/proxy/clip_a.mp4".into(),
-            has_audio: true,
-            audio_channels: 2,
-            ..StoryShot::default()
-        }];
-        seed_playlist_playback_inputs(&mut screen, &["clip_a"]);
-
-        let intent = screen.preview_hires(&HostClient::new("http://127.0.0.1:1"));
-
-        let request = match intent {
-            PlaybackTransportIntent::OpenProgram(request) => request,
-            other => {
-                panic!("expected playlist Home OpenProgram before preview build, got {other:?}")
-            }
-        };
-        assert_eq!(screen.view_mode, ViewMode::Wrap);
-        assert_eq!(screen.wrap_playhead_frame, 0);
-        assert_eq!(screen.selected_part_id, "part_a");
-        assert_eq!(request.start_program_frame, FrameNumber(0));
-        assert!(screen.status.contains("flat playlist"));
-        let commands = screen.drain_backend_commands();
-        assert_eq!(commands.len(), 1);
-        assert_eq!(commands[0].operation_id, "preview_hires_input.build");
     }
 
     #[test]

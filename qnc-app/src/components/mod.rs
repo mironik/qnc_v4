@@ -6,8 +6,6 @@ mod editorial_playback_transport;
 mod editorial_state;
 mod filesystem_list;
 mod hires_export_procedure;
-mod hires_preview_player;
-mod hires_preview_procedure;
 mod hires_render_procedures;
 mod hires_render_transport;
 mod playback_media_resolver;
@@ -38,13 +36,6 @@ pub(crate) use editorial_state::{EditorialStateComponent, EditorialStateData};
 pub(crate) use filesystem_list::FilesystemListComponent;
 pub(crate) use hires_export_procedure::{
     HiResExportProcedureComponent, HiResExportProcedureState, HIRES_EXPORT_POLL_INTERVAL,
-};
-pub(crate) use hires_preview_player::{
-    HiResPreviewOpen, HiResPreviewPlayerAction, HiResPreviewPlayerComponent,
-    HiResPreviewPlayerState,
-};
-pub(crate) use hires_preview_procedure::{
-    HiResPreviewProcedureComponent, HiResPreviewProcedureState,
 };
 pub(crate) use hires_render_procedures::{
     HiResRenderProceduresComponent, HiResRenderProceduresState,

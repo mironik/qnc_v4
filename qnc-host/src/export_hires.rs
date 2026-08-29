@@ -2,8 +2,8 @@ use std::fs;
 use std::path::PathBuf;
 
 use qnc_service_contracts::{
-    ExportHiResJobPayload, ExportHiResSubmitResponse, ExportJobState, PreviewHiResInputResponse,
-    JOB_SOURCE_EXPORT_HIRES, JOB_TYPE_EXPORT_HIRES,
+    ExportHiResJobPayload, ExportHiResSubmitResponse, ExportJobState, JOB_SOURCE_EXPORT_HIRES,
+    JOB_TYPE_EXPORT_HIRES,
 };
 use rusqlite::params;
 use serde_json::{json, Value};
@@ -115,39 +115,6 @@ pub(crate) fn hires_export_status(
             "timeline_timebase": payload.as_ref().map(|payload| payload.timeline_timebase),
             "duration_frames": payload.as_ref().map(|payload| payload.duration_frames),
         }))
-    })
-}
-
-pub(crate) fn build_hires_preview_input(
-    paths: &ProjectPaths,
-    project_db: &ProjectDbBroker,
-    media_gateway: &ProjectMediaGateway,
-    project_id: &str,
-) -> Result<PreviewHiResInputResponse, String> {
-    let pid = project_id.trim();
-    if pid.is_empty() {
-        return Err("project_id required".into());
-    }
-    let preview_id = format!("preview_{}", Uuid::new_v4().simple());
-    let scratch_path = paths
-        .project_dir(pid)
-        .join("preview_hires_input")
-        .join(&preview_id);
-    let payload = prepare_hires_flat_payload(
-        paths,
-        project_db,
-        media_gateway,
-        pid,
-        scratch_path,
-        &preview_id,
-    )?;
-    Ok(PreviewHiResInputResponse {
-        project_id: pid.to_string(),
-        preview_id,
-        timeline_timebase: payload.timeline_timebase,
-        duration_frames: payload.duration_frames,
-        items: payload.items,
-        message: Some("Preview HI-res input je pripremljen iz export flat playliste".into()),
     })
 }
 

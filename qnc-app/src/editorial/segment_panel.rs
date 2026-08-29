@@ -31,7 +31,6 @@ pub(crate) struct SegmentPanelInput<'a> {
     pub a2_peaks: &'a [f32],
     pub selected_slot_id: &'a str,
     pub selected_cover_id: &'a str,
-    pub preview_hires_pending: bool,
     pub sync_cover_enabled: bool,
     pub tc: &'a dyn Fn(f64) -> String,
 }
@@ -191,7 +190,6 @@ pub(crate) fn show(ui: &mut egui::Ui, input: SegmentPanelInput<'_>) -> SegmentPa
                                     playhead_sec: input.playhead_sec,
                                     tc: input.tc,
                                     show_playhead: false,
-                                    preview_hires_pending: input.preview_hires_pending,
                                     sync_cover_enabled: input.sync_cover_enabled,
                                 },
                             );

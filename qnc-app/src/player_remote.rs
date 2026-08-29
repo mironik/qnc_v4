@@ -105,7 +105,6 @@ pub struct BroadcastProgramOpenRequest {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BroadcastProgramPreviewVideoResolution {
     FastPreview,
-    SourceRaster,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -2166,9 +2165,6 @@ fn playlist_video_format(
         BroadcastProgramPreviewVideoResolution::FastPreview => {
             playlist_preview_video_format(&source_format)
         }
-        BroadcastProgramPreviewVideoResolution::SourceRaster => {
-            playlist_source_raster_video_format(&source_format)
-        }
     })
 }
 
@@ -2176,16 +2172,6 @@ fn playlist_preview_video_format(source_format: &VideoFormat) -> VideoFormat {
     VideoFormat::new(
         PLAYLIST_PREVIEW_WIDTH,
         PLAYLIST_PREVIEW_HEIGHT,
-        FieldMode::Progressive,
-        source_format.color_space.clone(),
-    )
-    .unwrap_or_else(|_| source_format.clone())
-}
-
-fn playlist_source_raster_video_format(source_format: &VideoFormat) -> VideoFormat {
-    VideoFormat::new(
-        source_format.width,
-        source_format.height,
         FieldMode::Progressive,
         source_format.color_space.clone(),
     )
@@ -4118,30 +4104,6 @@ mod tests {
         assert_eq!(source.timebase, CoreTimebase::new(50, 1).unwrap());
         assert!(source.video_format.is_some());
         assert_eq!(source.audio_format.as_ref().unwrap().channel_count, 2);
-    }
-
-    #[test]
-    fn playlist_input_source_can_use_source_raster_for_hires_preview() {
-        let request = BroadcastProgramOpenRequest {
-            program_id: "hires-preview:story_a".into(),
-            project_id: "project".into(),
-            timeline_fps: 50.0,
-            duration_frames: 100,
-            start_program_frame: FrameNumber(0),
-            preview_video_resolution: BroadcastProgramPreviewVideoResolution::SourceRaster,
-            items: Vec::new(),
-        };
-        let program = two_take_program_state();
-
-        let source = playlist_input_source(&request, &program).unwrap();
-
-        assert_eq!(
-            source
-                .video_format
-                .as_ref()
-                .map(|format| (format.width, format.height)),
-            Some((1920, 1080))
-        );
     }
 
     #[test]
